@@ -1,0 +1,29 @@
+# large binaries / downloads
+tools/
+*.zip
+
+# datasets: images stay out of git, metadata/GT stays in
+data/downloads/
+data/**/*.jpg
+data/**/*.JPG
+data/**/*.jpeg
+
+# generated / working files
+scratch/
+node_modules/
+tests/e2e/test-results/
+prototype_backup_isotropic/
+tmp/
+dist/
+mockup/
+REFACTOR.md
+browser_gs.txt
+examples/
+scripts/
+data/*
+!data/synthetic
+
+# Burn/Brush CLI autotune cache (brush_cli run with this dir as CWD)
+target/
+# headless bench runner output (the tracked baseline lives in tests/bench/*.jsonl)
+tests/bench/results/

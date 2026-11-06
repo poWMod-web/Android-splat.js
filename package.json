@@ -1,0 +1,45 @@
+{
+  "name": "splat.js",
+  "version": "0.1.0",
+  "description": "Gaussian-splat training that runs entirely in the browser: photographs in, camera poses + a trained 3D Gaussian splat out. No server, no upload, no build step.",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./sfm": "./src/sfm/sfm.js",
+    "./trainer": "./src/gs/trainer.js",
+    "./ply": "./src/io/ply.js",
+    "./frames": "./src/io/frames.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "dev": "node serve.mjs 3000",
+    "serve": "node serve.mjs 3000",
+    "build": "node build.mjs",
+    "test": "node tests/unit/run.mjs",
+    "test:xr": "node tests/unit/xr-math.mjs && node tests/unit/test_xr_dataset.mjs",
+    "test:quality": "node tests/quality/run.mjs",
+    "test:e2e": "playwright test -c tests/e2e"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arrival-space/splat.js.git"
+  },
+  "keywords": [
+    "gaussian-splatting",
+    "3dgs",
+    "webgpu",
+    "structure-from-motion",
+    "sfm",
+    "photogrammetry",
+    "browser"
+  ],
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  }
+}
