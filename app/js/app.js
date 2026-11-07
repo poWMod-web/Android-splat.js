@@ -962,9 +962,26 @@ async function localRunTiles(shares = new Map()) {
     // Community listing, the kill switch — but only when the account that
     // owns it is signed in here (`shares`, from /splatjs/mine)
     const sh = r.spaceId ? shares.get(String(r.spaceId)) : null;
+    const renameLocalModel = async () => {
+      const previousName = r.name || 'Training run';
+      const name = await textCard('Rename this model', previousName);
+      if (!name || name === previousName) return;
+      try {
+        const { patchRun } = await import('./store.js');
+        if (!await patchRun(r.id, { name })) {
+          flash('Could not save the new model name on this device.', 6000);
+          return;
+        }
+        r.name = name;
+        const title = b.querySelector('.galname');
+        if (title) title.textContent = name;
+        flash(`Renamed to ${name}.`, 4000);
+      } catch (e) { flash(`Rename failed: ${e.message}`, 6000); }
+    };
     tileMenu(b.querySelector('.run-menu'), [
       viewable && { label: 'View', act: r.sog ? openRun : () => viewFromState(r) },
       (r.sog || retrainable || (r.state && r.recon)) && { label: 'Train', act: () => { S._localRun = r; trainLocalChoice(); } },
+      !sh && { label: 'Rename', act: renameLocalModel },
       ...(sh ? shareMenuItems(sh)
         : r.spaceId ? [{ label: 'Copy link', act: async () => { try { await navigator.clipboard.writeText(shareLinkOf(r.spaceId)); flash('Link copied.', 2500); } catch { flash(shareLinkOf(r.spaceId), 8000); } } }] : []),
       r.sog && r.recon && !r.spaceId && { label: 'Share', act: () => shareDialog(r) },

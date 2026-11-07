@@ -74,17 +74,22 @@ export async function saveRun(rec) {
 export async function patchRun(id, patch) {
   try {
     const d = await openDb2();
+    let updated = false;
     await new Promise((res, rej) => {
       const tx = d.transaction(RUNS, 'readwrite');
       const s = tx.objectStore(RUNS);
       const rq = s.get(id);
       rq.onsuccess = () => {
-        if (rq.result) s.put({ ...rq.result, ...patch, updatedAt: Date.now() });
+        if (rq.result) {
+          s.put({ ...rq.result, ...patch, updatedAt: Date.now() });
+          updated = true;
+        }
       };
       tx.oncomplete = () => { d.close(); res(); };
       tx.onerror = () => { d.close(); rej(tx.error); };
     });
-  } catch { /* storage is best-effort — never disturb a run */ }
+    return updated;
+  } catch { return false; /* storage is best-effort — never disturb a run */ }
 }
 
 export async function listRuns() {
