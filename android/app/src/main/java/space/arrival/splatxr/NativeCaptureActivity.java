@@ -649,14 +649,14 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         private void drawBackground(Frame frame) {
             // ARCore accounts for display orientation and camera-texture UV layout.
-            // Rotate preview by 180° by exchanging opposite UV pairs: (0 <-> 3) and (1 <-> 2).
             uvInput.position(0);
             uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
 
-            // Perform 180° rotation by swapping diagonally opposite quad corners directly
-            swapUvCoords(uvOutput, 0, 3);
-            swapUvCoords(uvOutput, 1, 2);
+            // Swap adjacent horizontal pairs (0 <-> 1) and (2 <-> 3) to invert
+            // the vertical orientation while correcting horizontal mirroring.
+            swapUvCoords(uvOutput, 0, 1);
+            swapUvCoords(uvOutput, 2, 3);
 
             uvOutput.position(0);
 
