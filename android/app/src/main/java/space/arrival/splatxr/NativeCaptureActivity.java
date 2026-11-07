@@ -731,11 +731,11 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         private void putCoverageColor(FloatBuffer colors, float maxAngle) {
             // Spread the ramp over a wider viewpoint range so coverage does not
-            // jump straight from red to green: red -> orange at 45°, yellow at
-            // 90°, then a gradual transition to green at 150°.
-            float orangeAt = (float)(Math.PI / 4.0);
-            float yellowAt = (float)(Math.PI / 2.0);
-            float greenAt = (float)(Math.PI * 5.0 / 6.0);
+            // jump straight from red to green: red -> orange at 40°, yellow at
+            // 80°, then a gradual transition to green at 120°.
+            float orangeAt = (float)Math.toRadians(40.0);
+            float yellowAt = (float)Math.toRadians(80.0);
+            float greenAt = (float)Math.toRadians(120.0);
             float angle = Float.isFinite(maxAngle) ? Math.max(0f, Math.min(maxAngle, greenAt)) : 0f;
             float red, green, blue, t;
             if (angle < orangeAt) {
