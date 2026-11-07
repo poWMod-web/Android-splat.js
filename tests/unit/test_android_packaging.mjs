@@ -33,10 +33,10 @@ assert.match(native, /getDecorView\(\)\.setSystemUiVisibility\(0\)/,
 assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?uvOutput\.position\(0\);/,
   'camera preview must use ARCore-transformed display coordinates');
 const backgroundDraw = native.slice(native.indexOf('private void drawBackground(Frame frame)'), native.indexOf('private void updateCoverage(Frame frame)'));
-assert.match(backgroundDraw, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*for \(int row = 0; row < 2; row\+\+\)[\s\S]*int left = row \* 4, right = left \+ 2;[\s\S]*uvOutput\.put\(left, uvOutput\.get\(right\)\);[\s\S]*uvOutput\.put\(right, u\);/,
-  'the front-camera preview should be mirrored horizontally by swapping UV pairs within each row');
-assert.match(backgroundDraw, /Correct the camera image\x27s left-right mirroring[\s\S]*points and camera overlays keep their world-space poses/,
-  'correcting preview mirroring must not alter camera overlay or world-space point orientation');
+assert.match(backgroundDraw, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*for \(int vertex = 0; vertex < 2; vertex\+\+\)[\s\S]*int first = vertex \* 2, opposite = \(3 - vertex\) \* 2;[\s\S]*uvOutput\.put\(first, uvOutput\.get\(opposite\)\);[\s\S]*uvOutput\.put\(first \+ 1, uvOutput\.get\(opposite \+ 1\)\);[\s\S]*uvOutput\.put\(opposite, u\);[\s\S]*uvOutput\.put\(opposite \+ 1, v\);/,
+  'the preview must rotate 180 degrees by swapping complete opposite UV pairs');
+assert.match(backgroundDraw, /rotate only the preview[\s\S]*180° around its center[\s\S]*overlay geometry and world-space camera poses are left untouched/,
+  'a 180-degree preview rotation must not alter camera overlay or world-space point orientation');
 assert.match(native, /Matrix\.multiplyMM\(mvp, 0, projection, 0, view, 0\);/,
   'coverage points must use ARCore projection and view matrices directly');
 assert.match(native, /viewpoints\.add\(new CaptureViewpoint\(matrix, focal\[0\], focal\[1\], principal\[0\], principal\[1\], imageSize\[0\], imageSize\[1\]\)\)/,

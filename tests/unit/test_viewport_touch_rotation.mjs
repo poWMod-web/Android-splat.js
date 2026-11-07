@@ -48,16 +48,19 @@ pan.view.scene = { center: [1000, 0, 0], radius: 0.001 };
 pan.view.dist = 1;
 pan.view.target = [0, 0, 0];
 pan.view.fpv = true; // avoid scene-pivot re-anchoring on pointerdown
+pan.view.roll = 0.35;
+const panBasis = pan.view._basis();
+const panStart = pan.view.target.slice();
 pan.send('pointerdown', 3, 0, 0, true);
-pan.send('pointermove', 3, 100000, 100000);
-const { right, down } = pan.view._basis();
-const vertical = pan.view.target.reduce((sum, v, i) => sum + v * down[i], 0);
-const horizontal = pan.view.target.reduce((sum, v, i) => sum + v * right[i], 0);
-assert.equal(pan.view._panY, pan.view.h,
-  'vertical pan should clamp to the viewport height, not the scene bounds');
-assert.ok(Math.abs(vertical) > 2 * pan.view.scene.radius,
-  'vertical pan should be able to travel beyond any scene-relative limit');
-assert.ok(Math.abs(horizontal) > 10,
-  'centroid pan should remain unbounded left-to-right');
+pan.send('pointermove', 3, 100000, -100000);
+const panDelta = pan.view.target.map((v, i) => v - panStart[i]);
+const vertical = panDelta.reduce((sum, v, i) => sum + v * panBasis.down[i], 0);
+const horizontal = panDelta.reduce((sum, v, i) => sum + v * panBasis.right[i], 0);
+assert.ok(Math.abs(vertical) > 100,
+  'vertical pan should remain unbounded even for a tiny scene');
+assert.ok(Math.abs(horizontal) > 100,
+  'horizontal pan should remain unbounded');
+assert.equal(pan.view._panY, undefined,
+  'panning should not track or clamp to a vertical travel limit');
 
-console.log('viewport twist, pinch, and bounded vertical pan: passed');
+console.log('viewport twist, pinch, and unbounded viewport-relative pan: passed');

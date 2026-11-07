@@ -40,8 +40,16 @@ assert.doesNotMatch(chartSource, /ssimTrain|ssimHold/,
   'the chart should not depend on separately calculated SSIM histories');
 assert.match(appSource, /function formatTrainingScore\(psnr\)[\s\S]*psnrToApproxSsimPercent\(psnr\)/,
   'the metric above splat count should show the same approximate value as the graph');
-assert.match(appSource, /SSIM % approx\./,
-  'the headline should disclose that the SSIM percentage is approximate');
+assert.match(appSource, /const unit = similarity \? '%' : 'dB'/,
+  'the headline should show only a percent sign for the estimated scale');
+assert.doesNotMatch(appSource, /id="t-title"|class="t-state"/,
+  'training and paused status text should not precede the score');
+assert.doesNotMatch(appSource, /SSIM % approx\.|Use approx\. SSIM %/,
+  'the UI should use only % and Use % wording, not an approximation label');
+assert.match(appSource, /const next = S\.scoreScale === 'db' \? 'Use %' : 'Use dB'/,
+  'the scale button should say Use % for the percentage graph');
+assert.match(chartSource, /unit: this\.scale === 'similarity' \? '%' : 'dB'/,
+  'the chart tooltip should show only the percent unit');
 assert.doesNotMatch(appSource, /maybeEvaluateSsim|evalGraphSsim|evalGraphMetrics/,
   'displaying the approximate scale must not launch a model SSIM evaluation');
 assert.match(appSource, /function toggleScoreScale\(\)[\s\S]*S\.scoreScale = S\.scoreScale === 'db' \? 'similarity' : 'db'/,

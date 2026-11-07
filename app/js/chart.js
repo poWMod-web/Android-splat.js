@@ -185,7 +185,7 @@ export class Chart {
           xPct: (x / W) * 100,
           iter: Math.round(a[0]),
           train: this._displayValue(a[1]), hold: h ? this._displayValue(h[1]) : null,
-          unit: this.scale === 'similarity' ? 'SSIM % (approx.)' : 'dB', event: ev ? ev.label : null,
+          unit: this.scale === 'similarity' ? '%' : 'dB', event: ev ? ev.label : null,
         });
       }
     }

@@ -568,9 +568,7 @@ body { overflow: hidden; }
 .setgear[aria-expanded="true"] .chev { transform: rotate(90deg); }
 
 
-/* the state word lives ON the dB line (t-state in .score-1) — no floating
-   titles anymore; the stop-and-keep chip hangs below the pause circle,
-   out of flow, so pausing never moves a single string */
+/* Keep the pause and stop controls anchored without shifting score content. */
 .tmeta { position: relative; }
 .playwrap { position: relative; display: inline-flex; }
 #t-finish {

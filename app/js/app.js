@@ -5,7 +5,7 @@
 // The interaction model is the v2 mockup's, verbatim; underneath it now sits
 // the real library: prep beats are the solver's own progress events, the
 // model on the stage is the WebGPU trainer's render, the curve can show
-// measured PSNR or raw SSIM, and Export writes a real .ply. The UI talks to ONE object — the
+// measured PSNR or an SSIM estimate from that score, and Export writes a real .ply. The UI talks to ONE object — the
 // splat.js Session — plus the trainer's rendered canvas.
 
 import { createSession, parseCameras, gaussiansToPly, undistortFrames, solveTierOpts } from '../../src/index.js';
@@ -2508,9 +2508,6 @@ function toggleTrain() {
       ? '<svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z"/></svg>'
       : '<svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M8 4.8v14.4l12.4-7.2z"/></svg>';
   }
-  const label = on ? 'Training…' : 'Paused';
-  const tt = $('t-title');
-  if (tt) tt.textContent = label;
   const f = $('t-finish');
   if (f) f.hidden = on;   // paused = the moment "stop here" makes sense
   if (!on) checkpointRun('pause').catch(() => {});
@@ -2700,7 +2697,7 @@ function formatTrainingScore(psnr) {
 
 function renderTrainingScore() {
   const similarity = S.scoreScale === 'similarity';
-  const unit = similarity ? 'SSIM % approx.' : 'dB';
+  const unit = similarity ? '%' : 'dB';
   const trainEl = $('t-ptrain');
   if (trainEl) trainEl.textContent = formatTrainingScore(S.psnrTrain);
   const trainUnit = $('t-punit');
@@ -4885,12 +4882,12 @@ function dock(kind) {
       <div class="chartwrap"><canvas id="chart"></canvas><div class="chart-tip" id="chart-tip" hidden></div></div>
       <div class="tscores">
         <div class="score" data-tone="accent">
-          <div class="score-1"><span class="t-state" id="t-title">Training…</span><span class="score-v"><span id="t-ptrain">${formatTrainingScore(S.psnrTrain)}</span><small class="unit" id="t-punit">${S.scoreScale === 'similarity' ? 'SSIM % approx.' : 'dB'}</small></span></div>
+          <div class="score-1"><span class="score-v"><span id="t-ptrain">${formatTrainingScore(S.psnrTrain)}</span><small class="unit" id="t-punit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div>
           <div class="score-sub"><span id="t-splats">${S.splats ? fmt(S.splats) : '—'}</span> splats</div>
           <button class="chart-scale score-scale" id="chart-scale" type="button">Use %</button>
           <span class="tmeta-grow" id="t-grow">&nbsp;</span>
         </div>
-        ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${formatTrainingScore(S.psnrHold)}</span><small class="unit" id="t-hunit">${S.scoreScale === 'similarity' ? 'SSIM % approx.' : 'dB'}</small></span></div><div class="score-sub">held out</div></div>` : ''}
+        ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${formatTrainingScore(S.psnrHold)}</span><small class="unit" id="t-hunit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div><div class="score-sub">held out</div></div>` : ''}
       </div>`;
     $('t-play').addEventListener('click', toggleTrain);
     $('t-finish').addEventListener('click', async () => {
@@ -4907,9 +4904,9 @@ function dock(kind) {
 }
 
 function syncScoreScaleControls() {
-  const next = S.scoreScale === 'db' ? 'Use approx. SSIM %' : 'Use dB';
+  const next = S.scoreScale === 'db' ? 'Use %' : 'Use dB';
   const title = S.scoreScale === 'db'
-    ? 'Show an approximate SSIM percentage derived from PSNR'
+    ? 'Switch graph to percentage'
     : 'Switch graph to PSNR in decibels';
   for (const id of ['chart-scale', 'd-chart-scale']) {
     const button = $(id);

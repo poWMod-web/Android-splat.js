@@ -77,7 +77,6 @@ export class Viewport {
     this.scene = null;          // { xyz, rgb, center, radius }
     this.lock = null;           // a camera whose pose the view sits on
     this.yaw = 0.6; this.pitch = 0.22; this.roll = 0; this.dist = 8; this.target = [0, 0, 0];
-    this._panY = 0;
     this.fpv = false;           // per-set: rotate around the EYE, wheel walks
     this.setUp([0, -1, 0]);     // COLMAP-ish default until detectUp measures
     this.dirty = true;
@@ -99,14 +98,9 @@ export class Viewport {
     const panBy = (dx, dy) => {
       const s = this.dist * 0.0016;
       const { right, down } = this._basis();
-      // Bound cumulative vertical travel in viewport pixels, not by the scene's
-      // center or radius. Horizontal pan intentionally has no matching clamp.
-      const limit = Math.max(1, this.h || 1);
-      const nextPanY = Math.max(-limit, Math.min(limit, this._panY + dy));
-      const boundedDy = nextPanY - this._panY;
-      this._panY = nextPanY;
+      // Pan in viewport coordinates; all directions are unrestricted.
       for (let i = 0; i < 3; i++) {
-        this.target[i] -= (right[i] * dx + down[i] * boundedDy) * s;
+        this.target[i] -= (right[i] * dx + down[i] * dy) * s;
       }
     };
 
@@ -302,7 +296,6 @@ export class Viewport {
   frameScene() {
     if (!this.scene) return;
     this.target = [...this.scene.center];
-    this._panY = 0;
     this.dist = this.scene.radius * 2.5;
     this.yaw = 0.7; this.pitch = -0.32; this.roll = 0; // a little above the scene, looking down
     this.dirty = true;
@@ -345,7 +338,6 @@ export class Viewport {
     const fwd = [cam.R[6], cam.R[7], cam.R[8]];
     const d = this._pivotDist(cam);
     this.target = [C[0] + fwd[0] * d, C[1] + fwd[1] * d, C[2] + fwd[2] * d];
-    this._panY = 0;
     this.dist = d;
     const ang = this.anglesOf(fwd);
     this.yaw = ang.yaw;
@@ -457,7 +449,6 @@ export class Viewport {
     if (d == null) d = rad * 0.5;
     if (d < rad * 0.04) return;
     const step = Math.min(d * 0.45, rad * 0.3);
-    this._panY = 0;
     const from = [...this.target];
     const t0 = performance.now();
     this._cancelGlide();
@@ -495,7 +486,6 @@ export class Viewport {
     if (d == null) return;   // clicked into empty sky — nothing to focus
     d = Math.max(rad * 0.02, Math.min(rad * 2.5, d));
     this.target = [eye[0] + dir[0] * d, eye[1] + dir[1] * d, eye[2] + dir[2] * d];
-    this._panY = 0;
     const u = this.up, A = this._A, B = this._B;
     const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     this.pitch = Math.asin(Math.max(-1, Math.min(1, dot(dir, u))));
