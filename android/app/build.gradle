@@ -43,6 +43,8 @@ def webAssetsDir = layout.buildDirectory.dir('generated/webassets/www')
 
 tasks.register('syncWebAssets', Sync) {
     into webAssetsDir
+    // This build script lives in android/app, so go up two levels to the
+    // repository root before copying the web application and JS engine.
     from('../../app') { into 'app' }
     from('../../src') { into 'src' }
     if (rootProject.file('../data/synthetic').isDirectory()) {
