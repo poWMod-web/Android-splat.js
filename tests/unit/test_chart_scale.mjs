@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { ssimToPercent } from '../../app/js/chart.js';
+import { Chart, isSsimIndex, ssimToPercent } from '../../app/js/chart.js';
 import { ssimIndexRgb } from '../../src/gs/ssim.js';
 
 const chartSource = readFileSync(new URL('../../app/js/chart.js', import.meta.url), 'utf8');
@@ -9,14 +9,25 @@ const html = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf
 const appCss = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
 const baseCss = readFileSync(new URL('../../app/css/base.css', import.meta.url), 'utf8');
 const trainerSource = readFileSync(new URL('../../src/gs/trainer.js', import.meta.url), 'utf8');
+const sessionSource = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
 const shaderSource = readFileSync(new URL('../../src/gs/shaders.js', import.meta.url), 'utf8');
 
 assert.equal(ssimToPercent(0), 0);
 assert.equal(ssimToPercent(0.5), 50);
 assert.equal(ssimToPercent(1), 100);
 assert.equal(ssimToPercent(-0.1), 0, 'negative SSIM should not produce a negative percentage');
-assert.equal(ssimToPercent(1.1), 100, 'SSIM percentage should be capped at 100');
+assert.equal(ssimToPercent(1.001), 100, 'minor floating-point overshoot should be capped at 100');
 assert.equal(ssimToPercent(Number.NaN), 0, 'invalid metrics should not poison the graph scale');
+assert.equal(isSsimIndex(0.75), true);
+assert.equal(isSsimIndex(42), false, 'PSNR or pre-scaled percentages must not enter SSIM histories');
+assert.equal(ssimToPercent(42), 0, 'already-scaled scores must not be treated as raw SSIM');
+const chartCanvas = {
+  getContext: () => ({}), addEventListener: () => {},
+};
+const scoreChart = new Chart(chartCanvas);
+scoreChart.scale = 'similarity';
+assert.deepEqual(scoreChart._displaySeries([[0, 0.75], [1, 42]]), [[0, 75]],
+  'SSIM plots should display raw SSIM evaluation samples only, never dB or pre-scaled values');
 
 const w = 21, h = 21;
 const a = new Float32Array(w * h * 3).fill(0.35);
@@ -33,14 +44,18 @@ assert.doesNotMatch(chartSource, /psnrToSimilarity|10\s*\*\*\s*\(-psnr/,
   'PSNR must not be converted into a fake similarity percentage');
 assert.match(appSource, /function toggleScoreScale\(\)[\s\S]*S\.scoreScale = S\.scoreScale === 'db' \? 'similarity' : 'db'/,
   'the controls should switch between PSNR dB and actual SSIM percentage');
-assert.match(appSource, /evalGraphMetrics\(trainCi, holdCi\)/,
-  'SSIM samples should be evaluated from rendered train and holdout views');
-assert.match(appSource, /S\.ssimTrain = train\.ssim[\s\S]*S\.ssimTrainHist\.push\(\[iter, train\.ssim\]\)/,
-  'the SSIM headline and chart history must retain actual SSIM evaluation results');
+assert.match(appSource, /evalGraphSsim\(trainCi, holdCi\)/,
+  'SSIM samples should come from a dedicated raw-SSIM train/holdout evaluation');
+assert.match(appSource, /S\.ssimTrain = train[\s\S]*S\.ssimTrainHist\.push\(\[iter, train\]\)/,
+  'the SSIM headline and chart history must retain raw evaluation results, not PSNR');
+assert.match(appSource, /const rawSsimRows = \(rows\)[\s\S]*isSsimIndex\(value\)/,
+  'restored graph samples outside the raw SSIM index range must be discarded');
 assert.match(appSource, /function renderTrainingScore\(\)[\s\S]*S\.scoreScale === 'similarity'[\s\S]*ssimToPercent\(v\)[\s\S]*t-punit[\s\S]*SSIM %/,
   'the metric above splat count must display SSIM as a percentage when that scale is selected');
-assert.match(trainerSource, /evalCamMetrics\(ci\)[\s\S]*_evalPass\(ci, undefined, true\)/,
-  'the graph must use the trainer render evaluation path to obtain SSIM inputs');
+assert.match(trainerSource, /evalCamSsim\(ci\)[\s\S]*_evalPass\(ci, undefined, true\)/,
+  'the graph must compute SSIM directly from the rendered train and holdout views');
+assert.match(sessionSource, /evalGraphSsim\(trainCi, holdCi = -1\)[\s\S]*evalCamSsim\(trainCi\)[\s\S]*evalCamSsim\(holdCi\)/,
+  'the session graph API should pass raw SSIM values through without dB conversion');
 assert.match(shaderSource, /export const SSIM_METRIC_SRC[\s\S]*cam\.proj\.w[\s\S]*metric\[oi \+ 4u\]/,
   'the GPU readback should use rendered RGB and the exposure-corrected target');
 assert.match(appSource, /<div class="score-sub"><span id="t-splats">[\s\S]*?<\/div>\s*<button class="chart-scale score-scale" id="chart-scale"/,

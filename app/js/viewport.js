@@ -76,7 +76,7 @@ export class Viewport {
     this.ctx = canvas.getContext('2d');
     this.scene = null;          // { xyz, rgb, center, radius }
     this.lock = null;           // a camera whose pose the view sits on
-    this.yaw = 0.6; this.pitch = 0.22; this.dist = 8; this.target = [0, 0, 0];
+    this.yaw = 0.6; this.pitch = 0.22; this.roll = 0; this.dist = 8; this.target = [0, 0, 0];
     this.fpv = false;           // per-set: rotate around the EYE, wheel walks
     this.setUp([0, -1, 0]);     // COLMAP-ish default until detectUp measures
     this.dirty = true;
@@ -98,8 +98,16 @@ export class Viewport {
     const panBy = (dx, dy) => {
       const s = this.dist * 0.0016;
       const { right, down } = this._basis();
+      const center = this.scene?.center || [0, 0, 0];
+      const radius = Math.max(0.1, this.scene?.radius || 10);
+      // Keep vertical centroid travel within the scene-sized viewport, while
+      // leaving horizontal pan unrestricted for long, narrow scenes.
+      const vertical = this.target.reduce((sum, v, i) => sum + (v - center[i]) * down[i], 0);
+      const verticalDelta = Math.max(-2 * radius - vertical,
+        Math.min(2 * radius - vertical, -dy * s));
       for (let i = 0; i < 3; i++) {
-        this.target[i] -= (right[i] * dx + down[i] * dy) * s;
+        this.target[i] -= right[i] * dx * s;
+        this.target[i] += down[i] * verticalDelta;
       }
     };
 
@@ -156,16 +164,9 @@ export class Viewport {
           this.dist = Math.max(0.05, Math.min(400, this.dist * pinch.d / d));
         }
         if (turn) {
-          if (this.fpv) {
-            // Rotate around the first-person eye, just like a one-finger orbit.
-            const { fwd } = this._basis();
-            const eye = this.target.map((v, i) => v - fwd[i] * this.dist);
-            this.yaw += turn;
-            const { fwd: nextFwd } = this._basis();
-            this.target = eye.map((v, i) => v + nextFwd[i] * this.dist);
-          } else {
-            this.yaw += turn;
-          }
+          // Twist rolls the view around the line of sight, so the model rotates
+          // in the user's viewport instead of orbiting around world-up.
+          this.roll = pointerAngleDelta(this.roll + turn, 0);
         }
         panBy(cx - pinch.cx, cy - pinch.cy);
         pinch = { d, cx, cy, angle };
@@ -303,7 +304,7 @@ export class Viewport {
     if (!this.scene) return;
     this.target = [...this.scene.center];
     this.dist = this.scene.radius * 2.5;
-    this.yaw = 0.7; this.pitch = -0.32;   // a little above the scene, looking down
+    this.yaw = 0.7; this.pitch = -0.32; this.roll = 0; // a little above the scene, looking down
     this.dirty = true;
   }
 
@@ -375,6 +376,13 @@ export class Viewport {
       fwd[2] * right[0] - fwd[0] * right[2],
       fwd[0] * right[1] - fwd[1] * right[0],
     ];
+    if (this.roll) {
+      const cr = Math.cos(this.roll), sr = Math.sin(this.roll);
+      const rolledRight = right.map((v, i) => v * cr + down[i] * sr);
+      const rolledDown = down.map((v, i) => v * cr - right[i] * sr);
+      right = rolledRight;
+      return { fwd, right, down: rolledDown };
+    }
     return { fwd, right, down };
   }
 

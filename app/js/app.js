@@ -4,8 +4,8 @@
 //
 // The interaction model is the v2 mockup's, verbatim; underneath it now sits
 // the real library: prep beats are the solver's own progress events, the
-// model on the stage is the WebGPU trainer's render, the curve is measured
-// PSNR, and Export writes a real .ply. The UI talks to ONE object — the
+// model on the stage is the WebGPU trainer's render, the curve can show
+// measured PSNR or raw SSIM, and Export writes a real .ply. The UI talks to ONE object — the
 // splat.js Session — plus the trainer's rendered canvas.
 
 import { createSession, parseCameras, gaussiansToPly, undistortFrames, solveTierOpts } from '../../src/index.js';
@@ -29,7 +29,7 @@ const HOME_BENCHMARK_IDS = new Set([
 
 import { Viewport, camCentre, quatFromR, quatToR, qslerp } from './viewport.js';
 import { Developer, fitRect } from './develop.js';
-import { Chart, ssimToPercent } from './chart.js';
+import { Chart, isSsimIndex, ssimToPercent } from './chart.js';
 import { bmp, readyBmp, sizedUrl } from './img.js';
 
 const $ = (id) => document.getElementById(id);
@@ -2641,9 +2641,12 @@ function restoreRunDetails(run, session = S.session) {
   S.holdHist = Array.isArray(progress.holds) ? progress.holds.map((r) => Array.from(r || [])) : [];
   const ssimHistory = Array.isArray(progress.ssimChart) && progress.ssimChart.length
     ? progress.ssimChart : ((S.restored && S.restored.stats && S.restored.stats.ssimChart) || []);
-  S.ssimTrainHist = ssimHistory.map((r) => Array.from(r || []));
-  S.ssimHoldHist = (Array.isArray(progress.ssimHolds) ? progress.ssimHolds
-    : ((S.restored && S.restored.stats && S.restored.stats.ssimHolds) || [])).map((r) => Array.from(r || []));
+  const rawSsimRows = (rows) => rows.filter((r) => r && r[0] != null && r[1] != null)
+    .map((r) => [Number(r[0]), Number(r[1])])
+    .filter(([iter, value]) => Number.isFinite(iter) && isSsimIndex(value));
+  S.ssimTrainHist = rawSsimRows(ssimHistory);
+  S.ssimHoldHist = rawSsimRows(Array.isArray(progress.ssimHolds) ? progress.ssimHolds
+    : ((S.restored && S.restored.stats && S.restored.stats.ssimHolds) || []));
   S.ssimTrain = S.ssimTrainHist.length ? S.ssimTrainHist[S.ssimTrainHist.length - 1][1] : null;
   S.ssimHold = S.ssimHoldHist.length ? S.ssimHoldHist[S.ssimHoldHist.length - 1][1] : null;
   S._ssimLastEvalAt = 0;
@@ -2728,9 +2731,10 @@ function renderTrainingScore() {
 }
 
 function maybeEvaluateSsim(iter = S.iter) {
-  if (S.scoreScale !== 'similarity' || S._ssimEvalBusy || !S.session?.evalGraphMetrics) return;
+  if (S.scoreScale !== 'similarity' || S._ssimEvalBusy || !S.session?.evalGraphSsim) return;
   const now = performance.now();
-  if (S._ssimLastEvalAt && now - S._ssimLastEvalAt < 15000) return;
+  const interval = S.ssimTrainHist.length ? 15000 : 3000;
+  if (S._ssimLastEvalAt && now - S._ssimLastEvalAt < interval) return;
   const session = S.session;
   const trainer = session.trainer;
   if (!trainer?.camMeta?.length) return;
@@ -2740,12 +2744,16 @@ function maybeEvaluateSsim(iter = S.iter) {
   S._ssimEvalBusy = true;
   S._ssimLastEvalAt = now;
   const gen = S.gen;
-  session.evalGraphMetrics(trainCi, holdCi).then(({ train, hold }) => {
-    if (S.gen !== gen || S.session !== session || !Number.isFinite(train?.ssim)) return;
-    S.ssimTrain = train.ssim;
-    S.ssimHold = Number.isFinite(hold?.ssim) ? hold.ssim : null;
-    S.ssimTrainHist.push([iter, train.ssim]);
-    if (Number.isFinite(hold?.ssim)) S.ssimHoldHist.push([iter, hold.ssim]);
+  session.evalGraphSsim(trainCi, holdCi).then(({ train, hold }) => {
+    if (S.gen !== gen || S.session !== session) return;
+    if (!isSsimIndex(train)) {
+      console.warn('SSIM evaluation returned no raw SSIM index', { iter, train, hold });
+      return;
+    }
+    S.ssimTrain = train;
+    S.ssimHold = isSsimIndex(hold) ? hold : null;
+    S.ssimTrainHist.push([iter, train]);
+    if (isSsimIndex(hold)) S.ssimHoldHist.push([iter, hold]);
     renderTrainingScore();
     if (S.ssimTrainHist.length > 1000) S.ssimTrainHist = compactRows(S.ssimTrainHist, 800);
     if (S.ssimHoldHist.length > 1000) S.ssimHoldHist = compactRows(S.ssimHoldHist, 800);

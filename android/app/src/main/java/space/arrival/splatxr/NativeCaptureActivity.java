@@ -649,21 +649,21 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         private void drawBackground(Frame frame) {
             // ARCore accounts for display orientation and camera-texture UV layout.
-            // Use its transformed coordinates verbatim; extra manual axis flips
-            // mirrored the preview on portrait Android devices.
+            // Start with its transformed coordinates; the preview-only horizontal
+            // unmirror below leaves orientation and world-space overlays untouched.
             uvInput.position(0);
             uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
-            // Correct the camera preview's 180° display rotation by swapping
-            // opposite transformed UV pairs. This touches only the preview
-            // texture; the world-space coverage points keep ARCore's matrices.
-            for (int vertex = 0; vertex < 2; vertex++) {
-                int first = vertex * 2, opposite = (3 - vertex) * 2;
-                float u = uvOutput.get(first), v = uvOutput.get(first + 1);
-                uvOutput.put(first, uvOutput.get(opposite));
-                uvOutput.put(first + 1, uvOutput.get(opposite + 1));
-                uvOutput.put(opposite, u);
-                uvOutput.put(opposite + 1, v);
+            // Correct the camera image's left-right mirroring while preserving
+            // ARCore's display orientation. Only the preview UVs change; coverage
+            // points and camera overlays keep their world-space poses.
+            for (int row = 0; row < 2; row++) {
+                int left = row * 4, right = left + 2;
+                float u = uvOutput.get(left), v = uvOutput.get(left + 1);
+                uvOutput.put(left, uvOutput.get(right));
+                uvOutput.put(left + 1, uvOutput.get(right + 1));
+                uvOutput.put(right, u);
+                uvOutput.put(right + 1, v);
             }
             uvOutput.position(0);
             GLES20.glDisable(GLES20.GL_DEPTH_TEST);

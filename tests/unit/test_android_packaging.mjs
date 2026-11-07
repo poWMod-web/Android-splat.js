@@ -33,10 +33,10 @@ assert.match(native, /getDecorView\(\)\.setSystemUiVisibility\(0\)/,
 assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?uvOutput\.position\(0\);/,
   'camera preview must use ARCore-transformed display coordinates');
 const backgroundDraw = native.slice(native.indexOf('private void drawBackground(Frame frame)'), native.indexOf('private void updateCoverage(Frame frame)'));
-assert.match(backgroundDraw, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*for \(int vertex = 0; vertex < 2; vertex\+\+\)[\s\S]*int first = vertex \* 2, opposite = \(3 - vertex\) \* 2;[\s\S]*uvOutput\.put\(first, uvOutput\.get\(opposite\)\);[\s\S]*uvOutput\.put\(opposite, u\);/,
-  'the 180-degree correction should swap complete opposite UV pairs in the camera preview');
-assert.match(backgroundDraw, /touches only the preview[\s\S]*world-space coverage points keep ARCore\x27s matrices/,
-  'the 180-degree correction must leave world-space point projection unchanged');
+assert.match(backgroundDraw, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*for \(int row = 0; row < 2; row\+\+\)[\s\S]*int left = row \* 4, right = left \+ 2;[\s\S]*uvOutput\.put\(left, uvOutput\.get\(right\)\);[\s\S]*uvOutput\.put\(right, u\);/,
+  'the front-camera preview should be mirrored horizontally by swapping UV pairs within each row');
+assert.match(backgroundDraw, /Correct the camera image\x27s left-right mirroring[\s\S]*points and camera overlays keep their world-space poses/,
+  'correcting preview mirroring must not alter camera overlay or world-space point orientation');
 assert.match(native, /Matrix\.multiplyMM\(mvp, 0, projection, 0, view, 0\);/,
   'coverage points must use ARCore projection and view matrices directly');
 assert.match(native, /viewpoints\.add\(new CaptureViewpoint\(matrix, focal\[0\], focal\[1\], principal\[0\], principal\[1\], imageSize\[0\], imageSize\[1\]\)\)/,

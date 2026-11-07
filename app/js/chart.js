@@ -2,8 +2,12 @@
 // the moments where the optimiser changed its own setup, and an optional ghost
 // run so "what if" is a comparison instead of a claim.
 
+export function isSsimIndex(ssim) {
+  return Number.isFinite(ssim) && ssim >= -1.001 && ssim <= 1.001;
+}
+
 export function ssimToPercent(ssim) {
-  if (!Number.isFinite(ssim)) return 0;
+  if (!isSsimIndex(ssim)) return 0;
   return Math.max(0, Math.min(100, ssim * 100));
 }
 
@@ -54,7 +58,10 @@ export class Chart {
   }
 
   _displaySeries(series) {
-    return series.map(([iter, value]) => [iter, this._displayValue(value)]);
+    const samples = this.scale === 'similarity'
+      ? series.filter(([iter, value]) => Number.isFinite(iter) && isSsimIndex(value))
+      : series;
+    return samples.map(([iter, value]) => [iter, this._displayValue(value)]);
   }
 
   // top just fits the event dots; there are no x labels, so the bottom is
