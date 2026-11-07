@@ -2970,8 +2970,7 @@ function adoptSession(ses, stage = '', res = null) {
     // a person is not a scene: eye level rather than looking down from above,
     // and a little further back so the head clears the card at the top
     vp.dist = res.bounds.radius * 3.2;
-    vp.pitch = -0.12;
-    vp.dirty = true;
+    vp.setOrbitAngles(vp.yaw, -0.12);
   }
   renderControls();
   console.log(`[avatar] the viewer now shows the ${stage || 'new'} model — ${ses.trainer.n.toLocaleString()} splats`);
@@ -5162,9 +5161,7 @@ function tourStep(dt) {
   vp.target = [pos[0] + fwd[0] * d, pos[1] + fwd[1] * d, pos[2] + fwd[2] * d];
   vp.dist = d;
   const ang = vp.anglesOf(fwd);
-  vp.yaw = ang.yaw;
-  vp.pitch = clamp(ang.pitch, -1.45, 1.45);
-  vp.dirty = true;
+  vp.setOrbitAngles(ang.yaw, ang.pitch);
 }
 
 /** WASD fly: move the orbit target along the camera's own axes */
