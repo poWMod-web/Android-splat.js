@@ -1034,15 +1034,6 @@ export class Session {
     });
   }
 
-  /** Raw SSIM indexes for the graph; these values are never derived from PSNR. */
-  evalGraphSsim(trainCi, holdCi = -1) {
-    return this._locked(async () => {
-      const train = await this.trainer.evalCamSsim(trainCi);
-      const hold = holdCi >= 0 ? await this.trainer.evalCamSsim(holdCi) : null;
-      return { train, hold };
-    });
-  }
-
   /** Mean PSNR over the evalSplit test cameras — the number quality papers
    *  report. Resolves null when no eval split was requested. */
   evalTestPsnr() {

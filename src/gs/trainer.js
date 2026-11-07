@@ -1384,11 +1384,6 @@ export class GSTrainer {
     return { psnr, ssim };
   }
 
-  /** Raw SSIM index for a camera, deliberately separate from its dB score. */
-  async evalCamSsim(ci) {
-    return (await this._evalPass(ci, undefined, true)).ssim;
-  }
-
   /** PSNR of one camera (typically the holdout) at its current pose. */
   async evalCamPsnr(ci) {
     return (await this._evalPass(ci)).psnr;
