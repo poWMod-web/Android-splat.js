@@ -12,6 +12,9 @@ assert.match(gradle, /from\('\.\.\/\.\.\/src'\)\s*\{\s*into 'src'/,
 assert.equal(resolve(moduleDir, '../../app/index.html'), resolve(root, 'app/index.html'));
 assert.equal(resolve(moduleDir, '../../src/index.js'), resolve(root, 'src/index.js'));
 
+const manifest = readFileSync(resolve(moduleDir, 'src/main/AndroidManifest.xml'), 'utf8');
+assert.match(manifest, /NativeCaptureActivity[^>]*android:screenOrientation="portrait"/,
+  'ARCore capture must stay portrait-locked');
 const native = readFileSync(resolve(moduleDir, 'src/main/java/space/arrival/splatxr/NativeCaptureActivity.java'), 'utf8');
 assert.match(native, /text == null\) throw new IllegalStateException/,
   'capture export must report JSON serialization errors rather than dereference null');
@@ -25,4 +28,9 @@ assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S
   'camera preview UVs must receive the 180-degree orientation correction');
 assert.match(native, /mvp\[offset\] = -mvp\[offset\];[\s\S]*?mvp\[offset \+ 1\] = -mvp\[offset \+ 1\]/,
   'ARCore coverage points must receive the same 180-degree clip-space correction');
-console.log('Android asset paths, export guards, safe-area UI, and camera orientation: passed');
+assert.match(native, /orangeAt = \(float\)\(Math\.PI \/ 4\.0\)/);
+assert.match(native, /yellowAt = \(float\)\(Math\.PI \/ 2\.0\)/);
+assert.match(native, /greenAt = \(float\)\(Math\.PI \* 5\.0 \/ 6\.0\)/);
+assert.match(native, /green = 0\.42f \+ 0\.52f \* t/);
+assert.match(native, /red = 1f - 0\.92f \* t/);
+console.log('Android asset paths, portrait lock, export guards, system insets, and coverage colors: passed');

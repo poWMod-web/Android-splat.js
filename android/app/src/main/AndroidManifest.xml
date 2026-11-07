@@ -10,7 +10,7 @@
         android:theme="@android:style/Theme.Material.NoActionBar"
         android:usesCleartextTraffic="false">
         <meta-data android:name="com.google.ar.core" android:value="optional" />
-        <activity android:name=".NativeCaptureActivity" android:exported="false" android:screenOrientation="fullSensor" />
+        <activity android:name=".NativeCaptureActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".MainActivity" android:configChanges="orientation|screenSize|keyboardHidden" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
