@@ -649,32 +649,52 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         private void drawBackground(Frame frame) {
             // ARCore accounts for display orientation and camera-texture UV layout.
-            // Rotate only the preview by 180° (two 90° turns) by exchanging the
-            // complete UV pairs at opposite quad corners. This is not a mirror;
-            // overlay geometry and world-space camera poses remain untouched.
+            // Rotate preview by 180° by exchanging opposite UV pairs: (0 <-> 3) and (1 <-> 2).
             uvInput.position(0);
             uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
-            for (int vertex = 0; vertex < 2; vertex++) {
-                int first = vertex * 2, opposite = (3 - vertex) * 2;
-                float u = uvOutput.get(first), v = uvOutput.get(first + 1);
-                uvOutput.put(first, uvOutput.get(opposite));
-                uvOutput.put(first + 1, uvOutput.get(opposite + 1));
-                uvOutput.put(opposite, u);
-                uvOutput.put(opposite + 1, v);
-            }
+
+            // Perform 180° rotation by swapping diagonally opposite quad corners directly
+            swapUvCoords(uvOutput, 0, 3);
+            swapUvCoords(uvOutput, 1, 2);
+
             uvOutput.position(0);
+
+            // OpenGL ES setup and draw
             GLES20.glDisable(GLES20.GL_DEPTH_TEST);
             GLES20.glUseProgram(bgProgram);
+
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTexture);
             GLES20.glUniform1i(bgTexture, 0);
-            quadPositions.position(0); uvOutput.position(0);
-            GLES20.glEnableVertexAttribArray(bgPosition); GLES20.glEnableVertexAttribArray(bgUv);
+
+            quadPositions.position(0);
+            uvOutput.position(0);
+
+            GLES20.glEnableVertexAttribArray(bgPosition);
+            GLES20.glEnableVertexAttribArray(bgUv);
+
             GLES20.glVertexAttribPointer(bgPosition, 2, GLES20.GL_FLOAT, false, 0, quadPositions);
             GLES20.glVertexAttribPointer(bgUv, 2, GLES20.GL_FLOAT, false, 0, uvOutput);
+
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
-            GLES20.glDisableVertexAttribArray(bgPosition); GLES20.glDisableVertexAttribArray(bgUv);
+
+            GLES20.glDisableVertexAttribArray(bgPosition);
+            GLES20.glDisableVertexAttribArray(bgUv);
+        }
+
+        private void swapUvCoords(FloatBuffer buffer, int i, int j) {
+            int idx1 = i * 2;
+            int idx2 = j * 2;
+
+            float u = buffer.get(idx1);
+            float v = buffer.get(idx1 + 1);
+
+            buffer.put(idx1, buffer.get(idx2));
+            buffer.put(idx1 + 1, buffer.get(idx2 + 1));
+
+            buffer.put(idx2, u);
+            buffer.put(idx2 + 1, v);
         }
 
         private void updateCoverage(Frame frame) {
