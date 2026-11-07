@@ -491,6 +491,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         } catch (Exception ignored) { /* use ARCore's selected camera config */ }
         Config config = new Config(session);
         config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
+        config.setFocusMode(Config.FocusMode.AUTO);
         if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) config.setDepthMode(Config.DepthMode.AUTOMATIC);
         session.configure(config);
         cloudRenderer.setSession(session);

@@ -359,6 +359,13 @@ function boot() {
     e.stopPropagation();
     const runId = S.runId || (S._localRun && S._localRun.id);
     if (runId) await persistRunDetails(runId, { full: true }).catch(() => {});
+    // Local library viewers use a pushed in-app state; pop it to return to
+    // the same wall/feed without leaving the app.
+    if (S._localRun && S._viewerOpen) {
+      if (history.state && history.state.sj === 'viewer' && history.length > 1) history.back();
+      else closeViewerToHome();
+      return;
+    }
     // a shared creation holds nothing precious — Back is simply the way
     // home. When the visitor came from within the app, real history.back()
     // is better: the bfcache restores the feed with its scroll intact.
@@ -3581,7 +3588,7 @@ function renderControls() {
     '<i>Details ›</i>';
   stats.addEventListener('click', openDetails);
   c.appendChild(stats);
-  if (!S.restored) {
+  if (!S.restored && !S._localRun) {
     // a restored model has no training targets in this tab — viewing and
     // exporting work, continuing the run does not (yet)
     const more = document.createElement('button');
@@ -3610,22 +3617,22 @@ function renderControls() {
     c.appendChild(enter);
   }
   const rj = S.restored && S.restored.reconJson;
-  if (rj && rj.source && rj.source.urls && rj.source.urls.length && rj.source.urls.every(Boolean)) {
+  if (S._localRun && S._localRun.ownSrc) {
+    // Prefer the device-local action even if the saved recon contains stale
+    // blob: URLs: continue this run or train from the capture kept on-device.
+    const train = document.createElement('button');
+    train.className = 'cbtn accent';
+    train.textContent = 'Train';
+    train.title = 'Keep training this model, or train new from the saved photos';
+    train.addEventListener('click', trainLocalChoice);
+    c.appendChild(train);
+  } else if (rj && rj.source && rj.source.urls && rj.source.urls.length && rj.source.urls.every(Boolean)) {
     // the creation carries its photographs — the viewer can become the maker
     const train = document.createElement('button');
     train.className = 'cbtn accent';
     train.textContent = 'Train';
     train.title = `Solve and train the same ${rj.source.urls.length} photographs right here`;
     train.addEventListener('click', trainFromShare);
-    c.appendChild(train);
-  } else if (S._localRun && S._localRun.ownSrc) {
-    // a local run of the visitor's own photos: continue on the model, or
-    // start fresh from the capture kept on this device
-    const train = document.createElement('button');
-    train.className = 'cbtn accent';
-    train.textContent = 'Train';
-    train.title = 'Keep training this model, or train new from the saved photos';
-    train.addEventListener('click', trainLocalChoice);
     c.appendChild(train);
   }
   c.appendChild(buildExport());
@@ -3849,6 +3856,10 @@ async function continueLocalRun(viewOnly = false) {
   if (viewOnly) {
     S.maxIters = baseIter;
     S.runId = lr.id;
+    S._viewerOpen = true;
+    S.restored = { hasState: true, stats: (recon && recon.stats) || {}, reconJson: recon };
+    if (!(history.state && history.state.sj === 'viewer')) history.pushState({ sj: 'viewer' }, '');
+    $('btn-new').hidden = false;
     S.minutes = lr.minutes || 0;
     S.psnrTrain = lr.psnr ?? null;
     S.splats = g.n;

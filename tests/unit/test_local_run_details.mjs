@@ -30,6 +30,14 @@ assert.match(app, /restoreRunDetails\(lr, ses\)[\s\S]*S\._carryTrainElapsed = tr
   'continuing a local run should carry forward its history and cumulative elapsed time');
 assert.match(app, /await persistRunDetails\(runId, \{ full: true \}\)/,
   'leaving the model viewer should flush its current Details snapshot before navigation');
+assert.match(app, /if \(!S\.restored && !S\._localRun\)\s*\{[\s\S]*more\.textContent = 'Train'/,
+  'the generic continuation button must not render alongside a local-run Train action');
+assert.match(app, /if \(S\._localRun && S\._localRun\.ownSrc\)[\s\S]*train\.textContent = 'Train'[\s\S]*else if \(rj && rj\.source/,
+  'local model viewing should expose exactly the appropriate local or source-photo Train action');
+assert.match(app, /if \(viewOnly\) \{[\s\S]*S\.restored = \{ hasState: true, stats: \(recon && recon\.stats\) \|\| \{\}, reconJson: recon \}[\s\S]*\$\('btn-new'\)\.hidden = false[\s\S]*enterDone\(\)/,
+  'opening a local checkpoint for viewing should enter restored mode and show the top Back button');
+assert.match(app, /if \(S\._localRun && S\._viewerOpen\) \{[\s\S]*closeViewerToHome\(\)/,
+  'the top Back button should close a local viewer to the app home');
 
 assert.match(html, /<span id="install-slot"><button[^>]*id="btn-install"/,
   'the PWA install action should be isolated in its own top-bar slot');

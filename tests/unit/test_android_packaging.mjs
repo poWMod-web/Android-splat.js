@@ -16,6 +16,8 @@ const manifest = readFileSync(resolve(moduleDir, 'src/main/AndroidManifest.xml')
 assert.match(manifest, /NativeCaptureActivity[^>]*android:screenOrientation="portrait"/,
   'ARCore capture must stay portrait-locked');
 const native = readFileSync(resolve(moduleDir, 'src/main/java/space/arrival/splatxr/NativeCaptureActivity.java'), 'utf8');
+assert.match(native, /config\.setFocusMode\(Config\.FocusMode\.AUTO\)/,
+  'ARCore capture must request continuous autofocus');
 assert.match(native, /text == null\) throw new IllegalStateException/,
   'capture export must report JSON serialization errors rather than dereference null');
 assert.match(native, /if \(!finite\(world\[0\], world\[1\], world\[2\], confidence\) \|\| confidence < 0\.25f\)/,
