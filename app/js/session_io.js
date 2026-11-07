@@ -96,8 +96,6 @@ export function buildReconJson(S) {
       psnrTest: S.psnrTest ? { psnr: S.psnrTest.psnr, frames: S.psnrTest.frames.length } : null,
       // the training curve, decimated to ~400 points
       chart: decimate(ses.lossHistory || [], 400).map(([i, p]) => [i, +p.toFixed(3)]),
-      ssimChart: decimate(S.ssimTrainHist || [], 400).map(([i, v]) => [i, +v.toFixed(6)]),
-      ssimHolds: decimate(S.ssimHoldHist || [], 400).map(([i, v]) => [i, +v.toFixed(6)]),
       holds: (S.holdHist || []).map(([i, p]) => [i, +p.toFixed(3)]),
     },
     cloud,

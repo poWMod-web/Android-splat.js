@@ -2,9 +2,12 @@
 // the moments where the optimiser changed its own setup, and an optional ghost
 // run so "what if" is a comparison instead of a claim.
 
-export function ssimToPercent(ssim) {
-  if (!Number.isFinite(ssim)) return 0;
-  return Math.max(0, Math.min(100, ssim * 100));
+/** Approximate SSIM percentage from PSNR (in dB), per the app's calibration. */
+export function psnrToApproxSsimPercent(psnr) {
+  if (psnr === Infinity) return 100;
+  if (!Number.isFinite(psnr) || psnr <= 0) return 0;
+  const penalty = (320 / psnr) ** 1.5;
+  return Math.max(0, Math.min(100, (psnr / (psnr + penalty)) * 100));
 }
 
 export class Chart {
@@ -13,7 +16,6 @@ export class Chart {
     this.ctx = canvas.getContext('2d');
     this.scale = 'db';
     this.train = []; this.hold = [];
-    this.ssimTrain = []; this.ssimHold = [];
     this.ghost = null; this.events = []; this.maxIter = 40000;
     this.onHover = onHover; this.onScrub = onScrub;
     this.hover = null; this.scrubbable = false; this.mark = null;
@@ -44,13 +46,13 @@ export class Chart {
   }
 
   _displayValue(value) {
-    return this.scale === 'similarity' ? ssimToPercent(value) : value;
+    return this.scale === 'similarity' ? psnrToApproxSsimPercent(value) : value;
   }
 
   _activeSeries() {
-    return this.scale === 'similarity'
-      ? { train: this.ssimTrain, hold: this.ssimHold }
-      : { train: this.train, hold: this.hold };
+    // The approximate SSIM scale is derived from the same evaluated PSNR
+    // samples; there is no second model evaluation or synthetic history.
+    return { train: this.train, hold: this.hold };
   }
 
   _displaySeries(series) {
@@ -75,7 +77,7 @@ export class Chart {
     if (hold != null) this.hold.push([iter, hold]);
   }
 
-  reset() { this.train = []; this.hold = []; this.ssimTrain = []; this.ssimHold = []; }
+  reset() { this.train = []; this.hold = []; }
 
   draw() {
     const ctx = this.ctx, W = this.cv.width, H = this.cv.height, dpr = this.dpr || 1;
@@ -87,14 +89,12 @@ export class Chart {
     const active = this._activeSeries();
     const train = this._displaySeries(active.train);
     const hold = this._displaySeries(active.hold);
-    const ghostTrain = this._displaySeries(this.scale === 'similarity'
-      ? (this.ghost?.ssimTrain || []) : (this.ghost?.train || []));
-    const ghostHold = this._displaySeries(this.scale === 'similarity'
-      ? (this.ghost?.ssimHold || []) : (this.ghost?.hold || []));
+    const ghostTrain = this._displaySeries(this.ghost?.train || []);
+    const ghostHold = this._displaySeries(this.ghost?.hold || []);
     const ys = [...train, ...hold, ...ghostTrain, ...ghostHold].map((p) => p[1]);
-    let lo = ys.length ? Math.min(...ys) : (this.scale === 'similarity' ? 90 : 10);
+    let lo = ys.length ? Math.min(...ys) : (this.scale === 'similarity' ? 0 : 10);
     let hi = ys.length ? Math.max(...ys) : (this.scale === 'similarity' ? 100 : 30);
-    const minSpan = this.scale === 'similarity' ? 0.2 : 6;
+    const minSpan = this.scale === 'similarity' ? 1 : 6;
     if (hi - lo < minSpan) { const m = (hi + lo) / 2; lo = m - minSpan / 2; hi = m + minSpan / 2; }
     // hug the data: the first sample sits a hair off the floor, so the climb
     // uses the full plot height instead of floating on rounded padding
@@ -185,7 +185,7 @@ export class Chart {
           xPct: (x / W) * 100,
           iter: Math.round(a[0]),
           train: this._displayValue(a[1]), hold: h ? this._displayValue(h[1]) : null,
-          unit: this.scale === 'similarity' ? 'SSIM %' : 'dB', event: ev ? ev.label : null,
+          unit: this.scale === 'similarity' ? '%' : 'dB', event: ev ? ev.label : null,
         });
       }
     }

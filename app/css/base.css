@@ -548,9 +548,8 @@ select.sel {
 
 .tscores { display: flex; gap: 20px; }
 .score { text-align: right; }
-/* state + value share one line, one quiet size — the % carries the weight */
+/* Keep the score value aligned and tabular across training updates. */
 .score-1 { display: flex; align-items: baseline; justify-content: flex-end; gap: 10px; line-height: 24px; white-space: nowrap; }
-.t-state { font: 500 18px var(--ui); color: var(--accent); }
 .score-v { font: 500 18px var(--mono); font-variant-numeric: tabular-nums; }
 .score-v .unit { font: 400 11px var(--mono); color: var(--dim); margin-left: 2px; }
 .score-k { font: 400 10.5px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }

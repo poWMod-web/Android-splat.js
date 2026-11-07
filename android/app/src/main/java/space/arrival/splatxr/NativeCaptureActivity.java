@@ -649,35 +649,52 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         private void drawBackground(Frame frame) {
             // ARCore accounts for display orientation and camera-texture UV layout.
-            // Use its transformed coordinates verbatim; extra manual axis flips
-            // mirrored the preview on portrait Android devices.
             uvInput.position(0);
             uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
-            // Mirror only the camera preview across the display's left/right
-            // sides. Swap transformed UV pairs (not texture-u values) so the
-            // flip stays horizontal even when ARCore rotates the camera image.
-            for (int row = 0; row < 2; row++) {
-                int left = row * 4, right = left + 2;
-                float leftU = uvOutput.get(left), leftV = uvOutput.get(left + 1);
-                uvOutput.put(left, uvOutput.get(right));
-                uvOutput.put(left + 1, uvOutput.get(right + 1));
-                uvOutput.put(right, leftU);
-                uvOutput.put(right + 1, leftV);
-            }
-            // The world-space point cloud is still drawn from ARCore's camera matrices.
+
+            // Perform a pure VERTICAL FLIP to fix the upside-down image
+            // without mirroring the text left-to-right.
+            swapUvCoords(uvOutput, 0, 2);
+            swapUvCoords(uvOutput, 1, 3);
+
             uvOutput.position(0);
+
+            // OpenGL ES setup and draw
             GLES20.glDisable(GLES20.GL_DEPTH_TEST);
             GLES20.glUseProgram(bgProgram);
+
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTexture);
             GLES20.glUniform1i(bgTexture, 0);
-            quadPositions.position(0); uvOutput.position(0);
-            GLES20.glEnableVertexAttribArray(bgPosition); GLES20.glEnableVertexAttribArray(bgUv);
+
+            quadPositions.position(0);
+            uvOutput.position(0);
+
+            GLES20.glEnableVertexAttribArray(bgPosition);
+            GLES20.glEnableVertexAttribArray(bgUv);
+
             GLES20.glVertexAttribPointer(bgPosition, 2, GLES20.GL_FLOAT, false, 0, quadPositions);
             GLES20.glVertexAttribPointer(bgUv, 2, GLES20.GL_FLOAT, false, 0, uvOutput);
+
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
-            GLES20.glDisableVertexAttribArray(bgPosition); GLES20.glDisableVertexAttribArray(bgUv);
+
+            GLES20.glDisableVertexAttribArray(bgPosition);
+            GLES20.glDisableVertexAttribArray(bgUv);
+        }
+
+        private void swapUvCoords(FloatBuffer buffer, int i, int j) {
+            int idx1 = i * 2;
+            int idx2 = j * 2;
+
+            float u = buffer.get(idx1);
+            float v = buffer.get(idx1 + 1);
+
+            buffer.put(idx1, buffer.get(idx2));
+            buffer.put(idx1 + 1, buffer.get(idx2 + 1));
+
+            buffer.put(idx2, u);
+            buffer.put(idx2 + 1, v);
         }
 
         private void updateCoverage(Frame frame) {
@@ -1045,7 +1062,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         final float[] lineVertices = new float[16 * 3];
 
         CaptureViewpoint(float[] pose, float fx, float fy, float cx, float cy, int width, int height) {
-            final float depth = 0.12f;
+            final float depth = 0.012f;
             final float[] origin = {pose[12], pose[13], pose[14]};
             final float[][] corners = new float[4][3];
             final float[] px = {0f, width, width, 0f};

@@ -1,13 +1,75 @@
-# Splat.js
+# Android-Splat.js
 
-**Gaussian-splat training that runs entirely in the browser.** Photographs go
-in, camera poses come out, a 3D Gaussian splat is trained against the photos,
-and a standard `.ply` comes back. No server, no upload, no account, no build
-step: the whole pipeline is vanilla ES modules on WebGPU, running in a tab.
+**Splat.js with native ARCore capture for Android.** Capture photographs and
+camera poses on an ARCore-compatible phone, then train a 3D Gaussian splat
+against those images with the Splat.js WebGPU engine in the bundled WebView.
+Export the trained model as a standard `.ply`. Capture and local training
+require no account, photo upload, or compute server. The browser app also runs
+as vanilla ES modules with no web-app build step; building the optional Android
+APK uses Gradle.
+
+This project builds on [Arrival.Space's Splat.js](https://github.com/arrival-space/splat.js),
+an MIT-licensed JavaScript structure-from-motion and WebGPU 3DGS engine. The
+original browser workflow remains available for photos, video and supported
+WebXR camera capture.
 
 ![The Tanks & Temples Truck scene in Splat.js](docs/truck.jpg)
 *The Tanks & Temples **Truck** scene: features found, poses solved, and
 600,000 Gaussians trained, all live in one Chrome tab.*
+
+## Android app: ARCore capture + Splat.js training
+
+The Android app (display name **SplatXR**) pairs a native ARCore capture
+activity with the existing Splat.js WebGPU trainer inside a local WebView.
+ARCore tracks the phone while you move around a stationary subject. Capture
+is manual by default; you can opt into distance-based auto-capture at a
+2–200 cm interval (10 cm by default). Save at least three overlapping views;
+20–200 are recommended. The preview shows a red-to-green coverage point cloud
+and wireframe camera viewpoints to guide the capture path.
+
+For each keyframe, the native app saves the camera image, ARCore pose and
+image intrinsics from the same frame. It also samples RGB values for measured
+ARCore feature points and writes a `seed_points.json` plus binary RGB
+`seed.ply`. The pose list is written as `transforms.json`. These files remain
+in app-private storage and are exposed to the WebView through AndroidX's
+`WebViewAssetLoader`; capture and local training do not upload photographs.
+ARCore automatic depth mode is enabled on devices that support it, but the
+current coverage and seed cloud is based on ARCore feature points, not a
+dense depth reconstruction.
+
+```text
+Android native app                         Local WebView (bundled app)
+┌──────────────────────────────┐            ┌──────────────────────────────┐
+│ ARCore camera + tracking     │            │ Splat.js app (HTML/CSS/JS)   │
+│ same-frame image, pose,      │  local     │ known-camera import skips    │
+│ intrinsics, feature points   ├── files ──>│ SfM, then seeds and trains   │
+│ coverage + camera overlays   │            │ on WebGPU and exports .ply   │
+└──────────────────────────────┘            └──────────────────────────────┘
+```
+
+Known-camera AR captures bypass the structure-from-motion solve; the Gaussian
+splat training still runs. If Android System WebView exposes no usable WebGPU
+adapter, the captured dataset can be exported and trained on a desktop instead.
+The standard browser workflow remains available for ordinary photos, video,
+and supported WebXR camera capture.
+
+### Build and install the Android APK
+
+The native app targets `arm64-v8a` Android devices (minimum API 24) with
+Google Play Services for AR. It needs Android SDK Platform 35, Build Tools
+35.0.0, JDK 17 and Gradle 8.9 to build locally:
+
+```sh
+cd android
+gradle --no-daemon assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+The build copies the current `app/` and `src/` trees into APK assets, so the
+WebView and native app use this checkout's Splat.js code. Debug APKs are for
+testing; release distribution requires an owner-managed signing key and
+physical-device validation. GitHub Actions also builds the debug APK; see
+[the Android build and capture guide](android/README.md) for details.
 
 ## What is inside
 
@@ -33,9 +95,10 @@ step: the whole pipeline is vanilla ES modules on WebGPU, running in a tab.
 
 **Live: https://arrival.space/splat-js**
 
-Drop 20 to 200 overlapping photos of one place into the app, or a video, or
-capture straight from the device camera, or start from one of the bundled
-test sets. The gear next to **Start training** holds one-knob presets
+Drop 20 to 200 overlapping photos of one place into the browser app, or a
+video, or capture from a supported browser camera, or start from a hosted test
+set. For native ARCore capture, install the Android APK described above. The
+gear next to **Start training** holds one-knob presets
 (*Draft* for a fast first look, *Showcase* for a long high-detail run) and the
 knobs they drive: resolution, spherical harmonics, splat budget, cycles,
 optimizer. The splat budget sizes itself from the cycle budget and the device.
@@ -72,8 +135,8 @@ node serve.mjs 8734
 # http://localhost:8734/app/
 ```
 
-A clone bundles the synthetic test set; the photo sets are served on the
-hosted demo.
+The repository contains the application and engine; large photo datasets and
+some benchmark fixtures are not tracked. The hosted demo serves the photo sets.
 
 ### Requirements
 
@@ -185,9 +248,9 @@ const ply = await s.exportPlyBlob();
 ### Known cameras: renders, rigs, AR captures
 
 When the poses are already known, the solve is skipped. `parseCameras()` reads
-a NeRF / Blender `transforms.json` or the ground-truth list in
-`data/synthetic/cameras.json`; cameras are matched to the loaded images by
-file name and converted to the solver's feature scale for you. Rendered images
+a NeRF / Blender `transforms.json` or a supplied known-camera JSON list;
+cameras are matched to the loaded images by file name and converted to the
+solver's feature scale for you. Rendered images
 with a transparent background are their own subject masks with
 `frames.alphaMask`:
 
@@ -240,11 +303,12 @@ src/          the library — no UI, no globals
   gs/         WebGPU trainer, WGSL shaders, gradcheck harness
   gpu/        one shared device
   io/         frame decoding, video frame selection, PLY export
-app/          the Splat.js app (a Session consumer — the UI never touches internals)
+app/          browser app, WebXR fallback, and assets bundled into the Android APK
+android/      native ARCore capture activity and Android WebView wrapper
 tests/unit/   node tests for the maths (geometry, BA, rotation averaging, SIFT)
 tests/quality/ end-to-end accuracy gates in headless Chrome
-tests/e2e/    Playwright suite for the app's flows (train, pause/resume, restore)
-data/synthetic/ the bundled test set (known ground-truth cameras)
+tests/e2e/    Playwright suite for app flows (train, pause/resume, restore)
+data/         optional local datasets and fixtures (large data is not tracked)
 ```
 
 ## Tests

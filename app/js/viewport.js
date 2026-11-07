@@ -11,6 +11,29 @@
 // world frame is arbitrary — detectUp levels the horizon) without touching
 // the data.
 
+/** Shortest signed rotation from one pointer-pair angle to the next. */
+export function pointerAngleDelta(current, previous) {
+  const delta = current - previous;
+  return Math.atan2(Math.sin(delta), Math.cos(delta));
+}
+
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross3 = (a, b) => [
+  a[1] * b[2] - a[2] * b[1],
+  a[2] * b[0] - a[0] * b[2],
+  a[0] * b[1] - a[1] * b[0],
+];
+const unit3 = (v) => {
+  const n = Math.hypot(v[0], v[1], v[2]) || 1;
+  return v.map((x) => x / n);
+};
+
+function rotateVector(v, axis, angle) {
+  const c = Math.cos(angle), s = Math.sin(angle), projection = dot3(axis, v) * (1 - c);
+  const cross = cross3(axis, v);
+  return v.map((x, i) => x * c + cross[i] * s + axis[i] * projection);
+}
+
 /** world position of a camera from its world-to-camera pose */
 export const camCentre = ({ R, t }) => [
   -(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]),
@@ -70,7 +93,8 @@ export class Viewport {
     this.ctx = canvas.getContext('2d');
     this.scene = null;          // { xyz, rgb, center, radius }
     this.lock = null;           // a camera whose pose the view sits on
-    this.yaw = 0.6; this.pitch = 0.22; this.dist = 8; this.target = [0, 0, 0];
+    this.yaw = 0.6; this.pitch = 0.22; this.roll = 0; this.dist = 8; this.target = [0, 0, 0];
+    this._basisOverride = null; // incremental viewpoint-relative rotations, including past vertical
     this.fpv = false;           // per-set: rotate around the EYE, wheel walks
     this.setUp([0, -1, 0]);     // COLMAP-ish default until detectUp measures
     this.dirty = true;
@@ -85,13 +109,14 @@ export class Viewport {
     const cv = this.cv;
     const pts = new Map();   // pointerId -> {x, y} (all active pointers)
     let mode = null;         // 'orbit' | 'pan' | 'two'
-    let pinch = null;        // two-finger baseline { d, cx, cy }
+    let pinch = null;        // two-finger baseline { d, cx, cy, angle }
 
     // camera-relative pan: sideways along the view's right, vertical along
     // its up — content follows the fingers from any orientation
     const panBy = (dx, dy) => {
       const s = this.dist * 0.0016;
       const { right, down } = this._basis();
+      // Pan in viewport coordinates; all directions are unrestricted.
       for (let i = 0; i < 3; i++) {
         this.target[i] -= (right[i] * dx + down[i] * dy) * s;
       }
@@ -102,6 +127,7 @@ export class Viewport {
       pinch = {
         d: Math.max(20, Math.hypot(v[1].x - v[0].x, v[1].y - v[0].y)),
         cx: (v[0].x + v[1].x) / 2, cy: (v[0].y + v[1].y) / 2,
+        angle: Math.atan2(v[1].y - v[0].y, v[1].x - v[0].x),
       };
       mode = 'two';
     };
@@ -133,10 +159,13 @@ export class Viewport {
 
       if (mode === 'two') {
         if (pts.size < 2) return;
-        // pinch = dolly, centroid = pan — the standard two-finger camera
+        // pinch = dolly, centroid = pan, twist = orbit — the three natural
+        // two-finger camera gestures, applied incrementally to avoid jumps.
         const v = [...pts.values()];
         const d = Math.max(20, Math.hypot(v[1].x - v[0].x, v[1].y - v[0].y));
         const cx = (v[0].x + v[1].x) / 2, cy = (v[0].y + v[1].y) / 2;
+        const angle = Math.atan2(v[1].y - v[0].y, v[1].x - v[0].x);
+        const turn = pointerAngleDelta(angle, pinch.angle);
         if (this.fpv) {
           // pinch out = walk forward
           const { fwd } = this._basis();
@@ -145,8 +174,13 @@ export class Viewport {
         } else {
           this.dist = Math.max(0.05, Math.min(400, this.dist * pinch.d / d));
         }
+        if (turn) {
+          // A clockwise pointer-pair twist must rotate the model clockwise on
+          // screen, which means rotating the camera frame the opposite way.
+          this._rotateView(this._basis().fwd, -turn);
+        }
         panBy(cx - pinch.cx, cy - pinch.cy);
-        pinch = { d, cx, cy };
+        pinch = { d, cx, cy, angle };
         this.dirty = true;
         return;
       }
@@ -154,26 +188,26 @@ export class Viewport {
       if (mode === 'pan') {
         panBy(dx, dy);
       } else if (this.fpv) {
-        // first person, tuned like dragging a 360 sphere: the grabbed pixel
-        // stays under the finger, so the angle per pixel is 1/focal
-        const { fwd } = this._basis();
+        // First person turns around the eye using the current viewport axes.
+        const basis = this._basis();
         const eye = [
-          this.target[0] - fwd[0] * this.dist,
-          this.target[1] - fwd[1] * this.dist,
-          this.target[2] - fwd[2] * this.dist];
+          this.target[0] - basis.fwd[0] * this.dist,
+          this.target[1] - basis.fwd[1] * this.dist,
+          this.target[2] - basis.fwd[2] * this.dist];
         const f = this.freeF || Math.min(this.w, this.h) * 0.86;
-        this.yaw -= dx / f;
-        this.pitch = Math.max(-1.45, Math.min(1.45, this.pitch + dy / f));
-        const { fwd: f2 } = this._basis();
+        if (dx) this._rotateView(basis.down, -dx / f);
+        if (dy) this._rotateView(basis.right, dy / f);
+        const { fwd } = this._basis();
         this.target = [
-          eye[0] + f2[0] * this.dist,
-          eye[1] + f2[1] * this.dist,
-          eye[2] + f2[2] * this.dist];
+          eye[0] + fwd[0] * this.dist,
+          eye[1] + fwd[1] * this.dist,
+          eye[2] + fwd[2] * this.dist];
       } else {
-        // the up-frame has fixed handedness, so one sign fits every world;
-        // + matches the feel the app always had in y-down reconstructions
-        this.yaw += dx * 0.006;
-        this.pitch = Math.max(-1.45, Math.min(1.45, this.pitch - dy * 0.005));
+        // Orbit about the viewpoint's screen-down and screen-right axes. These
+        // incremental rotations preserve the view frame beyond either pole.
+        const basis = this._basis();
+        if (dx) this._rotateView(basis.down, dx * 0.006);
+        if (dy) this._rotateView(basis.right.map((v) => -v), dy * 0.005);
       }
       this.dirty = true;
     });
@@ -264,6 +298,16 @@ export class Viewport {
     if (am < 1e-3) { A = X(this.up, [1, 0, 0]); am = Math.hypot(A[0], A[1], A[2]); }
     this._A = [A[0] / am, A[1] / am, A[2] / am];
     this._B = X(this.up, this._A);
+    this._basisOverride = null;
+  }
+
+  /** Set the canonical orbit orientation and discard accumulated free rotations. */
+  setOrbitAngles(yaw, pitch, roll = 0) {
+    this.yaw = yaw;
+    this.pitch = pitch;
+    this.roll = roll;
+    this._basisOverride = null;
+    this.dirty = true;
   }
 
   /** yaw/pitch of a unit forward vector in the current up-frame */
@@ -281,8 +325,7 @@ export class Viewport {
     if (!this.scene) return;
     this.target = [...this.scene.center];
     this.dist = this.scene.radius * 2.5;
-    this.yaw = 0.7; this.pitch = -0.32;   // a little above the scene, looking down
-    this.dirty = true;
+    this.setOrbitAngles(0.7, -0.32); // a little above the scene, looking down
   }
 
   /** How far away is the stuff this camera looks at? Median depth of the
@@ -324,8 +367,20 @@ export class Viewport {
     this.target = [C[0] + fwd[0] * d, C[1] + fwd[1] * d, C[2] + fwd[2] * d];
     this.dist = d;
     const ang = this.anglesOf(fwd);
-    this.yaw = ang.yaw;
-    this.pitch = Math.max(-1.45, Math.min(1.45, ang.pitch));
+    this.setOrbitAngles(ang.yaw, ang.pitch);
+  }
+
+  /** Rotate the current viewport frame about an axis expressed in world space. */
+  _rotateView(axis, angle) {
+    if (!angle) return;
+    const current = this._basis();
+    const a = unit3(axis);
+    const fwd = unit3(rotateVector(current.fwd, a, angle));
+    let right = rotateVector(current.right, a, angle);
+    const alongFwd = dot3(right, fwd);
+    right = unit3(right.map((v, i) => v - fwd[i] * alongFwd));
+    const down = unit3(cross3(fwd, right));
+    this._basisOverride = { fwd, right, down };
     this.dirty = true;
   }
 
@@ -333,6 +388,7 @@ export class Viewport {
    *  (down = fwd x right keeps it a proper rotation, det +1 — negating a
    *  single row would be a reflection and the scene would mirror) */
   _basis() {
+    if (this._basisOverride) return this._basisOverride;
     const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
     const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
     const u = this.up, A = this._A, B = this._B;
@@ -341,18 +397,27 @@ export class Viewport {
       A[1] * sy * cp + B[1] * cy * cp + u[1] * sp,
       A[2] * sy * cp + B[2] * cy * cp + u[2] * sp,
     ];
-    let right = [
-      fwd[1] * u[2] - fwd[2] * u[1],
-      fwd[2] * u[0] - fwd[0] * u[2],
-      fwd[0] * u[1] - fwd[1] * u[0],
-    ];
-    const rm = Math.hypot(right[0], right[1], right[2]) || 1;
-    right = [right[0] / rm, right[1] / rm, right[2] / rm];
+    let right = cross3(fwd, u);
+    const rm = Math.hypot(right[0], right[1], right[2]);
+    if (rm < 1e-8) {
+      // At a pole, project the yaw reference into the horizontal plane rather
+      // than letting the screen axes collapse to zero length.
+      right = A.map((v, i) => v * cy - B[i] * sy);
+    } else {
+      right = right.map((v) => v / rm);
+    }
     const down = [
       fwd[1] * right[2] - fwd[2] * right[1],
       fwd[2] * right[0] - fwd[0] * right[2],
       fwd[0] * right[1] - fwd[1] * right[0],
     ];
+    if (this.roll) {
+      const cr = Math.cos(this.roll), sr = Math.sin(this.roll);
+      const rolledRight = right.map((v, i) => v * cr + down[i] * sr);
+      const rolledDown = down.map((v, i) => v * cr - right[i] * sr);
+      right = rolledRight;
+      return { fwd, right, down: rolledDown };
+    }
     return { fwd, right, down };
   }
 
@@ -465,10 +530,10 @@ export class Viewport {
     this.target = [eye[0] + dir[0] * d, eye[1] + dir[1] * d, eye[2] + dir[2] * d];
     const u = this.up, A = this._A, B = this._B;
     const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    this.pitch = Math.asin(Math.max(-1, Math.min(1, dot(dir, u))));
-    this.yaw = Math.atan2(dot(dir, A), dot(dir, B));
+    const pitch = Math.asin(Math.max(-1, Math.min(1, dot(dir, u))));
+    const yaw = Math.atan2(dot(dir, A), dot(dir, B));
     this.dist = d;
-    this.dirty = true;
+    this.setOrbitAngles(yaw, pitch);
   }
 
   /** current free-orbit pose in the trainer's camera shape */

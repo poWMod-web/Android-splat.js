@@ -4,8 +4,8 @@
 //
 // The interaction model is the v2 mockup's, verbatim; underneath it now sits
 // the real library: prep beats are the solver's own progress events, the
-// model on the stage is the WebGPU trainer's render, the curve is measured
-// PSNR, and Export writes a real .ply. The UI talks to ONE object — the
+// model on the stage is the WebGPU trainer's render, the curve can show
+// measured PSNR or an SSIM estimate from that score, and Export writes a real .ply. The UI talks to ONE object — the
 // splat.js Session — plus the trainer's rendered canvas.
 
 import { createSession, parseCameras, gaussiansToPly, undistortFrames, solveTierOpts } from '../../src/index.js';
@@ -29,7 +29,7 @@ const HOME_BENCHMARK_IDS = new Set([
 
 import { Viewport, camCentre, quatFromR, quatToR, qslerp } from './viewport.js';
 import { Developer, fitRect } from './develop.js';
-import { Chart } from './chart.js';
+import { Chart, psnrToApproxSsimPercent } from './chart.js';
 import { bmp, readyBmp, sizedUrl } from './img.js';
 
 const $ = (id) => document.getElementById(id);
@@ -249,10 +249,6 @@ const S = {
   regCams: [],                 // cameras as they register (beat 3)
   solveStats: { pairsChecked: 0, pairsUsable: 0, solveSec: 0 },
   chartEvents: [],             // real refine/growth moments for the curve
-  ssimTrainHist: [],
-  ssimHoldHist: [],
-  _ssimEvalBusy: false,
-  _ssimLastEvalAt: 0,
   scoreScale: 'db',
   flash: null,
   detailTab: 'score',
@@ -296,15 +292,25 @@ function syncTrainingVisualsControl() {
   const stage = $('stage'), dock = $('dock');
   const plot = dock?.querySelector('.chartwrap') || stage?.querySelector('.chartwrap-expanded');
   const expandPlot = training && !S.trainVisuals && !detailOpen;
+  let plotMoved = false;
   if (expandPlot && plot) {
-    if (plot.parentElement !== stage) stage.insertBefore(plot, $('hud'));
+    if (plot.parentElement !== stage) {
+      stage.insertBefore(plot, $('hud'));
+      plotMoved = true;
+    }
     plot.classList.add('chartwrap-expanded');
     dock.classList.add('chart-expanded');
   } else {
     if (plot) plot.classList.remove('chartwrap-expanded');
-    if (plot && plot.parentElement === stage && dock) dock.insertBefore(plot, dock.querySelector('.tscores'));
+    if (plot && plot.parentElement === stage && dock) {
+      dock.insertBefore(plot, dock.querySelector('.tscores'));
+      plotMoved = true;
+    }
     dock?.classList.remove('chart-expanded');
   }
+  // The canvas CSS fills its new container. Redraw its backing pixels after
+  // reparenting instead of letting the old dock-sized bitmap get stretched.
+  if (plotMoved) requestAnimationFrame(() => chart?.resize());
 }
 
 function toggleTrainingVisuals() {
@@ -1638,7 +1644,7 @@ async function open(preset, autostart = false) {
   S.maxIters = PERF.on ? PERF.iters : INITIAL_ITERS;
   S.perfMetrics = [];
   S.holdHist = [];
-  S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0;
+
   S._lastReady = null;
   S.growthStopped = false;
   S.plyBlob = null; S.sogBlob = null;
@@ -1817,7 +1823,7 @@ async function startPrep() {
   // metrics tick; stale dB and splat counts flash the same way).
   S.iter = 0; S.splats = 0; S.psnrTrain = null; S.psnrHold = null;
   S.itersPerSec = 0; S.minutes = 0; S.etaAt = null;
-  S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.growthStopped = false;
+  S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
   S.feats = new Map(); S.lastPairEv = null; S.shownPair = null; S.regCams = [];
   S.regPts = null; S.regPtsCount = 0; S.growNote = null;
   S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
@@ -2478,11 +2484,12 @@ function startTraining() {
   }
   renderControls();
   dock('train');
+  // The first visual-sync ran before the training dock existed. Re-run it now
+  // so the initial hidden-visuals state expands the graph into the stage.
+  syncTrainingVisualsControl();
   if (chart) {
     chart.train = (S.session.lossHistory || []).map(([i, v]) => [i, v]);
     chart.hold = (S.holdHist || []).slice();
-    chart.ssimTrain = (S.ssimTrainHist || []).slice();
-    chart.ssimHold = (S.ssimHoldHist || []).slice();
     chart.maxIter = S.maxIters;
     chart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
     chart.draw();
@@ -2504,9 +2511,6 @@ function toggleTrain() {
       ? '<svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z"/></svg>'
       : '<svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M8 4.8v14.4l12.4-7.2z"/></svg>';
   }
-  const label = on ? 'Training…' : 'Paused';
-  const tt = $('t-title');
-  if (tt) tt.textContent = label;
   const f = $('t-finish');
   if (f) f.hidden = on;   // paused = the moment "stop here" makes sense
   if (!on) checkpointRun('pause').catch(() => {});
@@ -2573,8 +2577,6 @@ function captureRunProgressDetails() {
     ? S.holdHist : ((S.restored && S.restored.stats && S.restored.stats.holds) || []);
   return {
     chart: compactRows(history, 800),
-    ssimChart: compactRows(S.ssimTrainHist || [], 800),
-    ssimHolds: compactRows(S.ssimHoldHist || [], 800),
     holds: compactRows(holds, 800),
     events: (S.chartEvents || []).slice(-300).map((e) => ({ ...e })),
     perf: {
@@ -2628,12 +2630,6 @@ function restoreRunDetails(run, session = S.session) {
   S._savedDetailSettings = progress.settings || null;
   S.chartEvents = Array.isArray(progress.events) ? progress.events.map((e) => ({ ...e })) : [];
   S.holdHist = Array.isArray(progress.holds) ? progress.holds.map((r) => Array.from(r || [])) : [];
-  const ssimHistory = Array.isArray(progress.ssimChart) && progress.ssimChart.length
-    ? progress.ssimChart : ((S.restored && S.restored.stats && S.restored.stats.ssimChart) || []);
-  S.ssimTrainHist = ssimHistory.map((r) => Array.from(r || []));
-  S.ssimHoldHist = (Array.isArray(progress.ssimHolds) ? progress.ssimHolds
-    : ((S.restored && S.restored.stats && S.restored.stats.ssimHolds) || [])).map((r) => Array.from(r || []));
-  S._ssimLastEvalAt = 0;
   S.perfMetrics = Array.isArray(progress.metrics) ? progress.metrics.map((m) => Array.from(m || [])) : [];
   const lastMetric = S.perfMetrics[S.perfMetrics.length - 1];
   if (lastMetric && Number.isFinite(+lastMetric[2])) S.itersPerSec = +lastMetric[2];
@@ -2697,38 +2693,22 @@ async function checkpointRun(reason) {
   } finally { S._ckptBusy = false; }
 }
 
-function maybeEvaluateSsim(iter = S.iter) {
-  if (S.scoreScale !== 'similarity' || S._ssimEvalBusy || !S.session?.evalGraphMetrics) return;
-  const now = performance.now();
-  if (S._ssimLastEvalAt && now - S._ssimLastEvalAt < 15000) return;
-  const session = S.session;
-  const trainer = session.trainer;
-  if (!trainer?.camMeta?.length) return;
-  const holdCi = Number.isInteger(session.holdout) ? session.holdout : -1;
-  let trainCi = trainer.camMeta.findIndex((_, i) => i !== holdCi);
-  if (trainCi < 0) trainCi = 0;
-  S._ssimEvalBusy = true;
-  S._ssimLastEvalAt = now;
-  const gen = S.gen;
-  session.evalGraphMetrics(trainCi, holdCi).then(({ train, hold }) => {
-    if (S.gen !== gen || S.session !== session || !Number.isFinite(train?.ssim)) return;
-    S.ssimTrainHist.push([iter, train.ssim]);
-    if (Number.isFinite(hold?.ssim)) S.ssimHoldHist.push([iter, hold.ssim]);
-    if (S.ssimTrainHist.length > 1000) S.ssimTrainHist = compactRows(S.ssimTrainHist, 800);
-    if (S.ssimHoldHist.length > 1000) S.ssimHoldHist = compactRows(S.ssimHoldHist, 800);
-    if (chart) {
-      chart.ssimTrain = S.ssimTrainHist.slice();
-      chart.ssimHold = S.ssimHoldHist.slice();
-      chart.draw();
-    }
-    if (dchart) {
-      dchart.ssimTrain = S.ssimTrainHist.slice();
-      dchart.ssimHold = S.ssimHoldHist.slice();
-      dchart.draw();
-    }
-  }).catch((e) => console.warn('SSIM graph evaluation failed', e)).finally(() => {
-    S._ssimEvalBusy = false;
-  });
+function formatTrainingScore(psnr) {
+  if (psnr == null || Number.isNaN(psnr)) return '—';
+  return (S.scoreScale === 'similarity' ? psnrToApproxSsimPercent(psnr) : psnr).toFixed(2);
+}
+
+function renderTrainingScore() {
+  const similarity = S.scoreScale === 'similarity';
+  const unit = similarity ? '%' : 'dB';
+  const trainEl = $('t-ptrain');
+  if (trainEl) trainEl.textContent = formatTrainingScore(S.psnrTrain);
+  const trainUnit = $('t-punit');
+  if (trainUnit) trainUnit.textContent = unit;
+  const holdEl = $('t-phold');
+  if (holdEl) holdEl.textContent = formatTrainingScore(S.psnrHold);
+  const holdUnit = $('t-hunit');
+  if (holdUnit) holdUnit.textContent = unit;
 }
 
 function onMetrics(m) {
@@ -2778,9 +2758,7 @@ function onMetrics(m) {
       el.textContent = pctOf(S.iter);
       $('t-splats').textContent = fmt(S.splats);
       $('t-eta').textContent = etaText();
-      $('t-ptrain').textContent = S.psnrTrain != null ? S.psnrTrain.toFixed(2) : '—';
-      const ph = $('t-phold');   // only rendered in ?eval benchmark mode
-      if (ph) ph.textContent = S.psnrHold != null ? S.psnrHold.toFixed(2) : '—';
+      renderTrainingScore();
     }
   }
   if (!$('details').hidden && S.detailTab === 'score') {
@@ -2788,8 +2766,6 @@ function onMetrics(m) {
       const history = (S.session && S.session.lossHistory) || [];
       dchart.train = history.map(([i, v]) => [i, v]);
       dchart.hold = (S.holdHist || []).slice();
-      dchart.ssimTrain = (S.ssimTrainHist || []).slice();
-      dchart.ssimHold = (S.ssimHoldHist || []).slice();
       dchart.maxIter = S.maxIters;
       dchart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
       dchart.draw();
@@ -2797,7 +2773,6 @@ function onMetrics(m) {
   } else if (!$('details').hidden && S.detailTab === 'perf') {
     $('d-perf').textContent = buildPerfReport();
   }
-  maybeEvaluateSsim(m.iter);
   // Local records get a compact diagnostics update alongside the headline
   // progress every twenty seconds. The complete final snapshot is written on
   // pause, finish, or when leaving the model viewer.
@@ -2879,7 +2854,7 @@ async function deviceLostRecovery() {
     await S.session.recover();
     if (S.gen !== gen) return;
     S.iter = 0; S.psnrTrain = null; S.psnrHold = null;
-    S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.growthStopped = false;
+    S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
     S.plyBlob = null; S.sogBlob = null;
     buildSceneFromSession();
     mountModelCanvas();
@@ -2998,8 +2973,7 @@ function adoptSession(ses, stage = '', res = null) {
     // a person is not a scene: eye level rather than looking down from above,
     // and a little further back so the head clears the card at the top
     vp.dist = res.bounds.radius * 3.2;
-    vp.pitch = -0.12;
-    vp.dirty = true;
+    vp.setOrbitAngles(vp.yaw, -0.12);
   }
   renderControls();
   console.log(`[avatar] the viewer now shows the ${stage || 'new'} model — ${ses.trainer.n.toLocaleString()} splats`);
@@ -3177,7 +3151,7 @@ async function restoreSession(src) {
     S._resumeRunId = null;
     S.feats = new Map(); S.lastPairEv = null;
     S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
-    S.chartEvents = []; S.holdHist = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.perfMetrics = []; S.itersPerSec = 0;
+    S.chartEvents = []; S.holdHist = [];  S.perfMetrics = []; S.itersPerSec = 0;
     S._savedGpuFacts = null; S._savedDetailSettings = null;
     // a run that was already shared knows its space: the viewer offers its
     // link and its listing, where a reload used to leave only a Download
@@ -3885,7 +3859,7 @@ async function continueLocalRun(viewOnly = false) {
   if (S.gen !== gen) return;
   S.iter = baseIter;
   S.psnrTrain = null; S.psnrHold = null;
-  S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.growthStopped = false;
+  S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
   restoreRunDetails(lr, ses);
   buildSceneFromSession();
   mountModelCanvas();
@@ -3928,11 +3902,10 @@ function continueTraining() {
   $('stage').dataset.cursor = 'grab';
   renderControls();
   dock('train');
+  syncTrainingVisualsControl();
   if (chart) {
     chart.train = S.session.lossHistory.map(([i, v]) => [i, v]);
     chart.hold = (S.holdHist || []).slice();
-    chart.ssimTrain = (S.ssimTrainHist || []).slice();
-    chart.ssimHold = (S.ssimHoldHist || []).slice();
     chart.maxIter = S.maxIters;
     chart.draw();
   }
@@ -4912,12 +4885,12 @@ function dock(kind) {
       <div class="chartwrap"><canvas id="chart"></canvas><div class="chart-tip" id="chart-tip" hidden></div></div>
       <div class="tscores">
         <div class="score" data-tone="accent">
-          <div class="score-1"><span class="t-state" id="t-title">Training…</span><span class="score-v"><span id="t-ptrain">${S.psnrTrain != null ? S.psnrTrain.toFixed(2) : '—'}</span><small class="unit">dB</small></span></div>
+          <div class="score-1"><span class="score-v"><span id="t-ptrain">${formatTrainingScore(S.psnrTrain)}</span><small class="unit" id="t-punit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div>
           <div class="score-sub"><span id="t-splats">${S.splats ? fmt(S.splats) : '—'}</span> splats</div>
           <button class="chart-scale score-scale" id="chart-scale" type="button">Use %</button>
           <span class="tmeta-grow" id="t-grow">&nbsp;</span>
         </div>
-        ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${S.psnrHold != null ? S.psnrHold.toFixed(2) : '—'}</span><small class="unit">dB</small></span></div><div class="score-sub">held out</div></div>` : ''}
+        ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${formatTrainingScore(S.psnrHold)}</span><small class="unit" id="t-hunit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div><div class="score-sub">held out</div></div>` : ''}
       </div>`;
     $('t-play').addEventListener('click', toggleTrain);
     $('t-finish').addEventListener('click', async () => {
@@ -4934,9 +4907,9 @@ function dock(kind) {
 }
 
 function syncScoreScaleControls() {
-  const next = S.scoreScale === 'db' ? 'Use SSIM %' : 'Use dB';
+  const next = S.scoreScale === 'db' ? 'Use %' : 'Use dB';
   const title = S.scoreScale === 'db'
-    ? 'Switch graph to SSIM percentage'
+    ? 'Switch graph to percentage'
     : 'Switch graph to PSNR in decibels';
   for (const id of ['chart-scale', 'd-chart-scale']) {
     const button = $(id);
@@ -4952,7 +4925,7 @@ function toggleScoreScale() {
   if (chart) { chart.scale = S.scoreScale; chart.draw(); }
   if (dchart) { dchart.scale = S.scoreScale; dchart.draw(); }
   syncScoreScaleControls();
-  if (S.scoreScale === 'similarity') maybeEvaluateSsim(S.iter);
+  renderTrainingScore();
 }
 
 function chartTip(h) {
@@ -5192,9 +5165,7 @@ function tourStep(dt) {
   vp.target = [pos[0] + fwd[0] * d, pos[1] + fwd[1] * d, pos[2] + fwd[2] * d];
   vp.dist = d;
   const ang = vp.anglesOf(fwd);
-  vp.yaw = ang.yaw;
-  vp.pitch = clamp(ang.pitch, -1.45, 1.45);
-  vp.dirty = true;
+  vp.setOrbitAngles(ang.yaw, ang.pitch);
 }
 
 /** WASD fly: move the orbit target along the camera's own axes */
@@ -5964,8 +5935,6 @@ function renderDetails() {
       ? S.session.lossHistory : (rstats.chart || []);
     dchart.train = hist.map(([i, v]) => [i, v]);
     dchart.hold = chart ? chart.hold : ((S.holdHist && S.holdHist.length ? S.holdHist : rstats.holds) || []).slice();
-    dchart.ssimTrain = (S.ssimTrainHist && S.ssimTrainHist.length ? S.ssimTrainHist : (rstats.ssimChart || [])).slice();
-    dchart.ssimHold = (S.ssimHoldHist && S.ssimHoldHist.length ? S.ssimHoldHist : (rstats.ssimHolds || [])).slice();
     dchart.events = S.chartEvents.map((e) => ({ ...e, at: e.iter / S.maxIters }));
     dchart.resize();
     dchart.draw();
