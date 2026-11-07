@@ -949,7 +949,7 @@ export class Session {
       await trainer.device.queue.onSubmittedWorkDone();
       this._fences.length = 0;
     }
-    if (this.training || this.view._dirty) this._scheduleFrame();
+    if (this.training || (this.view.enabled && this.view._dirty)) this._scheduleFrame();
   }
 
   /** serialize every metric readback: they share the trainer's staging
@@ -1101,6 +1101,7 @@ class SessionView {
     this.canvas = null;
     this.ctx = null;
     this.camera = null;   // { R, t, f, cx, cy, w, h } at canvas resolution
+    this.enabled = true;  // app viewport is optional; the trainer's own loss renderer is not
     this._dirty = false;
     this._offset = 0;     // training-target offset when looking through a frame
   }
@@ -1114,7 +1115,17 @@ class SessionView {
       alphaMode: 'opaque',
     });
     this._dirty = true;
-    if (!this.s.training) this.s._ensureScheduler(), this.s._scheduleFrame();
+    if (!this.s.training && this.enabled) this.s._ensureScheduler(), this.s._scheduleFrame();
+  }
+
+  /** Enable/disable the app's standalone viewport without touching trainer
+   *  steps, training renders, losses, or metric readbacks. */
+  setEnabled(enabled) {
+    enabled = !!enabled;
+    if (this.enabled === enabled) return;
+    this.enabled = enabled;
+    this._dirty = true; // repaint the latest model/camera when re-enabled
+    if (enabled && !this.s.training) this.s._ensureScheduler(), this.s._scheduleFrame();
   }
 
   /** Point the camera at training frame i (exact pose + intrinsics). Returns
@@ -1135,7 +1146,7 @@ class SessionView {
   }
 
   renderNow() {
-    if (!this.ctx || !this.camera) return;
+    if (!this.enabled || !this.ctx || !this.camera) return;
     this.s.trainer.renderView(this.camera, this.ctx, 0, this._offset);
     this._dirty = false;
     // any render satisfies the auto-refresh — a host that renders on its own
@@ -1144,7 +1155,7 @@ class SessionView {
   }
 
   _tick(frameCount, training) {
-    if (!this.ctx || !this.camera) return;
+    if (!this.enabled || !this.ctx || !this.camera) return;
     if (this._dirty) { this.renderNow(); return; }
     // during training, refresh the (unchanged-camera) view sparingly — every
     // render is a full raster pass stolen from the optimiser (~2/s at most,
