@@ -563,7 +563,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                     world[0] = points.get(); world[1] = points.get(); world[2] = points.get();
                     float confidence = points.get();
                     if (confidence < 0.25f) continue;
-                    worldToCamera.transformPoint(world, local);
+                    worldToCamera.transformPoint(world, 0, local, 0);
                     float z = -local[2];
                     if (z <= 0.05f) continue;
                     int u = Math.round(focal[0] * local[0] / z + principal[0]);
