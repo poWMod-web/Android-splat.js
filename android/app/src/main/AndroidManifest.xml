@@ -11,7 +11,9 @@
         android:allowBackup="false"
         android:label="SplatXR"
         android:theme="@android:style/Theme.Material.NoActionBar"
-        android:usesCleartextTraffic="false">
+        android:usesCleartextTraffic="false"
+        android:icon="@app/icons/icon-180"
+        android:roundIcon="@app/icons/icon-maskable-512">
         <meta-data android:name="com.google.ar.core" android:value="optional" />
         <activity android:name=".NativeCaptureActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".MainActivity" android:configChanges="orientation|screenSize|keyboardHidden" android:exported="true">
