@@ -8,10 +8,14 @@
 // PSNR, and Export writes a real .ply. The UI talks to ONE object — the
 // splat.js Session — plus the trainer's rendered canvas.
 
-import { createSession, gaussiansToPly, undistortFrames, solveTierOpts } from '../../src/index.js';
+import { createSession, parseCameras, gaussiansToPly, undistortFrames, solveTierOpts } from '../../src/index.js';
 import { extractSharpFrames, isVideoFile } from '../../src/io/video.js';
 import { recordCaptureVideo, cameraSupported } from './camera.js';
 import { saveLastCapture, loadLastCapture } from './store.js';
+import { initXRUI, reviewCapture, exportCapture } from './xr-ui.js';
+import { initPWAInstall } from './pwa-install.js';
+import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } from './xr-dataset.js';
+import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './training-settings.js';
 import { zipStore } from './zip.js';
 import { handleOAuthCallback, sendToArrival, hasToken, focusSignIn, API_BASE } from './arrival.js';
 import { buildSessionZip, fetchModel } from './session_io.js';
@@ -189,6 +193,8 @@ function loadSettings() {
     // phones: iters 0 (the old 20k default) was never an explicit choice —
     // migrate to the 10k draft default so first runs stay ~5 minutes
     if (d.iters === 10000 && m.iters === 0) m.iters = 10000;
+    try { m.iters = parseCycleCount(m.iters || ''); } catch { m.iters = d.iters; }
+    try { m.lodLevels = m.lod ? parseLODCount(m.lodLevels || 0, m.splats) : 0; } catch { m.lodLevels = 0; }
     if (BUF2X) m.buf = 2;
     return m;
   } catch { return d; }
@@ -214,6 +220,7 @@ function qualityMacros() {
   };
 }
 function qualityOf(st) {
+  if (st.lod || st.lodLevels) return 'custom';
   for (const [k, m] of Object.entries(qualityMacros())) {
     if (QKEYS.every((f) => st[f] === m[f])) return k;
   }
@@ -358,6 +365,31 @@ function boot() {
   }
 
   const card = $('start');
+  initPWAInstall({ flash });
+  initXRUI({
+    flash,
+    onCapture: (capture) => useOwnPhotos(capture.files, capture),
+    onExample: async () => {
+      const res = await fetch(`${DATA}synthetic/cameras.json`);
+      if (!res.ok) throw new Error('could not load bundled cameras');
+      const transforms = await res.json();
+      const files = await Promise.all(transforms.cameras.map(async (camera) => {
+        const image = await fetch(`${DATA}synthetic/${camera.image}`);
+        if (!image.ok) throw new Error(`could not load ${camera.image}`);
+        return new File([await image.blob()], camera.image, { type: 'image/png' });
+      }));
+      await useOwnPhotos(files, { kind: 'example', files, transforms, points: [], metadata: { seedSource: 'none', synthetic: true } });
+    },
+  });
+  $('xr-review-set').addEventListener('click', async () => {
+    const dataset = S.preset?.capture || { kind: 'photos', files: S.preset?.files || [], points: [] };
+    try { const retained = await reviewCapture(dataset); if (retained) await useOwnPhotos(retained.files, retained); }
+    catch (e) { flash(e.message, 7000); }
+  });
+  $('xr-export-set').addEventListener('click', async () => {
+    try { await exportCapture(S.preset?.capture || { files: S.preset?.files || [], points: [] }); }
+    catch (e) { flash(`Capture export failed: ${e.message}`, 7000); }
+  });
   ['dragenter', 'dragover'].forEach((t) => card.addEventListener(t, (e) => {
     e.preventDefault(); card.classList.add('drop');
   }));
@@ -402,6 +434,7 @@ function boot() {
     $('set-shup').value = st.shup ? '1' : '0';
     for (const k of AV_KEYS) { const el = $('set-av-' + k); if (!el) continue; el.value = k === 'crops' ? String(st.av && st.av.crops || 'face') : (st.av && st.av[k] === false ? '0' : '1'); }
     $('set-iters').value = st.iters ? String(st.iters) : '';
+    $('set-iters').setCustomValidity('');
     $('set-splats').value = st.splats ? String(st.splats) : '';
     $('set-q').value = qualityOf(st);
     $('q-quick').value = qualityOf(st);   // the dropdown next to Start
@@ -409,6 +442,13 @@ function boot() {
     const lodOk = st.splats >= 1000000;
     $('set-lod').disabled = !lodOk;
     $('set-lod').value = lodOk && st.lod ? '1' : '';
+    $('set-lod-count').disabled = !lodOk || !st.lod;
+    $('set-lod-count').max = String(maxLODLevels(st.splats) || 4);
+    $('set-lod-count').value = String(st.lodLevels || 0);
+    $('set-lod-count').setCustomValidity('');
+    $('set-lod-hint').textContent = lodOk
+      ? `0 = Auto (${maxLODLevels(st.splats)} snapshots). Choose 1–${maxLODLevels(st.splats)} earlier saved snapshots; final full detail is always included.`
+      : 'Enable LOD with a splat budget of at least 1,000,000. 0 = Auto.';
     $('set-mcmc').value = st.mcmc === '0' ? '0' : '';
   };
   showSettings();
@@ -418,6 +458,7 @@ function boot() {
     const m = qualityMacros()[v];
     if (!m) return;           // Custom is a display state, not a choice
     Object.assign(st, m);
+    st.lod = false; st.lodLevels = 0;
     showSettings();
     saveSettings();
   };
@@ -444,6 +485,18 @@ function boot() {
     $('btn-settings').setAttribute('aria-expanded', String(open));
   });
   const readSettings = () => {
+    const cyclesInput = $('set-iters'), lodInput = $('set-lod-count');
+    cyclesInput.setCustomValidity(''); lodInput.setCustomValidity('');
+    let cycleCount, lodCount = 0;
+    const splatBudget = parseInt($('set-splats').value, 10) || 0;
+    const lodEnabled = !!$('set-lod').value && splatBudget >= 1000000;
+    try { cycleCount = parseCycleCount(cyclesInput.value); }
+    catch (e) { cyclesInput.setCustomValidity(e.message); cyclesInput.reportValidity(); flash(e.message, 7000); return false; }
+    if (!cyclesInput.validity.valid) { cyclesInput.reportValidity(); return false; }
+    if (lodEnabled) {
+      try { lodCount = parseLODCount(lodInput.value, splatBudget); }
+      catch (e) { lodInput.setCustomValidity(e.message); lodInput.reportValidity(); flash(e.message, 7000); return false; }
+    }
     st.res = parseInt($('set-res').value, 10) || 0;
     st.feat = parseInt($('set-feat').value, 10) || 0;
     st.solve = $('set-solve').value || 'standard';
@@ -451,16 +504,19 @@ function boot() {
     st.sh = parseInt($('set-sh').value, 10);
     st.shup = $('set-shup').value === '1';
     st.av = { ...AV_DEFAULTS }; for (const k of AV_KEYS) { const el = $('set-av-' + k); if (!el) continue; st.av[k] = k === 'crops' ? el.value : el.value !== '0'; }
-    st.iters = parseInt($('set-iters').value, 10) || 0;
-    st.splats = parseInt($('set-splats').value, 10) || 0;
-    st.lod = !!$('set-lod').value && st.splats >= 1000000;
+    st.iters = cycleCount;
+    st.splats = splatBudget;
+    st.lod = lodEnabled;
+    st.lodLevels = lodCount;
     st.mcmc = $('set-mcmc').value;  // '' Auto | '1' on | '0' off
     showSettings();
     saveSettings();
+    return true;
   };
+  S.commitSettings = readSettings;
   // every select in the panel persists on change — the avatar rows (and Horizontal SH) were
   // missing from this list, so their toggles changed the dropdown and nothing else (2026-09-17)
-  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-mcmc', 'set-shup', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
+  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-shup', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
     const el = $(id); if (el) el.addEventListener('change', readSettings);
   }
   // the avatar route: the box on the start card. It is a property of THIS run,
@@ -622,7 +678,7 @@ function boot() {
     // card, and Start training lives only there. The visitor's own sets
     // (last capture, own shares) live under the wall's Local tab.
     $('start').appendChild($('gallery'));
-    $('detail-body').append($('set-desc'), $('av-choice'), document.querySelector('.startrow'), $('settings'));
+    $('detail-body').append($('set-desc'), $('av-choice'), $('xr-set-tools'), document.querySelector('.startrow'), $('settings'));
     $('detail-back').addEventListener('click', detailClose);
     $('detail-x').addEventListener('click', detailClose);
     // no implicit boot set: nothing loads until the visitor picks — the old
@@ -695,8 +751,8 @@ async function checkGpu() {
   const d = document.createElement('div');
   d.className = 'gpuwarn';
   d.innerHTML = `<b>The GPU is out of reach in this browser</b><span>` +
-    `Everything here — the camera solve and the training — runs on WebGPU, ` +
-    `and this browser is not exposing it yet. ${how}</span>`;
+    `Camera solving and splat training need WebGPU, and this browser is not exposing it yet. ` +
+    `Supported AR capture and capture export can still work; transfer the dataset to a GPU-capable device to train. ${how}</span>`;
   $('start').insertBefore(d, $('upload'));
 }
 
@@ -738,6 +794,12 @@ async function openCaptureSet(rec = null) {
   set.source = rec.source || { picks: files.length };
   set.origin = `${files.length} frames from your last capture, restored from this browser's ` +
     'own storage. They never left this device.';
+  if (rec.transforms) {
+    set.capture = validateDataset({ kind: 'ar', files, transforms: rec.transforms, points: rec.points || [], pointsByFrame: rec.pointsByFrame, metadata: rec.metadata || {} });
+    set.name = rec.metadata?.synthetic ? 'Synthetic Corner · known poses' : 'Your AR capture';
+    set.kind = 'Known camera poses';
+    set.origin = `${files.length} pose-tagged frames restored with their camera transforms; camera solve skipped.`;
+  }
   return set;
 }
 
@@ -1136,13 +1198,19 @@ function persistCapture(rec) {
   });
 }
 
-async function useOwnPhotos(list) {
+async function useOwnPhotos(list, capture = null) {
   const all = [...list];
+  if (!capture && all.some((f) => /\.json$/i.test(f.name))) {
+    try {
+      capture = await reviewCapture(await datasetFromSelection(all));
+      if (!capture) return;
+    } catch (e) { flash(`Could not import capture: ${e.message}`, 9000); return; }
+  }
   // video intake is back on (2026-09-08): the v2 extractor decodes every frame
   // through WebCodecs, scores it with the sharp-frames metric and picks by
   // camera motion — a video without photos goes through useOwnVideo
   const video = all.find(isVideoFile);
-  const files = all.filter((f) => f.type.startsWith('image/'));
+  const files = capture ? [...capture.files] : all.filter((f) => f.type.startsWith('image/'));
   if (video && files.length < 2) { useOwnVideo(video); return; }
   if (files.length < 2) {
     flash('Pick at least a couple of overlapping photos of the same place.', 4500);
@@ -1157,9 +1225,18 @@ async function useOwnPhotos(list) {
   persistCapture({
     kind: 'photos', created: Date.now(),
     files: files.map((f) => ({ name: f.name, blob: f })),
+    ...(capture ? storedCapture({ ...capture, files }) : {}),
   });
   const set = ownSet(files, S.ownUrls);
-  open(set);
+  if (capture?.transforms) {
+    validateDataset({ ...capture, files });
+    set.capture = { ...capture, files };
+    set.name = capture.metadata?.synthetic ? 'Synthetic Corner · known poses' : 'Your AR capture';
+    set.kind = 'Known camera poses';
+    const seeds = measuredSeeds(capture).length;
+    set.origin = `${files.length} pose-tagged views · camera solve skipped · ${seeds ? `${fmt(seeds)} measured seed points` : 'random-volume seed (orbit required)'}.`;
+  }
+  await open(set);
   showDetail(set);   // Start training lives on the detail card
 }
 
@@ -1556,9 +1633,15 @@ const BEATS_BASE = [
 // matte is the run's first beat, not something that happened minutes earlier
 // when the video was read (the decision moved to the start card, 2026-09-18)
 const MATTE_BEAT = { id: 'matte', label: 'Cutting the person out' };
+const BEATS_KNOWN = [
+  { id: 'decode', label: 'Reading photographs' },
+  { id: 'known', label: 'Using tracked cameras' },
+  { id: 'seed', label: 'Seeding splats' },
+];
 let BEATS = BEATS_BASE;
-const beatsFor = (avatar) => (avatar ? [MATTE_BEAT, ...BEATS_BASE] : BEATS_BASE);
+const beatsFor = (avatar) => S.preset?.capture?.transforms ? BEATS_KNOWN : (avatar ? [MATTE_BEAT, ...BEATS_BASE] : BEATS_BASE);
 const beatIndex = (stage) => {
+  if (BEATS === BEATS_KNOWN) return stage === 'seed' ? 2 : (stage === 'known' || stage === 'solved' ? 1 : 0);
   const off = BEATS[0].id === 'matte' ? 1 : 0;
   return Math.max(0, off + ({ matte: -1, decode: 0, features: 1, matching: 2, focal: 3, register: 3, ba: 3, solved: 3, seed: 4 }[stage] ?? 0));
 };
@@ -1635,6 +1718,13 @@ async function avatarPrep(gen) {
 
 async function startPrep() {
   document.getElementById('failcard')?.remove();
+  if (S.commitSettings && !S.commitSettings()) return;
+  if (!S.preset || S.photos.length < 3) { flash('Use at least 3 overlapping views; 20–200 are recommended.', 7000); return; }
+  if (S.preset.capture?.transforms) {
+    try { validateDataset(S.preset.capture); }
+    catch (e) { flash(e.message, 8000); return; }
+    S.avatarWanted = false;
+  }
   // consume the detail-card history entry — Back during a run must not
   // resurrect a card that no longer applies
   if (history.state && history.state.sj) history.replaceState(null, '');
@@ -1673,7 +1763,7 @@ async function startPrep() {
   S.feats = new Map(); S.lastPairEv = null; S.shownPair = null; S.regCams = [];
   S.regPts = null; S.regPtsCount = 0; S.growNote = null;
   S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
-  S.maxIters = PERF.on ? PERF.iters : (S.settings.iters || INITIAL_ITERS);
+  S.maxIters = ITERS_OVERRIDE >= 1000 ? ITERS_OVERRIDE : (PERF.on ? PERF.iters : (S.settings.iters || INITIAL_ITERS));
   S.state = 'prep';
   // ── the avatar route, as decided on the start card ───────────────────────
   // Unticked, this is a plain scene run whatever the set once was: a restored
@@ -1735,13 +1825,8 @@ async function startPrep() {
     // growing on — so it must START below the lowest level
     const lodOn = !!st.lod && st.splats >= 1000000;
     if (lodOn) {
-      const levels = [];
-      for (let n2 = st.splats; n2 >= 250000; n2 = Math.round(n2 / 2)) levels.unshift(n2);
-      // polish scales with the run: every level must be reached AND polished
-      // before growth freezes at 0.75x the horizon
-      const polish = Math.min(12000, Math.max(3000, Math.floor(S.maxIters * 0.05)));
-      S.lodPlan = { levels, idx: 0, holdUntil: null, polish, snaps: [] };
-      trainerOpts.capMult = Math.ceil(st.splats / 250000) + 1;
+      S.lodPlan = buildLODPlan(st.splats, st.lodLevels || 0, S.maxIters);
+      trainerOpts.capMult = Math.max(16, Math.ceil(st.splats / 250000) + 1);
     } else {
       S.lodPlan = null;
     }
@@ -1792,12 +1877,14 @@ async function startPrep() {
     if (engine) { trainerOpts.engine = engine; }
     // avatar mode: one subject, not a room — its own sizing (app/avatar)
     if (S.avatarOpts) Object.assign(trainerOpts, S.avatarOpts.trainer);
+    const knownCapture = S.preset.capture?.transforms ? S.preset.capture : null;
+    if (knownCapture) Object.assign(trainerOpts, { camOpt: false, aspectOpt: false });
     const session = createSession({
       maxIters: S.maxIters, evalHoldEvery: 2500,
       holdout: -1,
       ...(engine === 'v2' ? { refineEvery: 200 } : (mcmcActive ? { refineEvery: 500 } : {})),
       evalSplit: EVAL.on ? EVAL.split : 0,
-      initTarget: lodOn ? 250000 : (st.splats ? Math.round(st.splats / 4) : (phoneClass ? 60000 : undefined)),
+      initTarget: lodOn ? S.lodPlan.levels[0] : (st.splats ? Math.round(st.splats / 4) : (phoneClass ? 60000 : undefined)),
       maxViewW: mvW, maxViewH: mvH,
       ...(S.avatarOpts ? S.avatarOpts.session : {}),
       // phones: iOS jetsams the tab long before the GPU is the limit —
@@ -1834,7 +1921,7 @@ async function startPrep() {
       // avatar runs on a desktop take a larger target budget (700 MB -> 1.1 GB, with the
       // crop windows capped at 240 the trainer stays under its 2 GB binding): a 4K
       // orbit's 208 frames decoded at 706 px under the default budget (2026-09-15)
-      frames: phoneClass ? { featMaxDim: 960, ...(frames || {}) } : (S.avatarOpts && S.avatarOpts.budget ? { targetBudgetBytes: 1.1e9, ...(frames || {}) } : frames),
+      frames: knownCapture ? { ...(frames || {}), disablePano: true } : (phoneClass ? { featMaxDim: 960, ...(frames || {}) } : (S.avatarOpts && S.avatarOpts.budget ? { targetBudgetBytes: 1.1e9, ...(frames || {}) } : frames)),
       trainer: Object.keys(trainerOpts).length ? trainerOpts : undefined,
     });
     S.session = session;
@@ -1866,9 +1953,19 @@ async function startPrep() {
 
     // 2) solve — the beats are its real events
     const t0 = performance.now();
-    await session.solve({ debug: (d) => { S.internals = d; } });
+    if (knownCapture) {
+      onStage({ stage: 'known', done: 0, total: 1 });
+      const points = measuredSeeds(knownCapture);
+      session.useKnownCameras(parseCameras(knownCapture.transforms), { ...(points.length ? { points } : {}), seedCount: phoneClass ? 8000 : 20000 });
+      if (session.recon.cams.length !== session.frames.length) throw new Error('Some images lost their known cameras during decoding. No estimated poses will be substituted.');
+      S.solveStats.solveSec = 0;
+      onStage({ stage: 'solved', done: 1, total: 1, detail: { cams: session.recon.cams.length, points: session.recon.points.length, known: true } });
+      flash(`${session.recon.cams.length} known camera poses loaded — camera solve skipped. ${points.length ? 'Measured seeds.' : 'Random-volume initialization.'}`, 7000);
+    } else {
+      await session.solve({ debug: (d) => { S.internals = d; } });
+    }
     if (S.gen !== gen) return;
-    S.solveStats.solveSec = (performance.now() - t0) / 1000;
+    if (!knownCapture) S.solveStats.solveSec = (performance.now() - t0) / 1000;
 
     // No threshold guessing: below 3 placed cameras there is no multi-view
     // problem left to solve — stop with advice. Anything above that trains,
@@ -4142,11 +4239,18 @@ function showDetail(setOrPreset) {
   // the avatar route is offered on own captures only: the matte reads the
   // frames themselves, and a benchmark set of a truck is not a person
   {
-    const own = !!(setOrPreset && Array.isArray(setOrPreset.files) && setOrPreset.files.length >= 2 && !setOrPreset.spaceId);
+    const own = !!(setOrPreset && Array.isArray(setOrPreset.files) && setOrPreset.files.length >= 2 && !setOrPreset.spaceId && !setOrPreset.capture?.transforms);
     $('av-choice').hidden = !own;
     $('set-avatar').checked = own && !!S.avatarWanted;
     if (!own) S.avatarWanted = false;
   }
+  const capturedFiles = !!setOrPreset?.files?.length;
+  $('xr-set-tools').hidden = !capturedFiles;
+  $('xr-review-set').disabled = !capturedFiles || setOrPreset.files.length < 3;
+  $('xr-export-set').disabled = !capturedFiles || setOrPreset.files.length < 3;
+  $('xr-set-mode').textContent = setOrPreset?.capture?.transforms ? 'KNOWN POSES · NO CAMERA SOLVE' : 'PHOTO INPUT · ORIGINAL CAMERA SOLVE';
+  $('set-solve').disabled = !!setOrPreset?.capture?.transforms;
+  $('set-feat').disabled = !!setOrPreset?.capture?.transforms;
   setStartStyle(!(setOrPreset && setOrPreset.spaceId));
   if (setOrPreset && setOrPreset.spaceId) {
     // a trained model of this benchmark is shared — View opens it, and the
@@ -5215,6 +5319,7 @@ function prepSub() {
   const e = S.prep;
   if (!e) return '—';
   const n = S.photos.length;
+  if (e.stage === 'known') return 'using pose-synchronized cameras and per-frame intrinsics — no structure-from-motion';
   if (e.stage === 'matte') return `frame ${e.done} of ${e.total} · the room removed, the person kept`;
   if (e.stage === 'decode') return `photo ${e.done} of ${e.total}`;
   if (e.stage === 'features') {
@@ -5230,7 +5335,9 @@ function prepSub() {
       (S.regPtsCount ? ` · ${fmt(S.regPtsCount)} points triangulated` : '');
   }
   if (e.stage === 'ba') return 'polishing the geometry (bundle adjustment)';
+  if (e.stage === 'solved' && e.detail.known) return `${e.detail.cams} known cameras · ${fmt(e.detail.points)} seed points · camera solve skipped`;
   if (e.stage === 'solved') return `${e.detail.cams} cameras · ${fmt(e.detail.points)} points · ${e.detail.rms ? e.detail.rms.toFixed(2) + 'px' : ''}`;
+  if (e.stage === 'seed' && S.preset?.capture?.transforms) return 'seeding Gaussians with known poses; cameras and intrinsics remain fixed';
   if (e.stage === 'seed') return 'one splat per landmark, plus jittered copies';
   return '—';
 }

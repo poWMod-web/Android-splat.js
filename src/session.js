@@ -182,6 +182,8 @@ export class Session {
    *  Detection reads image HEADERS only (probeImageSize) — a normal photo
    *  set pays nothing here; panos are decoded once, sliced, released. */
   async _slicePanos(files) {
+    // Calibrated XR images must retain their captured frustum and pixels.
+    if (this.opts.frames?.disablePano) return { prepared: files, rigs: null };
     const meta = [];
     let panos = 0, sized = 0, maxW = 0;
     for (const f of files) {

@@ -1,7 +1,8 @@
 {
-  "name": "Splat.js — 3D capture in the browser",
-  "short_name": "Splat.js",
-  "description": "Photos in, camera poses solved, a 3D Gaussian splat trained — the whole pipeline in the browser.",
+  "id": "./",
+  "name": "SplatXR — Capture & Train",
+  "short_name": "SplatXR",
+  "description": "Pose-tagged WebXR photos and JavaScript 3D Gaussian Splatting on your GPU.",
   "start_url": "index.html",
   "scope": "./",
   "display": "standalone",

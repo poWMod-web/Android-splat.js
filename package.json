@@ -18,8 +18,11 @@
     "LICENSE"
   ],
   "scripts": {
-    "serve": "node serve.mjs 8734",
+    "dev": "node serve.mjs 3000",
+    "serve": "node serve.mjs 3000",
+    "build": "node build.mjs",
     "test": "node tests/unit/run.mjs",
+    "test:xr": "node tests/unit/xr-math.mjs && node tests/unit/test_xr_dataset.mjs",
     "test:quality": "node tests/quality/run.mjs",
     "test:e2e": "playwright test -c tests/e2e"
   },
