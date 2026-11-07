@@ -39,9 +39,16 @@ assert.match(main, /applySafeAreaInsets\(host\)/,
   'the main WebView host must apply safe-area insets on edge-to-edge Android');
 assert.match(main, /WindowInsets\.Type\.systemBars\(\) \| WindowInsets\.Type\.displayCutout\(\)/,
   'safe-area padding must cover status/navigation bars and display cutouts');
-assert.match(native, /orangeAt = \(float\)Math\.toRadians\(40\.0\)/);
-assert.match(native, /yellowAt = \(float\)Math\.toRadians\(80\.0\)/);
-assert.match(native, /greenAt = \(float\)Math\.toRadians\(120\.0\)/);
-assert.match(native, /green = 0\.42f \+ 0\.52f \* t/);
-assert.match(native, /red = 1f - 0\.92f \* t/);
+assert.match(native, /float degrees = Float\.isFinite\(maxAngle\)[\s\S]*Math\.toDegrees\(maxAngle\)/,
+  'the angular value must be converted from radians to degrees before mapping colors');
+assert.match(native, /degrees < 40f[\s\S]*degrees < 80f[\s\S]*degrees - 80f\) \/ 40f/,
+  'the color ramp must span red to orange to yellow to green at 0, 40, 80 and 120 degrees');
+assert.match(native, /MAX_DIRECTIONS = 16/);
+assert.match(native, /closestDot < nearestDots\[redundant\]/,
+  'the bounded view-direction sample must replace redundant early views with novel later angles');
+assert.match(native, /Math\.acos\(widestDot\)/);
+assert.match(native, /clampDot\(directions\[offset\] \* dx/,
+  'viewing-direction dot products must be clamped before angular comparison');
+assert.match(native, /translation\[0\] - x, translation\[1\] - y, translation\[2\] - z/,
+  'viewing directions must run from each world-space point toward the ARCore camera position');
 console.log('Android asset paths, portrait lock, capture orientation, safe-area insets, and coverage colors: passed');

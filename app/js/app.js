@@ -13,7 +13,6 @@ import { extractSharpFrames, isVideoFile } from '../../src/io/video.js';
 import { recordCaptureVideo, cameraSupported } from './camera.js';
 import { saveLastCapture, loadLastCapture } from './store.js';
 import { initXRUI, reviewCapture, exportCapture } from './xr-ui.js';
-import { initPWAInstall } from './pwa-install.js';
 import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } from './xr-dataset.js';
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './training-settings.js';
 import { zipStore } from './zip.js';
@@ -22,6 +21,10 @@ import { buildSessionZip, fetchModel } from './session_io.js';
 import { PRESETS, REPO, DISCORD, DATA, ownSet } from './data.js';
 // official demo scenes on the wall that are not bundled presets (Garden, The Lab, Camping)
 const EXTRA_PRESET_SPACES = ['42485456_3427', '42485456_9670', '42485456_7518'];
+const HOME_BENCHMARK_IDS = new Set([
+  PRESETS.find((preset) => preset.id === 'synthetic')?.spaceId,
+  '42485456_7518', // Camping
+].filter(Boolean).map(String));
 const presetSpaceIds = () => new Set([...PRESETS.map((p) => p.spaceId).filter(Boolean), ...EXTRA_PRESET_SPACES]);
 
 // the header's account glyph. Declared UP HERE on purpose: boot() runs while
@@ -427,7 +430,6 @@ function boot() {
   }
 
   const card = $('start');
-  initPWAInstall({ flash });
   initXRUI({
     flash,
     onCapture: (capture) => useOwnPhotos(capture.files, capture),
@@ -4967,7 +4969,8 @@ async function mountWall() {
     const rest = items || [];
     const pinOf = (x) => (x.splatjs && x.splatjs.pin) || 9e9;
     const newer = (a, b) => new Date(b.createdDate) - new Date(a.createdDate);
-    const presets = rest.filter((x) => presetIds.has(String(x.id))).sort((a, b) => (pinOf(a) - pinOf(b)) || newer(a, b));
+    const presets = rest.filter((x) => HOME_BENCHMARK_IDS.has(String(x.id)))
+      .sort((a, b) => (pinOf(a) - pinOf(b)) || newer(a, b));
     const shares = rest.filter((x) => !presetIds.has(String(x.id))).sort(newer);
     // tabs: Benchmarks | Community [| This device]. The chosen tab and the
     // scroll position survive a trip into a scene (sessionStorage), so Back

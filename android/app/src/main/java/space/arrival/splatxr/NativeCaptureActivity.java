@@ -733,31 +733,25 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
 
         private void putCoverageColor(FloatBuffer colors, float maxAngle) {
-            // Spread the ramp over a wider viewpoint range so coverage does not
-            // jump straight from red to green: red -> orange at 40°, yellow at
-            // 80°, then a gradual transition to green at 120°.
-            float orangeAt = (float)Math.toRadians(40.0);
-            float yellowAt = (float)Math.toRadians(80.0);
-            float greenAt = (float)Math.toRadians(120.0);
-            float angle = Float.isFinite(maxAngle) ? Math.max(0f, Math.min(maxAngle, greenAt)) : 0f;
-            float red, green, blue, t;
-            if (angle < orangeAt) {
-                t = angle / orangeAt;
+            // Four evenly spaced angular stops: red at 0°, orange at 40°,
+            // yellow at 80°, and green at 120°, with linear RGB interpolation.
+            float degrees = Float.isFinite(maxAngle)
+                    ? Math.max(0f, Math.min(120f, (float)Math.toDegrees(maxAngle))) : 0f;
+            float t, red, green;
+            if (degrees < 40f) {
+                t = degrees / 40f;
                 red = 1f;
-                green = 0.04f + 0.38f * t;
-                blue = 0.02f * (1f - t);
-            } else if (angle < yellowAt) {
-                t = (angle - orangeAt) / (yellowAt - orangeAt);
+                green = 0.5f * t;
+            } else if (degrees < 80f) {
+                t = (degrees - 40f) / 40f;
                 red = 1f;
-                green = 0.42f + 0.52f * t;
-                blue = 0.03f * t;
+                green = 0.5f + 0.5f * t;
             } else {
-                t = (angle - yellowAt) / (greenAt - yellowAt);
-                red = 1f - 0.92f * t;
-                green = 0.94f - 0.08f * t;
-                blue = 0.03f + 0.09f * t;
+                t = (degrees - 80f) / 40f;
+                red = 1f - t;
+                green = 1f;
             }
-            colors.put(red).put(green).put(blue);
+            colors.put(red).put(green).put(0f);
         }
 
         private void capture(Frame frame) {
@@ -1005,19 +999,104 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     }
 
     private static final class CoveragePoint {
+        private static final int MAX_DIRECTIONS = 16;
+        private static final float MIN_SAMPLE_DOT = (float)Math.cos(Math.toRadians(4.0));
         final float[] xyz;
-        final List<float[]> directions = new ArrayList<>();
+        // Fixed-size direction samples keep coverage memory bounded. Farthest-
+        // direction replacement prevents the first handful of similar views
+        // from permanently hiding later viewpoint changes.
+        final float[] directions = new float[MAX_DIRECTIONS * 3];
+        final float[] nearestDots = new float[MAX_DIRECTIONS];
+        // Preserve the pair that established the widest observed angle even if
+        // one endpoint is later replaced in the bounded representative set.
+        final float[] maxPair = new float[6];
+        int directionCount;
+        boolean hasMaxPair;
         float maxAngle;
+
         CoveragePoint(float x, float y, float z) { xyz = new float[]{x, y, z}; }
+
         void observe(float x, float y, float z) {
             if (!finite(x, y, z)) return;
             float n = (float)Math.sqrt(x*x + y*y + z*z);
-            if (!Float.isFinite(n) || n < 1e-6) return;
-            float[] d = {x/n, y/n, z/n};
-            for (float[] old : directions) maxAngle = Math.max(maxAngle,
-                    (float)Math.acos(Math.max(-1f, Math.min(1f, old[0]*d[0] + old[1]*d[1] + old[2]*d[2]))));
-            if (directions.size() < 8) directions.add(d);
+            if (!Float.isFinite(n) || n < 1e-6f) return;
+            float dx = x / n, dy = y / n, dz = z / n;
+
+            float closestDot = -1f;
+            float widestDot = 1f;
+            float ax = 0f, ay = 0f, az = 0f;
+            boolean foundPair = false;
+            for (int i = 0; i < directionCount; i++) {
+                int offset = i * 3;
+                float dot = clampDot(directions[offset] * dx + directions[offset + 1] * dy + directions[offset + 2] * dz);
+                closestDot = Math.max(closestDot, dot);
+                if (dot < widestDot) {
+                    widestDot = dot;
+                    ax = directions[offset]; ay = directions[offset + 1]; az = directions[offset + 2];
+                    foundPair = true;
+                }
+            }
+            if (hasMaxPair) {
+                for (int endpoint = 0; endpoint <= 3; endpoint += 3) {
+                    float dot = clampDot(maxPair[endpoint] * dx + maxPair[endpoint + 1] * dy + maxPair[endpoint + 2] * dz);
+                    if (dot < widestDot) {
+                        widestDot = dot;
+                        ax = maxPair[endpoint]; ay = maxPair[endpoint + 1]; az = maxPair[endpoint + 2];
+                        foundPair = true;
+                    }
+                }
+            }
+            if (foundPair && widestDot < Math.cos(maxAngle)) {
+                maxAngle = (float)Math.acos(widestDot);
+                maxPair[0] = ax; maxPair[1] = ay; maxPair[2] = az;
+                maxPair[3] = dx; maxPair[4] = dy; maxPair[5] = dz;
+                hasMaxPair = true;
+            }
+
+            if (directionCount < MAX_DIRECTIONS) {
+                if (directionCount == 0 || closestDot < MIN_SAMPLE_DOT) addDirection(dx, dy, dz);
+            } else {
+                int redundant = 1; // keep the first captured viewing direction as a stable anchor
+                for (int i = 2; i < directionCount; i++) {
+                    if (nearestDots[i] > nearestDots[redundant]) redundant = i;
+                }
+                if (closestDot < nearestDots[redundant]) {
+                    int offset = redundant * 3;
+                    directions[offset] = dx; directions[offset + 1] = dy; directions[offset + 2] = dz;
+                    recomputeNearestDots();
+                }
+            }
         }
+
+        private void addDirection(float x, float y, float z) {
+            int offset = directionCount * 3;
+            float nearest = -1f;
+            for (int i = 0; i < directionCount; i++) {
+                int other = i * 3;
+                float dot = clampDot(directions[other] * x + directions[other + 1] * y + directions[other + 2] * z);
+                nearest = Math.max(nearest, dot);
+                nearestDots[i] = Math.max(nearestDots[i], dot);
+            }
+            directions[offset] = x; directions[offset + 1] = y; directions[offset + 2] = z;
+            nearestDots[directionCount] = nearest;
+            directionCount++;
+        }
+
+        private void recomputeNearestDots() {
+            for (int i = 0; i < directionCount; i++) {
+                float nearest = -1f;
+                int a = i * 3;
+                for (int j = 0; j < directionCount; j++) {
+                    if (i == j) continue;
+                    int b = j * 3;
+                    float dot = clampDot(directions[a] * directions[b] + directions[a + 1] * directions[b + 1] + directions[a + 2] * directions[b + 2]);
+                    nearest = Math.max(nearest, dot);
+                }
+                nearestDots[i] = nearest;
+            }
+        }
+
+        private static float clampDot(float dot) { return Math.max(-1f, Math.min(1f, dot)); }
     }
 
     private static final class SeedPoint {

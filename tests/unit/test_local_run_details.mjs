@@ -43,8 +43,8 @@ assert.doesNotMatch(html, /id="btn-install"|>Install app</,
   'the top-bar Install app button should be removed');
 assert.match(html, /id="btn-training-visuals"[^>]*hidden[^>]*>Show visuals/,
   'the training-only visualization toggle should start hidden');
-assert.doesNotMatch(app, /installSlot/,
-  'the removed top-bar install button must not leave an empty reserved slot');
+assert.doesNotMatch(app, /installSlot|initPWAInstall/,
+  'removing install actions must not leave a reserved header slot or install prompt wiring');
 const drawStart = app.indexOf('function draw() {');
 const drawEnd = app.indexOf('/** a photograph filling the stage', drawStart);
 const draw = app.slice(drawStart, drawEnd);
