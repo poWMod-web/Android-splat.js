@@ -1,0 +1,48 @@
+{
+  "//": "Every gate is a measured baseline minus an explicit margin. Baselines (2026-08-19, RTX-class GPU): synthetic solve f 617.9 vs GT 620 (0.34%), rms ~0.4px, 12/12; synthetic 3k-iter train ~26 dB; truck-42 ATE 0.02% of path; camping-113 ATE 0.17%. rig-ate (2026-08-22, spherical-seeding solver): 48/48, rms 0.697, ATE 0.109% of span.",
+  "synthetic-solve": {
+    "cams": 12,
+    "fErrMax": 0.02,
+    "rmsMax": 1.0,
+    "timeoutMin": 4
+  },
+  "synthetic-train": {
+    "cams": 12,
+    "fErrMax": 0.02,
+    "psnrTrainMin": 24,
+    "psnrHoldMin": 22,
+    "timeoutMin": 8
+  },
+  "rig-ate": {
+    "cams": 48,
+    "rmsMax": 1.0,
+    "atePctMax": 0.25,
+    "timeoutMin": 5
+  },
+  "truck-ate": {
+    "cams": 42,
+    "rmsMax": 1.0,
+    "atePctMax": 0.1,
+    "timeoutMin": 8
+  },
+  "camping-ate": {
+    "cams": 113,
+    "rmsMax": 1.0,
+    "atePctMax": 0.35,
+    "timeoutMin": 12
+  },
+  "truckfull-ate": {
+    "//": "the README pose row: 250/250, 0.00 % ATE vs COLMAP (2026-09-09); a baseline of 250 registered at 0.01 % with margin",
+    "cams": 250,
+    "rmsMax": 1.0,
+    "atePctMax": 0.05,
+    "timeoutMin": 15
+  },
+  "tom-ate": {
+    "//": "a person orbit from video against COLMAP (2026-09-17): 65/65, max-camera residual 0.3 % of the path extent, ATE well under 0.5 %; the video gates + final trials must hold under any decoder",
+    "cams": 65,
+    "rmsMax": 1.2,
+    "atePctMax": 0.5,
+    "timeoutMin": 6
+  }
+}

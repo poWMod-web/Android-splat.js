@@ -20,6 +20,11 @@ REFACTOR.md
 browser_gs.txt
 examples/
 scripts/
+!scripts/
+scripts/*
+!scripts/readme_chart.mjs
+!scripts/restamp_space.mjs
+!scripts/sync_rig.mjs
 data/*
 !data/synthetic
 
