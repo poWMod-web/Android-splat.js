@@ -1,53 +1,48 @@
-# Android packaging notes
+# SplatXR Android (arm64-v8a)
 
-SplatXR is a web app, not a separate native or Expo app. There are two Android delivery modes:
+This Android project wraps the existing `app/` WebGPU interface in a local WebView and adds an optional native ARCore capture route. It is separate from the PWA/TWA install path: the native route uses ARCore directly, rather than relying on the browser's experimental WebXR Raw Camera Access extension.
 
-- **PWA/home-screen install:** use the deployed HTTPS site directly. Android Chrome may expose **Install app** or **Add to Home screen**. The installed entry uses `display: "standalone"` from `app/manifest.webmanifest`.
-- **Verified Trusted Web Activity:** after a real deployment exists, wrap that same site with the official Bubblewrap CLI. A TWA is still the site running in the browser’s fullscreen surface; it does not bundle WebGPU or turn unsupported hardware into a WebGPU device.
+## Build the APK
 
-## Start from a deployed site
-
-This repository deliberately has no production URL, release package name, signing certificate, or keystore. Do not generate a random release key or pretend that a signed APK has been tested. First deploy the app over HTTPS and confirm that the browser can fetch:
-
-- `https://your-domain.example/splatxr/index.html`
-- `https://your-domain.example/splatxr/manifest.webmanifest`
-- the existing icon paths under `icons/`
-
-Then run the repository helper with the deployed directory URL (or its `index.html` URL):
+Requirements: JDK 17, Android SDK Platform 35, Build Tools 35.0.0, and Gradle 8.9. From this directory:
 
 ```sh
-node android/package-android.mjs https://your-domain.example/splatxr/
+gradle --no-daemon assembleDebug
 ```
 
-The helper resolves the relative manifest URL and invokes the maintained package without inventing Bubblewrap configuration:
+The arm64-only debug APK is written to:
+
+```text
+app/build/outputs/apk/debug/app-debug.apk
+```
+
+Install on a compatible arm64 Android phone with Google Play Services for AR:
 
 ```sh
-npx --yes @bubblewrap/cli init --manifest=https://your-domain.example/splatxr/manifest.webmanifest
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Review the generated Bubblewrap project and its current CLI output. Once the real Android package ID and signing setup are chosen, build with the official command from that project:
+Debug builds use Android's automatically generated debug signing key and are for testing only; they are not Play Store release packages. The GitHub Actions workflow `.github/workflows/android-apk.yml` builds the same APK and uploads it as the `splatxr-arm64-debug-apk` artifact.
 
-```sh
-bubblewrap build
-```
+## Native capture flow
 
-The helper stops after `init`; it does not build, sign, install, upload, or publish an APK.
+1. The WebView loads the checked-in HTML/CSS/JS app from APK assets using `WebViewAssetLoader`; it does not need a server.
+2. **Capture with ARCore** opens a native camera surface. Allow camera permission and install/update Google Play Services for AR if requested.
+3. Move around a stationary subject and capture at least three overlapping keyframes (20–200 recommended). The preview accumulates a voxelized ARCore feature-point cloud, colored red-to-green by angular diversity.
+4. **Finish & train** writes JPEG keyframes, `transforms.json`, `seed_points.json`, a binary little-endian RGB `seed.ply`, and capture metadata under private app storage. The web app loads those files through same-origin local asset URLs and then uses its existing known-camera reconstruction path, bypassing SfM.
+5. Review the frames and train if the device's WebView exposes a usable WebGPU adapter. Otherwise the captured dataset remains exportable from the web interface for desktop training.
 
-## Verification before release
+The camera configuration is selected from the device's supported ARCore configurations by largest CPU-image size. Each pose and its image/intrinsics are sampled from the same ARCore frame. Seed colors are sampled from that frame's CPU image after projecting ARCore world feature points into the image. Depth mode is enabled when ARCore reports it as supported; the current seed source is the ARCore feature-point cloud, not a dense depth reconstruction.
 
-A TWA needs Digital Asset Links ownership verification. Publish `/.well-known/assetlinks.json` on the exact web origin with the final Android package name and the SHA-256 fingerprint for the certificate that signs the installed package. Those values must come from the actual release credentials. If verification is missing or incorrect, the Android experience can fall back to a Custom Tab instead of an owned fullscreen TWA.
+## Current scope and hardware checks
 
-After signing, test the release package on physical Android hardware against the final HTTPS deployment. Check the fullscreen launch, navigation back to the site, camera permission flow, WebXR availability, and WebGPU capability separately. A successful TWA launch does not imply WebXR or WebGPU support.
+- Only `arm64-v8a` is packaged. `minSdk` is 24 and `targetSdk` is 35.
+- A real ARCore-compatible Android device is required to validate camera configuration, display orientation, tracking, GPU coverage rendering and image capture. Those device tests cannot be run in this repository sandbox.
+- CPU camera image resolution depends on the ARCore device configuration. Selecting the largest supported image size does not guarantee a particular megapixel count.
+- The native coverage colors summarize the largest angular separation from tracked camera observations, capped at 90 degrees. They are feedback for capture coverage, not a photogrammetric quality metric.
+- The APK bundles the current app and training code, but WebGPU availability and memory limits are determined by Android System WebView and the device GPU.
+- The PWA/TWA path remains available for deployed HTTPS sites. It does not provide native ARCore capture by itself.
 
-## App limitations
+## Release packaging
 
-- `id: "./"`, `start_url: "index.html"`, `scope: "./"`, and the existing 192px/512px/maskable icons are the stable manifest contract.
-- The app’s install controller uses `beforeinstallprompt` when the browser supplies it, otherwise it explains the manual browser-menu path. In standalone display mode or after `appinstalled`, the install buttons are hidden.
-- `app/sw.js` intentionally has an empty fetch handler and no cache. Do not describe the installed app as an offline training package.
-- Splat training remains dependent on browser WebGPU and device resources. Android packaging cannot force a missing WebGPU implementation.
-
-## Official references
-
-- [Trusted Web Activity quick start (Chrome Developers)](https://developer.chrome.com/docs/android/trusted-web-activity/quick-start)
-- [Trusted Web Activities (Android Developers)](https://developer.android.com/develop/ui/views/layout/webapps/trusted-web-activities)
-- [GoogleChromeLabs Bubblewrap](https://github.com/GoogleChromeLabs/bubblewrap)
+The debug artifact is sufficient for device testing. A distributable release APK still needs an owner-managed release signing key, versioning, and a hardware-tested release build. Do not reuse or publish the debug keystore as a release credential. TWA/Digital Asset Links configuration is only relevant if a deployed HTTPS site is packaged as a separate TWA.

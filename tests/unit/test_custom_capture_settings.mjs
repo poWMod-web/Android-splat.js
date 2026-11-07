@@ -61,7 +61,9 @@ assert.match(controller, /buildLODPlan\(st\.splats, st\.lodLevels \|\| 0, S\.max
 assert.match(controller, /st\.iters = cycleCount/);
 assert.match(controller, /S\.commitSettings && !S\.commitSettings\(\)/);
 const html = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
-assert.match(html, /id="set-iters" type="number"/);
+assert.match(html, /<select id="set-iters"[\s\S]*?<option value="10000">10,000<\/option>[\s\S]*?<option value="50000">50,000<\/option>/);
+assert.match(controller, /10000, 20000, 30000, 40000, 50000/);
+assert.match(controller, /camera-orbit/);
 assert.match(html, /id="set-lod-count" type="number"/);
 assert.match(html, /<option value="">Off<\/option>\s*<option value="1">On<\/option>/);
 assert.match(controller, /lod: false/);

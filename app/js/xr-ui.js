@@ -17,21 +17,31 @@ function modal(html, className = '') {
 }
 
 export function showXRHelp(reason = '') {
-  const dialog = modal(`
-    <button class="xr-dialog-close" aria-label="Close device guide">×</button>
-    <p class="eyebrow">DEVICE GUIDE</p><h2>A camera that knows where it is.</h2>
-    <p>AR capture pairs a photo with the exact WebXR camera pose from the same XR frame. It skips the landmark matching and camera solve—not splat training.</p>
-    ${reason ? `<div class="xr-notice">${esc(reason)}</div>` : ''}
+  const native = !!(globalThis.AndroidARBridge && globalThis.AndroidARBridge.isAvailable?.());
+  const guidance = native ? `
+    <h3>Native ARCore capture</h3>
+    <p>Use an ARCore-compatible Android phone with Google Play Services for AR installed and updated. Allow camera permission when prompted. If tracking does not start, close other camera apps and relaunch the capture screen.</p>
+    <p>Move slowly around a stationary subject and capture at least three overlapping views (20–200 recommended). The native coverage cloud trends from red to green as viewpoint diversity grows. CPU image resolution depends on the device's supported ARCore camera configuration.</p>
+    <p>If Android WebView does not expose a WebGPU adapter, finish capture and export the dataset for training on a compatible desktop.</p>
+  ` : `
     <h3>For pose-tagged AR photos</h3>
     <p>Use a supported Android device with Google Play Services for AR, in a Chromium browser exposing WebXR and <b>Raw Camera Access</b>. Browser/device support varies; immersive AR alone is not enough. Camera access is checked when you start the session.</p>
     <p>Open this app over HTTPS in a full browser tab and allow camera and spatial-tracking permissions. Embedded previews may block those permissions.</p>
     <p>The splat.js renderer assumes zero projection skew. Skewed XR cameras or imported calibrations are rejected explicitly rather than trained with a mismatched camera model.</p>
-    <div class="xr-help-actions"><a class="btn btn-accent" href="${esc(location.href)}" target="_blank" rel="noopener">Open a capture tab ↗</a><button class="btn btn-outline" data-close>Got it</button></div>
+    <div class="xr-help-actions"><a class="btn btn-accent" href="${esc(location.href)}" target="_blank" rel="noopener">Open a capture tab ↗</a></div>
     <h3>Measured seeds, when available</h3>
-    <p>Optional WebXR depth and hit tests provide colored 3D seed positions in meters. ARCore's native feature-point cloud is not directly exposed. If measured seeds are unavailable, the app labels the library's random-volume initialization clearly. Walk an orbit around the subject so the cameras converge.</p>
-    <h3>Capture on a phone. Train on a GPU.</h3>
-    <p>AR capture does not require WebGPU. You can export the photos, camera transforms and seeds, then import them on a WebGPU-capable desktop. Unsupported devices can use regular photos or standard camera capture and the original splat.js solve.</p>
-    <p class="xr-credit">Built on <a href="https://github.com/arrival-space/splat.js" target="_blank" rel="noopener">arrival-space/splat.js</a> · <a href="https://immersive-web.github.io/raw-camera-access/" target="_blank" rel="noopener">WebXR camera specification</a></p>
+    <p>Optional WebXR depth and hit tests provide colored 3D seed positions in meters. ARCore's native feature-point cloud is not directly exposed to the browser. If measured seeds are unavailable, the app labels the library's random-volume initialization clearly.</p>
+  `;
+  const dialog = modal(`
+    <button class="xr-dialog-close" aria-label="Close device guide">×</button>
+    <p class="eyebrow">DEVICE GUIDE</p><h2>${native ? 'ARCore tracks every view.' : 'A camera that knows where it is.'}</h2>
+    <p>${native
+      ? 'The Android app captures camera images, poses, intrinsics and RGB seed points natively. Known poses skip the camera solve—not splat training.'
+      : 'AR capture pairs a photo with the exact WebXR camera pose from the same XR frame. It skips landmark matching and the camera solve—not splat training.'}</p>
+    ${reason ? `<div class="xr-notice">${esc(reason)}</div>` : ''}
+    ${guidance}
+    <div class="xr-help-actions"><button class="btn btn-outline" data-close>Got it</button></div>
+    <p class="xr-credit">Built on <a href="https://github.com/arrival-space/splat.js" target="_blank" rel="noopener">arrival-space/splat.js</a></p>
   `, 'xr-help');
   dialog.querySelector('.xr-dialog-close').onclick = () => dialog.close();
   dialog.querySelector('[data-close]').onclick = () => dialog.close();
@@ -118,7 +128,11 @@ export function reviewCapture(dataset) {
 
 export function initXRUI({ onCapture, onExample, flash }) {
   const button = $('btn-ar');
-  let capability = { supported: false, reason: 'Checking WebXR support…' };
+  const nativeBridge = globalThis.AndroidARBridge;
+  const nativeAvailable = !!(nativeBridge && typeof nativeBridge.isAvailable === 'function' && nativeBridge.isAvailable());
+  let capability = nativeAvailable
+    ? { supported: true, reason: 'Native ARCore capture is available in this Android app.' }
+    : { supported: false, reason: 'Checking WebXR support…' };
   $('btn-xr-help').onclick = () => showXRHelp(capability.reason);
   $('xr-device-guide').onclick = () => showXRHelp(capability.reason);
   $('btn-xr-example').onclick = async () => {
@@ -128,10 +142,31 @@ export function initXRUI({ onCapture, onExample, flash }) {
   let embedded = true;
   try { embedded = window.self !== window.top; } catch { /* cross-origin embedding */ }
   $('xr-open-tab').hidden = !embedded;
+
+  const importNativeCapture = async () => {
+    const payload = JSON.parse(nativeBridge.exportDataset());
+    if (!payload.ready || payload.frameCount < 3) throw new Error(payload.error || 'Capture at least three frames before importing.');
+    const metadataUri = 'https://appassets.androidplatform.net/captures/current/capture.json';
+    const responses = await Promise.all([
+      fetch(payload.transformsUri), fetch(payload.pointsUri), fetch(metadataUri),
+    ]);
+    if (responses.some((response) => !response.ok)) throw new Error('Native capture files could not be read from app storage.');
+    const [transforms, pointDocument, metadata] = await Promise.all(responses.map((response) => response.json()));
+    const files = await Promise.all(payload.frames.map(async (frame) => {
+      const response = await fetch(frame.uri);
+      if (!response.ok) throw new Error(`Could not read ${frame.name} from the native capture.`);
+      return new File([await response.blob()], frame.name, { type: 'image/jpeg' });
+    }));
+    return validateDataset({ kind: 'ar', files, transforms, points: pointDocument.points || [],
+      pointsByFrame: pointDocument.pointsByFrame || null,
+      metadata: { ...metadata, ...pointDocument.metadata, nativeARCore: true } });
+  };
+
   button.onclick = async () => {
     if (!capability.supported) { showXRHelp(capability.reason); return; }
     button.disabled = true;
     try {
+      if (nativeAvailable) { nativeBridge.startCapture(); return; }
       const dataset = await captureXR();
       if (!dataset) return;
       const reviewed = await reviewCapture(dataset);
@@ -141,7 +176,26 @@ export function initXRUI({ onCapture, onExample, flash }) {
       showXRHelp(e.message || 'AR capture could not start. Try the standard camera or choose photos.');
     } finally { button.disabled = false; }
   };
+
+  if (nativeAvailable) {
+    $('xr-ar-state').textContent = 'Native ARCore ready';
+    $('xr-ar-state').dataset.ready = '1';
+    button.querySelector('span').textContent = 'Capture with ARCore';
+    $('xr-capability-note').textContent = 'Native ARCore capture pairs camera images with tracked poses and an RGB seed cloud.';
+    window.addEventListener('splatxr-native-capture', async () => {
+      try {
+        const dataset = await importNativeCapture();
+        const reviewed = await reviewCapture(dataset);
+        if (reviewed) await onCapture(reviewed);
+      } catch (e) {
+        console.error('[SplatXR] Native capture import failed:', e);
+        showXRHelp(e.message || 'Native ARCore capture could not be imported.');
+      }
+    });
+  }
+
   probeXR().then((value) => {
+    if (nativeAvailable) return;
     capability = value;
     $('xr-ar-state').textContent = value.supported ? 'AR session available' : 'AR not available here';
     $('xr-ar-state').dataset.ready = value.supported ? '1' : '0';
@@ -149,7 +203,12 @@ export function initXRUI({ onCapture, onExample, flash }) {
     $('xr-capability-note').textContent = value.supported
       ? 'Immersive AR detected. Pose-tagged photos still require camera-access permission and Raw Camera Access support.'
       : value.reason;
-  }).catch((e) => { capability.reason = e.message; $('xr-ar-state').textContent = 'AR unavailable'; $('xr-capability-note').textContent = e.message; });
+  }).catch((e) => {
+    if (nativeAvailable) return;
+    capability.reason = e.message;
+    $('xr-ar-state').textContent = 'AR unavailable';
+    $('xr-capability-note').textContent = e.message;
+  });
   const gpuState = $('xr-gpu-state');
   if (!navigator.gpu) { gpuState.textContent = 'WebGPU unavailable'; return; }
   navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).then((a) => {

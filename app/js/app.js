@@ -169,13 +169,13 @@ function deviceDefaults() {
   const phone = matchMedia('(any-pointer: coarse)').matches &&
     Math.min(screen.width, screen.height) <= 820;
   return phone
-    // 8k cycles: a phone's first run should hit the magic moment in a few
+    // 10k cycles: a phone's first run should hit the magic moment in a few
     // minutes — the done screen offers more cycles for anyone who wants them
     // solve: the camera-solve tier (SOLVE_TIERS in the library) — phones stay
     // on the lean solve, desktops take the middle tier; the precise tier is
     // the High/Showcase macro's (a ten-minute solve behind a two-minute
     // draft training was the complaint, 2026-09-09)
-    ? { v: 2, res: 480, feat: 0, buf: 1, sh: 0, iters: 8000, splats: 0, lod: false, mcmc: false, solve: 'quick', av: { ...AV_DEFAULTS } }
+    ? { v: 2, res: 480, feat: 0, buf: 1, sh: 0, iters: 10000, splats: 0, lod: false, mcmc: false, solve: 'quick', av: { ...AV_DEFAULTS } }
     : { v: 2, res: 0, feat: 0, buf: 1, sh: 3, iters: 0, splats: 0, lod: false, mcmc: false, solve: 'standard', av: { ...AV_DEFAULTS } };
 }
 function loadSettings() {
@@ -194,6 +194,10 @@ function loadSettings() {
     // migrate to the 10k draft default so first runs stay ~5 minutes
     if (d.iters === 10000 && m.iters === 0) m.iters = 10000;
     try { m.iters = parseCycleCount(m.iters || ''); } catch { m.iters = d.iters; }
+    // The settings panel uses a fixed 10k–50k menu; migrate older custom values
+    // to the nearest offered cycle budget while URL performance overrides remain independent.
+    if (m.iters) m.iters = [10000, 20000, 30000, 40000, 50000].reduce((best, value) =>
+      Math.abs(value - m.iters) < Math.abs(best - m.iters) ? value : best, 10000);
     try { m.lodLevels = m.lod ? parseLODCount(m.lodLevels || 0, m.splats) : 0; } catch { m.lodLevels = 0; }
     if (BUF2X) m.buf = 2;
     return m;
@@ -433,7 +437,7 @@ function boot() {
     $('set-sh').value = String(st.sh);
     $('set-shup').value = st.shup ? '1' : '0';
     for (const k of AV_KEYS) { const el = $('set-av-' + k); if (!el) continue; el.value = k === 'crops' ? String(st.av && st.av.crops || 'face') : (st.av && st.av[k] === false ? '0' : '1'); }
-    $('set-iters').value = st.iters ? String(st.iters) : '';
+    $('set-iters').value = String(st.iters || 20000);
     $('set-iters').setCustomValidity('');
     $('set-splats').value = st.splats ? String(st.splats) : '';
     $('set-q').value = qualityOf(st);
@@ -6019,6 +6023,9 @@ function renderDetails() {
 
   // the visual slot: the photo/pair/cameras canvas, the score chart, or the log
   const vis = (S.detailTab === 'perf' || S.detailTab === 'gpu') ? 'perf' : S.detailTab === 'score' ? 'chart' : 'cv';
+  // Mobile browsers otherwise claim one-finger drags as page scrolling and
+  // cancel the pointer stream before OrbitController can keep tracking it.
+  $('d-cv').classList.toggle('camera-orbit', S.detailTab === 'cams');
   $('d-cv').hidden = vis !== 'cv';
   $('d-chart').hidden = vis !== 'chart';
   $('d-perf').hidden = vis !== 'perf';
