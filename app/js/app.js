@@ -283,13 +283,30 @@ function syncTrainingVisualsControl() {
   const training = S.state === 'train';
   const detailOpen = !!($('details') && !$('details').hidden);
   const visualsActive = !training || (S.trainVisuals && !detailOpen);
-  const installSlot = $('install-slot');
   const button = $('btn-training-visuals');
-  if (installSlot) installSlot.hidden = training;
   if (button) {
     button.hidden = !training || detailOpen;
     button.textContent = S.trainVisuals ? 'Hide visuals' : 'Show visuals';
     button.setAttribute('aria-pressed', String(!!S.trainVisuals));
+  }
+  // With the model presentation hidden, let the score graph use the whole
+  // stage. Move the same canvas back into the dock when visuals return.
+  const plot = $('chart')?.parentElement;
+  const dockEl = $('dock');
+  const stage = $('stage');
+  const expandPlot = training && !S.trainVisuals;
+  if (plot && dockEl && stage) {
+    const moved = expandPlot ? plot.parentElement !== stage : plot.parentElement !== dockEl;
+    if (expandPlot && moved) {
+      stage.insertBefore(plot, $('hud'));
+      plot.classList.add('chartwrap-expanded');
+    } else if (!expandPlot && moved) {
+      const scores = dockEl.querySelector('.tscores');
+      if (scores) dockEl.insertBefore(plot, scores);
+      plot.classList.remove('chartwrap-expanded');
+    }
+    dockEl.classList.toggle('chart-expanded', expandPlot);
+    if (moved) requestAnimationFrame(() => chart?.resize());
   }
   if (gpuCanvas) gpuCanvas.style.display = visualsActive ? '' : 'none';
   if (S.session && S.session.view && S.session.view.setEnabled) S.session.view.setEnabled(visualsActive);
@@ -5278,11 +5295,12 @@ function dock(kind) {
           <span class="tmeta-2">ETA <span id="t-eta">${etaText()}</span></span>
         </div>
       </div>
-      <div class="chartwrap"><canvas id="chart"></canvas><button class="chart-scale" id="chart-scale" type="button">Use %</button><div class="chart-tip" id="chart-tip" hidden></div></div>
+      <div class="chartwrap"><canvas id="chart"></canvas><div class="chart-tip" id="chart-tip" hidden></div></div>
       <div class="tscores">
         <div class="score" data-tone="accent">
           <div class="score-1"><span class="t-state" id="t-title">Training…</span><span class="score-v"><span id="t-ptrain">${S.psnrTrain != null ? S.psnrTrain.toFixed(2) : '—'}</span><small class="unit">dB</small></span></div>
           <div class="score-sub"><span id="t-splats">${S.splats ? fmt(S.splats) : '—'}</span> splats</div>
+          <button class="chart-scale score-scale" id="chart-scale" type="button">Use %</button>
           <span class="tmeta-grow" id="t-grow">&nbsp;</span>
         </div>
         ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${S.psnrHold != null ? S.psnrHold.toFixed(2) : '—'}</span><small class="unit">dB</small></span></div><div class="score-sub">held out</div></div>` : ''}
@@ -5298,6 +5316,7 @@ function dock(kind) {
     $('chart-scale').addEventListener('click', toggleScoreScale);
     syncScoreScaleControls();
     chart.resize();
+    syncTrainingVisualsControl();
   }
 }
 

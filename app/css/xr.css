@@ -114,5 +114,4 @@
 
 .xr-dialog ol { color: var(--muted); font-size: 13px; line-height: 1.7; padding-left: 22px; margin: 12px 0; }
 .xr-home-foot { flex-wrap: wrap; }
-#btn-install { white-space: nowrap; }
-@media (max-width: 640px) { #btn-install { font-size: 11px; padding-inline: 4px; } .bar #discord { display: none; } }
+@media (max-width: 640px) { .bar #discord { display: none; } }

@@ -28,8 +28,8 @@ assert.match(native, /getDecorView\(\)\.setSystemUiVisibility\(0\)/,
   'capture UI must not request layout behind system bars');
 assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?uvOutput\.position\(0\);/,
   'camera preview must use ARCore-transformed display coordinates');
-assert.doesNotMatch(native, /uvOutput\.put\(i(?: \+ 1)?,\s*1f\s*-\s*uvOutput\.get/,
-  'camera preview must not apply an extra axis reflection after ARCore transforms UVs');
+assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?for \(int row = 0; row < 2; row\+\+\)[\s\S]*?int left = row \* 4, right = left \+ 2;[\s\S]*?uvOutput\.put\(left, uvOutput\.get\(right\)\);[\s\S]*?uvOutput\.put\(right, leftU\);/,
+  'only the camera preview UV pairs should be swapped across the display horizontally');
 assert.match(native, /Matrix\.multiplyMM\(mvp, 0, projection, 0, view, 0\);/,
   'coverage points must use ARCore projection and view matrices directly');
 assert.doesNotMatch(native, /mvp\[offset(?: \+ 1)?\] = -mvp\[offset(?: \+ 1)?\]/,

@@ -39,12 +39,12 @@ assert.match(app, /if \(viewOnly\) \{[\s\S]*S\.restored = \{ hasState: true, sta
 assert.match(app, /if \(S\._localRun && S\._viewerOpen\) \{[\s\S]*closeViewerToHome\(\)/,
   'the top Back button should close a local viewer to the app home');
 
-assert.match(html, /<span id="install-slot"><button[^>]*id="btn-install"/,
-  'the PWA install action should be isolated in its own top-bar slot');
+assert.doesNotMatch(html, /id="btn-install"|>Install app</,
+  'the top-bar Install app button should be removed');
 assert.match(html, /id="btn-training-visuals"[^>]*hidden[^>]*>Show visuals/,
   'the training-only visualization toggle should start hidden');
-assert.match(app, /if \(installSlot\) installSlot\.hidden = training/,
-  'the install slot should be replaced only during training');
+assert.doesNotMatch(app, /installSlot/,
+  'the removed top-bar install button must not leave an empty reserved slot');
 const drawStart = app.indexOf('function draw() {');
 const drawEnd = app.indexOf('/** a photograph filling the stage', drawStart);
 const draw = app.slice(drawStart, drawEnd);

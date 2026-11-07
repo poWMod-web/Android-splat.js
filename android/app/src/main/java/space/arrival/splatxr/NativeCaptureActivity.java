@@ -650,6 +650,18 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             uvInput.position(0);
             uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
+            // Mirror only the camera preview across the display's left/right
+            // sides. Swap transformed UV pairs (not texture-u values) so the
+            // flip stays horizontal even when ARCore rotates the camera image.
+            for (int row = 0; row < 2; row++) {
+                int left = row * 4, right = left + 2;
+                float leftU = uvOutput.get(left), leftV = uvOutput.get(left + 1);
+                uvOutput.put(left, uvOutput.get(right));
+                uvOutput.put(left + 1, uvOutput.get(right + 1));
+                uvOutput.put(right, leftU);
+                uvOutput.put(right + 1, leftV);
+            }
+            // The world-space point cloud is still drawn from ARCore's camera matrices.
             uvOutput.position(0);
             GLES20.glDisable(GLES20.GL_DEPTH_TEST);
             GLES20.glUseProgram(bgProgram);
