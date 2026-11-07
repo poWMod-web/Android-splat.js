@@ -23,9 +23,9 @@
   --alt-14:    rgba(242, 160, 63, .14);
   --red:       #e2664f;
 
-  --display: 'Bricolage Grotesque', 'Archivo', system-ui, sans-serif;
-  --ui:      'Archivo', system-ui, -apple-system, sans-serif;
-  --mono:    'Spline Sans Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --display: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --ui:      system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --mono:    ui-monospace, 'SFMono-Regular', Menlo, monospace;
 
   --r: 10px;
   --pill: 999px;

@@ -1,6 +1,7 @@
 import { probeXR, captureXR } from './xr-capture.js';
 import { validateDataset, filterDataset, cameraForFile, measuredSeeds } from './xr-dataset.js';
 import { zipStore } from './zip.js';
+import { saveBlob } from './download.js';
 
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -56,9 +57,7 @@ export async function exportCapture(dataset) {
   entries.push({ name: 'seed_points.json', data: encode({ points: dataset.points || [], pointsByFrame: dataset.pointsByFrame || null }) });
   entries.push({ name: 'capture.json', data: encode({ ...dataset.metadata, frames: dataset.files.length, coordinateConvention: 'WebXR local world, meters; transforms camera-to-world OpenGL; seeds in the same world', measuredSeeds: measuredSeeds(dataset).length }) });
   entries.push({ name: 'README.txt', data: new TextEncoder().encode('SplatXR capture dataset\n\nUnzip this archive. In SplatXR, choose all photos and the camera JSON together, plus seed_points.json and optionally capture.json. Known camera poses bypass the camera solve. Do not crop, rotate or mirror photos independently of their intrinsics. Measured seed points are optional; an orbit is needed for random-volume initialization if none are present. All capture files stay on your device unless you choose to share them.\n') });
-  const url = URL.createObjectURL(zipStore(entries));
-  const a = document.createElement('a'); a.href = url; a.download = `splatxr-capture-${Date.now()}.zip`; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  return saveBlob(zipStore(entries), `splatxr-capture-${Date.now()}.zip`, 'application/zip');
 }
 
 export function reviewCapture(dataset) {
@@ -116,8 +115,12 @@ export function reviewCapture(dataset) {
       catch (e) { status.textContent = e.message; }
     };
     dialog.querySelector('[data-export]').onclick = async () => {
-      try { await exportCapture(filterDataset(dataset, selected)); status.textContent = 'Capture exported. Unzip and select the photos and camera JSON together to import on another device.'; }
-      catch (e) { status.textContent = `Export failed: ${e.message}`; }
+      try {
+        const saved = await exportCapture(filterDataset(dataset, selected));
+        status.textContent = saved
+          ? 'Capture export saved. Unzip and select the photos and camera JSON together to import on another device.'
+          : 'Export cancelled.';
+      } catch (e) { status.textContent = `Export failed: ${e.message}`; }
     };
     dialog.querySelector('[data-cancel]').onclick = () => dialog.close();
     dialog.querySelector('.xr-dialog-close').onclick = () => dialog.close();
@@ -126,7 +129,7 @@ export function reviewCapture(dataset) {
   });
 }
 
-export function initXRUI({ onCapture, onExample, flash }) {
+export function initXRUI({ onCapture, flash }) {
   const button = $('btn-ar');
   const nativeBridge = globalThis.AndroidARBridge;
   const nativeAvailable = !!(nativeBridge && typeof nativeBridge.isAvailable === 'function' && nativeBridge.isAvailable());
@@ -135,9 +138,6 @@ export function initXRUI({ onCapture, onExample, flash }) {
     : { supported: false, reason: 'Checking WebXR support…' };
   $('btn-xr-help').onclick = () => showXRHelp(capability.reason);
   $('xr-device-guide').onclick = () => showXRHelp(capability.reason);
-  $('btn-xr-example').onclick = async () => {
-    try { await onExample(); } catch (e) { flash(`Example unavailable: ${e.message}`, 8000); }
-  };
   $('xr-open-tab').href = location.href;
   let embedded = true;
   try { embedded = window.self !== window.top; } catch { /* cross-origin embedding */ }

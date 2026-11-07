@@ -20,12 +20,6 @@
 .xr-flow .xr-flow-no { display: block; color: var(--accent); font: 10px var(--mono); letter-spacing: .12em; margin-bottom: 6px; }
 .xr-flow h3 { color: var(--paper); font: 600 14px var(--ui); margin-bottom: 5px; }
 #start .xr-flow p { font-size: 12px; color: var(--dim); line-height: 1.6; }
-.xr-example { display: flex; align-items: center; gap: 17px; width: min(600px,100%) !important; text-align: left; padding: 11px; border: 1px solid var(--line); border-radius: 11px; background: rgba(23,28,29,.6); transition: border-color .15s, background .15s; }
-.xr-example:hover { border-color: var(--accent-30); background: var(--panel); }
-.xr-example img { width: 85px; height: 61px; object-fit: cover; border-radius: 5px; }
-.xr-example b { display: block; font: 500 13px var(--ui); color: var(--paper); }
-.xr-example small { display: block; font: 10px var(--mono); color: var(--dim); margin-top: 6px; }
-.xr-example .xr-arrow { margin-left: auto; padding-right: 8px; color: var(--accent); font-size: 22px; }
 .xr-home-foot { display: flex; justify-content: center; gap: 18px; padding: 15px 0 9px; font: 10px var(--mono); color: var(--dim); }
 .xr-home-foot a, .xr-home-foot button { color: var(--muted); font: inherit; padding: 0; text-decoration: none; }
 .xr-home-foot a:hover, .xr-home-foot button:hover { color: var(--accent); }

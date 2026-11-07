@@ -24,9 +24,6 @@
 <meta name="twitter:title" content="SplatXR — Capture &amp; Train">
 <meta name="twitter:description" content="Camera poses solved and a Gaussian splat trained entirely in the browser on WebGPU. No upload, no server, no install.">
 <meta name="twitter:image" content="https://ugc.arrival.space/splatjs/og.jpg">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=Spline+Sans+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="css/app.css">
 <link rel="stylesheet" href="css/xr.css">
 </head>
@@ -76,7 +73,6 @@
     <p class="xr-capability-note" id="xr-capability-note" role="status">Checking this browser’s capture capabilities…</p>
     <a class="xr-open-tab" id="xr-open-tab" target="_blank" rel="noopener" hidden>Open a full browser tab for AR capture ↗</a>
     <div class="xr-flow"><div><span class="xr-flow-no">01 / CAPTURE</span><h3>Walk around it.</h3><p>Take overlapping views. Each AR photo keeps its exact camera transform.</p></div><div><span class="xr-flow-no">02 / POSITION</span><h3>Already in place.</h3><p>Known poses bypass SfM. Depth or hit tests add measured seeds when available.</p></div><div><span class="xr-flow-no">03 / TRAIN</span><h3>Make it a splat.</h3><p>JavaScript + WebGPU. Preview the scene and export a standard .ply.</p></div></div>
-    <button class="xr-example" id="btn-xr-example"><img src="data/synthetic/synthetic_00.png" alt="Bundled synthetic room corner"><span><b>Try a scene with known cameras</b><small>12 bundled views · no AR device needed · real training</small></span><span class="xr-arrow" aria-hidden="true">↗</span></button>
     <div class="xr-home-foot"><button id="xr-device-guide">Compatibility &amp; capture guide</button><a href="https://github.com/poWMod-web/Android-splat.js" target="_blank" rel="noopener">Source ↗</a></div>
 
     <div id="gallery" hidden></div>
@@ -277,12 +273,11 @@
        against your photographs until the render matches them. What comes out is a
        standard <code>.ply</code> that opens in any splat viewer.</p>
     <div class="about-note">
-      <b>Nothing is uploaded unless you publish.</b>
-      <span>No server, no cloud, no queue: your photographs are decoded in this page,
-        solved and trained on your own GPU, and never leave your machine. No account
-        is needed for any of that. Publishing is the one thing that sends anything —
-        and what it sends is the finished model, not your photographs, unless you tick
-        the box that includes them.</span>
+      <b>Your photos stay on this device.</b>
+      <span>Photographs are decoded here, solved and trained on your GPU, and kept in
+        this browser's local storage. The Android app's local workflow needs no app-level
+        network access; native AR capture requires Google Play Services for AR to already
+        be installed and ready.</span>
     </div>
     <div class="about-gpu" id="about-gpu" hidden>
       <div class="about-gpu-head">

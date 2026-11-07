@@ -18,7 +18,7 @@ Known-camera datasets go through `session.load()`, `session.useKnownCameras(pars
 
 The splat.js renderer assumes zero projection skew. Capture stops and imported known-camera input is rejected if a nonzero-skew calibration is detected; asymmetric principal points are supported. Seed ownership is preserved through export/import so removed frames also remove their measured seeds.
 
-The bundled **Synthetic Corner** example demonstrates direct known-camera training without AR hardware. Its twelve rendered views are supplied by the upstream repository, not live captures.
+The app home contains no bundled demo scene or online Community gallery; it offers local photo capture/import and work saved on this device. The packaged synthetic dataset remains in the repository for build/test compatibility but is not loaded by the home screen.
 
 ## Custom training settings
 
@@ -28,7 +28,7 @@ LOD is **Off by default**. To enable it, choose **On**, select a splat budget of
 
 ## Install on Android
 
-The app includes a standalone PWA manifest and **Install app** controls. On a compatible Android device, open the hosted HTTPS page in full Chrome and use the install prompt or Chrome menu → Install app / Add to Home screen. This runs the JavaScript app in the browser's runtime; it does not unlock WebGPU on unsupported GPUs or grant unavailable WebXR modules. The current service worker intentionally does not provide offline training.
+The project includes a standalone PWA manifest. On a compatible Android device, open the hosted HTTPS page in full Chrome and use Chrome’s install prompt or menu → Install app / Add to Home screen. This runs the JavaScript app in the browser runtime; it does not unlock WebGPU on unsupported GPUs or grant unavailable WebXR modules. The browser PWA still needs to be served and its service worker does not cache the app for offline launch. The native Android APK packages its web assets locally and does not request `android.permission.INTERNET`; local photo intake, training, capture-file exchange and export do not make app-level Internet requests. Incoming shared-scene or remote-model URLs remain optional online features and are unavailable inside that APK. ARCore capture requires Google Play Services for AR to already be installed and usable; installing or updating that separate service may require connectivity.
 
 See [Android installation guide](docs/android-install.md) and [Android packaging runbook](android/README.md). The `android/` directory now contains a native arm64-v8a ARCore/WebView app project. GitHub Actions builds an installable debug APK artifact; a Play Store/release APK still needs owner-managed release signing credentials and physical-device validation. The browser PWA/WebXR path remains available separately.
 
@@ -36,7 +36,7 @@ See [Android installation guide](docs/android-install.md) and [Android packaging
 
 **Export capture** saves a ZIP containing the original photos, `transforms.json` or `cameras.json`, `seed_points.json`, and metadata. Unzip it on the training device and select the photos and camera JSON together through **Choose photos / import**. Seed points are optional. Image basenames must be unique. Cropping, rotating or mirroring images independently of the saved calibration invalidates their poses/intrinsics.
 
-Captures, their transforms, seed points and local runs are kept in the existing origin-local IndexedDB. Storage is best effort; export important work. Original Arrival community/viewer integrations remain from upstream and may require that service; no account is needed for capture, local training or export. Photos stay local unless a user explicitly uses upstream sharing functionality.
+Captures, their transforms, seed points and local runs are kept in the existing origin-local IndexedDB. Storage is best effort; export important work. The automatic Community feed and its profile/gallery requests have been removed. Optional incoming shared-scene or remote-model URLs can still be opened in a network-enabled browser, but the Android APK has no Internet permission. Capture, local training and export do not upload photographs.
 
 ## Platform limits
 

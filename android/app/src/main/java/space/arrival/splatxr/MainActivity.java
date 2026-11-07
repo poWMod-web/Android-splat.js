@@ -2,6 +2,7 @@ package space.arrival.splatxr;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.util.Base64;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -20,13 +21,19 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.OutputStream;
 
 public final class MainActivity extends Activity {
     private static final int REQUEST_CAPTURE = 41;
     private static final int REQUEST_FILE_PICKER = 42;
+    private static final int REQUEST_SAVE_FILE = 43;
     private ValueCallback<Uri[]> fileChooserCallback;
     private WebView webView;
     private WebViewAssetLoader assetLoader;
+    private final Object fileSaveLock = new Object();
+    private OutputStream fileSaveStream;
+    private boolean fileSavePickerPending;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -119,10 +126,118 @@ public final class MainActivity extends Activity {
                 fileChooserCallback.onReceiveValue(values);
                 fileChooserCallback = null;
             }
+        } else if (requestCode == REQUEST_SAVE_FILE) {
+            if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+                synchronized (fileSaveLock) { fileSavePickerPending = false; }
+                dispatchFileSaveEvent("cancelled", null);
+                return;
+            }
+            try {
+                OutputStream output = getContentResolver().openOutputStream(data.getData(), "w");
+                if (output == null) throw new IOException("Could not open the selected destination.");
+                synchronized (fileSaveLock) {
+                    fileSaveStream = output;
+                    fileSavePickerPending = false;
+                }
+                dispatchFileSaveEvent("ready", null);
+            } catch (Exception e) {
+                synchronized (fileSaveLock) { fileSavePickerPending = false; }
+                dispatchFileSaveEvent("error", e.getMessage());
+            }
         } else if (requestCode == REQUEST_CAPTURE && resultCode == RESULT_OK && webView != null) {
             webView.post(() -> webView.evaluateJavascript(
                     "window.dispatchEvent(new CustomEvent('splatxr-native-capture'))", null));
         }
+    }
+
+    private void startFileSave(String name, String mimeType) {
+        synchronized (fileSaveLock) {
+            if (fileSavePickerPending || fileSaveStream != null) {
+                dispatchFileSaveEvent("error", "Another file save is already in progress.");
+                return;
+            }
+            fileSavePickerPending = true;
+        }
+        Intent picker = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        picker.addCategory(Intent.CATEGORY_OPENABLE);
+        picker.setType(mimeType == null || mimeType.isEmpty() ? "application/octet-stream" : mimeType);
+        picker.putExtra(Intent.EXTRA_TITLE, safeFileName(name));
+        try {
+            startActivityForResult(picker, REQUEST_SAVE_FILE);
+        } catch (Exception e) {
+            synchronized (fileSaveLock) { fileSavePickerPending = false; }
+            dispatchFileSaveEvent("error", e.getMessage());
+        }
+    }
+
+    private static String safeFileName(String name) {
+        String safe = name == null ? "splat-export.bin" : name;
+        safe = safe.replace('/', '_').replace('\\', '_').replaceAll("[\\r\\n\\p{Cntrl}]", "_").trim();
+        return safe.isEmpty() ? "splat-export.bin" : safe;
+    }
+
+    private boolean writeFileSaveChunk(String encoded) {
+        synchronized (fileSaveLock) {
+            if (fileSaveStream == null) return false;
+            try {
+                fileSaveStream.write(Base64.decode(encoded, Base64.DEFAULT));
+                return true;
+            } catch (Exception e) {
+                try { fileSaveStream.close(); } catch (Exception ignored) { }
+                fileSaveStream = null;
+                dispatchFileSaveEvent("error", e.getMessage());
+                return false;
+            }
+        }
+    }
+
+    private void finishFileSave() {
+        OutputStream output;
+        synchronized (fileSaveLock) {
+            output = fileSaveStream;
+            fileSaveStream = null;
+        }
+        if (output == null) {
+            dispatchFileSaveEvent("error", "No destination is open for this export.");
+            return;
+        }
+        try {
+            output.close();
+            dispatchFileSaveEvent("complete", null);
+        } catch (Exception e) {
+            dispatchFileSaveEvent("error", e.getMessage());
+        }
+    }
+
+    private void cancelFileSave() {
+        OutputStream output;
+        synchronized (fileSaveLock) {
+            output = fileSaveStream;
+            fileSaveStream = null;
+            fileSavePickerPending = false;
+        }
+        if (output != null) try { output.close(); } catch (Exception ignored) { }
+    }
+
+    private void dispatchFileSaveEvent(String type, String message) {
+        WebView view = webView;
+        if (view == null) return;
+        JSONObject detail = new JSONObject();
+        try {
+            detail.put("type", type);
+            if (message != null) detail.put("message", message);
+        } catch (Exception ignored) { }
+        String script = "window.dispatchEvent(new CustomEvent('splatxr-native-file-save',{detail:" + detail + "}));";
+        view.post(() -> view.evaluateJavascript(script, null));
+    }
+
+    @Override protected void onDestroy() {
+        cancelFileSave();
+        if (fileChooserCallback != null) {
+            fileChooserCallback.onReceiveValue(null);
+            fileChooserCallback = null;
+        }
+        super.onDestroy();
     }
 
     private final class AndroidARBridge {
@@ -138,6 +253,22 @@ public final class MainActivity extends Activity {
 
         @JavascriptInterface public void resetCaptureSession() {
             NativeCaptureActivity.resetCaptureSession(MainActivity.this);
+        }
+
+        @JavascriptInterface public void beginFileSave(String name, String mimeType) {
+            runOnUiThread(() -> startFileSave(name, mimeType));
+        }
+
+        @JavascriptInterface public boolean writeFileChunk(String base64) {
+            return writeFileSaveChunk(base64);
+        }
+
+        @JavascriptInterface public void finishFileSave() {
+            MainActivity.this.finishFileSave();
+        }
+
+        @JavascriptInterface public void cancelFileSave() {
+            MainActivity.this.cancelFileSave();
         }
 
         @JavascriptInterface public String exportDataset() {

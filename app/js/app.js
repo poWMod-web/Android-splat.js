@@ -16,16 +16,9 @@ import { initXRUI, reviewCapture, exportCapture } from './xr-ui.js';
 import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } from './xr-dataset.js';
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './training-settings.js';
 import { zipStore } from './zip.js';
-import { API_BASE } from './arrival.js';
+import { saveBlob } from './download.js';
 import { buildSessionZip, fetchModel } from './session_io.js';
-import { PRESETS, REPO, DISCORD, DATA, ownSet } from './data.js';
-// official demo scenes on the wall that are not bundled presets (Garden, The Lab, Camping)
-const EXTRA_PRESET_SPACES = ['42485456_3427', '42485456_9670', '42485456_7518'];
-const presetSpaceIds = () => new Set([...PRESETS.map((p) => p.spaceId).filter(Boolean), ...EXTRA_PRESET_SPACES]);
-const HOME_BENCHMARK_IDS = new Set([
-  ...PRESETS.filter((preset) => preset.id === 'synthetic').map((preset) => String(preset.spaceId)),
-  '42485456_7518', // Camping
-]);
+import { REPO, DISCORD, DATA, ownSet } from './data.js';
 
 import { Viewport, camCentre, quatFromR, quatToR, qslerp } from './viewport.js';
 import { Developer, fitRect } from './develop.js';
@@ -38,9 +31,8 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-// Two front doors, one codebase: the classic view keeps the preset row
-// (splat-js), the wall-first redesign leads with community creations
-// (splat-js2, or ?v2 anywhere).
+// Two front doors, one codebase: classic and wall-first layouts use local
+// photo intake and device-saved work (splat-js2, or ?v2 anywhere).
 const WALL_FIRST = /splat-js2/.test(location.pathname)
   || new URLSearchParams(location.search).has('v2');
 
@@ -423,17 +415,6 @@ function boot() {
   initXRUI({
     flash,
     onCapture: (capture) => useOwnPhotos(capture.files, capture),
-    onExample: async () => {
-      const res = await fetch(`${DATA}synthetic/cameras.json`);
-      if (!res.ok) throw new Error('could not load bundled cameras');
-      const transforms = await res.json();
-      const files = await Promise.all(transforms.cameras.map(async (camera) => {
-        const image = await fetch(`${DATA}synthetic/${camera.image}`);
-        if (!image.ok) throw new Error(`could not load ${camera.image}`);
-        return new File([await image.blob()], camera.image, { type: 'image/png' });
-      }));
-      await useOwnPhotos(files, { kind: 'example', files, transforms, points: [], metadata: { seedSource: 'none', synthetic: true } });
-    },
   });
   $('xr-review-set').addEventListener('click', async () => {
     const dataset = S.preset?.capture || { kind: 'photos', files: S.preset?.files || [], points: [] };
@@ -441,8 +422,10 @@ function boot() {
     catch (e) { flash(e.message, 7000); }
   });
   $('xr-export-set').addEventListener('click', async () => {
-    try { await exportCapture(S.preset?.capture || { files: S.preset?.files || [], points: [] }); }
-    catch (e) { flash(`Capture export failed: ${e.message}`, 7000); }
+    try {
+      const saved = await exportCapture(S.preset?.capture || { files: S.preset?.files || [], points: [] });
+      flash(saved ? 'Capture export saved.' : 'Export cancelled.', 4000);
+    } catch (e) { flash(`Capture export failed: ${e.message}`, 7000); }
   });
   ['dragenter', 'dragover'].forEach((t) => card.addEventListener(t, (e) => {
     e.preventDefault(); card.classList.add('drop');
@@ -715,20 +698,15 @@ function boot() {
     if (!viewing) openDetails();
   }
   if (WALL_FIRST) {
-    // nothing preselected: the hero asks for photos, the Community wall
-    // below offers finished creations to view (and train from there)
+    // Nothing is preselected. The home screen offers local capture and saved work only.
     $('btn-go').disabled = true;
     $('start').hidden = false;
     $('start').querySelector('.origin').textContent =
       'Drop in 20–200 overlapping photos of one place, or capture them right ' +
       'here — the camera solve, the training and the export all run in this ' +
-      'tab. Or start with a community creation below: view it instantly, ' +
-      'then train the same photos yourself.';
+      'tab. Everything runs locally on this device; photos and trained models stay here.';
   } else {
-    // classic: ONE wall — Scenes — official trained benchmarks and community
-    // creations side by side; clicking any tile opens the focused DETAIL
-    // card, and Start training lives only there. The visitor's own sets
-    // (last capture, own shares) live under the wall's Local tab.
+    // Keep the classic setup card with saved captures and runs from this device.
     $('start').appendChild($('gallery'));
     $('detail-body').append($('set-desc'), $('av-choice'), $('xr-set-tools'), document.querySelector('.startrow'), $('settings'));
     $('detail-back').addEventListener('click', detailClose);
@@ -849,10 +827,7 @@ async function openCaptureSet(rec = null) {
   return set;
 }
 
-/** the previous own capture, restored from this device's storage — a tile
- *  for the wall's Local tab (null when nothing is stored). Every set lives
- *  on the Scenes wall; PRESETS stay as data: gates, data deploys and the
- *  official samples' sources. */
+/** The previous own capture, restored from this device's storage — a local-library tile. */
 async function lastCaptureTile() {
   const rec = await loadLastCapture();
   if (!rec || !rec.files || rec.files.length < 2) return null;
@@ -3997,12 +3972,12 @@ const SHARE_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" clas
   '<path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/></svg>';
 
 /** Save a Blob under the run's name. */
-function downloadBlob(blob, ext) {
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `${((S.preset && S.preset.name) || 'splat').toLowerCase().replace(/\W+/g, '_')}.${ext}`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+async function downloadBlob(blob, ext) {
+  const base = ((S.preset && S.preset.name) || 'splat').toLowerCase().replace(/\W+/g, '_');
+  const filename = `${base}.${ext}`;
+  const mime = /\.zip$/i.test(ext) ? 'application/zip'
+    : ext === 'txt' ? 'text/plain' : 'application/octet-stream';
+  return saveBlob(blob, filename, mime);
 }
 
 /** The download options for the current run — listed under Share in the
@@ -4014,11 +3989,11 @@ function exportActions() {
   acts.push({ act: 'sog', label: 'Download .sog', sub: `Compressed for the web · ~${sogMb} MB`, run: async () => {
     try {
       const blob = await getSogBlob();
-      downloadBlob(blob, 'sog');
-      flash(`${fmt(S.splats)} splats compressed to ${(blob.size / 1e6).toFixed(1)} MB.`, 4000);
+      const saved = await downloadBlob(blob, 'sog');
+      flash(saved ? `${fmt(S.splats)} splats compressed and saved (${(blob.size / 1e6).toFixed(1)} MB).` : 'Save cancelled.', 4000);
     } catch (e) {
       console.error(e);
-      flash(`SOG compression failed: ${e.message}`, 6000);
+      flash(`SOG export failed: ${e.message}`, 6000);
     }
   } });
   if (S.lodPlan && S.lodPlan.snaps.length) acts.push({ act: 'lod', label: 'Download LOD', sub: `Streamed SOG, ${S.lodPlan.snaps.length + 1} detail levels · zip`, run: async () => {
@@ -4049,8 +4024,8 @@ function exportActions() {
       });
       const zip = zipStore(entries.map(([name, data]) => ({ name: name.replace(/^\//, ''), data })));
       document.getElementById('sogcard')?.remove();
-      downloadBlob(zip, 'lod.zip');
-      flash(`Streamed LOD with ${levels.length} levels · ${(zip.size / 1e6).toFixed(1)} MB zipped.`, 5000);
+      const saved = await downloadBlob(zip, 'lod.zip');
+      flash(saved ? `Streamed LOD with ${levels.length} levels · ${(zip.size / 1e6).toFixed(1)} MB saved.` : 'Save cancelled.', 5000);
     } catch (e) {
       document.getElementById('sogcard')?.remove();
       console.error(e);
@@ -4058,16 +4033,22 @@ function exportActions() {
     }
   } });
   acts.push({ act: 'ply', label: 'Download .ply', sub: `Standard splat file · ${mb} MB`, run: async () => {
-    stopWalk();
-    downloadBlob(S.plyBlob || await S.session.exportPlyBlob(), 'ply');
-    flash(`${fmt(S.splats)} splats on their way to your downloads.`, 3500);
+    try {
+      stopWalk();
+      const saved = await downloadBlob(S.plyBlob || await S.session.exportPlyBlob(), 'ply');
+      flash(saved ? `${fmt(S.splats)} splats saved to the selected location.` : 'Save cancelled.', 3500);
+    } catch (e) {
+      console.error(e);
+      flash(`PLY save failed: ${e.message}`, 6000);
+    }
   } });
   if (!S.restored) acts.push({ act: 'session', label: 'Download session', sub: 'Re-loadable + resumable · sog, poses, raw state', run: async () => {
     try {
       const sog = await getSogBlob();
       flash('Packing the session …', 60000);
       const zip = await buildSessionZip(S, sog);
-      downloadBlob(zip, 'session.zip');
+      const saved = await downloadBlob(zip, 'session.zip');
+      if (!saved) { flash('Save cancelled.', 4000); return; }
       flash(`Session saved · ${(zip.size / 1e6).toFixed(1)} MB. Load it back with ` +
         `?model=<url> or by dropping it on the app.`, 7000);
     } catch (e) {
@@ -4076,16 +4057,21 @@ function exportActions() {
     }
   } });
   if (S.loadedFiles && S.loadedFiles.length) acts.push({ act: 'imgs', label: 'Download photos', sub: `The ${S.loadedFiles ? S.loadedFiles.length : 0} training images · zip`, run: async () => {
-    if (!S.loadedFiles || !S.loadedFiles.length) { flash('No source images in this run.'); return; }
-    flash('Packing your photos …', 60000);
-    const entries = [];
-    for (const f of S.loadedFiles) {
-      const blob = f.source || f;
-      entries.push({ name: f.name, data: new Uint8Array(await blob.arrayBuffer()) });
+    try {
+      if (!S.loadedFiles || !S.loadedFiles.length) { flash('No source images in this run.'); return; }
+      flash('Packing your photos …', 60000);
+      const entries = [];
+      for (const f of S.loadedFiles) {
+        const blob = f.source || f;
+        entries.push({ name: f.name, data: new Uint8Array(await blob.arrayBuffer()) });
+      }
+      const zip = zipStore(entries);
+      const saved = await downloadBlob(zip, 'photos.zip');
+      flash(saved ? `${entries.length} photos saved in a ZIP.` : 'Save cancelled.', 4000);
+    } catch (e) {
+      console.error(e);
+      flash(`Photo ZIP save failed: ${e.message}`, 6000);
     }
-    const zip = zipStore(entries);
-    downloadBlob(zip, 'photos.zip');
-    flash(`${entries.length} photos zipped and on their way.`, 4000);
   } });
   return acts;
 }
@@ -4400,18 +4386,6 @@ async function fetchShareRecon(it) {
 /** One creation card, post-style: hero, badge, title, the FULL description
  *  and the key numbers. The whole card is the View action — clicking loads
  *  the creation directly (Train lives in the viewer). */
-const OWNER_INFO = new Map();   // ownerId -> Promise<{name, avatar}|null>: the public profile, no sign-in needed
-function ownerInfo(ownerId) {
-  if (!OWNER_INFO.has(ownerId)) {
-    OWNER_INFO.set(ownerId, fetch(`${API_BASE}/getUserInfo/${encodeURIComponent(ownerId)}`)
-      .then((r) => r.json())
-      .then((u) => (u && u.status === 'ok') ? { name: u.name || u.uniqueName || '', avatar: (u.profileImageData && u.profileImageData.url) || '' } : null)
-      .catch(() => null));
-  }
-  return OWNER_INFO.get(ownerId);
-}
-const shareDate = (d) => { const t = new Date(d); return isNaN(t) ? '' : t.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }); };
-
 /** One field in the share sheet's chrome; resolves to the trimmed value, or
  *  null when the visitor backs out. (A browser prompt() would block the page
  *  and reads as a phishing box over someone else's scene.) */
@@ -4443,154 +4417,32 @@ function textCard(heading, value, { action = 'Save', max = 80 } = {}) {
   });
 }
 
-function creationTile(it, { shared = false, preset = false } = {}) {
-  const wrap = document.createElement('a');
-  wrap.className = 'galtile';
-  const img = (it.splatjs && it.splatjs.thumbUrl) || it.screenshotUrl || '';
-  // a benchmark tile names the scene and tags the dataset ("Truck — Tanks & Temples")
-  let title = it.title || 'Untitled', tag = '';
-  if (preset) {
-    const [name, dataset] = title.split(' — ');
-    title = name;
-    tag = dataset || ((it.splatjs && it.splatjs.badge === '360') ? '360° rig' : /camping/i.test(name) ? 'Phone video' : /synthetic/i.test(name) ? 'Sample' : '');
-  }
-  const dB = it.splatjs && (it.splatjs.psnrTest ? it.splatjs.psnrTest.psnr : it.splatjs.psnrTrain);
-  // index.html explicitly: a bare "?space=" resolves against <base> to the
-  // trailing-slash URL, and the CDN's slash-stripping 301 EATS the query
-  wrap.href = `index.html?space=${encodeURIComponent(it.id)}`;
-  // an optional corner chip from the stamp (e.g. "360") — same badge the
-  // last-capture tile wears
-  const badge = it.splatjs && it.splatjs.badge;
-  wrap.innerHTML = `<img loading="lazy" src="${esc(img)}" alt="" onerror="this.style.visibility='hidden'">
-    ${badge ? `<i class="yours">${esc(badge)}</i>` : ''}
-    ${tag ? `<i class="galtag">${esc(tag)}</i>` : ''}
-    <span class="galname">${esc(title)}${shared ? `<time>${esc(shareDate(it.createdDate))}</time>` : ''}</span>
-    ${it.description && !(shared && /trained in the browser by Splat.js/.test(it.description)) ? `<span class="galdesc">${esc(it.description)}</span>` : ''}
-    <span class="galmeta">${fmt((it.splatjs && it.splatjs.splats) || 0)} splats${dB ? ` · ${(+dB).toFixed(1)} dB` : ''}${it.splatjs && it.splatjs.device ? ` · ${esc(it.splatjs.device)}` : ''}${it.splatjs && it.splatjs.sogMb ? ` · ${it.splatjs.sogMb} MB` : ''}</span>`;
-  if (shared) {
-    // the sharer as a chip in the image's top-left corner (avatar + name);
-    // the date sits on the title row. The space id carries its owner
-    // (userId_xxxx, or the bare userId for a home space).
-    const by = document.createElement('span');
-    by.className = 'galby';
-    by.innerHTML = `<i class="galav"></i><b></b>`;
-    wrap.insertBefore(by, wrap.querySelector('img').nextSibling);
-    const ownerId = String(it.id).split('_')[0];
-    // the chip opens the sharer's profile (a link cannot nest inside the tile's link)
-    const profile = `https://profile.arrival.space/${encodeURIComponent(ownerId)}`;
-    by.setAttribute('role', 'link'); by.tabIndex = 0; by.title = 'Open profile';
-    const go = (e) => { e.preventDefault(); e.stopPropagation(); window.open(profile, '_blank', 'noopener'); };
-    by.addEventListener('click', go);
-    by.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') go(e); });
-    ownerInfo(ownerId).then((u) => {
-      if (!u || !u.name) { by.remove(); return; }
-      by.querySelector('b').textContent = u.name;
-      const av = by.querySelector('.galav');
-      if (u.avatar) { av.style.backgroundImage = `url("${u.avatar}")`; av.textContent = ''; }
-      else av.textContent = u.name.trim().charAt(0).toUpperCase();
-    });
-  }
-  return wrap;
-}
-
-const WALL_KEY = 'splatjs.wall';   // { tab, y }: where the visitor was on the wall
-if ('scrollRestoration' in history) history.scrollRestoration = 'manual';   // the wall restores its own position
-function wallState() { try { return JSON.parse(sessionStorage.getItem(WALL_KEY) || 'null'); } catch { return null; } }
-// the home scrolls inside the fixed start card on wide screens and with the
-// window on phones — read and set the position on whichever scrolls
-const wallScroller = () => { const st = $('start'); return (st && !st.hidden && getComputedStyle(st).position === 'fixed') ? st : null; };
-const wallY = () => { const sc = wallScroller(); return Math.round(sc ? sc.scrollTop : window.scrollY); };
-const wallScrollTo = (y) => { const sc = wallScroller(); if (sc) sc.scrollTop = y; else window.scrollTo(0, y); };
-function saveWallState() {
-  const on = document.querySelector('#walltabs [aria-selected="true"]');
-  try { sessionStorage.setItem(WALL_KEY, JSON.stringify({ tab: on ? on.dataset.tab : 'bench', y: wallY() })); } catch {}
-}
-// back from a scene through the browser's page cache: the wall is still
-// there, the scroll is not — put the visitor back where they were
-window.addEventListener('pageshow', (e) => {
-  if (!e.persisted || !document.getElementById('walltabs')) return;
-  // the wall may be stale (a share made in the viewer, a run finished): rebuild
-  // it, then land where the visitor was
-  mountWall().catch(() => {});
-});
-/** Show one wall tab. scrollToTabs: bring the tab row to the top (a switch
- *  starts the new list from its top); restoreY: land where the visitor was. */
-function selectWallTab(name, { scrollToTabs = false, restoreY = null } = {}) {
-  const host = $('gallery');
-  host.querySelectorAll('[role="tab"]').forEach((b) => { const on = b.dataset.tab === name; b.setAttribute('aria-selected', on ? 'true' : 'false'); b.classList.toggle('on', on); });
-  host.querySelectorAll('[data-pane]').forEach((p) => { p.hidden = p.dataset.pane !== name; });
-  if (scrollToTabs) { $('walltabs').scrollIntoView({ block: 'start', behavior: 'smooth' }); saveWallState(); }
-  else if (restoreY != null) {
-    // the wall may still be laying out (the start card shows a beat later on
-    // phones): keep trying for two seconds until the position holds
-    // (and the browser's own back-navigation restore may land on 0 a beat
-    // later: keep re-asserting until the position has held for a moment)
-    let held = 0;
-    const tryScroll = (n) => {
-      if (Math.abs(wallY() - restoreY) > 2) { wallScrollTo(restoreY); held = 0; } else held++;
-      if (held < 3 && n < 25) setTimeout(() => tryScroll(n + 1), 100);
-    };
-    tryScroll(0);
-  }
-}
-
-/** The creation wall on the start card: Scenes (public, everyone) and —
- *  when this device holds anything of the visitor's own — Local: the last
- *  capture and training runs saved in this browser. An empty wall stays invisible. */
+/** Rebuild the local library from captures and runs in this browser's storage. */
 async function mountWall() {
+  const host = $('gallery');
+  if (!host) return;
   try {
-    const { fetchGallery } = await import('./share.js');
-    const [{ items }, capTile] = await Promise.all([
-      fetchGallery({ count: 48 }),   // the API's page cap; the wall shows every listed scene
+    const [capTile, runTiles] = await Promise.all([
       lastCaptureTile().catch(() => null),
+      localRunTiles().catch(() => []),
     ]);
-    const runTiles = await localRunTiles().catch(() => []);
-    // the visitor's own content (capture, runs, shares) lives on its own tab
-    const presetIds = presetSpaceIds();
-    const own = [];
-    if (capTile) own.push(capTile);
-    for (const t of runTiles) own.push(t);
-    // the presets are benchmarks even for the account that owns them
-    const runSpaces = new Set(runTiles.map((t) => t.dataset && t.dataset.spaceId).filter(Boolean));
-    if ((!items || !items.length) && !own.length) return;
-    const host = $('gallery');
-    const rest = items || [];
-    const pinOf = (x) => (x.splatjs && x.splatjs.pin) || 9e9;
-    const newer = (a, b) => new Date(b.createdDate) - new Date(a.createdDate);
-    const presets = rest.filter((x) => HOME_BENCHMARK_IDS.has(String(x.id))).sort((a, b) => (pinOf(a) - pinOf(b)) || newer(a, b));
-    const shares = rest.filter((x) => !presetIds.has(String(x.id))).sort(newer);
-    // tabs: Benchmarks | Community [| This device]. The chosen tab and the
-    // scroll position survive a trip into a scene (sessionStorage), so Back
-    // lands on the next tile instead of the top of the page.
-    const tabs = [['bench', 'Benchmarks'], ['community', 'Community']];
-    if (own.length) tabs.push(['device', 'This device']);
-    host.innerHTML = `<div class="walltabs" id="walltabs" role="tablist">${tabs.map(([k, l]) => `<button type="button" role="tab" data-tab="${k}">${esc(l)}</button>`).join('')}</div>
-      ${own.length ? '<div class="galgrid" data-pane="device" hidden></div>' : ''}
-      <div class="galgrid" data-pane="bench"></div>
-      <div class="galgrid" data-pane="community" hidden></div>`;   // own content first in the DOM too
-    const pane = (k) => host.querySelector(`[data-pane="${k}"]`);
-    for (const it of presets) pane('bench').appendChild(creationTile(it, { preset: true }));
-    const more = document.createElement('button');
-    more.type = 'button';
-    more.className = 'btn btn-outline galmore';
-    more.textContent = 'See what people made →';
-    more.addEventListener('click', () => selectWallTab('community', { scrollToTabs: true }));
-    pane('bench').appendChild(more);
-    if (shares.length) for (const it of shares) {
-      pane('community').appendChild(creationTile(it, { shared: true }));
-    }
-    else pane('community').innerHTML = '<p class="galempty">No community scenes found yet.</p>';
-    if (own.length) for (const t of own) pane('device').appendChild(t);
-    host.querySelectorAll('[role="tab"]').forEach((b) => b.addEventListener('click', () => selectWallTab(b.dataset.tab, { scrollToTabs: true })));
-    host.addEventListener('click', (e) => { if (e.target.closest('a.galtile')) saveWallState(); }, true);
-    const saved = wallState();
-    // first visit: own content leads when there is any (a run just finished
-    // wants its tile), otherwise the benchmarks; a saved position wins
-    const initial = saved && host.querySelector(`[data-tab="${saved.tab}"]`) ? saved.tab : (own.length ? 'device' : 'bench');
-    selectWallTab(initial, { restoreY: saved ? saved.y : null });
+    const tiles = [...(capTile ? [capTile] : []), ...runTiles];
+    host.replaceChildren();
+    if (!tiles.length) { host.hidden = true; return; }
+    const heading = document.createElement('p');
+    heading.className = 'eyebrow';
+    heading.textContent = 'SAVED ON THIS DEVICE';
+    const grid = document.createElement('div');
+    grid.className = 'galgrid';
+    grid.append(...tiles);
+    host.append(heading, grid);
     host.hidden = false;
-  } catch (e) { /* the wall is decoration — never block the app on it */ }
+  } catch { host.hidden = true; }
 }
+
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted && document.getElementById('gallery')) mountWall().catch(() => {});
+});
 
 /** From the viewer into the studio: the shared creation's photographs become
  *  the training input — the moment of "I want to make this myself". */

@@ -3,16 +3,28 @@ import { readFileSync } from 'node:fs';
 
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
+const xrUi = readFileSync(new URL('../../app/js/xr-ui.js', import.meta.url), 'utf8');
 const styles = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
 const baseStyles = readFileSync(new URL('../../app/css/base.css', import.meta.url), 'utf8');
-const data = readFileSync(new URL('../../app/js/data.js', import.meta.url), 'utf8');
+const manifest = readFileSync(new URL('../../android/app/src/main/AndroidManifest.xml', import.meta.url), 'utf8');
 
-assert.match(app, /const HOME_BENCHMARK_IDS = new Set\(\[[\s\S]*preset\.id === 'synthetic'[\s\S]*'42485456_7518', \/\/ Camping/,
-  'the home benchmark allowlist should contain Synthetic Corner and Camping only');
-assert.match(app, /const presets = rest\.filter\(\(x\) => HOME_BENCHMARK_IDS\.has\(String\(x\.id\)\)\)/,
-  'the home Benchmarks tab should filter all other benchmark tiles');
-assert.match(html, /id="btn-xr-example"[\s\S]*Synthetic Corner|known cameras/i,
-  'the Synthetic Corner example should remain on the home screen');
+assert.doesNotMatch(html, /btn-xr-example|Try a scene with known cameras|Synthetic Corner/i,
+  'the synthetic room example must not appear on the home screen');
+assert.doesNotMatch(app, /onExample|btn-xr-example|fetchGallery|HOME_BENCHMARK_IDS|creationTile\(/,
+  'the synthetic example and remote community/benchmark gallery must not be active in the app');
+const wall = app.match(/async function mountWall\(\)[\s\S]*?(?=\/\*\* From the viewer into the studio)/)?.[0] || '';
+assert.match(wall, /lastCaptureTile\(\)[\s\S]*localRunTiles\(\)/,
+  'the saved-work area should be populated only from local captures and runs');
+assert.doesNotMatch(wall, /fetch\(|import\(['"]\.\/share\.js/,
+  'mounting saved work must not issue network requests');
+assert.doesNotMatch(xrUi, /btn-xr-example|onExample/,
+  'XR UI must not retain a handler for the removed demo tile');
+assert.doesNotMatch(html, /fonts\.googleapis\.com|fonts\.gstatic\.com/,
+  'page rendering must not fetch external fonts');
+assert.match(baseStyles, /--ui:\s+system-ui/,
+  'the app should use locally installed system fonts');
+assert.doesNotMatch(manifest, /android\.permission\.INTERNET/,
+  'the Android app must not request Internet permission');
 assert.doesNotMatch(html, /id="btn-install"|id="xr-install-app"|Install app|Install on Android/,
   'all install actions should be removed from the home UI');
 assert.doesNotMatch(html, /id="acct"|>Login</,
@@ -24,11 +36,9 @@ assert.doesNotMatch(avatarPublish, /getToken|hasToken|uploadFile|arrival-signin|
   'avatar packaging should download locally without an account sign-in flow');
 assert.match(avatarPublish, /Download package/,
   'the avatar completion stage should retain its local package download');
-assert.match(data, /https:\/\/github\.com\/poWMod-web\/Android-splat\.js/,
-  'the Source action should point at the Android-splat.js repository');
+assert.match(html, /https:\/\/github\.com\/poWMod-web\/Android-splat\.js/,
+  'the home Source link should use the Android-splat.js repository');
 assert.match(styles, /#btn-xr-help, #btn-training-visuals, #xr-device-guide\s*\{[\s\S]*padding: 4px 9px;[\s\S]*font-size: 11px;/,
   'Device guide and Show visuals should use the compact utility-button size');
-assert.match(html, /https:\/\/github\.com\/poWMod-web\/Android-splat\.js/,
-  'the home Source link should use the requested repository');
 
-console.log('Home benchmark allowlist, compact controls, source link, and removed login/install actions: passed');
+console.log('Local-only home, removed demo/gallery, offline Android manifest, compact controls, and removed login/install actions: passed');

@@ -966,14 +966,8 @@ a.cbtn { text-decoration: none; }
   #vidcard .vid-read { flex-wrap: wrap; }
 }
 
-/* shared-scene tiles: who shared it, and when */
-.galby { position: absolute; top: 18px; left: 18px; z-index: 1; display: flex; align-items: center; gap: 7px; padding: 3px 11px 3px 3px; border-radius: 999px; background: rgba(7, 9, 9, .72); backdrop-filter: blur(6px); font: 500 12.5px var(--ui); color: var(--paper); cursor: pointer; transition: background .15s, border-color .15s; border: 1px solid transparent; }
-.galby:hover, .galby:focus-visible { background: rgba(7, 9, 9, .9); border-color: var(--accent-30); outline: none; }
-.galby:hover b { color: var(--accent); }
-.galby b { font-weight: 500; color: var(--paper); }
-.galav { flex: none; width: 22px; height: 22px; border-radius: 50%; background: var(--panel-2) center / cover no-repeat; border: 1px solid var(--line-2); font: 600 11px/20px var(--ui); color: var(--muted); text-align: center; font-style: normal; }
+/* saved run titles and details */
 .galname { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
-.galname time { flex: none; font: 400 12px var(--mono); color: var(--dim); letter-spacing: .02em; }
 
 /* ?admin — the community moderation sheet */
 #admincard { position: fixed; inset: 0; transform: none; width: auto; border-radius: 0; border: 0; overflow-y: auto; gap: 14px; padding: clamp(16px, 4vh, 36px) clamp(16px, 6vw, 80px); justify-content: flex-start; background: rgba(10, 13, 13, .985); }
@@ -1011,26 +1005,12 @@ a.cbtn { text-decoration: none; }
   .adm-acts { grid-column: 1 / -1; }
 }
 
-/* the wall: Benchmarks | Community [| This device] tabs over responsive grids */
-/* sticky at the top of whatever scrolls: the fixed start card on wide screens, the window (under the 52 px bar) on phones */
-.walltabs { display: flex; gap: 6px; justify-content: center; width: min(1100px, 100%); margin: 10px auto 0; padding: 8px 0; position: sticky; top: -58px; z-index: 5; background: var(--ink); scroll-margin-top: -58px; }
-/* the start card's sticky reference sits 58 px (its top padding) below the bar on wide screens: a -58 px offset parks the stuck row right under the bar */
-@media (max-width: 640px) { .walltabs { top: 52px; scroll-margin-top: 52px; } }
-/* underline tabs: the selected one carries a 2 px accent line */
-.walltabs { gap: 22px; border-bottom: 1px solid var(--line); padding: 8px 0 0; }
-.walltabs [role="tab"] { padding: 8px 4px 11px; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; border-radius: 0; background: none; color: var(--muted); font: 600 14px var(--ui); cursor: pointer; transition: color .15s, border-color .15s; }
-.walltabs [role="tab"]:hover { color: var(--paper); }
-.walltabs [role="tab"].on { color: var(--accent); border-bottom-color: var(--accent); }
+/* Local captures and runs saved on this device. */
 .galgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 26px 18px; width: min(1100px, 100%); margin: 6px auto 0; padding: 10px 0 14px; }
 .galgrid .galtile { width: 100%; margin: 0; }
 .galgrid .galsep, .galgrid .orline { grid-column: 1 / -1; }
 @media (max-width: 1000px) { .galgrid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 640px) { .galgrid { grid-template-columns: 1fr; } }
-.galmore { grid-column: 1 / -1; justify-self: center; margin: 10px 0 6px; }
-.galempty { grid-column: 1 / -1; color: var(--dim); text-align: center; margin: 24px 0; }
-.galtag { position: absolute; top: 18px; left: 18px; z-index: 1; padding: 4px 9px; border-radius: 6px; background: rgba(7, 9, 9, .78); backdrop-filter: blur(6px); font: 600 10.5px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--alt); font-style: normal; }
-/* grid tiles: long curated descriptions clamp so rows stay even */
-.galgrid .galdesc { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 
 /* the finished run's call to action: Share (accent) — downloads live inside the share sheet */
 /* same pill as Compress / Train beside it; only the icon is added */

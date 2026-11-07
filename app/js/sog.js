@@ -1,12 +1,12 @@
 // sog.js — in-browser SOG compression via @playcanvas/splat-transform
-// (vendored ESM bundle in app/vendor: bundle + its webp wasm + its encode
-// worker; ~5MB, loaded on demand the first time an export needs it).
+// (bundled ESM module in app/models plus its WebP wasm and encode worker in
+// app/vendor; ~5MB, loaded on demand the first time an export needs it).
 //
 // SOG is the web-delivery format: Morton-ordered, quantized, k-means SH
 // palettes, WebP-packed — typically 10-20x smaller than the .ply.
 
 let stP = null;
-export const loadST = () => stP ??= import('../vendor/splat-transform.bundle.mjs').then((st) => {
+export const loadST = () => stP ??= import('../models/splat-transform.bundle.mjs').then((st) => {
   st.WorkerQueue.workerUrl = new URL('../vendor/st-worker.mjs', import.meta.url).href;
   // the workers' own fallback resolves ../lib/webp.wasm (package layout);
   // point everyone at the vendored copy instead
