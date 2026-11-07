@@ -134,11 +134,11 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         deleteTree(outputDir);
         outputDir.mkdirs();
 
-        getWindow().setStatusBarColor(Color.TRANSPARENT);
-        getWindow().setNavigationBarColor(Color.TRANSPARENT);
-        getWindow().getDecorView().setSystemUiVisibility(
-                View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
-                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        getWindow().setStatusBarColor(Color.rgb(7, 9, 9));
+        getWindow().setNavigationBarColor(Color.rgb(7, 9, 9));
+        // Keep app content out of the system bars. The inset listener also pads
+        // the root on Android versions that enforce edge-to-edge for targetSdk 35.
+        getWindow().getDecorView().setSystemUiVisibility(0);
         captureRoot = buildCaptureUi();
         setContentView(captureRoot);
         applySafeAreaInsets(captureRoot);
@@ -274,25 +274,33 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
     private void applySafeAreaInsets(FrameLayout root) {
         root.setOnApplyWindowInsetsListener((view, insets) -> {
-            int top, bottom;
+            int left, top, right, bottom;
             if (Build.VERSION.SDK_INT >= 30) {
-                android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
+                android.graphics.Insets bars = insets.getInsets(
+                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                left = bars.left;
                 top = bars.top;
+                right = bars.right;
                 bottom = bars.bottom;
             } else {
+                left = insets.getSystemWindowInsetLeft();
                 top = insets.getSystemWindowInsetTop();
+                right = insets.getSystemWindowInsetRight();
                 bottom = insets.getSystemWindowInsetBottom();
             }
+            // Pad the whole content area instead of drawing controls underneath
+            // the status/navigation bars. This also keeps the camera surface clear.
+            view.setPadding(left, top, right, bottom);
             FrameLayout.LayoutParams topParams = (FrameLayout.LayoutParams) topBar.getLayoutParams();
-            topParams.topMargin = top + dp(16);
+            topParams.topMargin = dp(16);
             topBar.setLayoutParams(topParams);
             FrameLayout.LayoutParams guideParams = (FrameLayout.LayoutParams) guideText.getLayoutParams();
-            guideParams.bottomMargin = bottom + dp(125);
+            guideParams.bottomMargin = dp(125);
             guideText.setLayoutParams(guideParams);
             FrameLayout.LayoutParams controlParams = (FrameLayout.LayoutParams) controlBar.getLayoutParams();
-            controlParams.bottomMargin = bottom + dp(25);
+            controlParams.bottomMargin = dp(25);
             controlBar.setLayoutParams(controlParams);
-            return view.onApplyWindowInsets(insets);
+            return insets;
         });
         root.requestApplyInsets();
     }
@@ -689,11 +697,16 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             if (coverage.isEmpty()) return;
             Camera camera = frame.getCamera();
             camera.getProjectionMatrix(projection, 0, 0.05f, 100f);
-            // Keep projected coverage samples aligned with the corrected 180-degree
-            // camera-background UV orientation.
-            Matrix.rotateM(projection, 0, 180f, 0f, 0f, 1f);
             camera.getViewMatrix(view, 0);
             Matrix.multiplyMM(mvp, 0, projection, 0, view, 0);
+            // Rotate in clip space, after projection. This matches the 180-degree
+            // rotation applied to the background UVs (rotating the projection input
+            // alone does not flip already-projected screen coordinates).
+            for (int column = 0; column < 4; column++) {
+                int offset = column * 4;
+                mvp[offset] = -mvp[offset];
+                mvp[offset + 1] = -mvp[offset + 1];
+            }
             pointPositionsBuffer.clear(); pointColorsBuffer.clear();
             int count = 0;
             for (CoveragePoint point : coverage.values()) {

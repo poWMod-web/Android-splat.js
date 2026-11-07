@@ -17,11 +17,12 @@ assert.match(native, /text == null\) throw new IllegalStateException/,
   'capture export must report JSON serialization errors rather than dereference null');
 assert.match(native, /if \(!finite\(world\[0\], world\[1\], world\[2\], confidence\) \|\| confidence < 0\.25f\)/,
   'non-finite feature points must not be serialized into seed JSON');
-assert.match(native, /View\.SYSTEM_UI_FLAG_LAYOUT_STABLE \| View\.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN/,
-  'camera preview should remain full bleed while controls use system-bar insets');
-assert.match(native, /guideParams\.bottomMargin = bottom \+ dp\(125\)/);
+assert.match(native, /view\.setPadding\(left, top, right, bottom\)/,
+  'all app content must be inset below system bars and display cutouts');
+assert.match(native, /getDecorView\(\)\.setSystemUiVisibility\(0\)/,
+  'capture UI must not request layout behind system bars');
 assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?1f - uvOutput\.get\(i\)/,
   'camera preview UVs must receive the 180-degree orientation correction');
-assert.match(native, /Matrix\.rotateM\(projection, 0, 180f, 0f, 0f, 1f\)/,
-  'ARCore coverage points must use the same corrected display orientation');
+assert.match(native, /mvp\[offset\] = -mvp\[offset\];[\s\S]*?mvp\[offset \+ 1\] = -mvp\[offset \+ 1\]/,
+  'ARCore coverage points must receive the same 180-degree clip-space correction');
 console.log('Android asset paths, export guards, safe-area UI, and camera orientation: passed');
