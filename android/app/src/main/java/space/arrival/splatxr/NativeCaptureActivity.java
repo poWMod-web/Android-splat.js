@@ -653,10 +653,10 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
 
-            // Swap adjacent horizontal pairs (0 <-> 1) and (2 <-> 3) to invert
-            // the vertical orientation while correcting horizontal mirroring.
-            swapUvCoords(uvOutput, 0, 1);
-            swapUvCoords(uvOutput, 2, 3);
+            // Perform a pure VERTICAL FLIP to fix the upside-down image
+            // without mirroring the text left-to-right.
+            swapUvCoords(uvOutput, 0, 2);
+            swapUvCoords(uvOutput, 1, 3);
 
             uvOutput.position(0);
 
