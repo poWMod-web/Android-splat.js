@@ -57,6 +57,7 @@ import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -1111,7 +1112,15 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         return true;
     }
     private static String safeMessage(Exception e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
-    private static String readText(File f) throws Exception { return new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8); }
+    private static String readText(File f) throws Exception {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (FileInputStream in = new FileInputStream(f)) {
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = in.read(buffer)) != -1) bytes.write(buffer, 0, count);
+        }
+        return new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+    }
     private static void deleteTree(File file) {
         if (file == null || !file.exists()) return;
         File[] children = file.listFiles();

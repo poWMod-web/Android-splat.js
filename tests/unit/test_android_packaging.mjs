@@ -20,6 +20,10 @@ assert.match(native, /config\.setFocusMode\(Config\.FocusMode\.AUTO\)/,
   'ARCore capture must request continuous autofocus');
 assert.match(native, /text == null\) throw new IllegalStateException/,
   'capture export must report JSON serialization errors rather than dereference null');
+assert.match(native, /private static String readText\(File f\)[\s\S]*new FileInputStream\(f\)/,
+  'capture JSON loading must use an API-24-compatible file stream');
+assert.doesNotMatch(native, /java\.nio\.file|\.toPath\(\)/,
+  'capture code must avoid java.nio.file APIs unavailable at minSdk 24');
 assert.match(native, /if \(!finite\(world\[0\], world\[1\], world\[2\], confidence\) \|\| confidence < 0\.25f\)/,
   'non-finite feature points must not be serialized into seed JSON');
 assert.match(native, /view\.setPadding\(left, top, right, bottom\)/,
