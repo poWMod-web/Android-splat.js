@@ -712,9 +712,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             for (CoveragePoint point : coverage.values()) {
                 if (count >= MAX_POINTS) break;
                 pointPositionsBuffer.put(point.xyz);
-                float s = Math.min(1f, point.maxAngle / (float)(Math.PI / 2.0));
-                // Red at one viewing direction, yellow around 45°, green at 90° diversity.
-                pointColorsBuffer.put(1f - s).put(s).put(0.02f);
+                putCoverageColor(pointColorsBuffer, point.maxAngle);
                 count++;
             }
             pointPositionsBuffer.flip(); pointColorsBuffer.flip();
@@ -729,6 +727,34 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             GLES20.glDrawArrays(GLES20.GL_POINTS, 0, count);
             GLES20.glDisableVertexAttribArray(pointPosition); GLES20.glDisableVertexAttribArray(pointColor);
             GLES20.glDisable(GLES20.GL_BLEND);
+        }
+
+        private void putCoverageColor(FloatBuffer colors, float maxAngle) {
+            // Spread the ramp over a wider viewpoint range so coverage does not
+            // jump straight from red to green: red -> orange at 40°, yellow at
+            // 80°, then a gradual transition to green at 120°.
+            float orangeAt = (float)Math.toRadians(40.0);
+            float yellowAt = (float)Math.toRadians(80.0);
+            float greenAt = (float)Math.toRadians(120.0);
+            float angle = Float.isFinite(maxAngle) ? Math.max(0f, Math.min(maxAngle, greenAt)) : 0f;
+            float red, green, blue, t;
+            if (angle < orangeAt) {
+                t = angle / orangeAt;
+                red = 1f;
+                green = 0.04f + 0.38f * t;
+                blue = 0.02f * (1f - t);
+            } else if (angle < yellowAt) {
+                t = (angle - orangeAt) / (yellowAt - orangeAt);
+                red = 1f;
+                green = 0.42f + 0.52f * t;
+                blue = 0.03f * t;
+            } else {
+                t = (angle - yellowAt) / (greenAt - yellowAt);
+                red = 1f - 0.92f * t;
+                green = 0.94f - 0.08f * t;
+                blue = 0.03f + 0.09f * t;
+            }
+            colors.put(red).put(green).put(blue);
         }
 
         private void capture(Frame frame) {

@@ -253,6 +253,9 @@ const S = {
   chartEvents: [],             // real refine/growth moments for the curve
   flash: null,
   detailTab: 'score',
+  trainVisuals: false,         // the app's model/compare/camera overlays sleep during training by default
+  _savedGpuFacts: null,        // GPU facts captured with a local run, not the current viewer device
+  _savedDetailSettings: null,
   keys: new Set(),             // held WASD keys (camera-relative fly)
   maxIters: INITIAL_ITERS,     // grows when the user continues training
   settings: loadSettings(),    // training knobs from the start-card panel
@@ -271,7 +274,32 @@ function mountModelCanvas() {
   gpuCanvas.id = 'cv-model';
   $('stage').insertBefore(gpuCanvas, $('cv'));
   S.session.view.attach(gpuCanvas);
+  gpuCanvas.style.display = S.state === 'train' && !S.trainVisuals ? 'none' : '';
   S._viewKey = '';
+}
+
+function syncTrainingVisualsControl() {
+  const training = S.state === 'train';
+  const detailOpen = !!($('details') && !$('details').hidden);
+  const visualsActive = !training || (S.trainVisuals && !detailOpen);
+  const installSlot = $('install-slot');
+  const button = $('btn-training-visuals');
+  if (installSlot) installSlot.hidden = training;
+  if (button) {
+    button.hidden = !training || detailOpen;
+    button.textContent = S.trainVisuals ? 'Hide visuals' : 'Show visuals';
+    button.setAttribute('aria-pressed', String(!!S.trainVisuals));
+  }
+  if (gpuCanvas) gpuCanvas.style.display = visualsActive ? '' : 'none';
+  if (S.session && S.session.view && S.session.view.setEnabled) S.session.view.setEnabled(visualsActive);
+}
+
+function toggleTrainingVisuals() {
+  if (S.state !== 'train') return;
+  S.trainVisuals = !S.trainVisuals;
+  if (S.trainVisuals) S._viewKey = ''; // render the current model at the current camera pose
+  else if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
+  syncTrainingVisualsControl();
 }
 
 // the OAuth popup lands back on this page with ?code= — report and close
@@ -326,8 +354,10 @@ function boot() {
     }
     startPrep();
   });
-  $('btn-new').addEventListener('click', (e) => {
+  $('btn-new').addEventListener('click', async (e) => {
     e.stopPropagation();
+    const runId = S.runId || (S._localRun && S._localRun.id);
+    if (runId) await persistRunDetails(runId, { full: true }).catch(() => {});
     // a shared creation holds nothing precious — Back is simply the way
     // home. When the visitor came from within the app, real history.back()
     // is better: the bfcache restores the feed with its scroll intact.
@@ -346,6 +376,7 @@ function boot() {
     // confirm guards a training in progress.
     location.href = 'index.html';
   });
+  $('btn-training-visuals').addEventListener('click', toggleTrainingVisuals);
   $('card-x').addEventListener('click', closePicker);
   $('file-input').addEventListener('change', (e) => {
     const files = Array.from(e.target.files);
@@ -689,6 +720,7 @@ function boot() {
     // truck default sat invisibly behind the start card and leaked into
     // Back navigation ("why is the truck loaded?")
   }
+  syncTrainingVisualsControl();
   requestAnimationFrame(loop);
 
   // a shared result: load it straight into the done-state viewer
@@ -962,9 +994,26 @@ async function localRunTiles(shares = new Map()) {
     // Community listing, the kill switch — but only when the account that
     // owns it is signed in here (`shares`, from /splatjs/mine)
     const sh = r.spaceId ? shares.get(String(r.spaceId)) : null;
+    const renameLocalModel = async () => {
+      const previousName = r.name || 'Training run';
+      const name = await textCard('Rename this model', previousName);
+      if (!name || name === previousName) return;
+      try {
+        const { patchRun } = await import('./store.js');
+        if (!await patchRun(r.id, { name })) {
+          flash('Could not save the new model name on this device.', 6000);
+          return;
+        }
+        r.name = name;
+        const title = b.querySelector('.galname');
+        if (title) title.textContent = name;
+        flash(`Renamed to ${name}.`, 4000);
+      } catch (e) { flash(`Rename failed: ${e.message}`, 6000); }
+    };
     tileMenu(b.querySelector('.run-menu'), [
       viewable && { label: 'View', act: r.sog ? openRun : () => viewFromState(r) },
       (r.sog || retrainable || (r.state && r.recon)) && { label: 'Train', act: () => { S._localRun = r; trainLocalChoice(); } },
+      !sh && { label: 'Rename', act: renameLocalModel },
       ...(sh ? shareMenuItems(sh)
         : r.spaceId ? [{ label: 'Copy link', act: async () => { try { await navigator.clipboard.writeText(shareLinkOf(r.spaceId)); flash('Link copied.', 2500); } catch { flash(shareLinkOf(r.spaceId), 8000); } } }] : []),
       r.sog && r.recon && !r.spaceId && { label: 'Share', act: () => shareDialog(r) },
@@ -1562,6 +1611,12 @@ async function open(preset, autostart = false) {
   S.session = null;
   S.preset = preset;
   S.state = 'ready';
+  S.trainVisuals = false;
+  S._carryTrainElapsed = false;
+  S._savedGpuFacts = null; S._savedDetailSettings = null;
+  S._localRun = null;
+  S.runId = null; S._resumeRunId = null;
+  syncTrainingVisualsControl();
   S.picking = false; S.pending = null;
   S.scene = null;
   S.sel = 0; S.atFrame = -1; S.fade = 0; S.fadeTo = 0;
@@ -1769,6 +1824,7 @@ async function startPrep() {
   S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
   S.maxIters = ITERS_OVERRIDE >= 1000 ? ITERS_OVERRIDE : (PERF.on ? PERF.iters : (S.settings.iters || INITIAL_ITERS));
   S.state = 'prep';
+  syncTrainingVisualsControl();
   // ── the avatar route, as decided on the start card ───────────────────────
   // Unticked, this is a plain scene run whatever the set once was: a restored
   // capture's stored mattes leave the frames the session sees.
@@ -1984,6 +2040,7 @@ async function startPrep() {
         : `Only ${placed} of ${S.photos.length} images could be placed — ` +
           'that is unusual for this test set. Reloading the page and retrying usually clears it.');
       S.state = 'ready';
+      syncTrainingVisualsControl();
       dock('');
       backToSetup();
       return;
@@ -2091,6 +2148,7 @@ async function startPrep() {
       ? 'The photos don\'t overlap enough to connect into one scene.'
       : (e.message || 'An unexpected error occurred during reconstruction.'));
     S.state = 'ready';
+    syncTrainingVisualsControl();
     dock('');
     backToSetup();
   }
@@ -2337,7 +2395,11 @@ function buildSceneFromSession() {
 // ── training ────────────────────────────────────────────────────────────────
 function startTraining() {
   S.state = 'train';
-  S.trainT0 = performance.now();
+  S.trainVisuals = false;
+  syncTrainingVisualsControl();
+  const carryMinutes = S._carryTrainElapsed ? (S.minutes || 0) : 0;
+  S._carryTrainElapsed = false;
+  S.trainT0 = performance.now() - carryMinutes * 60000;
   S.etaAt = null;   // the countdown re-anchors on this run's own pace
   // dual-GPU desktops: WebGPU can land on the integrated GPU even when a
   // dedicated card sits idle (seen in the wild: 3 h for a run a 3070 does in
@@ -2363,10 +2425,37 @@ function startTraining() {
     if (resumeId) {
       // the record already exists (thumb, checkpoint, name) — just mark it live
       const { patchRun } = await import('./store.js');
-      await patchRun(resumeId, { status: 'training', maxIters: S.maxIters });
+      await patchRun(resumeId, {
+        status: 'training', maxIters: S.maxIters,
+        detailSolve: captureRunSolveDetails(),
+        detailProgress: captureRunProgressDetails(),
+        detailGpu: gpuFacts(false),
+      });
       return;
     }
-    let thumb = null;
+    const runId = S.runId, runGen = S.gen;
+    const pid = String((S.preset && S.preset.id) || '');
+    // own scenes are SCENES, not photos — a continued run keeps the name it
+    // already carries; the tile's description holds the capture details
+    let runName = (S.preset && S.preset.name) || 'Your photos';
+    if ((pid === '__own' || pid === '__last') && (runName === 'Your photos' || pid === '__last')) {
+      runName = 'Local Scene';
+    }
+    const { saveRun, patchRun } = await import('./store.js');
+    await saveRun({
+      id: runId, name: runName,
+      status: 'training', createdAt: Date.now(), updatedAt: Date.now(),
+      iter: S.iter || 0, maxIters: S.maxIters, splats: S.splats || 0, psnr: S.psnrTrain ?? null,
+      frames: (S.photos || []).length,
+      // own-photo runs can train again from the device's capture store
+      ownSrc: pid === '__own' || pid === '__last',
+      detailSolve: captureRunSolveDetails(),
+      detailProgress: captureRunProgressDetails(),
+      detailGpu: gpuFacts(false),
+    });
+    // Save the model record before the optional thumbnail fetch; Back/close
+    // should not race image decoding and lose the run's first snapshot.
+    if (S.gen !== runGen) return;
     try {
       const p = S.photos && S.photos[0];
       if (p && p.url) {
@@ -2375,25 +2464,10 @@ function startTraining() {
         cv.width = bmp.width; cv.height = bmp.height;
         cv.getContext('2d').drawImage(bmp, 0, 0);
         bmp.close();
-        thumb = await new Promise((res) => cv.toBlob(res, 'image/webp', 0.8));
+        const thumb = await new Promise((res) => cv.toBlob(res, 'image/webp', 0.8));
+        if (thumb && S.gen === runGen) await patchRun(runId, { thumb });
       }
     } catch { /* the tile just goes textless */ }
-    const { saveRun } = await import('./store.js');
-    const pid = String((S.preset && S.preset.id) || '');
-    // own scenes are SCENES, not photos — a continued run keeps the name it
-    // already carries; the tile's description holds the capture details
-    let runName = (S.preset && S.preset.name) || 'Your photos';
-    if ((pid === '__own' || pid === '__last') && (runName === 'Your photos' || pid === '__last')) {
-      runName = 'Local Scene';
-    }
-    await saveRun({
-      id: S.runId, name: runName,
-      status: 'training', createdAt: Date.now(), updatedAt: Date.now(),
-      iter: 0, maxIters: S.maxIters, splats: S.splats || 0, psnr: null,
-      frames: (S.photos || []).length, thumb,
-      // own-photo runs can train again from the device's capture store
-      ownSrc: pid === '__own' || pid === '__last',
-    });
   })().catch(() => {});
   const first = S.scene.cams.find((c) => c.R && c.state !== 'holdout') || S.scene.cams[0];
   if (first && first.R) {
@@ -2404,6 +2478,13 @@ function startTraining() {
   }
   renderControls();
   dock('train');
+  if (chart) {
+    chart.train = (S.session.lossHistory || []).map(([i, v]) => [i, v]);
+    chart.hold = (S.holdHist || []).slice();
+    chart.maxIter = S.maxIters;
+    chart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
+    chart.draw();
+  }
   S.session.start();
 }
 
@@ -2429,6 +2510,142 @@ function toggleTrain() {
   if (!on) checkpointRun('pause').catch(() => {});
 }
 
+// Local-run diagnostics are a compact companion to the saved model. The
+// reconstruction already carries cameras and a coarse score curve; these
+// snapshots retain the solver's landmarks/match sample plus the detailed
+// score and timing history that the Details sheet needs after a reload.
+function compactRows(rows, max = 600) {
+  if (!Array.isArray(rows) || !rows.length) return [];
+  const stride = Math.max(1, Math.ceil(rows.length / max));
+  const out = [];
+  for (let i = 0; i < rows.length; i += stride) out.push(Array.from(rows[i] || []));
+  const last = rows[rows.length - 1];
+  if (out.length && rows.length > 1 && rows[rows.length - 1] !== rows[Math.min(rows.length - 1, (out.length - 1) * stride)]) {
+    out.push(Array.from(last || []));
+  }
+  return out;
+}
+
+function captureRunSolveDetails() {
+  const pair = S.lastPairEv;
+  const samples = pair ? (pair.sample || []).slice(0, 50).map((p) => Array.from(p || [])) : [];
+  const referenced = new Map();
+  const refer = (image, index) => {
+    if (!Number.isInteger(index) || index < 0) return;
+    if (!referenced.has(image)) referenced.set(image, new Set());
+    referenced.get(image).add(index);
+  };
+  for (const [a, b] of samples) { refer(pair.i, a); refer(pair.j, b); }
+  const remaps = new Map();
+  const features = [...(S.feats || new Map())].map(([image, f]) => {
+    const n = Math.min(f.x ? f.x.length : 0, f.y ? f.y.length : 0);
+    const indices = [];
+    for (let i = 0; i < Math.min(1200, n); i++) indices.push(i);
+    for (const i of referenced.get(image) || []) if (i < n && i >= 1200) indices.push(i);
+    const remap = new Map(indices.map((old, next) => [old, next]));
+    remaps.set(image, remap);
+    return {
+      image, n: f.n || 0,
+      x: indices.map((i) => f.x[i]), y: indices.map((i) => f.y[i]),
+    };
+  });
+  const savedPair = pair ? {
+    i: pair.i, j: pair.j,
+    sample: samples.map(([a, b]) => [remaps.get(pair.i)?.get(a), remaps.get(pair.j)?.get(b)])
+      .filter(([a, b]) => a != null && b != null),
+  } : null;
+  return {
+    solveStats: { ...(S.solveStats || {}) },
+    features,
+    lastPair: savedPair,
+    selected: S.sel | 0,
+  };
+}
+
+function captureRunProgressDetails() {
+  const ses = S.session;
+  const perf = (ses && ses.perf) || {};
+  const history = ses && Array.isArray(ses.lossHistory) && ses.lossHistory.length
+    ? ses.lossHistory : ((S.restored && S.restored.stats && S.restored.stats.chart) || []);
+  const holds = S.holdHist && S.holdHist.length
+    ? S.holdHist : ((S.restored && S.restored.stats && S.restored.stats.holds) || []);
+  return {
+    chart: compactRows(history, 800),
+    holds: compactRows(holds, 800),
+    events: (S.chartEvents || []).slice(-300).map((e) => ({ ...e })),
+    perf: {
+      frames: (perf.frames || []).slice(-6000).map((r) => Array.from(r || [])),
+      marks: (perf.marks || []).slice(-1200).map((m) => ({ ...m })),
+    },
+    metrics: (S.perfMetrics || []).slice(-2000).map((m) => Array.from(m || [])),
+    settings: { ...(S._savedDetailSettings || S.settings || {}) },
+    tileGrad: (ses && ses.trainer && ses.trainer.tileGrad) ?? null,
+    maxIters: S.maxIters || 0,
+    iter: S.iter || 0,
+    minutes: S.state === 'train'
+      ? Math.max(S.minutes || 0, Math.round((performance.now() - (S.trainT0 || performance.now())) / 60000))
+      : (S.minutes || 0),
+    psnrTrain: S.psnrTrain ?? null,
+    psnrHold: S.psnrHold ?? null,
+  };
+}
+
+async function persistRunDetails(id = S.runId, { full = false } = {}) {
+  if (!id) return false;
+  const patch = {
+    detailProgress: captureRunProgressDetails(),
+    detailGpu: S.state === 'train' || !S._savedGpuFacts ? gpuFacts(false) : S._savedGpuFacts,
+  };
+  if (full) patch.detailSolve = captureRunSolveDetails();
+  const { patchRun } = await import('./store.js');
+  const updated = await patchRun(id, patch);
+  if (updated && S._localRun && S._localRun.id === id) Object.assign(S._localRun, patch);
+  return updated;
+}
+
+function restoreRunDetails(run, session = S.session) {
+  if (!run) return;
+  const solve = run.detailSolve || {};
+  S.solveStats = solve.solveStats
+    ? { pairsChecked: 0, pairsUsable: 0, solveSec: 0, ...solve.solveStats }
+    : { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
+  S.feats = new Map(Array.isArray(solve.features) ? solve.features.map((f) => [f.image, {
+    n: f.n || 0, x: Float32Array.from(f.x || []), y: Float32Array.from(f.y || []),
+  }]) : []);
+  S.lastPairEv = solve.lastPair ? {
+    i: solve.lastPair.i, j: solve.lastPair.j,
+    sample: (solve.lastPair.sample || []).map((p) => Array.from(p || [])),
+  } : null;
+  if (Number.isFinite(solve.selected)) S.sel = solve.selected;
+  const frameCount = session && session.frames ? session.frames.length : 0;
+  if (frameCount) S.sel = Math.max(0, Math.min(frameCount - 1, S.sel | 0));
+  S._savedGpuFacts = run.detailGpu || null;
+  const progress = run.detailProgress || {};
+  S._savedDetailSettings = progress.settings || null;
+  S.chartEvents = Array.isArray(progress.events) ? progress.events.map((e) => ({ ...e })) : [];
+  S.holdHist = Array.isArray(progress.holds) ? progress.holds.map((r) => Array.from(r || [])) : [];
+  S.perfMetrics = Array.isArray(progress.metrics) ? progress.metrics.map((m) => Array.from(m || [])) : [];
+  const lastMetric = S.perfMetrics[S.perfMetrics.length - 1];
+  if (lastMetric && Number.isFinite(+lastMetric[2])) S.itersPerSec = +lastMetric[2];
+  const fallbackChart = (S.restored && S.restored.stats && S.restored.stats.chart) || [];
+  const history = Array.isArray(progress.chart) && progress.chart.length ? progress.chart : fallbackChart;
+  if (session) {
+    session.lossHistory = history.map((r) => Array.from(r || []));
+    session.perf = session.perf || { frames: [], marks: [] };
+    const frameRows = ((progress.perf && progress.perf.frames) || []).map((r) => Array.from(r || []));
+    const markRows = ((progress.perf && progress.perf.marks) || []).map((m) => ({ ...m }));
+    const metricRows = S.perfMetrics;
+    const lastT = frameRows.length ? frameRows[frameRows.length - 1][0] : 0;
+    const timeShift = frameRows.length ? performance.now() + 1 - lastT : 0;
+    session.perf.frames = frameRows.map((r) => { if (r.length) r[0] += timeShift; return r; });
+    session.perf.marks = markRows.map((m) => ({ ...m, ...(Number.isFinite(m.t) ? { t: m.t + timeShift } : {}) }));
+    S.perfMetrics = metricRows.map((m) => { if (m.length) m[0] += timeShift; return m; });
+  }
+  if (progress.minutes != null) S.minutes = Math.max(S.minutes || 0, progress.minutes || 0);
+  if (progress.psnrTrain != null) S.psnrTrain = progress.psnrTrain;
+  if (progress.psnrHold != null) S.psnrHold = progress.psnrHold;
+}
+
 // ── crash-safe checkpoint ───────────────────────────────────────────────────
 // The raw trainer state — a straight GPU readback, no PLY text, no SOG
 // k-means — goes into the run record whenever the user pauses, and (desktop
@@ -2452,12 +2669,16 @@ async function checkpointRun(reason) {
     const state = new Blob([await packState(S.session)]);
     if (S.gen !== gen) return;
     const recon = buildReconJson(S);
+    const detailProgress = captureRunProgressDetails();
     const { patchRun } = await import('./store.js');
     await patchRun(S.runId, {
       iter: it, splats: S.splats || S.session.trainer.n,
       psnr: S.psnrHold ?? S.psnrTrain ?? null,
       cap: S.session.trainer.cap || 0,   // growth headroom carries over
-      state, recon, ckptAt: Date.now(),
+      state, recon, ckptAt: Date.now(), minutes: detailProgress.minutes,
+      detailSolve: captureRunSolveDetails(),
+      detailProgress,
+      detailGpu: gpuFacts(false),
     });
     S._ckptIter = it;
     if (reason === 'pause') flash('Progress saved on this device — safe to close, continue anytime from Yours.', 6000);
@@ -2470,13 +2691,6 @@ function onMetrics(m) {
   S.iter = m.iter;
   S.splats = m.splats;
   S.itersPerSec = m.itersPerSec;
-  // local library: keep the run record roughly current (survives a closed tab)
-  if (S.runId && (!S._runSaveT || performance.now() - S._runSaveT > 20000)) {
-    S._runSaveT = performance.now();
-    import('./store.js').then(({ patchRun }) => patchRun(S.runId, {
-      iter: m.iter, splats: m.splats, psnr: m.psnrTrain ?? null,
-    })).catch(() => {});
-  }
   // LOD training: hold the model at each detail level for a polish window,
   // snapshot it, then raise the growth limit and move on
   const LP = S.lodPlan;
@@ -2524,6 +2738,30 @@ function onMetrics(m) {
       const ph = $('t-phold');   // only rendered in ?eval benchmark mode
       if (ph) ph.textContent = S.psnrHold != null ? S.psnrHold.toFixed(2) : '—';
     }
+  }
+  if (!$('details').hidden && S.detailTab === 'score') {
+    if (dchart) {
+      const history = (S.session && S.session.lossHistory) || [];
+      dchart.train = history.map(([i, v]) => [i, v]);
+      dchart.hold = (S.holdHist || []).slice();
+      dchart.maxIter = S.maxIters;
+      dchart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
+      dchart.draw();
+    }
+  } else if (!$('details').hidden && S.detailTab === 'perf') {
+    $('d-perf').textContent = buildPerfReport();
+  }
+  // Local records get a compact diagnostics update alongside the headline
+  // progress every twenty seconds. The complete final snapshot is written on
+  // pause, finish, or when leaving the model viewer.
+  if (S.runId && (!S._runSaveT || performance.now() - S._runSaveT > 20000)) {
+    S._runSaveT = performance.now();
+    const runId = S.runId;
+    const detailProgress = captureRunProgressDetails();
+    import('./store.js').then(({ patchRun }) => patchRun(runId, {
+      iter: m.iter, splats: m.splats, psnr: m.psnrTrain ?? null,
+      minutes: detailProgress.minutes, detailProgress,
+    })).catch(() => {});
   }
 }
 
@@ -2661,6 +2899,7 @@ if (!IOS) document.addEventListener('visibilitychange', () => {
  *  state checkpoint (viewOnly continueLocalRun). */
 function enterDone() {
   S.state = 'done';
+  syncTrainingVisualsControl();
   S.atFrame = -1; S.fadeTo = 0;
   vp.lock = null; vp.freeF = null;
   $('stage').dataset.cursor = 'grab';
@@ -2848,12 +3087,37 @@ async function finish() {
         status: 'finished', iter: S.iter, splats: S.splats,
         // app runs train every photo (holdout -1): train PSNR is the number
         psnr: S.psnrHold ?? S.psnrTrain ?? null, minutes: S.minutes,
+        detailSolve: captureRunSolveDetails(),
+        detailProgress: captureRunProgressDetails(),
+        detailGpu: gpuFacts(false),
         ...(thumb ? { thumb } : {}),
       });
       flash('Result saved on this device — it stays under Yours', 5000);
     } catch (e) { console.warn('local save failed', e); }
   }
   if (PERF.on) perfCard();
+}
+
+async function hydrateLocalRunPhotos(reconJson, run) {
+  const source = reconJson && reconJson.source;
+  if (!run || !run.ownSrc || !source || !Array.isArray(source.names) || !source.names.length) return;
+  if (Array.isArray(source.urls) && source.urls.length === source.names.length && source.urls.every(Boolean)) return;
+  try {
+    const { loadLastCapture } = await import('./store.js');
+    const capture = await loadLastCapture();
+    const byName = new Map(((capture && capture.files) || []).map((f) => [f.name, f]));
+    const urls = source.names.map((name) => {
+      const file = byName.get(name);
+      return file && file.blob ? URL.createObjectURL(file.blob) : null;
+    });
+    if (urls.every(Boolean)) {
+      if (S.ownUrls) S.ownUrls.forEach((url) => URL.revokeObjectURL(url));
+      S.ownUrls = urls;
+      source.urls = urls;
+    } else {
+      urls.filter(Boolean).forEach((url) => URL.revokeObjectURL(url));
+    }
+  } catch { /* source imagery is optional; the saved diagnostics still render */ }
 }
 
 // ── restore: present a saved run without re-training ────────────────────────
@@ -2863,6 +3127,12 @@ async function finish() {
 async function restoreSession(src) {
   try {
     S._localRun = src.localRun || null; // set only by the local runs library
+    S.runId = S._localRun ? S._localRun.id : null;
+    S._resumeRunId = null;
+    S.feats = new Map(); S.lastPairEv = null;
+    S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
+    S.chartEvents = []; S.holdHist = []; S.perfMetrics = []; S.itersPerSec = 0;
+    S._savedGpuFacts = null; S._savedDetailSettings = null;
     // a run that was already shared knows its space: the viewer offers its
     // link and its listing, where a reload used to leave only a Download
     if (S._localRun && S._localRun.spaceId) S.share = { id: S._localRun.spaceId, title: S._localRun.name || '' };
@@ -2889,6 +3159,7 @@ async function restoreSession(src) {
         } else {
           reconJson = JSON.parse(new TextDecoder().decode(buf));
         }
+        await hydrateLocalRunPhotos(reconJson, S._localRun);
         const { createSogView } = await import('./pcview.js');
         const ses = await createSogView(src.url, { radius: reconJson.sceneRadius || 10 });
         ses.frames = (reconJson.frames || []).map((f) => ({ ...f }));
@@ -2912,6 +3183,7 @@ async function restoreSession(src) {
       ? await decodeModel(src.bytes, src.reconUrl)
       : await fetchModel(src.url, src.reconUrl);
     const { gaussians, reconJson, state } = got;
+    await hydrateLocalRunPhotos(reconJson, S._localRun);
     const iter = (state && state.iter) || (reconJson && reconJson.iter) || 0;
     const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter) });
     if (reconJson) {
@@ -2959,6 +3231,8 @@ function finishRestore(ses, reconJson, nSplats, hasState, gaussians) {
     S.plyBlob = null; S.sogBlob = null;
     S.lodPlan = null;
     S.state = 'done';
+    restoreRunDetails(S._localRun, ses);
+    syncTrainingVisualsControl();
     const frames = (reconJson && reconJson.frames) || [];
     const source = (reconJson && reconJson.source) || {};
     // the photographs come back too when the session recorded where they
@@ -2979,7 +3253,7 @@ function finishRestore(ses, reconJson, nSplats, hasState, gaussians) {
                  cx: (fr.tw || 1000) / 2, cy: (fr.th || 1000) / 2,
                  w: fr.tw || 1000, h: fr.th || 1000, offset: 0 };
       });
-      ses.trainer.camMeta = metas;
+      if (ses.trainer) ses.trainer.camMeta = metas;
       const byImg = new Map(reconJson.cams.map((c, k) => [c.imgIdx, k]));
       cams = S.photos.map((p, i) => {
         const k = byImg.get(i);
@@ -3058,6 +3332,11 @@ function finishRestore(ses, reconJson, nSplats, hasState, gaussians) {
     } else if (!center) {
       center = [0, 0, 0];
     }
+    cams.forEach((cam) => {
+      const imgIdx = cam.ci >= 0 && reconJson && reconJson.cams[cam.ci]
+        ? reconJson.cams[cam.ci].imgIdx : cam.i;
+      cam.feats = (S.feats.get(imgIdx) || {}).n || 0;
+    });
     S.scene = {
       cams,
       xyz: Float32Array.from(cl.xyz), rgb: Uint8Array.from(cl.rgb),
@@ -3115,20 +3394,23 @@ function pctl(arr, p) {
 
 function buildPerfReport() {
   const ses = S.session;
-  const gi = (ses.gpu && ses.gpu.info) || {};
+  const gi = (ses.gpu && ses.gpu.info) || S._savedGpuFacts || {};
   const rows = (ses.perf && ses.perf.frames) || [];
   const marks = (ses.perf && ses.perf.marks) || [];
-  const fr0 = ses.frames[0] || {};
+  const fr0 = (ses.frames && ses.frames[0]) || {};
+  const settings = S._savedDetailSettings || S.settings;
+  const tileGrad = ses.trainer ? ses.trainer.tileGrad
+    : (S._localRun && S._localRun.detailProgress && S._localRun.detailProgress.tileGrad) ?? '?';
   const L = [];
   L.push(`splat.js perf log — ${new Date().toISOString()}`);
   L.push(`url: ${location.href}`);
-  L.push(`ua: ${navigator.userAgent}`);
+  L.push(`ua: ${(S._savedGpuFacts && S._savedGpuFacts.ua) || navigator.userAgent}`);
   L.push(`gpu: ${[gi.vendor, gi.architecture, gi.device].filter(Boolean).join(' ') || 'unknown'}`);
-  L.push(`screen: ${screen.width}x${screen.height} @dpr ${devicePixelRatio}`);
-  L.push(`photos: ${S.photos.length} · placed ${ses.recon ? ses.recon.cams.length : '?'} · training res ${fr0.tw}x${fr0.th}`);
-  L.push(`settings: ${JSON.stringify(S.settings)} · preset ${S.preset ? S.preset.id : '?'}`);
+  L.push(`screen: ${(S._savedGpuFacts && S._savedGpuFacts.screen) || `${screen.width}x${screen.height} @dpr ${devicePixelRatio}`}`);
+  L.push(`photos: ${S.photos.length || (ses.frames && ses.frames.length) || 0} · placed ${ses.recon ? ses.recon.cams.length : '?'} · training res ${fr0.tw || '?'}x${fr0.th || '?'}`);
+  L.push(`settings: ${JSON.stringify(settings)} · preset ${S.preset ? S.preset.id : '?'}`);
   L.push(`splats: ${fmt(S.splats)} · holdout psnr ${S.psnrHold != null ? S.psnrHold.toFixed(2) : '—'} dB`);
-  L.push(`tileGrad: ${ses.trainer ? ses.trainer.tileGrad : '?'} · maxIters ${S.maxIters}`);
+  L.push(`tileGrad: ${tileGrad} · maxIters ${S.maxIters}`);
   if (rows.length > 1) {
     const t0 = rows[0][0], t1 = rows[rows.length - 1][0];
     const iters = rows[rows.length - 1][1] - rows[0][1];
@@ -3558,6 +3840,7 @@ async function continueLocalRun(viewOnly = false) {
   S.iter = baseIter;
   S.psnrTrain = null; S.psnrHold = null;
   S.holdHist = []; S.chartEvents = []; S.growthStopped = false;
+  restoreRunDetails(lr, ses);
   buildSceneFromSession();
   mountModelCanvas();
   if (viewOnly) {
@@ -3571,6 +3854,9 @@ async function continueLocalRun(viewOnly = false) {
     flash(`${fmt(g.n)} splats — Compress turns this into a shareable .sog`, 6000);
     return;
   }
+  S.minutes = Math.max(S.minutes || 0, lr.minutes || 0,
+    (lr.detailProgress && lr.detailProgress.minutes) || 0);
+  S._carryTrainElapsed = true;
   if (lr.state && lr.status !== 'finished') S._resumeRunId = lr.id;
   startTraining();
   flash(`Continuing from ${fmt(baseIter)} cycles — +${fmt(S.maxIters - baseIter)} more.`, 6000);
@@ -3584,6 +3870,8 @@ function continueTraining() {
   S.etaAt = null;
   S.maxIters = S.session.continueFor(MORE_ITERS);
   S.state = 'train';
+  S.trainVisuals = false;
+  syncTrainingVisualsControl();
   S.trainT0 = performance.now() - S.minutes * 60000;   // minutes stay cumulative
   S.growthStopped = false;
   S.atFrame = -1; S.fadeTo = 0;
@@ -3660,6 +3948,9 @@ async function compressSog(gen) {
         await patchRun(S.runId, {
           sog: blob, recon: buildReconJson(S), splats: S.splats,
           psnr: S.psnrHold ?? S.psnrTrain ?? null,
+          detailSolve: captureRunSolveDetails(),
+          detailProgress: captureRunProgressDetails(),
+          detailGpu: gpuFacts(false),
           state: null, ckptAt: null,
         });
       } catch (e) { console.warn('local save failed', e); }
@@ -4331,11 +4622,13 @@ function closeViewerToHome() {
   gpuCanvas = null;
   S.gen++;
   S.session = null; S.share = null; S.restored = null; S._localRun = null;
+  S.runId = null; S._resumeRunId = null;
   S._viewerOpen = false;
   S._fromSpace = null;
   S._thumbsUrl = null; S._thumbPack = null;
   S.plyBlob = null; S.sogBlob = null;
   S.state = 'ready'; S.preset = null; S.photos = [];
+  syncTrainingVisualsControl();
   S.scene = null; S.tour = null;
   $('strip').innerHTML = '';
   $('controls').hidden = true;
@@ -4702,6 +4995,7 @@ function trainFromShare() {
   S._viewerOpen = false;
   S.plyBlob = null; S.sogBlob = null;
   S.state = 'ready';
+  syncTrainingVisualsControl();
   S.preset = { id: '__sample', name };
   S.photos = rj.source.names.map((n, i) => ({ url: rj.source.urls[i], name: n }));
   S.sel = 0; S.atFrame = -1; S.fadeTo = 0;
@@ -5372,6 +5666,16 @@ function draw() {
     return;
   }
 
+  // During training the optimizer keeps its own compute/render path. These
+  // app-level presentation passes (model viewport, camera overlays and image
+  // comparison) are optional and sleep by default; the score chart is separate.
+  if (S.state === 'train' && (!S.trainVisuals || !$('details').hidden)) {
+    if (gpuCanvas) gpuCanvas.style.display = 'none';
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    return;
+  }
+  if (gpuCanvas && gpuCanvas.style.display === 'none') gpuCanvas.style.display = '';
+
   // train/done: the model, rendered by the trainer at this exact pose
   // (render capped at the session's view-buffer size, blit scales up)
   const onFrame = S.atFrame >= 0;
@@ -5686,7 +5990,10 @@ function wireAccount() {
   });
 }
 
-function gpuFacts() {
+function gpuFacts(preferSaved = true) {
+  if (preferSaved && S._savedGpuFacts && S.state !== 'train') {
+    return { ...S._savedGpuFacts, ips: S.itersPerSec || S._savedGpuFacts.ips || 0 };
+  }
   const g = S.session && S.session.gpu;
   const adapter = (g && g.adapter) || (S.gpuProbe && S.gpuProbe.adapter) || null;
   const device = (g && g.device) || null;
@@ -5803,7 +6110,7 @@ function buildGpuReport() {
   L.push(`features: ${g.features.join(', ') || 'none of interest'}${g.granted ? ' (device granted)' : ' (adapter)'}`);
   if (S.session) {
     L.push(`session: ${S.state} · ${fmt(S.splats || 0)} splats · ${fmt(S.iter || 0)} cycles${g.ips ? ` · ${fmt(g.ips)} cycles/s` : ''}`);
-    L.push(`settings: ${JSON.stringify(S.settings)} · preset ${S.preset ? S.preset.id : '?'}`);
+    L.push(`settings: ${JSON.stringify(S._savedDetailSettings || S.settings)} · preset ${S.preset ? S.preset.id : (S._localRun && S._localRun.name) || '?'}`);
   }
   return L.join('\n');
 }
@@ -5833,11 +6140,14 @@ function syncDetailsUrl() {
 
 function closeDetails() {
   $('details').hidden = true;
+  syncTrainingVisualsControl();
+  if (S.state === 'train') persistRunDetails(S.runId, { full: false }).catch(() => {});
   syncDetailsUrl();
 }
 
 function openDetails() {
   $('details').hidden = false;
+  syncTrainingVisualsControl();
   if (!S.session) {
     // the wall: only the device itself has facts to show
     S.detailTab = 'gpu';
@@ -5861,7 +6171,7 @@ function openDetails() {
 function renderDetails() {
   if (!S.session) return renderDetailsNoSession();
   const ses = S.session, recon = ses.recon;
-  const n = S.photos.length;
+  const n = S.photos.length || (ses.frames && ses.frames.length) || 0;
   const placed = recon.cams.length;
   $('d-sub').textContent = `${S.preset.name} · ` +
     // pano sets have no 1:1 photograph list — count placed views instead
@@ -6002,7 +6312,7 @@ function renderDetails() {
       ],
       rows: [
         stat('GPU', (() => {
-          const gi = (S.session && S.session.gpu && S.session.gpu.info) || {};
+          const gi = (S.session && S.session.gpu && S.session.gpu.info) || S._savedGpuFacts || {};
           return esc([gi.vendor, gi.architecture].filter(Boolean).join(' ')) || '—';
         })()),
         stat('Speed', ipsAll ? `${fmt(ipsAll)} <small>cycles/s</small>` : '—', 'accent'),
@@ -6019,7 +6329,7 @@ function renderDetails() {
     gpu: S.detailTab === 'gpu' ? gpuTab(stat) : null,
   }[S.detailTab];
 
-  $('d-prev').hidden = $('d-next').hidden = S.detailTab !== 'marks';
+  $('d-prev').hidden = $('d-next').hidden = S.detailTab !== 'marks' || !S.photos.length;
 
   // the visual slot: the photo/pair/cameras canvas, the score chart, or the log
   const vis = (S.detailTab === 'perf' || S.detailTab === 'gpu') ? 'perf' : S.detailTab === 'score' ? 'chart' : 'cv';
@@ -6131,10 +6441,19 @@ function drawDetail() {
   }
   const ctx = cv.getContext('2d');
   const w = cv.width, h = cv.height;
+  const sourceUnavailable = () => {
+    ctx.fillStyle = '#070909'; ctx.fillRect(0, 0, w, h);
+    ctx.save(); ctx.scale(dpr, dpr);
+    ctx.fillStyle = '#93a1a0'; ctx.font = '500 12px "Spline Sans Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('The saved landmarks and match counts are available,', w / dpr / 2, h / dpr / 2 - 8);
+    ctx.fillText('but the original photos are not on this device.', w / dpr / 2, h / dpr / 2 + 12);
+    ctx.restore();
+  };
   if (S.detailTab === 'marks') {
     ctx.fillStyle = '#070909'; ctx.fillRect(0, 0, w, h);
     const p = S.photos && S.photos[S.sel];
-    if (!p || !p.url) return;
+    if (!p || !p.url) { sourceUnavailable(); return; }
     const img = readyBmp(p.url);
     if (!img) return;
     const r = fitRect(img.width, img.height, w / dpr, h / dpr, 6);
@@ -6142,6 +6461,8 @@ function drawDetail() {
     ctx.drawImage(img, r.x, r.y, r.w, r.h);
     drawRealMarks(ctx, r, S.sel);
     ctx.restore();
+  } else if (!S.photos.length || !S.photos.some((p) => p && p.url)) {
+    sourceUnavailable();
   } else {
     pairStage(ctx, w, h, dpr);
   }
