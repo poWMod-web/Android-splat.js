@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0e1112">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>SplatXR — Capture &amp; Train</title>
+<meta name="description" content="Capture pose-tagged photos with WebXR and train a 3D Gaussian splat in JavaScript on your GPU. Built on splat.js. Photos stay on your device.">
+<meta name="author" content="arrival.space">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="SplatXR">
+<meta property="og:title" content="SplatXR — Capture &amp; Train">
+<meta property="og:description" content="Camera poses solved and a Gaussian splat trained entirely in the browser on WebGPU. No upload, no server, no install.">
+<meta property="og:image" content="https://ugc.arrival.space/splatjs/og.jpg">
+<meta property="og:image:width" content="1632">
+<meta property="og:image:height" content="1099">
+<meta property="og:image:alt" content="The Tanks &amp; Temples Truck scene reconstructed as a Gaussian splat in Splat.js">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="SplatXR — Capture &amp; Train">
+<meta name="twitter:description" content="Camera poses solved and a Gaussian splat trained entirely in the browser on WebGPU. No upload, no server, no install.">
+<meta name="twitter:image" content="https://ugc.arrival.space/splatjs/og.jpg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=Spline+Sans+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/app.css">
+<link rel="stylesheet" href="css/xr.css">
+</head>
+<body>
+
+<header class="bar">
+  <button class="brand" id="brand" title="Home">
+    <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M29.3953 17.408C29.3974 15.1319 28.8196 12.8928 27.7163 10.9021C26.6131 8.91129 25.0207 7.23447 23.0896 6.02986C21.1584 4.82525 18.9522 4.13258 16.679 4.01722C14.4059 3.90186 12.1409 4.36762 10.0977 5.37053C8.05453 6.37345 6.3006 7.88044 5.00145 9.7493C3.70229 11.6182 2.90077 13.7872 2.67251 16.0518C2.44426 18.3164 2.7968 20.6018 3.69688 22.6923C4.59695 24.7828 6.01487 26.6095 7.81681 28H11.2131L11.8429 26.5165C11.8418 26.5157 11.8406 26.5152 11.8393 26.5149L18.1329 11.6902L14.4801 11.6916L9.00327 24.5643C7.57173 23.167 6.59147 21.373 6.18883 19.4135C5.78619 17.454 5.97963 15.4188 6.7442 13.5702C7.50878 11.7217 8.80946 10.1445 10.4786 9.04187C12.1477 7.93927 14.1089 7.36183 16.1092 7.38397C18.1095 7.4061 20.0573 8.0268 21.7017 9.16607C23.346 10.3053 24.6115 11.911 25.3349 13.776C26.0584 15.641 26.2068 17.68 25.7609 19.6301C25.3149 21.5802 24.2952 23.3521 22.8331 24.7173L19.6872 17.3043L18.6266 14.7649L16.7468 19.1231L20.6179 28H24.1831C25.8052 26.7518 27.1189 25.1475 28.0226 23.3109C28.9263 21.4744 29.396 19.4548 29.3953 17.408Z" fill="currentColor"/><path d="M12.9377 28.0001H20.6179L16.7468 19.123L12.9377 28.0001Z" fill="#73D8D4"/></svg></span>
+    <span class="brand-name">Splat<em>XR</em></span>
+  </button>
+  <span class="xr-edition">CAPTURE &amp; TRAIN</span>
+  <button class="tbtn" id="btn-new" hidden title="Back to the front page"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true" class="ai"><path d="M13 8H3M7.2 3.8 3 8l4.2 4.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Back</button>
+  <span class="grow"></span>
+  <button class="tbtn" id="btn-xr-help">Device guide</button>
+  <button class="tbtn" id="btn-install">Install app</button>
+  <a class="tbtn ghlink" id="discord" target="_blank" rel="noopener" hidden title="Tell us what you think — on Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.369a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.249a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.036A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.009c.12.099.246.198.373.292a.077.077 0 0 1-.006.127c-.598.35-1.22.644-1.873.891a.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.029 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.056c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.331c-1.183 0-2.157-1.086-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.332-.955 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.086-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.332-.946 2.418-2.157 2.418z"/></svg>Feedback</a>
+  <a class="tbtn ghlink" id="gh" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>Source</a>
+  <button class="tbtn" id="acct" type="button"></button>
+  </header>
+
+<footer class="dock" id="dock"></footer>
+
+<main class="stage" id="stage" data-cursor="grab">
+  <canvas id="cv"></canvas>
+
+  <div class="hud" id="hud"></div>
+
+  <div class="controls" id="controls" hidden></div>
+
+  <div class="card-start" id="start" hidden>
+    <button class="card-x" id="card-x" hidden aria-label="Keep the current run">&times;</button>
+
+    <p class="eyebrow">SPATIAL CAPTURE, ENTIRELY IN YOUR BROWSER</p>
+    <h1>Turn your world into a splat.</h1>
+    <p class="origin">Same splat.js. A camera that knows where it is. Capture pose-tagged
+      photos with WebXR to <b>skip the camera solve</b>, or use 20–200 overlapping photos
+      and the original workflow. Training and export run locally on your GPU.
+      <a class="linkish" id="read-more" href="#">Read more</a></p>
+
+    <div class="xr-capabilities" aria-label="Device capabilities"><span id="xr-ar-state">Checking WebXR</span><span id="xr-gpu-state">Checking WebGPU</span><span class="xr-local">Local-first capture</span></div>
+    <div class="upload" id="upload">
+      <div class="upload-btns">
+        <button class="btn btn-accent btn-cta" id="btn-ar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H4a1 1 0 0 0-1 1v4m13-5h4a1 1 0 0 1 1 1v4M3 16v4a1 1 0 0 0 1 1h4m13-5v4a1 1 0 0 1-1 1h-4"/><circle cx="12" cy="12" r="4"/><path d="M12 7v2m0 6v2m-5-5h2m6 0h2"/></svg><span>Checking AR…</span></button>
+        <label class="btn btn-outline">Choose photos / import<input type="file" id="file-input" multiple accept="image/*,video/*,.json,.mov,.mp4,.m4v,.webm,.mkv" hidden></label>
+        <button class="btn btn-outline" id="btn-record" hidden><svg viewBox="0 0 24 24" class="capicon" aria-hidden="true"><path d="M4.5 7.5h2.6l1.5-2h6.8l1.5 2h2.6a1.4 1.4 0 0 1 1.4 1.4v8.6a1.4 1.4 0 0 1-1.4 1.4h-15a1.4 1.4 0 0 1-1.4-1.4V8.9a1.4 1.4 0 0 1 1.4-1.4z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="12" cy="12.7" r="3.3" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Camera</button>
+      </div>
+    </div>
+    <p class="xr-capability-note" id="xr-capability-note" role="status">Checking this browser’s capture capabilities…</p>
+    <a class="xr-open-tab" id="xr-open-tab" target="_blank" rel="noopener" hidden>Open a full browser tab for AR capture ↗</a>
+    <div class="xr-flow"><div><span class="xr-flow-no">01 / CAPTURE</span><h3>Walk around it.</h3><p>Take overlapping views. Each AR photo keeps its exact camera transform.</p></div><div><span class="xr-flow-no">02 / POSITION</span><h3>Already in place.</h3><p>Known poses bypass SfM. Depth or hit tests add measured seeds when available.</p></div><div><span class="xr-flow-no">03 / TRAIN</span><h3>Make it a splat.</h3><p>JavaScript + WebGPU. Preview the scene and export a standard .ply.</p></div></div>
+    <button class="xr-example" id="btn-xr-example"><img src="data/synthetic/synthetic_00.png" alt="Bundled synthetic room corner"><span><b>Try a scene with known cameras</b><small>12 bundled views · no AR device needed · real training</small></span><span class="xr-arrow" aria-hidden="true">↗</span></button>
+    <div class="xr-home-foot"><button id="xr-device-guide">Compatibility &amp; capture guide</button><button id="xr-install-app">Install on Android</button><a href="https://github.com/arrival-space/splat.js" target="_blank" rel="noopener">Built on splat.js ↗</a></div>
+
+    <div id="gallery" hidden></div>
+
+    <p class="setdesc" id="set-desc" hidden></p>
+
+    <!-- the avatar route: decided HERE, on the start-training card, next to the
+         other settings — not minutes earlier when the video was read (the user,
+         2026-09-18). Ticking it cuts the person out of every frame first. -->
+    <label class="av-choice" id="av-choice" hidden title="Cuts the person out of every frame before training, keeps the room in the solve, isolates the person afterwards and rigs the result. Your own captures only.">
+      <input type="checkbox" id="set-avatar">
+      <span>This is a person — make an avatar
+        <small>An orbit at arm's length, arms slightly out. The person is cut out of every frame before training; afterwards the splat is isolated, fitted to a body model and can go on your arrival.space account.</small>
+      </span>
+    </label>
+
+    <div class="xr-set-tools" id="xr-set-tools" hidden><span id="xr-set-mode"></span><button class="btn btn-outline" id="xr-review-set">Review frames &amp; poses</button><button class="btn btn-outline" id="xr-export-set">Export capture ↓</button></div>
+    <div class="startrow">
+      <button class="btn btn-accent big btn-cta" id="btn-go">Start training</button>
+      <select class="q-quick" id="q-quick" title="Training quality — Draft is quick and light, Showcase trains long at the largest splat budget. The gear holds every knob.">
+        <option value="draft">Draft</option>
+        <option value="standard">Standard</option>
+        <option value="high">High</option>
+        <option value="showcase">Showcase</option>
+        <option value="custom" hidden>Custom</option>
+      </select>
+      <button class="iconbtn setgear" id="btn-settings" aria-expanded="false" title="Training settings" aria-label="Training settings"><svg viewBox="0 0 24 24" class="gear" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.09a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.09a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z"/></svg><span class="chev">&#8250;</span></button>
+    </div>
+
+    <div class="settings" id="settings" hidden>
+      <div class="setrow setrow-range" id="row-count" hidden title="How many of the set's images to use. More images, longer solve — pair matching grows with the square of the count."><label for="set-count">Images</label>
+        <input id="set-count" type="range" min="2" step="1" value="42">
+        <button class="countv" id="set-count-v" title="Use every image">42 / 251</button></div>
+      <!-- the quality macro lives in the dropdown beside Start; this row stays
+           in the DOM (the two selects mirror each other) but is not shown -->
+      <div class="setrow" hidden title="One knob for the rows below. Draft is quick and light, Showcase trains long at the largest splat budget. Editing a row below shows Custom."><label for="set-q">Quality</label>
+        <select id="set-q">
+          <option value="draft">Draft</option>
+          <option value="standard">Standard</option>
+          <option value="high">High</option>
+          <option value="showcase">Showcase</option>
+          <option value="custom" hidden>Custom</option>
+        </select></div>
+      <div class="setrow" title="Largest image dimension the photos are downscaled to for training. Auto picks from image size, count and GPU memory. Full = the pictures' own size, as far as the memory budget allows; only steps the pictures can fill are listed."><label for="set-res">Training resolution</label>
+        <select id="set-res">
+          <option value="">Auto</option>
+          <option value="480">480 px</option>
+          <option value="640">640 px</option>
+          <option value="960">960 px</option>
+          <option value="1280">1280 px</option>
+          <option value="1600">1600 px</option>
+          <option value="1920">1920 px</option>
+          <option value="-1">Full size</option>
+        </select></div>
+      <div class="setrow" title="Image dimension the camera solver finds its landmarks at. Higher = more precise camera poses (sharper splats), slower solve, more memory."><label for="set-feat">Solve resolution</label>
+        <select id="set-feat">
+          <option value="">Auto (960 px)</option>
+          <option value="1280">1280 px</option>
+          <option value="1600">1600 px</option>
+        </select></div>
+      <div class="setrow" title="How hard the camera solver works. Quick: 3900 landmarks per photo at the base scale — about half the solve time, poses good enough for a draft. Standard: 8000 landmarks from an upsampled scale plus a pixel-aspect term — the sharpest poses (about +0.4 dB on the trained model)."><label for="set-solve">Camera solve</label>
+        <select id="set-solve">
+          <option value="quick">Quick</option>
+          <option value="standard">Standard</option>
+        </select></div>
+      <div class="setrow" title="Render grid relative to the training resolution. 2× removes edge ringing at sharp viewing sizes (~1.7× slower); 0.5× quarters the raster work."><label for="set-buf">Working buffer</label>
+        <select id="set-buf">
+          <option value="0.5">0.5×</option>
+          <option value="1">1×</option>
+          <option value="2">2×</option>
+        </select></div>
+      <div class="setrow" title="View-dependent colour detail. 0 = flat colours (faster, smaller file); 3 = full."><label for="set-sh">Spherical harmonics</label>
+        <select id="set-sh">
+          <option value="0">0</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+        </select></div>
+      <div class="setrow" title="Splat budget the model grows toward. More splats, finer detail — and a larger export file and more GPU memory. Auto sizes from the cycle budget and device (a short run cannot feed a large budget)."><label for="set-splats">Splats</label>
+        <select id="set-splats">
+          <option value="">Auto</option>
+          <option value="300000">300,000</option>
+          <option value="600000">600,000</option>
+          <option value="1000000">1,000,000</option>
+          <option value="2000000">2,000,000</option>
+          <option value="4000000">4,000,000</option>
+        </select></div>
+      <div class="setrow" title="Off by default. When enabled, train and snapshot at halving detail levels (…250k, 500k, 1M) on the way to the full budget. Needs a splat budget of 1,000,000 or more."><label for="set-lod">LOD levels</label>
+        <select id="set-lod">
+          <option value="">Off</option>
+          <option value="1">On</option>
+        </select></div>
+      <div class="setrow" title="Choose how many intermediate LOD snapshots to create. The final full-detail model is always included. 0 means Auto. Halving levels never go below 250,000 splats."><label for="set-lod-count">LOD snapshots</label>
+        <input id="set-lod-count" type="number" min="0" max="4" step="1" value="0" inputmode="numeric" aria-describedby="set-lod-hint" disabled></div>
+      <p class="set-hint" id="set-lod-hint">Enable LOD with a splat budget of at least 1,000,000. 0 = Auto.</p>
+      <div class="setrow" title="MCMC-style optimizer: fine-grained growth and relocation, exploration noise, scale pressure. Measured ahead of the classic schedule on most scene and budget combinations; Off restores the classic schedule."><label for="set-mcmc">MCMC optimizer</label>
+        <select id="set-mcmc">
+          <option value="">On</option>
+          <option value="0">Off</option>
+        </select></div>
+      <div class="setrow" title="Choose a training budget from 10,000 to 50,000 cycles. A finished run can continue with +10,000 more."><label for="set-iters">Cycles</label>
+        <select id="set-iters" aria-describedby="set-iters-hint">
+          <option value="10000">10,000</option>
+          <option value="20000" selected>20,000</option>
+          <option value="30000">30,000</option>
+          <option value="40000">40,000</option>
+          <option value="50000">50,000</option>
+        </select></div>
+      <p class="set-hint" id="set-iters-hint">Choose 10,000–50,000 cycles. Short runs may not reach every requested LOD.</p>
+      <div class="setgroup av-only" title="These rows apply to avatar runs only (the box on the video card). All off (the default) solves and trains like a scene run; each row adds one avatar specific.">Avatar</div>
+      <div class="setrow av-only" title="Avatar runs only. Evaluates the colour harmonics on the horizontal part of the view direction: an orbit never looks down at a person, so the vertical colour variation is unconstrained and shows as blotches from above. Off = full harmonics."><label for="set-shup">Horizontal SH</label>
+        <select id="set-shup">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select></div>
+      <div class="setrow av-only" title="Avatar runs only. Native-resolution windows of the person join the cameras so the face and body train at full pixel detail. Re-posed: when the head moved against the room, the head windows take a face-PnP pose of their own. Room pose: every window keeps its frame's pose. Off = the room frames only, like a scene run."><label for="set-av-crops">Person crops</label>
+        <select id="set-av-crops">
+          <option value="off" selected>Off</option>
+          <option value="room">On, room pose</option>
+          <option value="face">On, head re-posed to the face</option>
+        </select></div>
+      <div class="setrow av-only" title="Avatar runs only. The precise camera-solve tier regardless of the Camera solve setting. Off = the panel's Camera solve, like a scene run."><label for="set-av-tier">Precise solve</label>
+        <select id="set-av-tier">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select></div>
+      <div class="setrow av-only" title="Avatar runs only. A 1.1 GB decode budget so the frames train larger. Off = the default budget, like a scene run."><label for="set-av-budget">Large decode</label>
+        <select id="set-av-budget">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select></div>
+      <div class="setrow av-only" title="Avatar runs only. The model starts from 100,000 Gaussians. Off = the seed scales with the solve's point count, like a scene run."><label for="set-av-seed">100k seed</label>
+        <select id="set-av-seed">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select></div>
+      <div class="setrow av-only" title="Avatar runs only. Opacity pressure 0.004 that stops at half the run, keeping the face dense. Off = the scene pressure 0.01 throughout."><label for="set-av-opa">Opacity pressure</label>
+        <select id="set-av-opa">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select></div>
+      <div class="setrow av-only" title="Avatar runs only. A small penalty on needle-shaped splats (0.03). Off = none, like a scene run."><label for="set-av-needle">Needle term</label>
+        <select id="set-av-needle">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select></div>
+    </div>
+  </div>
+
+  <div class="card-start" id="detail" hidden>
+    <button class="card-back" id="detail-back" aria-label="Back">&#8249;</button>
+    <button class="card-x" id="detail-x" aria-label="Close">&times;</button>
+    <img class="detail-hero" id="detail-hero" alt="" hidden><div class="detail-stats" id="detail-stats" hidden></div>
+    <div id="detail-body"></div>
+  </div>
+</main>
+
+<div class="strip" id="strip"></div>
+
+<section class="sheet" id="details" hidden>
+  <div class="sheet-head">
+    <div>
+      <h2>Details</h2>
+      <p id="d-sub">—</p>
+    </div>
+    <div class="sheet-tools">
+      <span id="d-export"></span>
+      <button class="sheet-x" id="d-close" aria-label="Close">&times;</button>
+    </div>
+  </div>
+  <div class="sheet-body">
+    <div class="sheet-row">
+      <div class="sheet-vis">
+        <div class="seg" id="d-seg"></div>
+        <button class="d-nav" id="d-prev" hidden aria-label="Previous photo">&#8249;</button>
+        <button class="d-nav" id="d-next" hidden aria-label="Next photo">&#8250;</button>
+        <canvas id="d-cv"></canvas>
+        <canvas id="d-chart" hidden></canvas>
+        <pre id="d-perf" class="perfpre" hidden></pre>
+        <p class="cap" id="d-cap">—</p>
+      </div>
+      <div class="sheet-txt" id="d-txt"></div>
+    </div>
+  </div>
+</section>
+
+<section class="about" id="about" hidden>
+  <div class="about-card">
+    <button class="card-x" id="about-x" aria-label="Close">&times;</button>
+    <p class="eyebrow">Splat.js</p>
+    <h2>Gaussian splat training, in a browser tab</h2>
+    <p>Give it overlapping photographs of a place and the whole pipeline runs here:
+       landmarks are found and matched across the photos, the camera positions are
+       solved for, those points become Gaussian splats, and the splats are trained
+       against your photographs until the render matches them. What comes out is a
+       standard <code>.ply</code> that opens in any splat viewer.</p>
+    <div class="about-note">
+      <b>Nothing is uploaded unless you publish.</b>
+      <span>No server, no cloud, no queue: your photographs are decoded in this page,
+        solved and trained on your own GPU, and never leave your machine. No account
+        is needed for any of that. Publishing is the one thing that sends anything —
+        and what it sends is the finished model, not your photographs, unless you tick
+        the box that includes them.</span>
+    </div>
+    <div class="about-gpu" id="about-gpu" hidden>
+      <div class="about-gpu-head">
+        <b>Device Info</b>
+        <button class="iconbtn" id="about-gpu-copy" type="button" title="Copy GPU report" aria-label="Copy GPU report">
+          <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9" y="9" width="11" height="11" rx="2"/>
+            <path d="M5 15V6a2 2 0 0 1 2-2h9"/>
+          </svg>
+        </button>
+      </div>
+      <span id="about-gpu-txt">…</span>
+    </div>
+    <div class="about-foot">
+      <a id="about-gh" target="_blank" rel="noopener">Source on GitHub ↗</a>
+      <span>Made by <a href="https://arrival.space" target="_blank" rel="noopener">Arrival.Space</a></span>
+      <span class="about-ver">dev build</span>
+    </div>
+  </div>
+</section>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

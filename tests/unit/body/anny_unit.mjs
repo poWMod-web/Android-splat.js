@@ -1,0 +1,13 @@
+import { readFileSync } from 'node:fs';
+import { parseAnny } from '../../../app/avatar/body/anny.js';
+const buf = readFileSync('app/models/anny_game_engine.bin'); const anny = parseAnny(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+const t = anny.meta.test; const B = anny.B;
+console.log(`snapshot: V ${anny.V} B ${B} K ${anny.K}; pca rms ${anny.meta.vertexRmsMm.toFixed(2)} mm`);
+const rv = new Float32Array(B * 3); t.rotvec.forEach((r, b) => rv.set(r, b * 3));
+const t0 = performance.now(); const out = anny.forward(t.beta, rv); const dt = performance.now() - t0;
+const err = (a, b, n) => { let s = 0, mx = 0; for (let i = 0; i < n; i++) { const d = Math.hypot(a[i * 3] - b[i * 3], a[i * 3 + 1] - b[i * 3 + 1], a[i * 3 + 2] - b[i * 3 + 2]); s += d; mx = Math.max(mx, d); } return [s / n * 1000, mx * 1000]; };
+console.log('rest heads vs torch (exact shape): mean/max mm', err(out.restHeads, t.restHeadsExact, B).map((v) => v.toFixed(2)));
+console.log('posed heads vs torch: mean/max mm', err(out.heads, t.headsExact, B).map((v) => v.toFixed(2)));
+console.log('posed verts (first 1000) vs torch: mean/max mm', err(out.verts, t.vertsExact, 1000).map((v) => v.toFixed(2)));
+console.log(`forward ${dt.toFixed(1)} ms; keypoints`, Object.fromEntries(Object.entries(anny.keypoints(out.verts)).slice(0, 3).map(([k, v]) => [k, v.map((x) => +x.toFixed(3))])));
+console.log('outer surface verts', anny.outerSurfaceMask().reduce((a, b) => a + b, 0), 'of', anny.V);

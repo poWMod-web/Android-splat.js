@@ -30,7 +30,7 @@ LOD is **Off by default**. To enable it, choose **On**, select a splat budget of
 
 The app includes a standalone PWA manifest and **Install app** controls. On a compatible Android device, open the hosted HTTPS page in full Chrome and use the install prompt or Chrome menu → Install app / Add to Home screen. This runs the JavaScript app in the browser's runtime; it does not unlock WebGPU on unsupported GPUs or grant unavailable WebXR modules. The current service worker intentionally does not provide offline training.
 
-See [Android installation guide](docs/android-install.md) and [Android packaging runbook](android/README.md). The `android/` directory contains an official Bubblewrap/TWA initialization helper. A verified signed APK is not included: it needs a stable deployed HTTPS URL, an owner-chosen Android package ID and signing key, and verified Digital Asset Links. No domain or production signing identity is invented for this project.
+See [Android installation guide](docs/android-install.md) and [Android packaging runbook](android/README.md). The `android/` directory now contains a native arm64-v8a ARCore/WebView app project. GitHub Actions builds an installable debug APK artifact; a Play Store/release APK still needs owner-managed release signing credentials and physical-device validation. The browser PWA/WebXR path remains available separately.
 
 ## Transfer a capture
 
@@ -40,9 +40,9 @@ Captures, their transforms, seed points and local runs are kept in the existing 
 
 ## Platform limits
 
-ARCore itself is native, and is not bundled or run inside the browser. WebXR uses the device's available AR backend. Browser capability checks, not a broad Android/browser-name claim, decide whether immersive AR is offered. Raw Camera Access and depth support vary independently of AR support; unsupported devices retain file and standard-camera input. Native ARCore Cloud Anchors, Geospatial API and sparse feature-point access are not implemented.
+The browser version's WebXR route uses the device's available AR backend; browser capability checks decide whether immersive AR is offered. The separate Android APK contains a native ARCore capture route with CPU camera images, tracked poses, an accumulated coverage cloud, and RGB seed export. ARCore depth support and WebXR Raw Camera Access vary independently. Unsupported devices retain file and standard-camera input. Native ARCore Cloud Anchors and the Geospatial API are not implemented.
 
-WebGPU training requires an actual browser GPU adapter. AR capture can be used without WebGPU, followed by dataset export and desktop training. A real ARCore-compatible Android phone is required to validate physical tracking, camera orientation and depth on the target browser; those hardware capabilities cannot be exercised in this sandbox.
+WebGPU training requires an actual browser GPU adapter. AR capture can be used without WebGPU, followed by dataset export and desktop training. A real ARCore-compatible Android phone is required to validate physical tracking, camera orientation and depth on the native APK; those hardware capabilities cannot be exercised in this sandbox.
 
 ## Project structure
 
