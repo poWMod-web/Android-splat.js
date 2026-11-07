@@ -11,6 +11,12 @@
 // world frame is arbitrary — detectUp levels the horizon) without touching
 // the data.
 
+/** Shortest signed rotation from one pointer-pair angle to the next. */
+export function pointerAngleDelta(current, previous) {
+  const delta = current - previous;
+  return Math.atan2(Math.sin(delta), Math.cos(delta));
+}
+
 /** world position of a camera from its world-to-camera pose */
 export const camCentre = ({ R, t }) => [
   -(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]),
@@ -85,7 +91,7 @@ export class Viewport {
     const cv = this.cv;
     const pts = new Map();   // pointerId -> {x, y} (all active pointers)
     let mode = null;         // 'orbit' | 'pan' | 'two'
-    let pinch = null;        // two-finger baseline { d, cx, cy }
+    let pinch = null;        // two-finger baseline { d, cx, cy, angle }
 
     // camera-relative pan: sideways along the view's right, vertical along
     // its up — content follows the fingers from any orientation
@@ -102,6 +108,7 @@ export class Viewport {
       pinch = {
         d: Math.max(20, Math.hypot(v[1].x - v[0].x, v[1].y - v[0].y)),
         cx: (v[0].x + v[1].x) / 2, cy: (v[0].y + v[1].y) / 2,
+        angle: Math.atan2(v[1].y - v[0].y, v[1].x - v[0].x),
       };
       mode = 'two';
     };
@@ -133,10 +140,13 @@ export class Viewport {
 
       if (mode === 'two') {
         if (pts.size < 2) return;
-        // pinch = dolly, centroid = pan — the standard two-finger camera
+        // pinch = dolly, centroid = pan, twist = orbit — the three natural
+        // two-finger camera gestures, applied incrementally to avoid jumps.
         const v = [...pts.values()];
         const d = Math.max(20, Math.hypot(v[1].x - v[0].x, v[1].y - v[0].y));
         const cx = (v[0].x + v[1].x) / 2, cy = (v[0].y + v[1].y) / 2;
+        const angle = Math.atan2(v[1].y - v[0].y, v[1].x - v[0].x);
+        const turn = pointerAngleDelta(angle, pinch.angle);
         if (this.fpv) {
           // pinch out = walk forward
           const { fwd } = this._basis();
@@ -145,8 +155,20 @@ export class Viewport {
         } else {
           this.dist = Math.max(0.05, Math.min(400, this.dist * pinch.d / d));
         }
+        if (turn) {
+          if (this.fpv) {
+            // Rotate around the first-person eye, just like a one-finger orbit.
+            const { fwd } = this._basis();
+            const eye = this.target.map((v, i) => v - fwd[i] * this.dist);
+            this.yaw += turn;
+            const { fwd: nextFwd } = this._basis();
+            this.target = eye.map((v, i) => v + nextFwd[i] * this.dist);
+          } else {
+            this.yaw += turn;
+          }
+        }
         panBy(cx - pinch.cx, cy - pinch.cy);
-        pinch = { d, cx, cy };
+        pinch = { d, cx, cy, angle };
         this.dirty = true;
         return;
       }

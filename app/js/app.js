@@ -29,7 +29,7 @@ const HOME_BENCHMARK_IDS = new Set([
 
 import { Viewport, camCentre, quatFromR, quatToR, qslerp } from './viewport.js';
 import { Developer, fitRect } from './develop.js';
-import { Chart } from './chart.js';
+import { Chart, ssimToPercent } from './chart.js';
 import { bmp, readyBmp, sizedUrl } from './img.js';
 
 const $ = (id) => document.getElementById(id);
@@ -251,6 +251,7 @@ const S = {
   chartEvents: [],             // real refine/growth moments for the curve
   ssimTrainHist: [],
   ssimHoldHist: [],
+  ssimTrain: null, ssimHold: null,
   _ssimEvalBusy: false,
   _ssimLastEvalAt: 0,
   scoreScale: 'db',
@@ -296,15 +297,25 @@ function syncTrainingVisualsControl() {
   const stage = $('stage'), dock = $('dock');
   const plot = dock?.querySelector('.chartwrap') || stage?.querySelector('.chartwrap-expanded');
   const expandPlot = training && !S.trainVisuals && !detailOpen;
+  let plotMoved = false;
   if (expandPlot && plot) {
-    if (plot.parentElement !== stage) stage.insertBefore(plot, $('hud'));
+    if (plot.parentElement !== stage) {
+      stage.insertBefore(plot, $('hud'));
+      plotMoved = true;
+    }
     plot.classList.add('chartwrap-expanded');
     dock.classList.add('chart-expanded');
   } else {
     if (plot) plot.classList.remove('chartwrap-expanded');
-    if (plot && plot.parentElement === stage && dock) dock.insertBefore(plot, dock.querySelector('.tscores'));
+    if (plot && plot.parentElement === stage && dock) {
+      dock.insertBefore(plot, dock.querySelector('.tscores'));
+      plotMoved = true;
+    }
     dock?.classList.remove('chart-expanded');
   }
+  // The canvas CSS fills its new container. Redraw its backing pixels after
+  // reparenting instead of letting the old dock-sized bitmap get stretched.
+  if (plotMoved) requestAnimationFrame(() => chart?.resize());
 }
 
 function toggleTrainingVisuals() {
@@ -1638,7 +1649,7 @@ async function open(preset, autostart = false) {
   S.maxIters = PERF.on ? PERF.iters : INITIAL_ITERS;
   S.perfMetrics = [];
   S.holdHist = [];
-  S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0;
+  S.ssimTrainHist = []; S.ssimHoldHist = []; S.ssimTrain = null; S.ssimHold = null; S._ssimLastEvalAt = 0;
   S._lastReady = null;
   S.growthStopped = false;
   S.plyBlob = null; S.sogBlob = null;
@@ -1817,7 +1828,7 @@ async function startPrep() {
   // metrics tick; stale dB and splat counts flash the same way).
   S.iter = 0; S.splats = 0; S.psnrTrain = null; S.psnrHold = null;
   S.itersPerSec = 0; S.minutes = 0; S.etaAt = null;
-  S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.growthStopped = false;
+  S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S.ssimTrain = null; S.ssimHold = null; S._ssimLastEvalAt = 0; S.growthStopped = false;
   S.feats = new Map(); S.lastPairEv = null; S.shownPair = null; S.regCams = [];
   S.regPts = null; S.regPtsCount = 0; S.growNote = null;
   S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
@@ -2633,6 +2644,8 @@ function restoreRunDetails(run, session = S.session) {
   S.ssimTrainHist = ssimHistory.map((r) => Array.from(r || []));
   S.ssimHoldHist = (Array.isArray(progress.ssimHolds) ? progress.ssimHolds
     : ((S.restored && S.restored.stats && S.restored.stats.ssimHolds) || [])).map((r) => Array.from(r || []));
+  S.ssimTrain = S.ssimTrainHist.length ? S.ssimTrainHist[S.ssimTrainHist.length - 1][1] : null;
+  S.ssimHold = S.ssimHoldHist.length ? S.ssimHoldHist[S.ssimHoldHist.length - 1][1] : null;
   S._ssimLastEvalAt = 0;
   S.perfMetrics = Array.isArray(progress.metrics) ? progress.metrics.map((m) => Array.from(m || [])) : [];
   const lastMetric = S.perfMetrics[S.perfMetrics.length - 1];
@@ -2697,6 +2710,23 @@ async function checkpointRun(reason) {
   } finally { S._ckptBusy = false; }
 }
 
+function renderTrainingScore() {
+  const similarity = S.scoreScale === 'similarity';
+  const train = similarity ? S.ssimTrain : S.psnrTrain;
+  const hold = similarity ? S.ssimHold : S.psnrHold;
+  const value = (v) => v == null || Number.isNaN(v)
+    ? '—' : (similarity ? ssimToPercent(v) : v).toFixed(2);
+  const unit = similarity ? 'SSIM %' : 'dB';
+  const trainEl = $('t-ptrain');
+  if (trainEl) trainEl.textContent = value(train);
+  const trainUnit = $('t-punit');
+  if (trainUnit) trainUnit.textContent = unit;
+  const holdEl = $('t-phold');
+  if (holdEl) holdEl.textContent = value(hold);
+  const holdUnit = $('t-hunit');
+  if (holdUnit) holdUnit.textContent = unit;
+}
+
 function maybeEvaluateSsim(iter = S.iter) {
   if (S.scoreScale !== 'similarity' || S._ssimEvalBusy || !S.session?.evalGraphMetrics) return;
   const now = performance.now();
@@ -2712,8 +2742,11 @@ function maybeEvaluateSsim(iter = S.iter) {
   const gen = S.gen;
   session.evalGraphMetrics(trainCi, holdCi).then(({ train, hold }) => {
     if (S.gen !== gen || S.session !== session || !Number.isFinite(train?.ssim)) return;
+    S.ssimTrain = train.ssim;
+    S.ssimHold = Number.isFinite(hold?.ssim) ? hold.ssim : null;
     S.ssimTrainHist.push([iter, train.ssim]);
     if (Number.isFinite(hold?.ssim)) S.ssimHoldHist.push([iter, hold.ssim]);
+    renderTrainingScore();
     if (S.ssimTrainHist.length > 1000) S.ssimTrainHist = compactRows(S.ssimTrainHist, 800);
     if (S.ssimHoldHist.length > 1000) S.ssimHoldHist = compactRows(S.ssimHoldHist, 800);
     if (chart) {
@@ -2778,9 +2811,7 @@ function onMetrics(m) {
       el.textContent = pctOf(S.iter);
       $('t-splats').textContent = fmt(S.splats);
       $('t-eta').textContent = etaText();
-      $('t-ptrain').textContent = S.psnrTrain != null ? S.psnrTrain.toFixed(2) : '—';
-      const ph = $('t-phold');   // only rendered in ?eval benchmark mode
-      if (ph) ph.textContent = S.psnrHold != null ? S.psnrHold.toFixed(2) : '—';
+      renderTrainingScore();
     }
   }
   if (!$('details').hidden && S.detailTab === 'score') {
@@ -2879,7 +2910,7 @@ async function deviceLostRecovery() {
     await S.session.recover();
     if (S.gen !== gen) return;
     S.iter = 0; S.psnrTrain = null; S.psnrHold = null;
-    S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.growthStopped = false;
+    S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S.ssimTrain = null; S.ssimHold = null; S._ssimLastEvalAt = 0; S.growthStopped = false;
     S.plyBlob = null; S.sogBlob = null;
     buildSceneFromSession();
     mountModelCanvas();
@@ -3177,7 +3208,7 @@ async function restoreSession(src) {
     S._resumeRunId = null;
     S.feats = new Map(); S.lastPairEv = null;
     S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
-    S.chartEvents = []; S.holdHist = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.perfMetrics = []; S.itersPerSec = 0;
+    S.chartEvents = []; S.holdHist = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S.ssimTrain = null; S.ssimHold = null; S._ssimLastEvalAt = 0; S.perfMetrics = []; S.itersPerSec = 0;
     S._savedGpuFacts = null; S._savedDetailSettings = null;
     // a run that was already shared knows its space: the viewer offers its
     // link and its listing, where a reload used to leave only a Download
@@ -3885,7 +3916,7 @@ async function continueLocalRun(viewOnly = false) {
   if (S.gen !== gen) return;
   S.iter = baseIter;
   S.psnrTrain = null; S.psnrHold = null;
-  S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.growthStopped = false;
+  S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S.ssimTrain = null; S.ssimHold = null; S._ssimLastEvalAt = 0; S.growthStopped = false;
   restoreRunDetails(lr, ses);
   buildSceneFromSession();
   mountModelCanvas();
@@ -4912,12 +4943,12 @@ function dock(kind) {
       <div class="chartwrap"><canvas id="chart"></canvas><div class="chart-tip" id="chart-tip" hidden></div></div>
       <div class="tscores">
         <div class="score" data-tone="accent">
-          <div class="score-1"><span class="t-state" id="t-title">Training…</span><span class="score-v"><span id="t-ptrain">${S.psnrTrain != null ? S.psnrTrain.toFixed(2) : '—'}</span><small class="unit">dB</small></span></div>
+          <div class="score-1"><span class="t-state" id="t-title">Training…</span><span class="score-v"><span id="t-ptrain">${S.scoreScale === 'similarity' ? (S.ssimTrain != null ? ssimToPercent(S.ssimTrain).toFixed(2) : '—') : (S.psnrTrain != null ? S.psnrTrain.toFixed(2) : '—')}</span><small class="unit" id="t-punit">${S.scoreScale === 'similarity' ? 'SSIM %' : 'dB'}</small></span></div>
           <div class="score-sub"><span id="t-splats">${S.splats ? fmt(S.splats) : '—'}</span> splats</div>
           <button class="chart-scale score-scale" id="chart-scale" type="button">Use %</button>
           <span class="tmeta-grow" id="t-grow">&nbsp;</span>
         </div>
-        ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${S.psnrHold != null ? S.psnrHold.toFixed(2) : '—'}</span><small class="unit">dB</small></span></div><div class="score-sub">held out</div></div>` : ''}
+        ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${S.scoreScale === 'similarity' ? (S.ssimHold != null ? ssimToPercent(S.ssimHold).toFixed(2) : '—') : (S.psnrHold != null ? S.psnrHold.toFixed(2) : '—')}</span><small class="unit" id="t-hunit">${S.scoreScale === 'similarity' ? 'SSIM %' : 'dB'}</small></span></div><div class="score-sub">held out</div></div>` : ''}
       </div>`;
     $('t-play').addEventListener('click', toggleTrain);
     $('t-finish').addEventListener('click', async () => {
@@ -4952,6 +4983,7 @@ function toggleScoreScale() {
   if (chart) { chart.scale = S.scoreScale; chart.draw(); }
   if (dchart) { dchart.scale = S.scoreScale; dchart.draw(); }
   syncScoreScaleControls();
+  renderTrainingScore();
   if (S.scoreScale === 'similarity') maybeEvaluateSsim(S.iter);
 }
 

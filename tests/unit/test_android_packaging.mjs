@@ -32,10 +32,11 @@ assert.match(native, /getDecorView\(\)\.setSystemUiVisibility\(0\)/,
   'capture UI must not request layout behind system bars');
 assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?uvOutput\.position\(0\);/,
   'camera preview must use ARCore-transformed display coordinates');
-assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?for \(int row = 0; row < 2; row\+\+\)[\s\S]*?int left = row \* 4, right = left \+ 2;[\s\S]*?uvOutput\.put\(left, uvOutput\.get\(right\)\);[\s\S]*?uvOutput\.put\(right, leftU\);/,
-  'the front-camera preview should be mirrored by swapping transformed UV pairs');
-assert.match(native, /world-space point cloud is still drawn from ARCore\x27s camera matrices/,
-  'mirroring the preview must not transform world-space point coordinates');
+const backgroundDraw = native.slice(native.indexOf('private void drawBackground(Frame frame)'), native.indexOf('private void updateCoverage(Frame frame)'));
+assert.match(backgroundDraw, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*for \(int vertex = 0; vertex < 2; vertex\+\+\)[\s\S]*int first = vertex \* 2, opposite = \(3 - vertex\) \* 2;[\s\S]*uvOutput\.put\(first, uvOutput\.get\(opposite\)\);[\s\S]*uvOutput\.put\(opposite, u\);/,
+  'the 180-degree correction should swap complete opposite UV pairs in the camera preview');
+assert.match(backgroundDraw, /touches only the preview[\s\S]*world-space coverage points keep ARCore\x27s matrices/,
+  'the 180-degree correction must leave world-space point projection unchanged');
 assert.match(native, /Matrix\.multiplyMM\(mvp, 0, projection, 0, view, 0\);/,
   'coverage points must use ARCore projection and view matrices directly');
 assert.match(native, /viewpoints\.add\(new CaptureViewpoint\(matrix, focal\[0\], focal\[1\], principal\[0\], principal\[1\], imageSize\[0\], imageSize\[1\]\)\)/,
@@ -46,6 +47,8 @@ assert.match(native, /private void drawViewpoints\(float\[\] viewProjection\)[\s
   'captured viewpoints should be drawn as wireframe camera pyramids');
 assert.match(native, /pose\[0\] \* x \+ pose\[4\] \* y \+ pose\[8\] \* z \+ pose\[12\]/,
   'camera frustum corners should be transformed by the captured camera-to-world pose');
+assert.match(native, /final float depth = 0\.012f/,
+  'capture camera pyramids should be one tenth of the previous 0.12 m size');
 assert.match(native, /frames\.clear\(\); viewpoints\.clear\(\);/,
   'reset capture must clear the stored camera viewpoint overlays');
 assert.doesNotMatch(native, /mvp\[offset(?: \+ 1)?\] = -mvp\[offset(?: \+ 1)?\]/,

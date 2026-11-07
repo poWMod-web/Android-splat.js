@@ -35,6 +35,10 @@ assert.match(appSource, /function toggleScoreScale\(\)[\s\S]*S\.scoreScale = S\.
   'the controls should switch between PSNR dB and actual SSIM percentage');
 assert.match(appSource, /evalGraphMetrics\(trainCi, holdCi\)/,
   'SSIM samples should be evaluated from rendered train and holdout views');
+assert.match(appSource, /S\.ssimTrain = train\.ssim[\s\S]*S\.ssimTrainHist\.push\(\[iter, train\.ssim\]\)/,
+  'the SSIM headline and chart history must retain actual SSIM evaluation results');
+assert.match(appSource, /function renderTrainingScore\(\)[\s\S]*S\.scoreScale === 'similarity'[\s\S]*ssimToPercent\(v\)[\s\S]*t-punit[\s\S]*SSIM %/,
+  'the metric above splat count must display SSIM as a percentage when that scale is selected');
 assert.match(trainerSource, /evalCamMetrics\(ci\)[\s\S]*_evalPass\(ci, undefined, true\)/,
   'the graph must use the trainer render evaluation path to obtain SSIM inputs');
 assert.match(shaderSource, /export const SSIM_METRIC_SRC[\s\S]*cam\.proj\.w[\s\S]*metric\[oi \+ 4u\]/,
@@ -45,6 +49,8 @@ assert.match(appSource, /const expandPlot = training && !S\.trainVisuals[\s\S]*s
   'hiding training visuals should move the score graph into the stage');
 assert.match(appSource, /plot\.classList\.remove\('chartwrap-expanded'\)/,
   'showing training visuals should return the score graph to the dock');
+assert.match(appSource, /if \(plotMoved\) requestAnimationFrame\(\(\) => chart\?\.resize\(\)\)/,
+  'the chart backing canvas should be redrawn at its enlarged size instead of stretching the old bitmap');
 assert.match(appCss, /\.stage > \.chartwrap-expanded\s*\{[\s\S]*inset: 0/,
   'the expanded score graph should fill the training visual stage');
 assert.match(baseCss, /\.score \.score-scale\s*\{[\s\S]*display: block/,

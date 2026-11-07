@@ -654,18 +654,17 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             uvInput.position(0);
             uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
-            // Mirror only the camera preview across the display's left/right
-            // sides. Swap transformed UV pairs (not texture-u values) so the
-            // flip stays horizontal even when ARCore rotates the camera image.
-            for (int row = 0; row < 2; row++) {
-                int left = row * 4, right = left + 2;
-                float leftU = uvOutput.get(left), leftV = uvOutput.get(left + 1);
-                uvOutput.put(left, uvOutput.get(right));
-                uvOutput.put(left + 1, uvOutput.get(right + 1));
-                uvOutput.put(right, leftU);
-                uvOutput.put(right + 1, leftV);
+            // Correct the camera preview's 180° display rotation by swapping
+            // opposite transformed UV pairs. This touches only the preview
+            // texture; the world-space coverage points keep ARCore's matrices.
+            for (int vertex = 0; vertex < 2; vertex++) {
+                int first = vertex * 2, opposite = (3 - vertex) * 2;
+                float u = uvOutput.get(first), v = uvOutput.get(first + 1);
+                uvOutput.put(first, uvOutput.get(opposite));
+                uvOutput.put(first + 1, uvOutput.get(opposite + 1));
+                uvOutput.put(opposite, u);
+                uvOutput.put(opposite + 1, v);
             }
-            // The world-space point cloud is still drawn from ARCore's camera matrices.
             uvOutput.position(0);
             GLES20.glDisable(GLES20.GL_DEPTH_TEST);
             GLES20.glUseProgram(bgProgram);
@@ -1045,7 +1044,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         final float[] lineVertices = new float[16 * 3];
 
         CaptureViewpoint(float[] pose, float fx, float fy, float cx, float cy, int width, int height) {
-            final float depth = 0.12f;
+            final float depth = 0.012f;
             final float[] origin = {pose[12], pose[13], pose[14]};
             final float[][] corners = new float[4][3];
             final float[] px = {0f, width, width, 0f};
