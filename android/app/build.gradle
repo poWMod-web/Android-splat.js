@@ -6,6 +6,10 @@ android {
     namespace 'space.arrival.splatxr'
     compileSdk 35
 
+    buildFeatures {
+        buildConfig true
+    }
+
     defaultConfig {
         applicationId 'space.arrival.splatxr'
         minSdk 24
