@@ -253,6 +253,7 @@ const S = {
   chartEvents: [],             // real refine/growth moments for the curve
   flash: null,
   detailTab: 'score',
+  scoreScale: 'db',
   trainVisuals: false,         // the app's model/compare/camera overlays sleep during training by default
   _savedGpuFacts: null,        // GPU facts captured with a local run, not the current viewer device
   _savedDetailSettings: null,
@@ -377,6 +378,8 @@ function boot() {
     location.href = 'index.html';
   });
   $('btn-training-visuals').addEventListener('click', toggleTrainingVisuals);
+  $('d-chart-scale').addEventListener('click', toggleScoreScale);
+  syncScoreScaleControls();
   $('card-x').addEventListener('click', closePicker);
   $('file-input').addEventListener('change', (e) => {
     const files = Array.from(e.target.files);
@@ -5264,7 +5267,7 @@ function dock(kind) {
           <span class="tmeta-2">ETA <span id="t-eta">${etaText()}</span></span>
         </div>
       </div>
-      <div class="chartwrap"><canvas id="chart"></canvas><div class="chart-tip" id="chart-tip" hidden></div></div>
+      <div class="chartwrap"><canvas id="chart"></canvas><button class="chart-scale" id="chart-scale" type="button">Use %</button><div class="chart-tip" id="chart-tip" hidden></div></div>
       <div class="tscores">
         <div class="score" data-tone="accent">
           <div class="score-1"><span class="t-state" id="t-title">Training…</span><span class="score-v"><span id="t-ptrain">${S.psnrTrain != null ? S.psnrTrain.toFixed(2) : '—'}</span><small class="unit">dB</small></span></div>
@@ -5279,9 +5282,33 @@ function dock(kind) {
       await S.session.finish();   // emits train-complete -> finish()
     });
     chart = new Chart($('chart'), { onHover: chartTip });
+    chart.scale = S.scoreScale;
     chart.maxIter = S.maxIters;
+    $('chart-scale').addEventListener('click', toggleScoreScale);
+    syncScoreScaleControls();
     chart.resize();
   }
+}
+
+function syncScoreScaleControls() {
+  const next = S.scoreScale === 'db' ? 'Use %' : 'Use dB';
+  const title = S.scoreScale === 'db'
+    ? 'Switch graph to percent similarity'
+    : 'Switch graph to PSNR in decibels';
+  for (const id of ['chart-scale', 'd-chart-scale']) {
+    const button = $(id);
+    if (!button) continue;
+    button.textContent = next;
+    button.title = title;
+    button.setAttribute('aria-label', title);
+  }
+}
+
+function toggleScoreScale() {
+  S.scoreScale = S.scoreScale === 'db' ? 'similarity' : 'db';
+  if (chart) { chart.scale = S.scoreScale; chart.draw(); }
+  if (dchart) { dchart.scale = S.scoreScale; dchart.draw(); }
+  syncScoreScaleControls();
 }
 
 function chartTip(h) {
@@ -5291,8 +5318,8 @@ function chartTip(h) {
   tip.hidden = false;
   tip.style.left = `${h.xPct}%`;
   tip.style.top = '4px';
-  tip.innerHTML = `${fmt(h.iter)} · <b style="color:#2fd4c1">${h.train.toFixed(1)}</b>` +
-    (h.hold != null ? ` / <b style="color:#f2a03f">${h.hold.toFixed(1)}</b> dB` : '') +
+  tip.innerHTML = `${fmt(h.iter)} · <b style="color:#2fd4c1">${h.train.toFixed(1)} ${h.unit}</b>` +
+    (h.hold != null ? ` / <b style="color:#f2a03f">${h.hold.toFixed(1)} ${h.unit}</b>` : '') +
     (h.event ? `<br><span style="color:#93a1a0">${h.event}</span>` : '');
 }
 
@@ -6337,12 +6364,14 @@ function renderDetails() {
   // cancel the pointer stream before OrbitController can keep tracking it.
   $('d-cv').classList.toggle('camera-orbit', S.detailTab === 'cams');
   $('d-cv').hidden = vis !== 'cv';
-  $('d-chart').hidden = vis !== 'chart';
+  $('d-chart-wrap').hidden = vis !== 'chart';
   $('d-perf').hidden = vis !== 'perf';
   if (vis === 'perf') $('d-perf').textContent = S.detailTab === 'gpu' ? buildGpuReport() : buildPerfReport();
   if (vis === 'chart') {
     if (!dchart) dchart = new Chart($('d-chart'), {});
+    dchart.scale = S.scoreScale;
     dchart.maxIter = S.maxIters;
+    syncScoreScaleControls();
     // a restored share has no live loss history — its recorded training
     // curve (recon stats) is the same line, saved at share time
     const rstats = (S.restored && S.restored.stats) || {};
@@ -6400,7 +6429,7 @@ function renderDetailsNoSession() {
   const T = gpuTab(stat);
   $('d-prev').hidden = $('d-next').hidden = true;
   $('d-cv').hidden = true;
-  $('d-chart').hidden = true;
+  $('d-chart-wrap').hidden = true;
   $('d-perf').hidden = false;
   $('d-perf').textContent = buildGpuReport();
   $('d-cap').textContent = T.cap;

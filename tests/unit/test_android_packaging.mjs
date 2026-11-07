@@ -24,13 +24,22 @@ assert.match(native, /view\.setPadding\(left, top, right, bottom\)/,
   'all app content must be inset below system bars and display cutouts');
 assert.match(native, /getDecorView\(\)\.setSystemUiVisibility\(0\)/,
   'capture UI must not request layout behind system bars');
-assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?1f - uvOutput\.get\(i\)/,
-  'camera preview UVs must receive the 180-degree orientation correction');
-assert.match(native, /mvp\[offset\] = -mvp\[offset\];[\s\S]*?mvp\[offset \+ 1\] = -mvp\[offset \+ 1\]/,
-  'ARCore coverage points must receive the same 180-degree clip-space correction');
+assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?uvOutput\.position\(0\);/,
+  'camera preview must use ARCore-transformed display coordinates');
+assert.doesNotMatch(native, /uvOutput\.put\(i(?: \+ 1)?,\s*1f\s*-\s*uvOutput\.get/,
+  'camera preview must not apply an extra axis reflection after ARCore transforms UVs');
+assert.match(native, /Matrix\.multiplyMM\(mvp, 0, projection, 0, view, 0\);/,
+  'coverage points must use ARCore projection and view matrices directly');
+assert.doesNotMatch(native, /mvp\[offset(?: \+ 1)?\] = -mvp\[offset(?: \+ 1)?\]/,
+  'coverage points must not apply a second clip-space axis reflection');
+const main = readFileSync(resolve(moduleDir, 'src/main/java/space/arrival/splatxr/MainActivity.java'), 'utf8');
+assert.match(main, /applySafeAreaInsets\(host\)/,
+  'the main WebView host must apply safe-area insets on edge-to-edge Android');
+assert.match(main, /WindowInsets\.Type\.systemBars\(\) \| WindowInsets\.Type\.displayCutout\(\)/,
+  'safe-area padding must cover status/navigation bars and display cutouts');
 assert.match(native, /orangeAt = \(float\)Math\.toRadians\(40\.0\)/);
 assert.match(native, /yellowAt = \(float\)Math\.toRadians\(80\.0\)/);
 assert.match(native, /greenAt = \(float\)Math\.toRadians\(120\.0\)/);
 assert.match(native, /green = 0\.42f \+ 0\.52f \* t/);
 assert.match(native, /red = 1f - 0\.92f \* t/);
-console.log('Android asset paths, portrait lock, export guards, system insets, and coverage colors: passed');
+console.log('Android asset paths, portrait lock, capture orientation, safe-area insets, and coverage colors: passed');

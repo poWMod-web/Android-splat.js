@@ -256,7 +256,10 @@
         <button class="d-nav" id="d-prev" hidden aria-label="Previous photo">&#8249;</button>
         <button class="d-nav" id="d-next" hidden aria-label="Next photo">&#8250;</button>
         <canvas id="d-cv"></canvas>
-        <canvas id="d-chart" hidden></canvas>
+        <div class="chartwrap details-chartwrap" id="d-chart-wrap" hidden>
+          <canvas id="d-chart"></canvas>
+          <button class="chart-scale" id="d-chart-scale" type="button">Use %</button>
+        </div>
         <pre id="d-perf" class="perfpre" hidden></pre>
         <p class="cap" id="d-cap">—</p>
       </div>

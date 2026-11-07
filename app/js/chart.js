@@ -2,10 +2,17 @@
 // the moments where the optimiser changed its own setup, and an optional ghost
 // run so "what if" is a comparison instead of a claim.
 
+export function psnrToSimilarity(psnr) {
+  if (!Number.isFinite(psnr)) return 0;
+  // PSNR = -10 log10(MSE), with pixel error normalized to [0, 1].
+  return Math.max(0, Math.min(100, (1 - 10 ** (-psnr / 10)) * 100));
+}
+
 export class Chart {
   constructor(canvas, { onHover, onScrub } = {}) {
     this.cv = canvas;
     this.ctx = canvas.getContext('2d');
+    this.scale = 'db';
     this.train = []; this.hold = [];
     this.ghost = null; this.events = []; this.maxIter = 40000;
     this.onHover = onHover; this.onScrub = onScrub;
@@ -36,6 +43,14 @@ export class Chart {
     return Math.max(0, Math.min(1, (xf * w - l) / (w - l - r)));
   }
 
+  _displayValue(value) {
+    return this.scale === 'similarity' ? psnrToSimilarity(value) : value;
+  }
+
+  _displaySeries(series) {
+    return series.map(([iter, value]) => [iter, this._displayValue(value)]);
+  }
+
   // top just fits the event dots; there are no x labels, so the bottom is
   // nearly flush — the plot gets the height
   _box() { return { l: 8 * this.dpr, r: 48 * this.dpr, t: 8 * this.dpr, b: 4 * this.dpr }; }
@@ -63,13 +78,20 @@ export class Chart {
     ctx.clearRect(0, 0, W, H);
     if (pw <= 0 || ph <= 0) return;
 
-    const ys = [...this.train, ...this.hold, ...(this.ghost?.train || [])].map((p) => p[1]);
-    let lo = ys.length ? Math.min(...ys) : 10, hi = ys.length ? Math.max(...ys) : 30;
-    if (hi - lo < 6) { const m = (hi + lo) / 2; lo = m - 3; hi = m + 3; }
+    const train = this._displaySeries(this.train);
+    const hold = this._displaySeries(this.hold);
+    const ghostTrain = this._displaySeries(this.ghost?.train || []);
+    const ghostHold = this._displaySeries(this.ghost?.hold || []);
+    const ys = [...train, ...hold, ...ghostTrain, ...ghostHold].map((p) => p[1]);
+    let lo = ys.length ? Math.min(...ys) : (this.scale === 'similarity' ? 90 : 10);
+    let hi = ys.length ? Math.max(...ys) : (this.scale === 'similarity' ? 100 : 30);
+    const minSpan = this.scale === 'similarity' ? 0.2 : 6;
+    if (hi - lo < minSpan) { const m = (hi + lo) / 2; lo = m - minSpan / 2; hi = m + minSpan / 2; }
     // hug the data: the first sample sits a hair off the floor, so the climb
     // uses the full plot height instead of floating on rounded padding
     const pad = (hi - lo) * .03;
     lo -= pad; hi += pad;
+    if (this.scale === 'similarity') { lo = Math.max(0, lo); hi = Math.min(100, hi); }
 
     const X = (i) => l + (i / this.maxIter) * pw;
     const Y = (v) => t + ph - ((v - lo) / (hi - lo)) * ph;
@@ -85,13 +107,17 @@ export class Chart {
     // grid
     ctx.font = `400 ${11 * dpr}px "Spline Sans Mono", monospace`;
     ctx.textBaseline = 'middle';
-    const stepdB = (hi - lo) > 24 ? 10 : (hi - lo) > 12 ? 5 : 2;
-    for (let v = Math.ceil(lo / stepdB) * stepdB; v <= hi; v += stepdB) {
+    const span = hi - lo;
+    const step = this.scale === 'similarity'
+      ? ([0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10].find((s) => span / s <= 5) || 10)
+      : (span > 24 ? 10 : span > 12 ? 5 : 2);
+    const precision = this.scale === 'similarity' ? (step < 0.1 ? 2 : step < 1 ? 1 : 0) : 0;
+    for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-6; v += step) {
       const y = Y(v);
       ctx.strokeStyle = 'rgba(59,69,71,.5)'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(l, y); ctx.lineTo(l + pw, y); ctx.stroke();
       ctx.fillStyle = '#6b7877'; ctx.textAlign = 'left';
-      ctx.fillText(`${v} dB`, l + pw + 6 * dpr, y);
+      ctx.fillText(this.scale === 'similarity' ? `${v.toFixed(precision)}%` : `${v} dB`, l + pw + 6 * dpr, y);
     }
 
     // events
@@ -118,11 +144,11 @@ export class Chart {
     };
 
     if (this.ghost) {
-      line(this.ghost.train, 'rgba(147,161,160,.35)', [4, 3], 1.2);
-      line(this.ghost.hold, 'rgba(147,161,160,.22)', [2, 3], 1.2);
+      line(ghostTrain, 'rgba(147,161,160,.35)', [4, 3], 1.2);
+      line(ghostHold, 'rgba(147,161,160,.22)', [2, 3], 1.2);
     }
-    line(this.hold, '#f2a03f', [5, 3], 1.5);
-    line(this.train, '#2fd4c1', null, 1.8);
+    line(hold, '#f2a03f', [5, 3], 1.5);
+    line(train, '#2fd4c1', null, 1.8);
 
     // playhead
     const last = this.train[this.train.length - 1];
@@ -132,7 +158,7 @@ export class Chart {
       ctx.beginPath(); ctx.moveTo(x, t); ctx.lineTo(x, t + ph); ctx.stroke();
       if (this.mark == null) {
         ctx.fillStyle = '#2fd4c1';
-        ctx.beginPath(); ctx.arc(X(last[0]), Y(last[1]), 3 * dpr, 0, 7); ctx.fill();
+        ctx.beginPath(); ctx.arc(X(last[0]), Y(this._displayValue(last[1])), 3 * dpr, 0, 7); ctx.fill();
       }
     }
 
@@ -149,7 +175,8 @@ export class Chart {
         this.onHover?.({
           xPct: (x / W) * 100,
           iter: Math.round(a[0]),
-          train: a[1], hold: h ? h[1] : null, event: ev ? ev.label : null,
+          train: this._displayValue(a[1]), hold: h ? this._displayValue(h[1]) : null,
+          unit: this.scale === 'similarity' ? '%' : 'dB', event: ev ? ev.label : null,
         });
       }
     }

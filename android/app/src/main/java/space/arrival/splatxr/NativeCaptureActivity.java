@@ -643,16 +643,12 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
 
         private void drawBackground(Frame frame) {
-            // ARCore's camera OES texture is upside down relative to this GL view's
-            // quad coordinates. Reset both buffers because transformDisplayUvCoords
-            // advances their positions, then rotate the transformed UVs 180 degrees.
+            // ARCore accounts for display orientation and camera-texture UV layout.
+            // Use its transformed coordinates verbatim; extra manual axis flips
+            // mirrored the preview on portrait Android devices.
             uvInput.position(0);
             uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
-            for (int i = 0; i + 1 < uvOutput.capacity(); i += 2) {
-                uvOutput.put(i, 1f - uvOutput.get(i));
-                uvOutput.put(i + 1, 1f - uvOutput.get(i + 1));
-            }
             uvOutput.position(0);
             GLES20.glDisable(GLES20.GL_DEPTH_TEST);
             GLES20.glUseProgram(bgProgram);
@@ -699,14 +695,8 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             camera.getProjectionMatrix(projection, 0, 0.05f, 100f);
             camera.getViewMatrix(view, 0);
             Matrix.multiplyMM(mvp, 0, projection, 0, view, 0);
-            // Rotate in clip space, after projection. This matches the 180-degree
-            // rotation applied to the background UVs (rotating the projection input
-            // alone does not flip already-projected screen coordinates).
-            for (int column = 0; column < 4; column++) {
-                int offset = column * 4;
-                mvp[offset] = -mvp[offset];
-                mvp[offset + 1] = -mvp[offset + 1];
-            }
+            // Keep ARCore's projected screen coordinates unchanged so the sparse
+            // cloud shares the camera image's display orientation.
             pointPositionsBuffer.clear(); pointColorsBuffer.clear();
             int count = 0;
             for (CoveragePoint point : coverage.values()) {
