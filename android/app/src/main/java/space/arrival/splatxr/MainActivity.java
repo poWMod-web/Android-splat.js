@@ -3,7 +3,9 @@ package space.arrival.splatxr;
 import android.app.Activity;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.view.WindowInsets;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebChromeClient;
@@ -30,6 +32,7 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         getWindow().setStatusBarColor(android.graphics.Color.rgb(14, 17, 18));
         getWindow().setNavigationBarColor(android.graphics.Color.rgb(14, 17, 18));
+        getWindow().getDecorView().setSystemUiVisibility(0);
 
         File captureRoot = new File(getFilesDir(), "captures");
         if (!captureRoot.exists()) captureRoot.mkdirs();
@@ -72,8 +75,33 @@ public final class MainActivity extends Activity {
         setContentView(host);
         host.addView(webView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        applySafeAreaInsets(host);
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
         webView.loadUrl("https://appassets.androidplatform.net/assets/app/index.html");
+    }
+
+    private void applySafeAreaInsets(FrameLayout content) {
+        final int baseLeft = content.getPaddingLeft();
+        final int baseTop = content.getPaddingTop();
+        final int baseRight = content.getPaddingRight();
+        final int baseBottom = content.getPaddingBottom();
+        content.setOnApplyWindowInsetsListener((view, insets) -> {
+            int left, top, right, bottom;
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets bars = insets.getInsets(
+                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                left = bars.left; top = bars.top; right = bars.right; bottom = bars.bottom;
+            } else {
+                left = insets.getSystemWindowInsetLeft();
+                top = insets.getSystemWindowInsetTop();
+                right = insets.getSystemWindowInsetRight();
+                bottom = insets.getSystemWindowInsetBottom();
+            }
+            view.setPadding(baseLeft + left, baseTop + top,
+                    baseRight + right, baseBottom + bottom);
+            return insets;
+        });
+        content.requestApplyInsets();
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {

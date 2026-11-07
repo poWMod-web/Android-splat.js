@@ -1,19 +1,5 @@
-// publish.js — the last stage, in one of two shapes.
-//
-// HAND-OFF (ctx.handoff, the embedded route): the finished avatar goes to
-// whoever opened this tool — the splat rigger — and that is the end of Splat.js'
-// job. The rigger inspects it, attaches the animation clips and puts it on the
-// account, which is where all of that already lives (the user, 2026-09-18:
-// "splat-js need to hand off the avatar once it's finished ... the ui is just
-// for the creation"). Nothing is uploaded here and no account is touched.
-//
-// THE ACCOUNT (standalone, arrival.space/splat-js and the open-source build):
-// rig GLB, splat, sidecar, fit and thumbnail through the arrival.space upload
-// flow, then POST /avatars/splat (the backend copies the GLB to
-// <user>/splat_avatar_<hash>_<stamp>.glb, writes the sibling config, inserts
-// the row and assigns it). Sign-in needs a click (the OAuth popup can only open
-// inside one), so this stage draws the button and waits for it.
-import { getToken, api, uploadFile, hasToken, forgetRevokedToken } from '../../js/arrival.js';
+// publish.js — the final stage either hands an avatar back to an embedded
+// rigger or offers a local package download. It does not sign in or upload.
 
 export const id = 'publish';
 export const needs = ['bind'];
@@ -81,36 +67,14 @@ export async function run(ctx, manifest, hooks) {
     return { handedOff: true, format: 'ply', note: 'handed to the rigger' };
   }
 
-  // the button — and the download, for anyone who wants the package instead
-  const clicked = await new Promise((resolve) => {
-    if (!body) return resolve('go');
-    body.innerHTML = `<div class="upcard-row"><p class="fine">Splat ${sog ? `${fmtMB(sog.size)} (SOG, from ${fmtMB(ply.size)})` : fmtMB(ply.size)} · binding ${fmtMB(bin.byteLength)} · rig ${fmtMB(glb.byteLength)}. ${hasToken() ? '' : 'You will be asked to sign in to arrival.space.'}</p>
-      <span style="display:flex;gap:8px"><button class="btn btn-outline" id="av-dl">Download package</button><button class="btn btn-accent" id="av-go">Use as my avatar</button></span></div>
-      <p class="fine" id="av-status"></p>`;
+  // Standalone builds no longer sign in or publish to an account. The
+  // completed avatar remains fully exportable as a local package.
+  if (body) {
+    body.innerHTML = `<div class="upcard-row"><p class="fine">Avatar package ready · splat ${sog ? fmtMB(sog.size) : fmtMB(ply.size)} · binding ${fmtMB(bin.byteLength)} · rig ${fmtMB(glb.byteLength)}.</p>
+      <button class="btn btn-accent" id="av-dl">Download package</button></div>
+      <p class="fine" id="av-status">Everything stays on this device.</p>`;
     wireDownload(body, { name, ply, bin, fit, glb, sog, thumb });
-    body.querySelector('#av-go').onclick = () => {
-      // a popup for the first sign-in must be opened inside the click
-      const popup = hasToken() ? null : window.open('', 'arrival-signin', 'width=520,height=640');
-      resolve({ popup });
-    };
-  });
-  const status = (m) => { const el = body?.querySelector('#av-status'); if (el) el.textContent = m; hooks.progress?.(0, 1, m); log(m); };
-  const popup = clicked && clicked.popup;
-  let token;
-  try {
-    token = await getToken(status, popup);
-  } catch (e) { forgetRevokedToken(e); throw e; }
-  const up = async (blob, fname, label) => (await uploadFile(blob, fname, { token, onStatus: status, onProgress: (p) => hooks.progress?.(p, 1, `${label} …`) })).resourceKey;
-  const keys = {};
-  keys.glb = await up(new Blob([glb], { type: 'model/gltf-binary' }), 'rig.glb', 'rig');
-  keys.splat = sog ? await up(sog, `${name}.sog`, 'splat') : await up(ply, `${name}.ply`, 'splat');
-  keys.binding = await up(new Blob([bin], { type: 'application/octet-stream' }), `${name}_binding.bin`, 'binding');
-  keys.fit = await up(new Blob([JSON.stringify(fit)], { type: 'application/json' }), `${name}_fit.json`, 'fit');
-  if (thumb) keys.thumbnail = await up(thumb, thumb.type === 'image/webp' ? 'thumb.webp' : 'thumb.png', 'thumbnail');
-  status('Registering the avatar …');
-  const res = await api('/avatars/splat', token, { ...keys, originalName: `${name} (Splat.js)`, assign: true });
-  const d = res.data || {};
-  status(`Done — avatar ${d.id} is on your account.`);
-  if (body) body.innerHTML = `<p class="fine">Your avatar is on your account (id ${d.id}). Open <a href="https://arrival.space" target="_blank" rel="noopener">arrival.space</a> and you are wearing it.</p>`;
-  return { avatarId: d.id, url: d.url, assigned: !!d.assigned, format: sog ? 'sog' : 'ply', note: `avatar ${d.id}` };
+  }
+  log('avatar package ready for local download');
+  return { format: sog ? 'sog' : 'ply', note: 'local download package' };
 }

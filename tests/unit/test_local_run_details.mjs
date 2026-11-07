@@ -6,6 +6,7 @@ const root = resolve(new URL('../..', import.meta.url).pathname);
 const app = readFileSync(resolve(root, 'app/js/app.js'), 'utf8');
 const html = readFileSync(resolve(root, 'app/index.html'), 'utf8');
 const session = readFileSync(resolve(root, 'src/session.js'), 'utf8');
+const sessionIo = readFileSync(resolve(root, 'app/js/session_io.js'), 'utf8');
 
 const captureStart = app.indexOf('function captureRunSolveDetails()');
 const captureEnd = app.indexOf('function persistRunDetails(', captureStart);
@@ -30,13 +31,21 @@ assert.match(app, /restoreRunDetails\(lr, ses\)[\s\S]*S\._carryTrainElapsed = tr
   'continuing a local run should carry forward its history and cumulative elapsed time');
 assert.match(app, /await persistRunDetails\(runId, \{ full: true \}\)/,
   'leaving the model viewer should flush its current Details snapshot before navigation');
+assert.match(app, /if \(!S\.restored && !S\._localRun\)\s*\{[\s\S]*more\.textContent = 'Train'/,
+  'the generic continuation button must not render alongside a local-run Train action');
+assert.match(app, /if \(S\._localRun && S\._localRun\.ownSrc\)[\s\S]*train\.textContent = 'Train'[\s\S]*else if \(rj && rj\.source/,
+  'local model viewing should expose exactly the appropriate local or source-photo Train action');
+assert.match(app, /if \(viewOnly\) \{[\s\S]*S\.restored = \{ hasState: true, stats: \(recon && recon\.stats\) \|\| \{\}, reconJson: recon \}[\s\S]*\$\('btn-new'\)\.hidden = false[\s\S]*enterDone\(\)/,
+  'opening a local checkpoint for viewing should enter restored mode and show the top Back button');
+assert.match(app, /if \(S\._localRun && S\._viewerOpen\) \{[\s\S]*closeViewerToHome\(\)/,
+  'the top Back button should close a local viewer to the app home');
 
-assert.match(html, /<span id="install-slot"><button[^>]*id="btn-install"/,
-  'the PWA install action should be isolated in its own top-bar slot');
+assert.doesNotMatch(html, /id="btn-install"|>Install app</,
+  'the top-bar Install app button should be removed');
 assert.match(html, /id="btn-training-visuals"[^>]*hidden[^>]*>Show visuals/,
   'the training-only visualization toggle should start hidden');
-assert.match(app, /if \(installSlot\) installSlot\.hidden = training/,
-  'the install slot should be replaced only during training');
+assert.doesNotMatch(app, /installSlot|initPWAInstall/,
+  'removing install actions must not leave a reserved header slot or install prompt wiring');
 const drawStart = app.indexOf('function draw() {');
 const drawEnd = app.indexOf('/** a photograph filling the stage', drawStart);
 const draw = app.slice(drawStart, drawEnd);
@@ -54,5 +63,11 @@ assert.match(session, /if \(!this\.enabled \|\| !this\.ctx \|\| !this\.camera\) 
   'disabled session view should skip its standalone GPU render');
 assert.match(app, /dchart\.draw\(\)/,
   'the Details score graph remains rendered and refreshed during training');
+assert.match(app, /const capturedPoints = S\.preset\?\.capture\?\.points \|\| \[\][\s\S]*const pts = capturedPoints\.length \? capturedPoints/,
+  'the Cameras view should use the point cloud saved by capture rather than reconstructing it during training');
+assert.match(sessionIo, /capture-time snapshot[\s\S]*potentially-mutated optimizer\/reconstruction state/,
+  'saved model details should preserve the frozen camera-view point cloud');
+assert.match(sessionIo, /if \(S\.scene\?\.xyz\?\.length\)/,
+  'the saved scene cloud should be the source for model Details after training');
 
 console.log('Local model Details persistence, continuation, and training visualization gate: passed');

@@ -57,6 +57,7 @@ import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -491,6 +492,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         } catch (Exception ignored) { /* use ARCore's selected camera config */ }
         Config config = new Config(session);
         config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
+        config.setFocusMode(Config.FocusMode.AUTO);
         if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) config.setDepthMode(Config.DepthMode.AUTOMATIC);
         session.configure(config);
         cloudRenderer.setSession(session);
@@ -554,6 +556,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private final Map<String, CoveragePoint> coverage = new HashMap<>();
         private final Map<String, SeedPoint> seeds = new HashMap<>();
         private final List<JSONObject> frames = new ArrayList<>();
+        private final List<CaptureViewpoint> viewpoints = new ArrayList<>();
         private final TravelCaptureTrigger travelTrigger = new TravelCaptureTrigger(0.10f);
         private Session arSession;
         private int cameraTexture = -1;
@@ -567,6 +570,8 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private final FloatBuffer uvOutput = floats(new float[8]);
         private final FloatBuffer pointPositionsBuffer = ByteBuffer.allocateDirect(MAX_POINTS * 3 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         private final FloatBuffer pointColorsBuffer = ByteBuffer.allocateDirect(MAX_POINTS * 3 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+        private final FloatBuffer viewpointPositionsBuffer = ByteBuffer.allocateDirect(200 * 16 * 3 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+        private final FloatBuffer viewpointColorsBuffer = ByteBuffer.allocateDirect(200 * 16 * 3 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         private final float[] projection = new float[16], view = new float[16], mvp = new float[16];
 
         void setSession(Session value) { arSession = value; }
@@ -643,16 +648,24 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
 
         private void drawBackground(Frame frame) {
-            // ARCore's camera OES texture is upside down relative to this GL view's
-            // quad coordinates. Reset both buffers because transformDisplayUvCoords
-            // advances their positions, then rotate the transformed UVs 180 degrees.
+            // ARCore accounts for display orientation and camera-texture UV layout.
+            // Use its transformed coordinates verbatim; extra manual axis flips
+            // mirrored the preview on portrait Android devices.
             uvInput.position(0);
             uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
-            for (int i = 0; i + 1 < uvOutput.capacity(); i += 2) {
-                uvOutput.put(i, 1f - uvOutput.get(i));
-                uvOutput.put(i + 1, 1f - uvOutput.get(i + 1));
+            // Mirror only the camera preview across the display's left/right
+            // sides. Swap transformed UV pairs (not texture-u values) so the
+            // flip stays horizontal even when ARCore rotates the camera image.
+            for (int row = 0; row < 2; row++) {
+                int left = row * 4, right = left + 2;
+                float leftU = uvOutput.get(left), leftV = uvOutput.get(left + 1);
+                uvOutput.put(left, uvOutput.get(right));
+                uvOutput.put(left + 1, uvOutput.get(right + 1));
+                uvOutput.put(right, leftU);
+                uvOutput.put(right + 1, leftV);
             }
+            // The world-space point cloud is still drawn from ARCore's camera matrices.
             uvOutput.position(0);
             GLES20.glDisable(GLES20.GL_DEPTH_TEST);
             GLES20.glUseProgram(bgProgram);
@@ -694,67 +707,93 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
 
         private void drawCoverage(Frame frame) {
-            if (coverage.isEmpty()) return;
+            if (coverage.isEmpty() && viewpoints.isEmpty()) return;
             Camera camera = frame.getCamera();
             camera.getProjectionMatrix(projection, 0, 0.05f, 100f);
             camera.getViewMatrix(view, 0);
             Matrix.multiplyMM(mvp, 0, projection, 0, view, 0);
-            // Rotate in clip space, after projection. This matches the 180-degree
-            // rotation applied to the background UVs (rotating the projection input
-            // alone does not flip already-projected screen coordinates).
-            for (int column = 0; column < 4; column++) {
-                int offset = column * 4;
-                mvp[offset] = -mvp[offset];
-                mvp[offset + 1] = -mvp[offset + 1];
+            if (!coverage.isEmpty()) {
+                // Keep ARCore's projected screen coordinates unchanged so the sparse
+                // cloud shares the camera image's display orientation.
+                pointPositionsBuffer.clear(); pointColorsBuffer.clear();
+                int count = 0;
+                for (CoveragePoint point : coverage.values()) {
+                    if (count >= MAX_POINTS) break;
+                    pointPositionsBuffer.put(point.xyz);
+                    putCoverageColor(pointColorsBuffer, point.maxAngle);
+                    count++;
+                }
+                pointPositionsBuffer.flip(); pointColorsBuffer.flip();
+                GLES20.glEnable(GLES20.GL_DEPTH_TEST);
+                GLES20.glEnable(GLES20.GL_BLEND);
+                GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA);
+                GLES20.glUseProgram(pointProgram);
+                GLES20.glUniformMatrix4fv(pointMvp, 1, false, mvp, 0);
+                GLES20.glEnableVertexAttribArray(pointPosition); GLES20.glEnableVertexAttribArray(pointColor);
+                GLES20.glVertexAttribPointer(pointPosition, 3, GLES20.GL_FLOAT, false, 0, pointPositionsBuffer);
+                GLES20.glVertexAttribPointer(pointColor, 3, GLES20.GL_FLOAT, false, 0, pointColorsBuffer);
+                GLES20.glDrawArrays(GLES20.GL_POINTS, 0, count);
+                GLES20.glDisableVertexAttribArray(pointPosition); GLES20.glDisableVertexAttribArray(pointColor);
+                GLES20.glDisable(GLES20.GL_BLEND);
             }
-            pointPositionsBuffer.clear(); pointColorsBuffer.clear();
-            int count = 0;
-            for (CoveragePoint point : coverage.values()) {
-                if (count >= MAX_POINTS) break;
-                pointPositionsBuffer.put(point.xyz);
-                putCoverageColor(pointColorsBuffer, point.maxAngle);
-                count++;
+            drawViewpoints(mvp);
+        }
+
+        /** Draw captured camera poses as world-locked wireframe pyramids. */
+        private void drawViewpoints(float[] viewProjection) {
+            if (viewpoints.isEmpty()) return;
+            viewpointPositionsBuffer.clear(); viewpointColorsBuffer.clear();
+            int vertexCount = 0;
+            for (int i = 0; i < viewpoints.size() && i < 200; i++) {
+                float[] vertices = viewpoints.get(i).lineVertices;
+                boolean latest = i == viewpoints.size() - 1;
+                float r = latest ? 0.18f : 0.78f;
+                float g = latest ? 0.90f : 0.87f;
+                float b = latest ? 0.82f : 0.85f;
+                for (int vertex = 0; vertex < 16; vertex++) {
+                    int offset = vertex * 3;
+                    viewpointPositionsBuffer.put(vertices[offset]).put(vertices[offset + 1]).put(vertices[offset + 2]);
+                    viewpointColorsBuffer.put(r).put(g).put(b);
+                    vertexCount++;
+                }
             }
-            pointPositionsBuffer.flip(); pointColorsBuffer.flip();
-            GLES20.glEnable(GLES20.GL_DEPTH_TEST);
+            if (vertexCount == 0) return;
+            viewpointPositionsBuffer.flip(); viewpointColorsBuffer.flip();
+            // Like the camera overlay in Details, keep the wireframes visible
+            // above the sparse point cloud rather than depth-occluding them.
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST);
             GLES20.glEnable(GLES20.GL_BLEND);
             GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA);
             GLES20.glUseProgram(pointProgram);
-            GLES20.glUniformMatrix4fv(pointMvp, 1, false, mvp, 0);
+            GLES20.glUniformMatrix4fv(pointMvp, 1, false, viewProjection, 0);
             GLES20.glEnableVertexAttribArray(pointPosition); GLES20.glEnableVertexAttribArray(pointColor);
-            GLES20.glVertexAttribPointer(pointPosition, 3, GLES20.GL_FLOAT, false, 0, pointPositionsBuffer);
-            GLES20.glVertexAttribPointer(pointColor, 3, GLES20.GL_FLOAT, false, 0, pointColorsBuffer);
-            GLES20.glDrawArrays(GLES20.GL_POINTS, 0, count);
+            GLES20.glVertexAttribPointer(pointPosition, 3, GLES20.GL_FLOAT, false, 0, viewpointPositionsBuffer);
+            GLES20.glVertexAttribPointer(pointColor, 3, GLES20.GL_FLOAT, false, 0, viewpointColorsBuffer);
+            GLES20.glDrawArrays(GLES20.GL_LINES, 0, vertexCount);
             GLES20.glDisableVertexAttribArray(pointPosition); GLES20.glDisableVertexAttribArray(pointColor);
             GLES20.glDisable(GLES20.GL_BLEND);
         }
 
         private void putCoverageColor(FloatBuffer colors, float maxAngle) {
-            // Spread the ramp over a wider viewpoint range so coverage does not
-            // jump straight from red to green: red -> orange at 40°, yellow at
-            // 80°, then a gradual transition to green at 120°.
-            float orangeAt = (float)Math.toRadians(40.0);
-            float yellowAt = (float)Math.toRadians(80.0);
-            float greenAt = (float)Math.toRadians(120.0);
-            float angle = Float.isFinite(maxAngle) ? Math.max(0f, Math.min(maxAngle, greenAt)) : 0f;
-            float red, green, blue, t;
-            if (angle < orangeAt) {
-                t = angle / orangeAt;
+            // Four evenly spaced angular stops: red at 0°, orange at 40°,
+            // yellow at 80°, and green at 120°, with linear RGB interpolation.
+            float degrees = Float.isFinite(maxAngle)
+                    ? Math.max(0f, Math.min(120f, (float)Math.toDegrees(maxAngle))) : 0f;
+            float t, red, green;
+            if (degrees < 40f) {
+                t = degrees / 40f;
                 red = 1f;
-                green = 0.04f + 0.38f * t;
-                blue = 0.02f * (1f - t);
-            } else if (angle < yellowAt) {
-                t = (angle - orangeAt) / (yellowAt - orangeAt);
+                green = 0.5f * t;
+            } else if (degrees < 80f) {
+                t = (degrees - 40f) / 40f;
                 red = 1f;
-                green = 0.42f + 0.52f * t;
-                blue = 0.03f * t;
+                green = 0.5f + 0.5f * t;
             } else {
-                t = (angle - yellowAt) / (greenAt - yellowAt);
-                red = 1f - 0.92f * t;
-                green = 0.94f - 0.08f * t;
-                blue = 0.03f + 0.09f * t;
+                t = (degrees - 80f) / 40f;
+                red = 1f - t;
+                green = 1f;
             }
-            colors.put(red).put(green).put(blue);
+            colors.put(red).put(green).put(0f);
         }
 
         private void capture(Frame frame) {
@@ -787,6 +826,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 item.put("cx", principal[0]); item.put("cy", principal[1]);
                 item.put("w", imageSize[0]); item.put("h", imageSize[1]);
                 frames.add(item);
+                viewpoints.add(new CaptureViewpoint(matrix, focal[0], focal[1], principal[0], principal[1], imageSize[0], imageSize[1]));
                 capturedFrameCount = frames.size();
                 addColoredSeeds(frame, pose, bitmap, focal, principal, imageSize, name);
                 bitmap.recycle();
@@ -835,7 +875,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
 
         void resetData() {
-            coverage.clear(); seeds.clear(); frames.clear(); capturedFrameCount = 0; capturedSeedCount = 0;
+            coverage.clear(); seeds.clear(); frames.clear(); viewpoints.clear(); capturedFrameCount = 0; capturedSeedCount = 0;
             refreshCaptureTelemetry();
             travelTrigger.reset();
             deleteTree(outputDir); outputDir.mkdirs();
@@ -1001,20 +1041,141 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
     }
 
+    private static final class CaptureViewpoint {
+        final float[] lineVertices = new float[16 * 3];
+
+        CaptureViewpoint(float[] pose, float fx, float fy, float cx, float cy, int width, int height) {
+            final float depth = 0.12f;
+            final float[] origin = {pose[12], pose[13], pose[14]};
+            final float[][] corners = new float[4][3];
+            final float[] px = {0f, width, width, 0f};
+            final float[] py = {0f, 0f, height, height};
+            for (int i = 0; i < 4; i++) {
+                float x = (px[i] - cx) / fx * depth;
+                float y = (cy - py[i]) / fy * depth;
+                float z = -depth; // ARCore camera looks down its local -Z axis.
+                corners[i][0] = pose[0] * x + pose[4] * y + pose[8] * z + pose[12];
+                corners[i][1] = pose[1] * x + pose[5] * y + pose[9] * z + pose[13];
+                corners[i][2] = pose[2] * x + pose[6] * y + pose[10] * z + pose[14];
+            }
+            int out = 0;
+            for (int i = 0; i < 4; i++) {
+                out = putLineVertex(lineVertices, out, origin);
+                out = putLineVertex(lineVertices, out, corners[i]);
+            }
+            for (int i = 0; i < 4; i++) {
+                out = putLineVertex(lineVertices, out, corners[i]);
+                out = putLineVertex(lineVertices, out, corners[(i + 1) % 4]);
+            }
+        }
+
+        private static int putLineVertex(float[] target, int offset, float[] point) {
+            target[offset++] = point[0];
+            target[offset++] = point[1];
+            target[offset++] = point[2];
+            return offset;
+        }
+    }
+
     private static final class CoveragePoint {
+        private static final int MAX_DIRECTIONS = 16;
+        private static final float MIN_SAMPLE_DOT = (float)Math.cos(Math.toRadians(4.0));
         final float[] xyz;
-        final List<float[]> directions = new ArrayList<>();
+        // Fixed-size direction samples keep coverage memory bounded. Farthest-
+        // direction replacement prevents the first handful of similar views
+        // from permanently hiding later viewpoint changes.
+        final float[] directions = new float[MAX_DIRECTIONS * 3];
+        final float[] nearestDots = new float[MAX_DIRECTIONS];
+        // Preserve the pair that established the widest observed angle even if
+        // one endpoint is later replaced in the bounded representative set.
+        final float[] maxPair = new float[6];
+        int directionCount;
+        boolean hasMaxPair;
         float maxAngle;
+
         CoveragePoint(float x, float y, float z) { xyz = new float[]{x, y, z}; }
+
         void observe(float x, float y, float z) {
             if (!finite(x, y, z)) return;
             float n = (float)Math.sqrt(x*x + y*y + z*z);
-            if (!Float.isFinite(n) || n < 1e-6) return;
-            float[] d = {x/n, y/n, z/n};
-            for (float[] old : directions) maxAngle = Math.max(maxAngle,
-                    (float)Math.acos(Math.max(-1f, Math.min(1f, old[0]*d[0] + old[1]*d[1] + old[2]*d[2]))));
-            if (directions.size() < 8) directions.add(d);
+            if (!Float.isFinite(n) || n < 1e-6f) return;
+            float dx = x / n, dy = y / n, dz = z / n;
+
+            float closestDot = -1f;
+            float widestDot = 1f;
+            float ax = 0f, ay = 0f, az = 0f;
+            boolean foundPair = false;
+            for (int i = 0; i < directionCount; i++) {
+                int offset = i * 3;
+                float dot = clampDot(directions[offset] * dx + directions[offset + 1] * dy + directions[offset + 2] * dz);
+                closestDot = Math.max(closestDot, dot);
+                if (dot < widestDot) {
+                    widestDot = dot;
+                    ax = directions[offset]; ay = directions[offset + 1]; az = directions[offset + 2];
+                    foundPair = true;
+                }
+            }
+            if (hasMaxPair) {
+                for (int endpoint = 0; endpoint <= 3; endpoint += 3) {
+                    float dot = clampDot(maxPair[endpoint] * dx + maxPair[endpoint + 1] * dy + maxPair[endpoint + 2] * dz);
+                    if (dot < widestDot) {
+                        widestDot = dot;
+                        ax = maxPair[endpoint]; ay = maxPair[endpoint + 1]; az = maxPair[endpoint + 2];
+                        foundPair = true;
+                    }
+                }
+            }
+            if (foundPair && widestDot < Math.cos(maxAngle)) {
+                maxAngle = (float)Math.acos(widestDot);
+                maxPair[0] = ax; maxPair[1] = ay; maxPair[2] = az;
+                maxPair[3] = dx; maxPair[4] = dy; maxPair[5] = dz;
+                hasMaxPair = true;
+            }
+
+            if (directionCount < MAX_DIRECTIONS) {
+                if (directionCount == 0 || closestDot < MIN_SAMPLE_DOT) addDirection(dx, dy, dz);
+            } else {
+                int redundant = 1; // keep the first captured viewing direction as a stable anchor
+                for (int i = 2; i < directionCount; i++) {
+                    if (nearestDots[i] > nearestDots[redundant]) redundant = i;
+                }
+                if (closestDot < nearestDots[redundant]) {
+                    int offset = redundant * 3;
+                    directions[offset] = dx; directions[offset + 1] = dy; directions[offset + 2] = dz;
+                    recomputeNearestDots();
+                }
+            }
         }
+
+        private void addDirection(float x, float y, float z) {
+            int offset = directionCount * 3;
+            float nearest = -1f;
+            for (int i = 0; i < directionCount; i++) {
+                int other = i * 3;
+                float dot = clampDot(directions[other] * x + directions[other + 1] * y + directions[other + 2] * z);
+                nearest = Math.max(nearest, dot);
+                nearestDots[i] = Math.max(nearestDots[i], dot);
+            }
+            directions[offset] = x; directions[offset + 1] = y; directions[offset + 2] = z;
+            nearestDots[directionCount] = nearest;
+            directionCount++;
+        }
+
+        private void recomputeNearestDots() {
+            for (int i = 0; i < directionCount; i++) {
+                float nearest = -1f;
+                int a = i * 3;
+                for (int j = 0; j < directionCount; j++) {
+                    if (i == j) continue;
+                    int b = j * 3;
+                    float dot = clampDot(directions[a] * directions[b] + directions[a + 1] * directions[b + 1] + directions[a + 2] * directions[b + 2]);
+                    nearest = Math.max(nearest, dot);
+                }
+                nearestDots[i] = nearest;
+            }
+        }
+
+        private static float clampDot(float dot) { return Math.max(-1f, Math.min(1f, dot)); }
     }
 
     private static final class SeedPoint {
@@ -1029,7 +1190,15 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         return true;
     }
     private static String safeMessage(Exception e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
-    private static String readText(File f) throws Exception { return new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8); }
+    private static String readText(File f) throws Exception {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (FileInputStream in = new FileInputStream(f)) {
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = in.read(buffer)) != -1) bytes.write(buffer, 0, count);
+        }
+        return new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+    }
     private static void deleteTree(File file) {
         if (file == null || !file.exists()) return;
         File[] children = file.listFiles();

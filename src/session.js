@@ -1020,6 +1020,20 @@ export class Session {
     return this._locked(() => this.trainer.evalCamPsnr(ci));
   }
 
+  /** PSNR and true Gaussian-window SSIM for one training frame. */
+  evalFrameMetrics(ci) {
+    return this._locked(() => this.trainer.evalCamMetrics(ci));
+  }
+
+  /** Paired train/holdout samples for the graph, serialized as one readback job. */
+  evalGraphMetrics(trainCi, holdCi = -1) {
+    return this._locked(async () => {
+      const train = await this.trainer.evalCamMetrics(trainCi);
+      const hold = holdCi >= 0 ? await this.trainer.evalCamMetrics(holdCi) : null;
+      return { train, hold };
+    });
+  }
+
   /** Mean PSNR over the evalSplit test cameras — the number quality papers
    *  report. Resolves null when no eval split was requested. */
   evalTestPsnr() {

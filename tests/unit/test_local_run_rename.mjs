@@ -9,8 +9,8 @@ const from = app.indexOf('async function localRunTiles(');
 const to = app.indexOf('/** the first `cnt` photos', from);
 assert.ok(from >= 0 && to > from, 'local run tile renderer should be present');
 const localTiles = app.slice(from, to);
-assert.match(localTiles, /!sh && \{ label: 'Rename', act: renameLocalModel \}/,
-  'unshared local model menus should include Rename');
+assert.match(localTiles, /\{ label: 'Rename', act: renameLocalModel \}/,
+  'local model menus should include Rename regardless of cloud-share state');
 assert.match(localTiles, /textCard\('Rename this model', previousName\)/,
   'renaming should use the app rename dialog');
 assert.match(localTiles, /patchRun\(r\.id, \{ name \}\)/,

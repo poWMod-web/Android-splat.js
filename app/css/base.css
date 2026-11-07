@@ -527,6 +527,15 @@ select.sel {
 
 .chartwrap { position: relative; min-width: 0; height: 92px; }
 .chartwrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.chart-scale {
+  padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px;
+  background: rgba(14, 17, 18, .88); color: var(--muted);
+  font: 400 10px var(--mono); line-height: 1.2;
+}
+.chartwrap > .chart-scale { position: absolute; z-index: 4; top: 4px; left: 10px; }
+.score .score-scale { display: block; margin: 3px 0 0 auto; padding: 2px 6px; background: transparent; }
+.chart-scale:hover { color: var(--paper); border-color: var(--line-2); }
+.details-chartwrap { height: auto; aspect-ratio: 16 / 9; }
 .chart-tip {
   position: absolute; pointer-events: none; z-index: 3; transform: translate(-50%, -100%);
   padding: 5px 8px; border-radius: var(--r); border: 1px solid var(--line-2);
