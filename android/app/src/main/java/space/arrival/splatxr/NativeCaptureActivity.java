@@ -10,6 +10,7 @@ import android.graphics.ImageFormat;
 import android.graphics.Rect;
 import android.graphics.YuvImage;
 import android.media.Image;
+import android.text.InputType;
 import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
@@ -19,8 +20,10 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
 import android.view.Surface;
-import android.view.View;
+import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -71,6 +74,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     private Session session;
     private GLSurfaceView glView;
     private TextView status;
+    private EditText spacingInput;
+    private volatile boolean autoCaptureEnabled;
+    private volatile int captureSpacingCm = 10;
     private boolean installRequested;
     private boolean sessionResumed;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -108,6 +114,8 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         active = this;
+        captureSpacingCm = Math.max(2, Math.min(200, getPreferences(MODE_PRIVATE).getInt("capture_spacing_cm", 10)));
+        cloudRenderer.setSpacingCm(captureSpacingCm);
         outputDir = new File(getFilesDir(), "captures/current");
         deleteTree(outputDir);
         outputDir.mkdirs();
@@ -130,6 +138,53 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         status.setText("Starting ARCore… Move slowly around the subject.");
         controls.addView(status, new LinearLayout.LayoutParams(-1, -2));
 
+        LinearLayout captureOptions = new LinearLayout(this);
+        captureOptions.setGravity(Gravity.CENTER_VERTICAL);
+        CheckBox autoToggle = new CheckBox(this);
+        autoToggle.setText("Auto-capture");
+        autoToggle.setTextColor(0xFFFFFFFF);
+        autoToggle.setChecked(false); // Match WebXR: manual shutter is the default.
+        captureOptions.addView(autoToggle, new LinearLayout.LayoutParams(-2, dp(44)));
+        TextView everyLabel = new TextView(this);
+        everyLabel.setText("Every");
+        everyLabel.setTextColor(0xFFFFFFFF);
+        LinearLayout.LayoutParams everyParams = new LinearLayout.LayoutParams(-2, -2);
+        everyParams.setMargins(dp(12), 0, dp(6), 0);
+        captureOptions.addView(everyLabel, everyParams);
+        spacingInput = new EditText(this);
+        spacingInput.setSingleLine(true);
+        spacingInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        spacingInput.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        spacingInput.setText(String.valueOf(captureSpacingCm));
+        spacingInput.setTextColor(0xFFFFFFFF);
+        spacingInput.setSelectAllOnFocus(true);
+        spacingInput.setContentDescription("Auto-capture travel spacing in centimeters, from 2 to 200");
+        captureOptions.addView(spacingInput, new LinearLayout.LayoutParams(dp(64), dp(44)));
+        TextView cmLabel = new TextView(this);
+        cmLabel.setText("cm traveled");
+        cmLabel.setTextColor(0xFFFFFFFF);
+        LinearLayout.LayoutParams cmParams = new LinearLayout.LayoutParams(-2, -2);
+        cmParams.setMargins(dp(6), 0, 0, 0);
+        captureOptions.addView(cmLabel, cmParams);
+        controls.addView(captureOptions, new LinearLayout.LayoutParams(-1, -2));
+
+        autoToggle.setOnCheckedChangeListener((view, enabled) -> {
+            autoCaptureEnabled = enabled;
+            glView.queueEvent(cloudRenderer::resetDistanceBaseline);
+            showStatus(enabled
+                    ? "Auto-capture enabled: one photo every " + captureSpacingCm + " cm traveled. Move slowly."
+                    : "Manual capture enabled. Press Capture frame to take a photo.");
+        });
+        spacingInput.setOnFocusChangeListener((view, hasFocus) -> { if (!hasFocus) commitCaptureSpacing(); });
+        spacingInput.setOnEditorActionListener((view, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_DONE) {
+                commitCaptureSpacing();
+                spacingInput.clearFocus();
+                return true;
+            }
+            return false;
+        });
+
         LinearLayout buttons = new LinearLayout(this);
         buttons.setGravity(Gravity.CENTER);
         Button shutter = button("Capture frame");
@@ -139,6 +194,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         });
         Button reset = button("Reset");
         reset.setOnClickListener(v -> {
+            captureRequested.set(false);
             glView.queueEvent(() -> {
                 cloudRenderer.resetData();
                 deleteTree(outputDir);
@@ -170,6 +226,28 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         return b;
     }
     private int dp(float px) { return Math.round(px * getResources().getDisplayMetrics().density); }
+
+    private void commitCaptureSpacing() {
+        if (spacingInput == null) return;
+        String raw = spacingInput.getText().toString().trim();
+        int value;
+        try { value = Integer.parseInt(raw); }
+        catch (NumberFormatException e) { value = -1; }
+        if (value < 2 || value > 200) {
+            spacingInput.setError("Enter a whole number from 2 to 200 cm");
+            spacingInput.setText(String.valueOf(captureSpacingCm));
+            return;
+        }
+        spacingInput.setError(null);
+        if (value == captureSpacingCm) return;
+        final int spacing = value;
+        captureSpacingCm = spacing;
+        getPreferences(MODE_PRIVATE).edit().putInt("capture_spacing_cm", spacing).apply();
+        glView.queueEvent(() -> cloudRenderer.setSpacingCm(spacing));
+        showStatus(autoCaptureEnabled
+                ? "Auto-capture updated: one photo every " + value + " cm traveled."
+                : "Auto-capture distance set to " + value + " cm. Auto-capture is still off.");
+    }
 
     private void showStatus(String message) {
         main.post(() -> { if (status != null) status.setText(message); });
@@ -277,7 +355,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private final Map<String, CoveragePoint> coverage = new HashMap<>();
         private final Map<String, SeedPoint> seeds = new HashMap<>();
         private final List<JSONObject> frames = new ArrayList<>();
-        private final JSONArray seedJson = new JSONArray();
+        private final TravelCaptureTrigger travelTrigger = new TravelCaptureTrigger(0.10f);
         private Session arSession;
         private int cameraTexture = -1;
         private int bgProgram, pointProgram;
@@ -294,6 +372,11 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private final float[] cameraCenter = new float[3];
 
         void setSession(Session value) { arSession = value; }
+        void setSpacingCm(int centimeters) { travelTrigger.setSpacingMeters(centimeters / 100f); }
+        void resetDistanceBaseline() { travelTrigger.reset(); }
+        boolean sampleTravel(float[] position) { return travelTrigger.sample(position); }
+        void breakTravelContinuity() { travelTrigger.breakContinuity(); }
+        void capturePosition(float[] position) { travelTrigger.captured(position); }
 
         void onSurfaceCreated() {
             cameraTextureAssigned = false;
@@ -339,10 +422,16 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 Frame frame = arSession.update();
                 drawBackground(frame);
                 if (frame.getCamera().getTrackingState() == TrackingState.TRACKING) {
-                    if (captureRequested.compareAndSet(true, false)) capture(frame);
-                    // Render the accumulated capture samples every preview frame, but only
-                    // capture() is allowed to add new coverage observations.
+                    float[] position = frame.getCamera().getPose().getTranslation();
+                    boolean autoDue = autoCaptureEnabled && cloudRenderer.sampleTravel(position);
+                    if (!autoCaptureEnabled) cloudRenderer.breakTravelContinuity();
+                    boolean manualDue = captureRequested.getAndSet(false);
+                    if (manualDue || autoDue) capture(frame);
+                    // Render accumulated capture samples each preview frame, but only
+                    // successful keyframe capture may add coverage observations.
                     drawCoverage(frame);
+                } else {
+                    cloudRenderer.breakTravelContinuity();
                 }
             } catch (CameraNotAvailableException e) {
                 showStatus("AR camera is unavailable. Close other camera apps and retry.");
@@ -451,7 +540,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 addColoredSeeds(frame, pose, bitmap, focal, principal, imageSize, name);
                 bitmap.recycle();
                 updateCoverage(frame);
-                showStatus("Captured " + frames.size() + " / 200 · " + coverage.size() + " coverage points · move to another angle");
+                cloudRenderer.capturePosition(pose.getTranslation());
+                showStatus("Captured " + frames.size() + " / 200 · " + coverage.size() + " coverage points · " +
+                        (autoCaptureEnabled ? "auto every " + captureSpacingCm + " cm" : "manual capture"));
             } catch (NotYetAvailableException e) {
                 showStatus("Camera image is not ready yet. Hold steady and capture again.");
             } catch (Exception e) {
@@ -491,6 +582,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         void resetData() {
             coverage.clear(); seeds.clear(); frames.clear(); capturedFrameCount = 0;
+            travelTrigger.reset();
             deleteTree(outputDir); outputDir.mkdirs();
             showStatus("Capture reset. Move around the subject and capture at least 3 views.");
         }
@@ -601,6 +693,44 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private void writeFloatLE(DataOutputStream out, float value) throws Exception {
             int bits = Float.floatToIntBits(value);
             out.writeByte(bits); out.writeByte(bits >>> 8); out.writeByte(bits >>> 16); out.writeByte(bits >>> 24);
+        }
+    }
+
+    /** Distance-only auto shutter trigger. Tracking gaps establish a new pose baseline. */
+    private static final class TravelCaptureTrigger {
+        private float spacingMeters;
+        private float distanceSinceCapture;
+        private float[] lastPosition;
+        private static final float NOISE_FLOOR_METERS = 0.002f;
+
+        TravelCaptureTrigger(float spacingMeters) { setSpacingMeters(spacingMeters); }
+        void setSpacingMeters(float value) {
+            if (!Float.isFinite(value) || value <= 0f) throw new IllegalArgumentException("Spacing must be positive.");
+            spacingMeters = value;
+            reset();
+        }
+        void reset() { lastPosition = null; distanceSinceCapture = 0f; }
+        void breakContinuity() { lastPosition = null; }
+        boolean sample(float[] position) {
+            if (position == null || position.length < 3 || !Float.isFinite(position[0]) ||
+                    !Float.isFinite(position[1]) || !Float.isFinite(position[2])) {
+                breakContinuity();
+                return false;
+            }
+            if (lastPosition == null) { lastPosition = position.clone(); return false; }
+            float dx = position[0] - lastPosition[0];
+            float dy = position[1] - lastPosition[1];
+            float dz = position[2] - lastPosition[2];
+            float distance = (float)Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (distance > NOISE_FLOOR_METERS) {
+                distanceSinceCapture += distance;
+                lastPosition = position.clone();
+            }
+            return distanceSinceCapture + 1e-6f >= spacingMeters;
+        }
+        void captured(float[] position) {
+            lastPosition = position.clone();
+            distanceSinceCapture = 0f;
         }
     }
 

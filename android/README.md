@@ -28,7 +28,7 @@ Debug builds use Android's automatically generated debug signing key and are for
 
 1. The WebView loads the checked-in HTML/CSS/JS app from APK assets using `WebViewAssetLoader`; it does not need a server.
 2. **Capture with ARCore** opens a native camera surface. Allow camera permission and install/update Google Play Services for AR if requested.
-3. Move around a stationary subject and capture at least three overlapping keyframes (20–200 recommended). The preview accumulates a voxelized ARCore feature-point cloud only when a keyframe is successfully captured; it is colored red-to-green by angular diversity. The saved cloud remains visible as you move between shots.
+3. Move around a stationary subject and capture at least three overlapping keyframes (20–200 recommended). Manual shutter is the default; optionally enable distance-based auto-capture and edit the 2–200 cm spacing (10 cm default). The preview accumulates a voxelized ARCore feature-point cloud only when a keyframe is successfully captured; it is colored red-to-green by angular diversity. The saved cloud remains visible as you move between shots.
 4. **Finish & train** writes JPEG keyframes, `transforms.json`, `seed_points.json`, a binary little-endian RGB `seed.ply`, and capture metadata under private app storage. The web app loads those files through same-origin local asset URLs and then uses its existing known-camera reconstruction path, bypassing SfM.
 5. Review the frames and train if the device's WebView exposes a usable WebGPU adapter. Otherwise the captured dataset remains exportable from the web interface for desktop training.
 

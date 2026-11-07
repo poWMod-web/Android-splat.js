@@ -21,7 +21,7 @@ export function showXRHelp(reason = '') {
   const guidance = native ? `
     <h3>Native ARCore capture</h3>
     <p>Use an ARCore-compatible Android phone with Google Play Services for AR installed and updated. Allow camera permission when prompted. If tracking does not start, close other camera apps and relaunch the capture screen.</p>
-    <p>Move slowly around a stationary subject and capture at least three overlapping views (20–200 recommended). The native coverage cloud adds observations only when a keyframe is captured; saved points trend from red to green as viewpoint diversity grows. CPU image resolution depends on the device's supported ARCore camera configuration.</p>
+    <p>Move slowly around a stationary subject and capture at least three overlapping views (20–200 recommended). Manual shutter is the default; optionally enable distance-based auto-capture and edit its 2–200 cm spacing (10 cm default). The native coverage cloud adds observations only when a keyframe is captured; saved points trend from red to green as viewpoint diversity grows. CPU image resolution depends on the device's supported ARCore camera configuration.</p>
     <p>If Android WebView does not expose a WebGPU adapter, finish capture and export the dataset for training on a compatible desktop.</p>
   ` : `
     <h3>For pose-tagged AR photos</h3>
