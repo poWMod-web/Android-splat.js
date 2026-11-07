@@ -60,6 +60,12 @@ assert.match(appSource, /const expandPlot = training && !S\.trainVisuals[\s\S]*s
   'hiding training visuals should move the score graph into the stage');
 assert.match(appSource, /plot\.classList\.remove\('chartwrap-expanded'\)/,
   'showing training visuals should return the score graph to the dock');
+const trainingDockPositions = [...appSource.matchAll(/dock\('train'\);/g)].map((match) => match.index);
+assert.ok(trainingDockPositions.length >= 2 && trainingDockPositions.every((position) => {
+  const syncAt = appSource.indexOf('syncTrainingVisualsControl();', position);
+  const drawAt = appSource.indexOf('if (chart)', position);
+  return syncAt > position && syncAt < drawAt;
+}), 'initial training and continued training should expand the chart after creating the training dock');
 assert.match(appSource, /if \(plotMoved\) requestAnimationFrame\(\(\) => chart\?\.resize\(\)\)/,
   'the chart backing canvas should be redrawn at its enlarged size instead of stretching the old bitmap');
 assert.match(appCss, /\.stage > \.chartwrap-expanded\s*\{[\s\S]*inset: 0/,

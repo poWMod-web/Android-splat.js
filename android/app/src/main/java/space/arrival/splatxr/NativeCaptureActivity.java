@@ -649,19 +649,19 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         private void drawBackground(Frame frame) {
             // ARCore accounts for display orientation and camera-texture UV layout.
-            // Mirror only left-to-right by exchanging each screen row's UV pairs;
-            // this preserves the already-correct vertical orientation. The overlay
-            // geometry and world-space camera poses are left untouched.
+            // Rotate only the preview by 180° (two 90° turns) by exchanging the
+            // complete UV pairs at opposite quad corners. This is not a mirror;
+            // overlay geometry and world-space camera poses remain untouched.
             uvInput.position(0);
             uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
-            for (int row = 0; row < 2; row++) {
-                int left = row * 4, right = left + 2;
-                float u = uvOutput.get(left), v = uvOutput.get(left + 1);
-                uvOutput.put(left, uvOutput.get(right));
-                uvOutput.put(left + 1, uvOutput.get(right + 1));
-                uvOutput.put(right, u);
-                uvOutput.put(right + 1, v);
+            for (int vertex = 0; vertex < 2; vertex++) {
+                int first = vertex * 2, opposite = (3 - vertex) * 2;
+                float u = uvOutput.get(first), v = uvOutput.get(first + 1);
+                uvOutput.put(first, uvOutput.get(opposite));
+                uvOutput.put(first + 1, uvOutput.get(opposite + 1));
+                uvOutput.put(opposite, u);
+                uvOutput.put(opposite + 1, v);
             }
             uvOutput.position(0);
             GLES20.glDisable(GLES20.GL_DEPTH_TEST);

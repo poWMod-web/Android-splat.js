@@ -2484,6 +2484,9 @@ function startTraining() {
   }
   renderControls();
   dock('train');
+  // The first visual-sync ran before the training dock existed. Re-run it now
+  // so the initial hidden-visuals state expands the graph into the stage.
+  syncTrainingVisualsControl();
   if (chart) {
     chart.train = (S.session.lossHistory || []).map(([i, v]) => [i, v]);
     chart.hold = (S.holdHist || []).slice();
@@ -3899,6 +3902,7 @@ function continueTraining() {
   $('stage').dataset.cursor = 'grab';
   renderControls();
   dock('train');
+  syncTrainingVisualsControl();
   if (chart) {
     chart.train = S.session.lossHistory.map(([i, v]) => [i, v]);
     chart.hold = (S.holdHist || []).slice();
