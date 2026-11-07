@@ -339,9 +339,10 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 Frame frame = arSession.update();
                 drawBackground(frame);
                 if (frame.getCamera().getTrackingState() == TrackingState.TRACKING) {
-                    updateCoverage(frame);
-                    drawCoverage(frame);
                     if (captureRequested.compareAndSet(true, false)) capture(frame);
+                    // Render the accumulated capture samples every preview frame, but only
+                    // capture() is allowed to add new coverage observations.
+                    drawCoverage(frame);
                 }
             } catch (CameraNotAvailableException e) {
                 showStatus("AR camera is unavailable. Close other camera apps and retry.");
@@ -449,6 +450,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 capturedFrameCount = frames.size();
                 addColoredSeeds(frame, pose, bitmap, focal, principal, imageSize, name);
                 bitmap.recycle();
+                updateCoverage(frame);
                 showStatus("Captured " + frames.size() + " / 200 · " + coverage.size() + " coverage points · move to another angle");
             } catch (NotYetAvailableException e) {
                 showStatus("Camera image is not ready yet. Hold steady and capture again.");
