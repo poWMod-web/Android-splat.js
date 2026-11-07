@@ -32,7 +32,9 @@ Debug builds use Android's automatically generated debug signing key and are for
 4. **Finish & train** writes JPEG keyframes, `transforms.json`, `seed_points.json`, a binary little-endian RGB `seed.ply`, and capture metadata under private app storage. The web app loads those files through same-origin local asset URLs and then uses its existing known-camera reconstruction path, bypassing SfM.
 5. Review the frames and train if the device's WebView exposes a usable WebGPU adapter. Otherwise the captured dataset remains exportable from the web interface for desktop training.
 
-The camera configuration is selected from the device's supported ARCore configurations by largest CPU-image size. Each pose and its image/intrinsics are sampled from the same ARCore frame. Seed colors are sampled from that frame's CPU image after projecting ARCore world feature points into the image. Depth mode is enabled when ARCore reports it as supported; the current seed source is the ARCore feature-point cloud, not a dense depth reconstruction.
+The native capture overlay mirrors the WebXR capture layout (telemetry, framing reticle, guide, distance-auto toggle, shutter and finish control). The camera preview draws edge-to-edge while overlay controls are positioned inside Android's status/navigation-bar safe insets. Web app assets are copied from the repository's top-level `app/` and `src/` directories into the APK.
+
+The camera configuration is selected from the device's supported ARCore configurations by largest CPU-image size. Each pose and its image/intrinsics are sampled from the same ARCore frame. Seed colors are sampled from that frame's CPU image after projecting finite ARCore world feature points into the image. Depth mode is enabled when ARCore reports it as supported; the current seed source is the ARCore feature-point cloud, not a dense depth reconstruction.
 
 ## Current scope and hardware checks
 

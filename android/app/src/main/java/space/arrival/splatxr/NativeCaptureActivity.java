@@ -3,10 +3,16 @@ package space.arrival.splatxr;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
+import android.content.res.ColorStateList;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
 import android.graphics.ImageFormat;
+import android.graphics.Paint;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.graphics.Rect;
 import android.graphics.YuvImage;
 import android.media.Image;
@@ -15,13 +21,15 @@ import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
 import android.opengl.Matrix;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
 import android.view.Surface;
+import android.view.View;
+import android.view.WindowInsets;
 import android.view.inputmethod.EditorInfo;
-import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -53,16 +61,12 @@ import java.io.FileOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
-import java.nio.ShortBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
@@ -73,7 +77,14 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     private static final int CAMERA_PERMISSION = 71;
     private Session session;
     private GLSurfaceView glView;
-    private TextView status;
+    private FrameLayout captureRoot;
+    private FrameLayout topBar;
+    private FrameLayout controlBar;
+    private TextView guideText;
+    private TextView countLabel;
+    private TextView trackingLabel;
+    private TextView seedsLabel;
+    private TextView finishLabel;
     private EditText spacingInput;
     private volatile boolean autoCaptureEnabled;
     private volatile int captureSpacingCm = 10;
@@ -84,6 +95,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     private final CoverageRenderer cloudRenderer = new CoverageRenderer();
     private File outputDir;
     private volatile int capturedFrameCount;
+    private volatile int capturedSeedCount;
+    private boolean trackingUiInitialized;
+    private boolean lastTrackingUiState;
 
     static void requestKeyframe() {
         NativeCaptureActivity value = active;
@@ -120,7 +134,20 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         deleteTree(outputDir);
         outputDir.mkdirs();
 
+        getWindow().setStatusBarColor(Color.TRANSPARENT);
+        getWindow().setNavigationBarColor(Color.TRANSPARENT);
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        captureRoot = buildCaptureUi();
+        setContentView(captureRoot);
+        applySafeAreaInsets(captureRoot);
+    }
+
+
+    private FrameLayout buildCaptureUi() {
         FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(Color.BLACK);
         glView = new GLSurfaceView(this);
         glView.setEGLContextClientVersion(3);
         glView.setPreserveEGLContextOnPause(true);
@@ -128,52 +155,110 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
         root.addView(glView, new FrameLayout.LayoutParams(-1, -1));
 
-        LinearLayout controls = new LinearLayout(this);
-        controls.setOrientation(LinearLayout.VERTICAL);
-        controls.setPadding(dp(16), dp(12), dp(16), dp(16));
-        controls.setBackgroundColor(0xAA0E1112);
-        status = new TextView(this);
-        status.setTextColor(0xFFFFFFFF);
-        status.setTextSize(14);
-        status.setText("Starting ARCore… Move slowly around the subject.");
-        controls.addView(status, new LinearLayout.LayoutParams(-1, -2));
+        ReticleOverlay reticle = new ReticleOverlay(this);
+        root.addView(reticle, new FrameLayout.LayoutParams(-1, -1));
 
-        LinearLayout captureOptions = new LinearLayout(this);
-        captureOptions.setGravity(Gravity.CENTER_VERTICAL);
+        topBar = new FrameLayout(this);
+        LinearLayout telemetry = new LinearLayout(this);
+        telemetry.setOrientation(LinearLayout.VERTICAL);
+        telemetry.setPadding(dp(14), dp(10), dp(14), dp(10));
+        telemetry.setBackground(rounded(Color.argb(205, 7, 9, 9), Color.TRANSPARENT, 0, dp(10)));
+        countLabel = telemetryText("0 photos", 14, Color.rgb(47, 212, 193));
+        trackingLabel = telemetryText("Tracking: waiting for tracking", 10, Color.argb(200, 230, 236, 235));
+        seedsLabel = telemetryText("Seeds: none measured (random fallback)", 10, Color.argb(200, 230, 236, 235));
+        telemetry.addView(countLabel);
+        telemetry.addView(trackingLabel, topMargin(dp(4)));
+        telemetry.addView(seedsLabel, topMargin(dp(4)));
+        FrameLayout.LayoutParams telemetryParams = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.LEFT);
+        topBar.addView(telemetry, telemetryParams);
+
+        TextView cancel = controlText("Cancel", 12, Color.WHITE);
+        cancel.setPadding(dp(14), dp(9), dp(14), dp(9));
+        cancel.setBackground(rounded(Color.argb(205, 7, 9, 9), Color.argb(55, 255, 255, 255), dp(1), dp(22)));
+        cancel.setOnClickListener(v -> { setResult(RESULT_CANCELED); finish(); });
+        FrameLayout.LayoutParams cancelParams = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.RIGHT);
+        topBar.addView(cancel, cancelParams);
+        root.addView(topBar, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
+
+        guideText = controlText(
+                "Manual capture is ready. Press Shutter for each photo, or enable auto-capture to take one every " + captureSpacingCm + " cm traveled. Move slowly and aim for 20 or more overlapping views. Rotating in place does not trigger automatic photos.",
+                12, Color.rgb(230, 236, 235));
+        guideText.setGravity(Gravity.CENTER);
+        guideText.setLineSpacing(dp(2), 1f);
+        guideText.setPadding(dp(16), dp(12), dp(16), dp(12));
+        guideText.setBackground(rounded(Color.argb(210, 7, 9, 9), Color.argb(30, 255, 255, 255), dp(1), dp(12)));
+        FrameLayout.LayoutParams guideParams = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        guideParams.setMargins(dp(16), 0, dp(16), dp(125));
+        root.addView(guideText, guideParams);
+
+        controlBar = new FrameLayout(this);
+        LinearLayout autoPanel = new LinearLayout(this);
+        autoPanel.setOrientation(LinearLayout.VERTICAL);
+        autoPanel.setPadding(dp(8), dp(6), dp(8), dp(6));
+        autoPanel.setBackground(rounded(Color.argb(210, 7, 9, 9), Color.TRANSPARENT, 0, dp(12)));
         CheckBox autoToggle = new CheckBox(this);
         autoToggle.setText("Auto-capture");
-        autoToggle.setTextColor(0xFFFFFFFF);
-        autoToggle.setChecked(false); // Match WebXR: manual shutter is the default.
-        captureOptions.addView(autoToggle, new LinearLayout.LayoutParams(-2, dp(44)));
-        TextView everyLabel = new TextView(this);
-        everyLabel.setText("Every");
-        everyLabel.setTextColor(0xFFFFFFFF);
-        LinearLayout.LayoutParams everyParams = new LinearLayout.LayoutParams(-2, -2);
-        everyParams.setMargins(dp(12), 0, dp(6), 0);
-        captureOptions.addView(everyLabel, everyParams);
+        autoToggle.setTextSize(11);
+        autoToggle.setTextColor(Color.argb(220, 230, 236, 235));
+        autoToggle.setButtonTintList(new ColorStateList(
+                new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
+                new int[]{Color.rgb(47, 212, 193), Color.WHITE}));
+        autoToggle.setChecked(false);
+        autoPanel.addView(autoToggle, new LinearLayout.LayoutParams(-2, dp(28)));
+
+        LinearLayout spacingRow = new LinearLayout(this);
+        spacingRow.setGravity(Gravity.CENTER_VERTICAL);
+        spacingRow.setPadding(dp(22), 0, 0, 0);
         spacingInput = new EditText(this);
         spacingInput.setSingleLine(true);
         spacingInput.setInputType(InputType.TYPE_CLASS_NUMBER);
         spacingInput.setImeOptions(EditorInfo.IME_ACTION_DONE);
         spacingInput.setText(String.valueOf(captureSpacingCm));
-        spacingInput.setTextColor(0xFFFFFFFF);
+        spacingInput.setTextSize(10);
+        spacingInput.setTypeface(Typeface.MONOSPACE);
+        spacingInput.setTextColor(Color.WHITE);
+        spacingInput.setGravity(Gravity.CENTER);
+        spacingInput.setPadding(dp(4), 0, dp(4), 0);
         spacingInput.setSelectAllOnFocus(true);
         spacingInput.setContentDescription("Auto-capture travel spacing in centimeters, from 2 to 200");
-        captureOptions.addView(spacingInput, new LinearLayout.LayoutParams(dp(64), dp(44)));
-        TextView cmLabel = new TextView(this);
-        cmLabel.setText("cm traveled");
-        cmLabel.setTextColor(0xFFFFFFFF);
+        spacingInput.setBackground(rounded(Color.argb(24, 255, 255, 255), Color.argb(45, 255, 255, 255), dp(1), dp(6)));
+        spacingRow.addView(spacingInput, new LinearLayout.LayoutParams(dp(45), dp(27)));
+        TextView cm = controlText("cm", 10, Color.argb(220, 230, 236, 235));
         LinearLayout.LayoutParams cmParams = new LinearLayout.LayoutParams(-2, -2);
-        cmParams.setMargins(dp(6), 0, 0, 0);
-        captureOptions.addView(cmLabel, cmParams);
-        controls.addView(captureOptions, new LinearLayout.LayoutParams(-1, -2));
+        cmParams.setMargins(dp(4), 0, 0, 0);
+        spacingRow.addView(cm, cmParams);
+        autoPanel.addView(spacingRow);
+        FrameLayout.LayoutParams autoParams = new FrameLayout.LayoutParams(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL);
+        controlBar.addView(autoPanel, autoParams);
+
+        CaptureShutterView shutter = new CaptureShutterView(this);
+        shutter.setOnClickListener(v -> {
+            if (session == null || !sessionResumed) { showStatus("AR tracking is not ready yet."); return; }
+            captureRequested.set(true);
+            showStatus("Shutter armed; waiting for the next tracked camera frame…");
+        });
+        int shutterSize = dp(76);
+        FrameLayout.LayoutParams shutterParams = new FrameLayout.LayoutParams(shutterSize, shutterSize, Gravity.CENTER);
+        controlBar.addView(shutter, shutterParams);
+
+        finishLabel = controlText("Finish (0/3)", 12, Color.rgb(47, 212, 193));
+        finishLabel.setGravity(Gravity.CENTER);
+        finishLabel.setPadding(dp(13), dp(11), dp(13), dp(11));
+        finishLabel.setBackground(rounded(Color.argb(205, 7, 9, 9), Color.argb(80, 47, 212, 193), dp(1), dp(24)));
+        finishLabel.setEnabled(false);
+        finishLabel.setOnClickListener(v -> finishCapture());
+        FrameLayout.LayoutParams finishParams = new FrameLayout.LayoutParams(-2, -2, Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        controlBar.addView(finishLabel, finishParams);
+        FrameLayout.LayoutParams controlParams = new FrameLayout.LayoutParams(-1, dp(82), Gravity.BOTTOM);
+        controlParams.setMargins(dp(18), 0, dp(18), dp(25));
+        root.addView(controlBar, controlParams);
 
         autoToggle.setOnCheckedChangeListener((view, enabled) -> {
             autoCaptureEnabled = enabled;
             glView.queueEvent(cloudRenderer::resetDistanceBaseline);
             showStatus(enabled
                     ? "Auto-capture enabled: one photo every " + captureSpacingCm + " cm traveled. Move slowly."
-                    : "Manual capture enabled. Press Capture frame to take a photo.");
+                    : "Manual capture enabled. Press Shutter to take a photo.");
         });
         spacingInput.setOnFocusChangeListener((view, hasFocus) -> { if (!hasFocus) commitCaptureSpacing(); });
         spacingInput.setOnEditorActionListener((view, actionId, event) -> {
@@ -184,47 +269,125 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             }
             return false;
         });
-
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setGravity(Gravity.CENTER);
-        Button shutter = button("Capture frame");
-        shutter.setOnClickListener(v -> {
-            if (session == null || !sessionResumed) { showStatus("AR tracking is not ready yet."); return; }
-            captureRequested.set(true);
-        });
-        Button reset = button("Reset");
-        reset.setOnClickListener(v -> {
-            captureRequested.set(false);
-            glView.queueEvent(() -> {
-                cloudRenderer.resetData();
-                deleteTree(outputDir);
-                outputDir.mkdirs();
-                showStatus("Capture reset. Move around the subject and capture at least 3 views.");
-            });
-        });
-        Button finish = button("Finish & train");
-        finish.setOnClickListener(v -> finishCapture());
-        buttons.addView(shutter, weightedButton());
-        buttons.addView(reset, weightedButton());
-        buttons.addView(finish, weightedButton());
-        controls.addView(buttons, new LinearLayout.LayoutParams(-1, -2));
-        FrameLayout.LayoutParams controlParams = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM);
-        root.addView(controls, controlParams);
-        setContentView(root);
+        return root;
     }
 
-    private LinearLayout.LayoutParams weightedButton() {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(48), 1f);
-        p.setMargins(dp(4), dp(10), dp(4), 0);
-        return p;
+    private void applySafeAreaInsets(FrameLayout root) {
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            int top, bottom;
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
+                top = bars.top;
+                bottom = bars.bottom;
+            } else {
+                top = insets.getSystemWindowInsetTop();
+                bottom = insets.getSystemWindowInsetBottom();
+            }
+            FrameLayout.LayoutParams topParams = (FrameLayout.LayoutParams) topBar.getLayoutParams();
+            topParams.topMargin = top + dp(16);
+            topBar.setLayoutParams(topParams);
+            FrameLayout.LayoutParams guideParams = (FrameLayout.LayoutParams) guideText.getLayoutParams();
+            guideParams.bottomMargin = bottom + dp(125);
+            guideText.setLayoutParams(guideParams);
+            FrameLayout.LayoutParams controlParams = (FrameLayout.LayoutParams) controlBar.getLayoutParams();
+            controlParams.bottomMargin = bottom + dp(25);
+            controlBar.setLayoutParams(controlParams);
+            return view.onApplyWindowInsets(insets);
+        });
+        root.requestApplyInsets();
     }
-    private Button button(String text) {
-        Button b = new Button(this);
-        b.setText(text);
-        b.setTextSize(12);
-        b.setAllCaps(false);
-        return b;
+
+    private LinearLayout.LayoutParams topMargin(int value) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
+        params.topMargin = value;
+        return params;
     }
+
+    private TextView telemetryText(String text, float size, int color) {
+        TextView view = controlText(text, size, color);
+        view.setTypeface(Typeface.MONOSPACE);
+        return view;
+    }
+
+    private TextView controlText(String text, float size, int color) {
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextSize(size);
+        view.setTextColor(color);
+        return view;
+    }
+
+    private GradientDrawable rounded(int fill, int stroke, int strokeWidth, float radius) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(fill);
+        drawable.setCornerRadius(radius);
+        if (strokeWidth > 0) drawable.setStroke(strokeWidth, stroke);
+        return drawable;
+    }
+
+    private final class ReticleOverlay extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        ReticleOverlay(Context context) { super(context); setClickable(false); setFocusable(false); }
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float cx = getWidth() * 0.5f;
+            float cy = getHeight() * 0.43f;
+            float w = Math.min(getWidth() * 0.58f, dp(340));
+            float h = Math.min(getHeight() * 0.46f, dp(340));
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(dp(1));
+            paint.setColor(Color.argb(145, 47, 212, 193));
+            canvas.drawRoundRect(cx-w/2, cy-h/2, cx+w/2, cy+h/2, dp(18), dp(18), paint);
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.argb(190, 255, 255, 255));
+            paint.setStrokeWidth(dp(2));
+            canvas.drawLine(cx-dp(4), cy, cx+dp(4), cy, paint);
+            canvas.drawLine(cx, cy-dp(4), cx, cy+dp(4), paint);
+        }
+    }
+
+    private final class CaptureShutterView extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        CaptureShutterView(Context context) {
+            super(context);
+            setClickable(true);
+            setContentDescription("Take photo");
+        }
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float cx = getWidth()/2f, cy = getHeight()/2f;
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.argb(100, 0, 0, 0));
+            canvas.drawCircle(cx, cy, dp(37), paint);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(dp(4));
+            paint.setColor(Color.rgb(230, 236, 235));
+            canvas.drawCircle(cx, cy, dp(33), paint);
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(isPressed() ? Color.rgb(25, 183, 165) : Color.rgb(47, 212, 193));
+            canvas.drawCircle(cx, cy, dp(28), paint);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(dp(4));
+            paint.setColor(Color.argb(200, 7, 9, 9));
+            canvas.drawCircle(cx, cy, dp(21), paint);
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.rgb(3, 36, 32));
+            paint.setTextSize(dp(11));
+            paint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+            paint.setTextAlign(Paint.Align.CENTER);
+            canvas.drawText("Shutter", cx, cy+dp(4), paint);
+        }
+        @Override public boolean onTouchEvent(android.view.MotionEvent event) {
+            if (event.getAction() == android.view.MotionEvent.ACTION_DOWN) { setPressed(true); invalidate(); return true; }
+            if (event.getAction() == android.view.MotionEvent.ACTION_UP) {
+                setPressed(false); invalidate(); performClick(); return true;
+            }
+            if (event.getAction() == android.view.MotionEvent.ACTION_CANCEL) { setPressed(false); invalidate(); return true; }
+            return true;
+        }
+        @Override public boolean performClick() { super.performClick(); return true; }
+    }
+
     private int dp(float px) { return Math.round(px * getResources().getDisplayMetrics().density); }
 
     private void commitCaptureSpacing() {
@@ -250,7 +413,35 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     }
 
     private void showStatus(String message) {
-        main.post(() -> { if (status != null) status.setText(message); });
+        main.post(() -> { if (guideText != null) guideText.setText(message); });
+    }
+
+    private void refreshCaptureTelemetry() {
+        main.post(() -> {
+            if (countLabel != null) {
+                int count = capturedFrameCount;
+                countLabel.setText(count + " photo" + (count == 1 ? "" : "s"));
+            }
+            if (seedsLabel != null) {
+                int count = capturedSeedCount;
+                seedsLabel.setText(count == 0 ? "Seeds: none measured (random fallback)" : "Seeds: " + count + " measured");
+            }
+            if (finishLabel != null) {
+                int count = capturedFrameCount;
+                finishLabel.setText(count >= 3 ? "Finish (" + count + ")" : "Finish (" + count + "/3)");
+                finishLabel.setEnabled(count >= 3);
+                finishLabel.setAlpha(count >= 3 ? 1f : 0.42f);
+            }
+        });
+    }
+
+    private void setTrackingTelemetry(boolean tracking) {
+        if (trackingUiInitialized && tracking == lastTrackingUiState) return;
+        trackingUiInitialized = true;
+        lastTrackingUiState = tracking;
+        main.post(() -> {
+            if (trackingLabel != null) trackingLabel.setText(tracking ? "Tracking: active" : "Tracking: waiting for tracking");
+        });
     }
 
     @Override protected void onResume() {
@@ -275,7 +466,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 sessionResumed = true;
                 glView.onResume();
             }
-            showStatus("AR tracking ready · capture overlapping views around the subject");
+            showStatus("Manual capture is ready. Press Shutter for each photo, or enable auto-capture to take one every " + captureSpacingCm + " cm traveled. Move slowly and aim for 20 or more overlapping views. Rotating in place does not trigger automatic photos.");
         } catch (Exception e) {
             showStatus("ARCore unavailable: " + safeMessage(e));
             Toast.makeText(this, "Install or update Google Play Services for AR, then try again.", Toast.LENGTH_LONG).show();
@@ -369,7 +560,6 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private final FloatBuffer pointPositionsBuffer = ByteBuffer.allocateDirect(MAX_POINTS * 3 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         private final FloatBuffer pointColorsBuffer = ByteBuffer.allocateDirect(MAX_POINTS * 3 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         private final float[] projection = new float[16], view = new float[16], mvp = new float[16];
-        private final float[] cameraCenter = new float[3];
 
         void setSession(Session value) { arSession = value; }
         void setSpacingCm(int centimeters) { travelTrigger.setSpacingMeters(centimeters / 100f); }
@@ -421,7 +611,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 arSession.setDisplayGeometry(displayRotation, width, height);
                 Frame frame = arSession.update();
                 drawBackground(frame);
-                if (frame.getCamera().getTrackingState() == TrackingState.TRACKING) {
+                boolean tracking = frame.getCamera().getTrackingState() == TrackingState.TRACKING;
+                setTrackingTelemetry(tracking);
+                if (tracking) {
                     float[] position = frame.getCamera().getPose().getTranslation();
                     boolean autoDue = autoCaptureEnabled && cloudRenderer.sampleTravel(position);
                     if (!autoCaptureEnabled) cloudRenderer.breakTravelContinuity();
@@ -434,14 +626,26 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                     cloudRenderer.breakTravelContinuity();
                 }
             } catch (CameraNotAvailableException e) {
+                setTrackingTelemetry(false);
                 showStatus("AR camera is unavailable. Close other camera apps and retry.");
             } catch (Exception e) {
+                setTrackingTelemetry(false);
                 showStatus("AR frame error: " + safeMessage(e));
             }
         }
 
         private void drawBackground(Frame frame) {
+            // ARCore's camera OES texture is upside down relative to this GL view's
+            // quad coordinates. Reset both buffers because transformDisplayUvCoords
+            // advances their positions, then rotate the transformed UVs 180 degrees.
+            uvInput.position(0);
+            uvOutput.position(0);
             frame.transformDisplayUvCoords(uvInput, uvOutput);
+            for (int i = 0; i + 1 < uvOutput.capacity(); i += 2) {
+                uvOutput.put(i, 1f - uvOutput.get(i));
+                uvOutput.put(i + 1, 1f - uvOutput.get(i + 1));
+            }
+            uvOutput.position(0);
             GLES20.glDisable(GLES20.GL_DEPTH_TEST);
             GLES20.glUseProgram(bgProgram);
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
@@ -459,6 +663,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             Camera camera = frame.getCamera();
             Pose pose = camera.getPose();
             float[] translation = pose.getTranslation();
+            if (!finite(translation)) return;
             PointCloud cloud = null;
             try {
                 cloud = frame.acquirePointCloud();
@@ -467,7 +672,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 while (points.remaining() >= 4) {
                     float x = points.get(), y = points.get(), z = points.get();
                     float confidence = points.get();
-                    if (confidence < 0.15f) continue;
+                    if (!finite(x, y, z, confidence) || confidence < 0.15f) continue;
                     String key = voxelKey(x, y, z, VOXEL);
                     CoveragePoint point = coverage.get(key);
                     if (point == null) {
@@ -484,6 +689,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             if (coverage.isEmpty()) return;
             Camera camera = frame.getCamera();
             camera.getProjectionMatrix(projection, 0, 0.05f, 100f);
+            // Keep projected coverage samples aligned with the corrected 180-degree
+            // camera-background UV orientation.
+            Matrix.rotateM(projection, 0, 180f, 0f, 0f, 1f);
             camera.getViewMatrix(view, 0);
             Matrix.multiplyMM(mvp, 0, projection, 0, view, 0);
             pointPositionsBuffer.clear(); pointColorsBuffer.clear();
@@ -529,6 +737,10 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 intrinsics.getFocalLength(focal, 0);
                 intrinsics.getPrincipalPoint(principal, 0);
                 intrinsics.getImageDimensions(imageSize, 0);
+                if (!finite(matrix) || !finite(focal[0], focal[1], principal[0], principal[1]) ||
+                        focal[0] <= 0 || focal[1] <= 0 || imageSize[0] <= 0 || imageSize[1] <= 0) {
+                    throw new IllegalStateException("ARCore returned invalid camera pose or intrinsics for this frame.");
+                }
                 JSONObject item = new JSONObject();
                 item.put("file_path", name);
                 item.put("transform_matrix", matrixRows(matrix));
@@ -539,6 +751,8 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 capturedFrameCount = frames.size();
                 addColoredSeeds(frame, pose, bitmap, focal, principal, imageSize, name);
                 bitmap.recycle();
+                capturedSeedCount = seeds.size();
+                refreshCaptureTelemetry();
                 updateCoverage(frame);
                 cloudRenderer.capturePosition(pose.getTranslation());
                 showStatus("Captured " + frames.size() + " / 200 · " + coverage.size() + " coverage points · " +
@@ -562,8 +776,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 while (points.remaining() >= 4 && seeds.size() < 30000) {
                     world[0] = points.get(); world[1] = points.get(); world[2] = points.get();
                     float confidence = points.get();
-                    if (confidence < 0.25f) continue;
+                    if (!finite(world[0], world[1], world[2], confidence) || confidence < 0.25f) continue;
                     worldToCamera.transformPoint(world, 0, local, 0);
+                    if (!finite(local[0], local[1], local[2])) continue;
                     float z = -local[2];
                     if (z <= 0.05f) continue;
                     int u = Math.round(focal[0] * local[0] / z + principal[0]);
@@ -581,7 +796,8 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
 
         void resetData() {
-            coverage.clear(); seeds.clear(); frames.clear(); capturedFrameCount = 0;
+            coverage.clear(); seeds.clear(); frames.clear(); capturedFrameCount = 0; capturedSeedCount = 0;
+            refreshCaptureTelemetry();
             travelTrigger.reset();
             deleteTree(outputDir); outputDir.mkdirs();
             showStatus("Capture reset. Move around the subject and capture at least 3 views.");
@@ -593,12 +809,15 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             JSONObject first = frames.get(0);
             int w = first.getInt("w"), h = first.getInt("h");
             float fx = (float) first.getDouble("fl_x");
+            if (w <= 0 || h <= 0 || !Float.isFinite(fx) || fx <= 0) {
+                throw new IllegalStateException("The captured camera intrinsics are incomplete.");
+            }
             transforms.put("camera_angle_x", 2.0 * Math.atan(w / (2.0 * fx)));
             for (String key : new String[]{"fl_x", "fl_y", "cx", "cy", "w", "h"}) transforms.put(key, first.get(key));
             JSONArray frameArray = new JSONArray();
             for (JSONObject frame : frames) frameArray.put(frame);
             transforms.put("frames", frameArray);
-            writeText(new File(dir, "transforms.json"), transforms.toString(2));
+            writeText(new File(dir, "transforms.json"), jsonText(transforms, 2, "transforms.json"));
 
             JSONArray points = new JSONArray();
             for (SeedPoint seed : seeds.values()) {
@@ -611,13 +830,13 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             JSONObject pointDocument = new JSONObject();
             pointDocument.put("points", points);
             pointDocument.put("metadata", new JSONObject().put("seedSource", seeds.isEmpty() ? "none" : "arcore-point-cloud-rgb"));
-            writeText(new File(dir, "seed_points.json"), pointDocument.toString());
+            writeText(new File(dir, "seed_points.json"), jsonText(pointDocument, 0, "seed_points.json"));
             writePly(new File(dir, "seed.ply"));
-            writeText(new File(dir, "capture.json"), new JSONObject()
+            JSONObject metadata = new JSONObject()
                     .put("frames", frames.size()).put("pointCount", seeds.size())
                     .put("seedSource", seeds.isEmpty() ? "none" : "arcore-point-cloud-rgb")
-                    .put("coordinateConvention", "ARCore world meters; OpenGL camera-to-world transforms; RGB measured from matching camera image")
-                    .toString(2));
+                    .put("coordinateConvention", "ARCore world meters; OpenGL camera-to-world transforms; RGB measured from matching camera image");
+            writeText(new File(dir, "capture.json"), jsonText(metadata, 2, "capture.json"));
         }
 
         private void writePly(File file) throws Exception {
@@ -686,8 +905,17 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             return Math.round(x / size) + ":" + Math.round(y / size) + ":" + Math.round(z / size);
         }
 
+        private String jsonText(JSONObject value, int indent, String label) throws Exception {
+            String text = indent > 0 ? value.toString(indent) : value.toString();
+            if (text == null) throw new IllegalStateException("Could not serialize " + label + "; discard non-finite ARCore values and retry.");
+            return text;
+        }
+
         private void writeText(File file, String text) throws Exception {
-            try (FileOutputStream out = new FileOutputStream(file)) { out.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
+            if (text == null) throw new IllegalStateException("Refusing to write null capture data to " + file.getName() + ".");
+            try (FileOutputStream out = new FileOutputStream(file)) {
+                out.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
         }
 
         private void writeFloatLE(DataOutputStream out, float value) throws Exception {
@@ -740,8 +968,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         float maxAngle;
         CoveragePoint(float x, float y, float z) { xyz = new float[]{x, y, z}; }
         void observe(float x, float y, float z) {
+            if (!finite(x, y, z)) return;
             float n = (float)Math.sqrt(x*x + y*y + z*z);
-            if (n < 1e-6) return;
+            if (!Float.isFinite(n) || n < 1e-6) return;
             float[] d = {x/n, y/n, z/n};
             for (float[] old : directions) maxAngle = Math.max(maxAngle,
                     (float)Math.acos(Math.max(-1f, Math.min(1f, old[0]*d[0] + old[1]*d[1] + old[2]*d[2]))));
@@ -756,6 +985,10 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
     }
 
+    private static boolean finite(float... values) {
+        for (float value : values) if (!Float.isFinite(value)) return false;
+        return true;
+    }
     private static String safeMessage(Exception e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
     private static String readText(File f) throws Exception { return new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8); }
     private static void deleteTree(File file) {
