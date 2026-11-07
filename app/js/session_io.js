@@ -45,12 +45,24 @@ export function buildReconJson(S) {
   const recon = ses.recon;
   const r6 = (a) => Array.from(a, (v) => +v.toPrecision(7));
   const pts = recon.points || [];
-  const step = Math.max(1, Math.ceil(pts.length / 4000));
   const cloud = { xyz: [], rgb: [] };
-  for (let i = 0; i < pts.length; i += step) {
-    cloud.xyz.push(+pts[i].X[0].toPrecision(5), +pts[i].X[1].toPrecision(5), +pts[i].X[2].toPrecision(5));
-    const c = pts[i].rgb;
-    cloud.rgb.push(Math.round(c[0] * 255), Math.round(c[1] * 255), Math.round(c[2] * 255));
+  // The display cloud is a capture-time snapshot (especially for AR depth
+  // seeds). Keep that exact cloud in saved reconstructions instead of reading
+  // potentially-mutated optimizer/reconstruction state after training.
+  if (S.scene?.xyz?.length) {
+    const count = Math.floor(S.scene.xyz.length / 3);
+    const step = Math.max(1, Math.ceil(count / 4000));
+    for (let i = 0; i < count; i += step) {
+      cloud.xyz.push(+S.scene.xyz[i * 3].toPrecision(5), +S.scene.xyz[i * 3 + 1].toPrecision(5), +S.scene.xyz[i * 3 + 2].toPrecision(5));
+      cloud.rgb.push(S.scene.rgb[i * 3], S.scene.rgb[i * 3 + 1], S.scene.rgb[i * 3 + 2]);
+    }
+  } else {
+    const step = Math.max(1, Math.ceil(pts.length / 4000));
+    for (let i = 0; i < pts.length; i += step) {
+      cloud.xyz.push(+pts[i].X[0].toPrecision(5), +pts[i].X[1].toPrecision(5), +pts[i].X[2].toPrecision(5));
+      const c = pts[i].rgb;
+      cloud.rgb.push(Math.round(c[0] * 255), Math.round(c[1] * 255), Math.round(c[2] * 255));
+    }
   }
   return {
     version: 1,
@@ -84,6 +96,8 @@ export function buildReconJson(S) {
       psnrTest: S.psnrTest ? { psnr: S.psnrTest.psnr, frames: S.psnrTest.frames.length } : null,
       // the training curve, decimated to ~400 points
       chart: decimate(ses.lossHistory || [], 400).map(([i, p]) => [i, +p.toFixed(3)]),
+      ssimChart: decimate(S.ssimTrainHist || [], 400).map(([i, v]) => [i, +v.toFixed(6)]),
+      ssimHolds: decimate(S.ssimHoldHist || [], 400).map(([i, v]) => [i, +v.toFixed(6)]),
       holds: (S.holdHist || []).map(([i, p]) => [i, +p.toFixed(3)]),
     },
     cloud,

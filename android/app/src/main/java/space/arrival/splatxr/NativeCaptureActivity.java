@@ -556,6 +556,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private final Map<String, CoveragePoint> coverage = new HashMap<>();
         private final Map<String, SeedPoint> seeds = new HashMap<>();
         private final List<JSONObject> frames = new ArrayList<>();
+        private final List<CaptureViewpoint> viewpoints = new ArrayList<>();
         private final TravelCaptureTrigger travelTrigger = new TravelCaptureTrigger(0.10f);
         private Session arSession;
         private int cameraTexture = -1;
@@ -569,6 +570,8 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private final FloatBuffer uvOutput = floats(new float[8]);
         private final FloatBuffer pointPositionsBuffer = ByteBuffer.allocateDirect(MAX_POINTS * 3 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         private final FloatBuffer pointColorsBuffer = ByteBuffer.allocateDirect(MAX_POINTS * 3 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+        private final FloatBuffer viewpointPositionsBuffer = ByteBuffer.allocateDirect(200 * 16 * 3 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+        private final FloatBuffer viewpointColorsBuffer = ByteBuffer.allocateDirect(200 * 16 * 3 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         private final float[] projection = new float[16], view = new float[16], mvp = new float[16];
 
         void setSession(Session value) { arSession = value; }
@@ -704,31 +707,69 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
 
         private void drawCoverage(Frame frame) {
-            if (coverage.isEmpty()) return;
+            if (coverage.isEmpty() && viewpoints.isEmpty()) return;
             Camera camera = frame.getCamera();
             camera.getProjectionMatrix(projection, 0, 0.05f, 100f);
             camera.getViewMatrix(view, 0);
             Matrix.multiplyMM(mvp, 0, projection, 0, view, 0);
-            // Keep ARCore's projected screen coordinates unchanged so the sparse
-            // cloud shares the camera image's display orientation.
-            pointPositionsBuffer.clear(); pointColorsBuffer.clear();
-            int count = 0;
-            for (CoveragePoint point : coverage.values()) {
-                if (count >= MAX_POINTS) break;
-                pointPositionsBuffer.put(point.xyz);
-                putCoverageColor(pointColorsBuffer, point.maxAngle);
-                count++;
+            if (!coverage.isEmpty()) {
+                // Keep ARCore's projected screen coordinates unchanged so the sparse
+                // cloud shares the camera image's display orientation.
+                pointPositionsBuffer.clear(); pointColorsBuffer.clear();
+                int count = 0;
+                for (CoveragePoint point : coverage.values()) {
+                    if (count >= MAX_POINTS) break;
+                    pointPositionsBuffer.put(point.xyz);
+                    putCoverageColor(pointColorsBuffer, point.maxAngle);
+                    count++;
+                }
+                pointPositionsBuffer.flip(); pointColorsBuffer.flip();
+                GLES20.glEnable(GLES20.GL_DEPTH_TEST);
+                GLES20.glEnable(GLES20.GL_BLEND);
+                GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA);
+                GLES20.glUseProgram(pointProgram);
+                GLES20.glUniformMatrix4fv(pointMvp, 1, false, mvp, 0);
+                GLES20.glEnableVertexAttribArray(pointPosition); GLES20.glEnableVertexAttribArray(pointColor);
+                GLES20.glVertexAttribPointer(pointPosition, 3, GLES20.GL_FLOAT, false, 0, pointPositionsBuffer);
+                GLES20.glVertexAttribPointer(pointColor, 3, GLES20.GL_FLOAT, false, 0, pointColorsBuffer);
+                GLES20.glDrawArrays(GLES20.GL_POINTS, 0, count);
+                GLES20.glDisableVertexAttribArray(pointPosition); GLES20.glDisableVertexAttribArray(pointColor);
+                GLES20.glDisable(GLES20.GL_BLEND);
             }
-            pointPositionsBuffer.flip(); pointColorsBuffer.flip();
-            GLES20.glEnable(GLES20.GL_DEPTH_TEST);
+            drawViewpoints(mvp);
+        }
+
+        /** Draw captured camera poses as world-locked wireframe pyramids. */
+        private void drawViewpoints(float[] viewProjection) {
+            if (viewpoints.isEmpty()) return;
+            viewpointPositionsBuffer.clear(); viewpointColorsBuffer.clear();
+            int vertexCount = 0;
+            for (int i = 0; i < viewpoints.size() && i < 200; i++) {
+                float[] vertices = viewpoints.get(i).lineVertices;
+                boolean latest = i == viewpoints.size() - 1;
+                float r = latest ? 0.18f : 0.78f;
+                float g = latest ? 0.90f : 0.87f;
+                float b = latest ? 0.82f : 0.85f;
+                for (int vertex = 0; vertex < 16; vertex++) {
+                    int offset = vertex * 3;
+                    viewpointPositionsBuffer.put(vertices[offset]).put(vertices[offset + 1]).put(vertices[offset + 2]);
+                    viewpointColorsBuffer.put(r).put(g).put(b);
+                    vertexCount++;
+                }
+            }
+            if (vertexCount == 0) return;
+            viewpointPositionsBuffer.flip(); viewpointColorsBuffer.flip();
+            // Like the camera overlay in Details, keep the wireframes visible
+            // above the sparse point cloud rather than depth-occluding them.
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST);
             GLES20.glEnable(GLES20.GL_BLEND);
             GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA);
             GLES20.glUseProgram(pointProgram);
-            GLES20.glUniformMatrix4fv(pointMvp, 1, false, mvp, 0);
+            GLES20.glUniformMatrix4fv(pointMvp, 1, false, viewProjection, 0);
             GLES20.glEnableVertexAttribArray(pointPosition); GLES20.glEnableVertexAttribArray(pointColor);
-            GLES20.glVertexAttribPointer(pointPosition, 3, GLES20.GL_FLOAT, false, 0, pointPositionsBuffer);
-            GLES20.glVertexAttribPointer(pointColor, 3, GLES20.GL_FLOAT, false, 0, pointColorsBuffer);
-            GLES20.glDrawArrays(GLES20.GL_POINTS, 0, count);
+            GLES20.glVertexAttribPointer(pointPosition, 3, GLES20.GL_FLOAT, false, 0, viewpointPositionsBuffer);
+            GLES20.glVertexAttribPointer(pointColor, 3, GLES20.GL_FLOAT, false, 0, viewpointColorsBuffer);
+            GLES20.glDrawArrays(GLES20.GL_LINES, 0, vertexCount);
             GLES20.glDisableVertexAttribArray(pointPosition); GLES20.glDisableVertexAttribArray(pointColor);
             GLES20.glDisable(GLES20.GL_BLEND);
         }
@@ -785,6 +826,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 item.put("cx", principal[0]); item.put("cy", principal[1]);
                 item.put("w", imageSize[0]); item.put("h", imageSize[1]);
                 frames.add(item);
+                viewpoints.add(new CaptureViewpoint(matrix, focal[0], focal[1], principal[0], principal[1], imageSize[0], imageSize[1]));
                 capturedFrameCount = frames.size();
                 addColoredSeeds(frame, pose, bitmap, focal, principal, imageSize, name);
                 bitmap.recycle();
@@ -833,7 +875,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
 
         void resetData() {
-            coverage.clear(); seeds.clear(); frames.clear(); capturedFrameCount = 0; capturedSeedCount = 0;
+            coverage.clear(); seeds.clear(); frames.clear(); viewpoints.clear(); capturedFrameCount = 0; capturedSeedCount = 0;
             refreshCaptureTelemetry();
             travelTrigger.reset();
             deleteTree(outputDir); outputDir.mkdirs();
@@ -996,6 +1038,42 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         void captured(float[] position) {
             lastPosition = position.clone();
             distanceSinceCapture = 0f;
+        }
+    }
+
+    private static final class CaptureViewpoint {
+        final float[] lineVertices = new float[16 * 3];
+
+        CaptureViewpoint(float[] pose, float fx, float fy, float cx, float cy, int width, int height) {
+            final float depth = 0.12f;
+            final float[] origin = {pose[12], pose[13], pose[14]};
+            final float[][] corners = new float[4][3];
+            final float[] px = {0f, width, width, 0f};
+            final float[] py = {0f, 0f, height, height};
+            for (int i = 0; i < 4; i++) {
+                float x = (px[i] - cx) / fx * depth;
+                float y = (cy - py[i]) / fy * depth;
+                float z = -depth; // ARCore camera looks down its local -Z axis.
+                corners[i][0] = pose[0] * x + pose[4] * y + pose[8] * z + pose[12];
+                corners[i][1] = pose[1] * x + pose[5] * y + pose[9] * z + pose[13];
+                corners[i][2] = pose[2] * x + pose[6] * y + pose[10] * z + pose[14];
+            }
+            int out = 0;
+            for (int i = 0; i < 4; i++) {
+                out = putLineVertex(lineVertices, out, origin);
+                out = putLineVertex(lineVertices, out, corners[i]);
+            }
+            for (int i = 0; i < 4; i++) {
+                out = putLineVertex(lineVertices, out, corners[i]);
+                out = putLineVertex(lineVertices, out, corners[(i + 1) % 4]);
+            }
+        }
+
+        private static int putLineVertex(float[] target, int offset, float[] point) {
+            target[offset++] = point[0];
+            target[offset++] = point[1];
+            target[offset++] = point[2];
+            return offset;
         }
     }
 

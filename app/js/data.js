@@ -2,7 +2,7 @@
 // app is measured live; what lives here is only what a card needs to SAY
 // before anything has run.
 
-export const REPO = 'https://github.com/arrival-space/splat.js';
+export const REPO = 'https://github.com/poWMod-web/Android-splat.js';
 // the feedback channel in the top bar — empty hides the button, so a build
 // never ships a Discord link that goes nowhere
 export const DISCORD = 'https://discord.gg/ATWXzHDRbZ';

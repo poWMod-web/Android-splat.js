@@ -58,7 +58,7 @@ body {
   color: var(--paper); border-color: var(--line-2);
 }
 /* New and Source: no pills — a quiet divider, then icon + word */
-#btn-new, #gh, #discord, #acct {
+#btn-new, #gh, #discord {
   border: 0; background: none; border-radius: 8px;
   padding: 6px 8px; margin-left: 14px;
   position: relative; color: var(--muted);
@@ -68,22 +68,7 @@ body {
   transform: translateY(-50%);
   width: 1px; height: 18px; background: var(--line-2);
 }
-#btn-new:hover, #gh:hover, #discord:hover, #acct:hover { color: var(--accent); }
-/* the account corner: "Login", or the signed-in visitor's picture and name */
-#acct { display: inline-flex; align-items: center; gap: 7px; }
-#acct .acct-av {
-  width: 18px; height: 18px; border-radius: 50%; flex: none;
-  background: var(--line-2) center/cover no-repeat;
-  display: inline-grid; place-items: center;
-  font-size: 10px; font-weight: 700; color: var(--paper);
-}
-#acct.armed { color: #ff8585; }   /* same red the tile menus arm with */
-#btn-new .ai, #acct .ai {
-  width: 14px; height: 14px; flex: none;
-  fill: none; stroke: currentColor; stroke-width: 1.75;
-  stroke-linecap: round; stroke-linejoin: round;
-}
-
+#btn-new:hover, #gh:hover, #discord:hover { color: var(--accent); }
 /* ── touch ownership ─────────────────────────────────────────────────────────
    The page must never react on its own: no pinch-zoom, no rubber-banding, no
    stray scrolling. Touches on the stage belong entirely to the app (pinch /
@@ -1163,3 +1148,10 @@ a.cbtn { text-decoration: none; }
 .av-sheet .vid-head b { font: 600 20px var(--ui); }
 .stage .av-sheet canvas { position: static; inset: auto; height: auto; }   /* the stage's own canvases are absolute */
 .av-sheet .prep-cut { height: min(320px, 42vh); }
+
+/* Keep utility controls light beside the main capture and training actions. */
+#btn-xr-help, #btn-training-visuals, #xr-device-guide {
+  padding: 4px 9px;
+  font-size: 11px;
+  line-height: 1.2;
+}

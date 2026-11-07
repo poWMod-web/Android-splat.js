@@ -44,7 +44,6 @@
   <button class="tbtn" id="btn-training-visuals" type="button" aria-pressed="false" title="Show or hide the model, photo comparison, and camera poses during training" hidden>Show visuals</button>
   <a class="tbtn ghlink" id="discord" target="_blank" rel="noopener" hidden title="Tell us what you think — on Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.369a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.249a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.036A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.009c.12.099.246.198.373.292a.077.077 0 0 1-.006.127c-.598.35-1.22.644-1.873.891a.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.029 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.056c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.331c-1.183 0-2.157-1.086-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.332-.955 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.086-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.332-.946 2.418-2.157 2.418z"/></svg>Feedback</a>
   <a class="tbtn ghlink" id="gh" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>Source</a>
-  <button class="tbtn" id="acct" type="button"></button>
   </header>
 
 <footer class="dock" id="dock"></footer>
@@ -78,7 +77,7 @@
     <a class="xr-open-tab" id="xr-open-tab" target="_blank" rel="noopener" hidden>Open a full browser tab for AR capture ↗</a>
     <div class="xr-flow"><div><span class="xr-flow-no">01 / CAPTURE</span><h3>Walk around it.</h3><p>Take overlapping views. Each AR photo keeps its exact camera transform.</p></div><div><span class="xr-flow-no">02 / POSITION</span><h3>Already in place.</h3><p>Known poses bypass SfM. Depth or hit tests add measured seeds when available.</p></div><div><span class="xr-flow-no">03 / TRAIN</span><h3>Make it a splat.</h3><p>JavaScript + WebGPU. Preview the scene and export a standard .ply.</p></div></div>
     <button class="xr-example" id="btn-xr-example"><img src="data/synthetic/synthetic_00.png" alt="Bundled synthetic room corner"><span><b>Try a scene with known cameras</b><small>12 bundled views · no AR device needed · real training</small></span><span class="xr-arrow" aria-hidden="true">↗</span></button>
-    <div class="xr-home-foot"><button id="xr-device-guide">Compatibility &amp; capture guide</button><a href="https://github.com/arrival-space/splat.js" target="_blank" rel="noopener">Built on splat.js ↗</a></div>
+    <div class="xr-home-foot"><button id="xr-device-guide">Compatibility &amp; capture guide</button><a href="https://github.com/poWMod-web/Android-splat.js" target="_blank" rel="noopener">Source ↗</a></div>
 
     <div id="gallery" hidden></div>
 
@@ -90,7 +89,7 @@
     <label class="av-choice" id="av-choice" hidden title="Cuts the person out of every frame before training, keeps the room in the solve, isolates the person afterwards and rigs the result. Your own captures only.">
       <input type="checkbox" id="set-avatar">
       <span>This is a person — make an avatar
-        <small>An orbit at arm's length, arms slightly out. The person is cut out of every frame before training; afterwards the splat is isolated, fitted to a body model and can go on your arrival.space account.</small>
+        <small>An orbit at arm's length, arms slightly out. The person is cut out of every frame before training; afterwards the splat is isolated and fitted to a body model. Download the finished avatar package to keep or use elsewhere.</small>
       </span>
     </label>
 

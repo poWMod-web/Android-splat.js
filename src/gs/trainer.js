@@ -4,10 +4,11 @@ import {
   STRIDE, TILE, ENTRIES_CAP, makeProjectSrc, makeRenderSrc, makeChainSrc,
   SCAN_SRC, SCATTER_SRC, SORT_SRC, ADAM_SRC, SH_ADAM_SRC, BLIT_SRC, shRestCoefs,
   VIS_COUNT_SRC, VIS_SCAN_SRC, VIS_SCATTER_SRC, makeAdamSrc, makeSHAdamSrc, makeShapeClampSrc,
-  GATHER_SRC, REFINE_APPLY_SRC, REFINE_PATCH_SRC, SSIM_SRC, makeSsaaLossSrc,
+  GATHER_SRC, REFINE_APPLY_SRC, REFINE_PATCH_SRC, SSIM_SRC, SSIM_METRIC_SRC, makeSsaaLossSrc,
 } from './shaders.js';
 import { rodrigues, m3mul, makeRng } from '../sfm/geometry.js';
 import { createGpu } from '../gpu/context.js';
+import { ssimIndexRgb } from './ssim.js';
 
 export class GSTrainer {
   /** opts.gpu: a GpuContext from createGpu() — share ONE device between the
@@ -209,6 +210,10 @@ export class GSTrainer {
       label: 'refine-apply', layout: 'auto',
       compute: { module: mk(REFINE_APPLY_SRC, 'refine-apply'), entryPoint: 'main' },
     });
+    this.pipeSsimMetric = d.createComputePipeline({
+      label: 'ssim-metric', layout: 'auto',
+      compute: { module: mk(SSIM_METRIC_SRC, 'ssim-metric'), entryPoint: 'main' },
+    });
     const blitModule = mk(BLIT_SRC, 'blit');
     this.pipeBlit = d.createRenderPipeline({
       label: 'blit', layout: 'auto',
@@ -360,6 +365,15 @@ export class GSTrainer {
     this.bufOut = buf(maxPix * ssq * 4 * 4, B.STORAGE | B.COPY_SRC, 'outImg');
     this.bufTarget = buf(Math.max(16, total * 4), B.STORAGE | B.COPY_DST, 'targets');
     d.queue.writeBuffer(this.bufTarget, 0, targetData);
+    // SSIM is measured only on demand (when the graph uses its percentage
+    // scale). Its compact 2x2-averaged image pair is read back for the exact
+    // 11x11 Gaussian SSIM calculation on the CPU.
+    const maxSsimPixels = Math.max(
+      Math.ceil(maxViewW / 2) * Math.ceil(maxViewH / 2),
+      ...this.camMeta.map((m) => Math.ceil(m.w / 2) * Math.ceil(m.h / 2)));
+    this.ssimMetricBytes = Math.max(32, maxSsimPixels * 32);
+    this.bufSsimMetric = buf(this.ssimMetricBytes, B.STORAGE | B.COPY_SRC, 'ssim-metric');
+    this.bufSsimMetricRead = buf(this.ssimMetricBytes, B.COPY_DST | B.MAP_READ, 'ssim-metric-read');
     this.bufStats = buf(16, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'stats');
     d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
     this.bufStatsRead = buf(16, B.COPY_DST | B.MAP_READ, 'statsRead');
@@ -472,6 +486,15 @@ export class GSTrainer {
     this.bgScatterView = bgScatter(this.uniView);
     this.bgRenderTrain = bgRender(this.uniTrain);
     this.bgRenderView = bgRender(this.uniView);
+    this.bgSsimMetric = d.createBindGroup({
+      layout: this.pipeSsimMetric.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.uniTrain } },
+        { binding: 1, resource: { buffer: this.bufOut } },
+        { binding: 2, resource: { buffer: this.bufTarget } },
+        { binding: 3, resource: { buffer: this.bufSsimMetric } },
+      ],
+    });
     if (this.ssimW > 0) {
       // SSIM working buffers: A/B pixel-major 16 f32/px, gssim 4 f32/px,
       // endBuf 1 u32/px (per-pixel walk end handed from fwd to bwd kernel)
@@ -1292,7 +1315,7 @@ export class GSTrainer {
   /** One training-path pass for camera ci (optionally with a pose override);
    *  returns { psnr, camGrad (Int32Array row ci + focal row) }. Drains all
    *  gradient pollution so training state stays clean. */
-  async _evalPass(ci, override) {
+  async _evalPass(ci, override, includeSsim = false) {
     const d = this.device;
     const meta = this.camMeta[ci];
     const uni = override
@@ -1306,25 +1329,59 @@ export class GSTrainer {
     const enc = d.createCommandEncoder();
     const p = enc.beginComputePass();
     this.encodeRaster(p, meta, true);
+    if (includeSsim) {
+      p.setPipeline(this.pipeSsimMetric);
+      p.setBindGroup(0, this.bgSsimMetric);
+      p.dispatchWorkgroups(Math.ceil(Math.ceil(meta.w / 2) / 8), Math.ceil(Math.ceil(meta.h / 2) / 8));
+    }
     p.setPipeline(this.pipeChain); p.setBindGroup(0, this.bgChain); // zeroes gradP
     p.dispatchWorkgroups(Math.ceil(this.n / 256));
     p.end();
+    const ssimBytes = includeSsim ? Math.ceil(meta.w / 2) * Math.ceil(meta.h / 2) * 32 : 0;
+    if (includeSsim) enc.copyBufferToBuffer(this.bufSsimMetric, 0, this.bufSsimMetricRead, 0, ssimBytes);
     enc.copyBufferToBuffer(this.bufStats, 0, this.bufStatsRead, 0, 16);
     const rbC = d.createBuffer({ size: rows * 32, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyBufferToBuffer(this.bufCamGrad, 0, rbC, 0, rows * 32);
     d.queue.submit([enc.finish()]);
     d.queue.writeBuffer(this.bufCamGrad, 0, new Int32Array(rows * 8)); // drain
-    await Promise.all([this.bufStatsRead.mapAsync(GPUMapMode.READ), rbC.mapAsync(GPUMapMode.READ)]);
+    await Promise.all([
+      this.bufStatsRead.mapAsync(GPUMapMode.READ), rbC.mapAsync(GPUMapMode.READ),
+      ...(includeSsim ? [this.bufSsimMetricRead.mapAsync(GPUMapMode.READ)] : []),
+    ]);
     const sarr = new Uint32Array(this.bufStatsRead.getMappedRange());
     const v = sarr[0];
     const validPx = Math.max(1, sarr[2]);
     this.bufStatsRead.unmap();
     const camGrad = new Int32Array(rbC.getMappedRange()).slice();
     rbC.unmap(); rbC.destroy();
+    let ssim = null;
+    if (includeSsim) {
+      const values = new Float32Array(this.bufSsimMetricRead.getMappedRange(0, ssimBytes)).slice();
+      this.bufSsimMetricRead.unmap();
+      const width = Math.ceil(meta.w / 2), height = Math.ceil(meta.h / 2);
+      const count = width * height;
+      const pred = new Float32Array(count * 3), target = new Float32Array(count * 3);
+      const valid = new Uint8Array(count);
+      for (let i = 0; i < count; i++) {
+        const j = i * 8, k = i * 3;
+        if (values[j + 3] > 0.5) {
+          valid[i] = 1;
+          pred[k] = values[j]; pred[k + 1] = values[j + 1]; pred[k + 2] = values[j + 2];
+          target[k] = values[j + 4]; target[k + 1] = values[j + 5]; target[k + 2] = values[j + 6];
+        }
+      }
+      ssim = ssimIndexRgb(pred, target, width, height, valid);
+    }
     d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
     this.pixelsSeen = 0; // running train-psnr window was clobbered
     const mse = v / 16 / (validPx * 3);
-    return { psnr: mse > 0 ? -10 * Math.log10(mse) : Infinity, camGrad };
+    return { psnr: mse > 0 ? -10 * Math.log10(mse) : Infinity, camGrad, ...(includeSsim ? { ssim } : {}) };
+  }
+
+  /** PSNR and mean Gaussian-window SSIM for one camera at the current pose. */
+  async evalCamMetrics(ci) {
+    const { psnr, ssim } = await this._evalPass(ci, undefined, true);
+    return { psnr, ssim };
   }
 
   /** PSNR of one camera (typically the holdout) at its current pose. */

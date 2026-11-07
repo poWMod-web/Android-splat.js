@@ -6,6 +6,7 @@ const root = resolve(new URL('../..', import.meta.url).pathname);
 const app = readFileSync(resolve(root, 'app/js/app.js'), 'utf8');
 const html = readFileSync(resolve(root, 'app/index.html'), 'utf8');
 const session = readFileSync(resolve(root, 'src/session.js'), 'utf8');
+const sessionIo = readFileSync(resolve(root, 'app/js/session_io.js'), 'utf8');
 
 const captureStart = app.indexOf('function captureRunSolveDetails()');
 const captureEnd = app.indexOf('function persistRunDetails(', captureStart);
@@ -62,5 +63,11 @@ assert.match(session, /if \(!this\.enabled \|\| !this\.ctx \|\| !this\.camera\) 
   'disabled session view should skip its standalone GPU render');
 assert.match(app, /dchart\.draw\(\)/,
   'the Details score graph remains rendered and refreshed during training');
+assert.match(app, /const capturedPoints = S\.preset\?\.capture\?\.points \|\| \[\][\s\S]*const pts = capturedPoints\.length \? capturedPoints/,
+  'the Cameras view should use the point cloud saved by capture rather than reconstructing it during training');
+assert.match(sessionIo, /capture-time snapshot[\s\S]*potentially-mutated optimizer\/reconstruction state/,
+  'saved model details should preserve the frozen camera-view point cloud');
+assert.match(sessionIo, /if \(S\.scene\?\.xyz\?\.length\)/,
+  'the saved scene cloud should be the source for model Details after training');
 
 console.log('Local model Details persistence, continuation, and training visualization gate: passed');

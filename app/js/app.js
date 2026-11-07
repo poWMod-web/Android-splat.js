@@ -16,22 +16,17 @@ import { initXRUI, reviewCapture, exportCapture } from './xr-ui.js';
 import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } from './xr-dataset.js';
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './training-settings.js';
 import { zipStore } from './zip.js';
-import { handleOAuthCallback, sendToArrival, hasToken, focusSignIn, API_BASE } from './arrival.js';
+import { API_BASE } from './arrival.js';
 import { buildSessionZip, fetchModel } from './session_io.js';
 import { PRESETS, REPO, DISCORD, DATA, ownSet } from './data.js';
 // official demo scenes on the wall that are not bundled presets (Garden, The Lab, Camping)
 const EXTRA_PRESET_SPACES = ['42485456_3427', '42485456_9670', '42485456_7518'];
-const HOME_BENCHMARK_IDS = new Set([
-  PRESETS.find((preset) => preset.id === 'synthetic')?.spaceId,
-  '42485456_7518', // Camping
-].filter(Boolean).map(String));
 const presetSpaceIds = () => new Set([...PRESETS.map((p) => p.spaceId).filter(Boolean), ...EXTRA_PRESET_SPACES]);
+const HOME_BENCHMARK_IDS = new Set([
+  ...PRESETS.filter((preset) => preset.id === 'synthetic').map((preset) => String(preset.spaceId)),
+  '42485456_7518', // Camping
+]);
 
-// the header's account glyph. Declared UP HERE on purpose: boot() runs while
-// this module is still evaluating, so a const further down is in the temporal
-// dead zone by the time renderAccount() reads it (it threw on live, 2026-09-16)
-const USER_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true" class="ai">' +
-  '<circle cx="12" cy="8" r="3.4"/><path d="M4.8 20c.6-3.6 3.6-5.6 7.2-5.6s6.6 2 7.2 5.6"/></svg>';
 import { Viewport, camCentre, quatFromR, quatToR, qslerp } from './viewport.js';
 import { Developer, fitRect } from './develop.js';
 import { Chart } from './chart.js';
@@ -254,9 +249,13 @@ const S = {
   regCams: [],                 // cameras as they register (beat 3)
   solveStats: { pairsChecked: 0, pairsUsable: 0, solveSec: 0 },
   chartEvents: [],             // real refine/growth moments for the curve
+  ssimTrainHist: [],
+  ssimHoldHist: [],
+  _ssimEvalBusy: false,
+  _ssimLastEvalAt: 0,
+  scoreScale: 'db',
   flash: null,
   detailTab: 'score',
-  scoreScale: 'db',
   trainVisuals: false,         // the app's model/compare/camera overlays sleep during training by default
   _savedGpuFacts: null,        // GPU facts captured with a local run, not the current viewer device
   _savedDetailSettings: null,
@@ -292,27 +291,20 @@ function syncTrainingVisualsControl() {
     button.textContent = S.trainVisuals ? 'Hide visuals' : 'Show visuals';
     button.setAttribute('aria-pressed', String(!!S.trainVisuals));
   }
-  // With the model presentation hidden, let the score graph use the whole
-  // stage. Move the same canvas back into the dock when visuals return.
-  const plot = $('chart')?.parentElement;
-  const dockEl = $('dock');
-  const stage = $('stage');
-  const expandPlot = training && !S.trainVisuals;
-  if (plot && dockEl && stage) {
-    const moved = expandPlot ? plot.parentElement !== stage : plot.parentElement !== dockEl;
-    if (expandPlot && moved) {
-      stage.insertBefore(plot, $('hud'));
-      plot.classList.add('chartwrap-expanded');
-    } else if (!expandPlot && moved) {
-      const scores = dockEl.querySelector('.tscores');
-      if (scores) dockEl.insertBefore(plot, scores);
-      plot.classList.remove('chartwrap-expanded');
-    }
-    dockEl.classList.toggle('chart-expanded', expandPlot);
-    if (moved) requestAnimationFrame(() => chart?.resize());
-  }
   if (gpuCanvas) gpuCanvas.style.display = visualsActive ? '' : 'none';
   if (S.session && S.session.view && S.session.view.setEnabled) S.session.view.setEnabled(visualsActive);
+  const stage = $('stage'), dock = $('dock');
+  const plot = dock?.querySelector('.chartwrap') || stage?.querySelector('.chartwrap-expanded');
+  const expandPlot = training && !S.trainVisuals && !detailOpen;
+  if (expandPlot && plot) {
+    if (plot.parentElement !== stage) stage.insertBefore(plot, $('hud'));
+    plot.classList.add('chartwrap-expanded');
+    dock.classList.add('chart-expanded');
+  } else {
+    if (plot) plot.classList.remove('chartwrap-expanded');
+    if (plot && plot.parentElement === stage && dock) dock.insertBefore(plot, dock.querySelector('.tscores'));
+    dock?.classList.remove('chart-expanded');
+  }
 }
 
 function toggleTrainingVisuals() {
@@ -324,7 +316,7 @@ function toggleTrainingVisuals() {
 }
 
 // the OAuth popup lands back on this page with ?code= — report and close
-if (!handleOAuthCallback()) boot();
+boot();
 
 // ── boot ────────────────────────────────────────────────────────────────────
 function boot() {
@@ -379,16 +371,10 @@ function boot() {
     e.stopPropagation();
     const runId = S.runId || (S._localRun && S._localRun.id);
     if (runId) await persistRunDetails(runId, { full: true }).catch(() => {});
-    // Local library viewers use a pushed in-app state; pop it to return to
-    // the same wall/feed without leaving the app.
-    if (S._localRun && S._viewerOpen) {
-      if (history.state && history.state.sj === 'viewer' && history.length > 1) history.back();
-      else closeViewerToHome();
-      return;
-    }
     // a shared creation holds nothing precious — Back is simply the way
     // home. When the visitor came from within the app, real history.back()
     // is better: the bfcache restores the feed with its scroll intact.
+    if (S._localRun && S._viewerOpen) { closeViewerToHome(); return; }
     if (S.restored) {
       let fromApp = false;
       try {
@@ -405,8 +391,6 @@ function boot() {
     location.href = 'index.html';
   });
   $('btn-training-visuals').addEventListener('click', toggleTrainingVisuals);
-  $('d-chart-scale').addEventListener('click', toggleScoreScale);
-  syncScoreScaleControls();
   $('card-x').addEventListener('click', closePicker);
   $('file-input').addEventListener('change', (e) => {
     const files = Array.from(e.target.files);
@@ -657,8 +641,6 @@ function boot() {
   $('about-gh').href = REPO;
   // the feedback channel shows only when this build has one to point at
   if (DISCORD) { $('discord').href = DISCORD; $('discord').hidden = false; }
-  wireAccount();
-  renderAccount();
   // the brand: on the home tile view (nothing open) it tells the story —
   // the About sheet; from inside a scene it stays the way back home
   // the card's state lives in the address (?about=1): a refresh keeps it
@@ -756,13 +738,6 @@ function boot() {
   if (mp.get('space')) restoreShared(mp.get('space'));
   else if (mp.get('model')) restoreSession({ url: mp.get('model'), reconUrl: mp.get('recon') });
   else mountWall();
-  // ?admin: the community moderation sheet over the home wall
-  if (mp.has('admin')) {
-    import('./admin.js').then(({ adminDashboard }) => adminDashboard({
-      flash, ownerInfo, presetIds: presetSpaceIds(),
-      onClose: () => { history.replaceState(null, '', location.pathname); showHome(); },
-    })).catch((e) => flash(`Admin sheet failed: ${e.message}`, 8000));
-  }
 }
 
 // WebGPU probe: navigator.gpu can EXIST while the adapter is unavailable
@@ -959,7 +934,7 @@ function tileMenu(btn, items) {
   });
 }
 
-async function localRunTiles(shares = new Map()) {
+async function localRunTiles() {
   const { listRuns, deleteRun } = await import('./store.js');
   const runs = await listRuns();
   const tiles = [];
@@ -1019,10 +994,6 @@ async function localRunTiles(shares = new Map()) {
       });
     };
     const viewable = !!(r.recon && (r.sog || (r.status === 'finished' && r.state)));
-    // a run that was shared carries the share's management too — rename, the
-    // Community listing, the kill switch — but only when the account that
-    // owns it is signed in here (`shares`, from /splatjs/mine)
-    const sh = r.spaceId ? shares.get(String(r.spaceId)) : null;
     const renameLocalModel = async () => {
       const previousName = r.name || 'Training run';
       const name = await textCard('Rename this model', previousName);
@@ -1042,10 +1013,8 @@ async function localRunTiles(shares = new Map()) {
     tileMenu(b.querySelector('.run-menu'), [
       viewable && { label: 'View', act: r.sog ? openRun : () => viewFromState(r) },
       (r.sog || retrainable || (r.state && r.recon)) && { label: 'Train', act: () => { S._localRun = r; trainLocalChoice(); } },
-      !sh && { label: 'Rename', act: renameLocalModel },
-      ...(sh ? shareMenuItems(sh)
-        : r.spaceId ? [{ label: 'Copy link', act: async () => { try { await navigator.clipboard.writeText(shareLinkOf(r.spaceId)); flash('Link copied.', 2500); } catch { flash(shareLinkOf(r.spaceId), 8000); } } }] : []),
-      r.sog && r.recon && !r.spaceId && { label: 'Share', act: () => shareDialog(r) },
+      { label: 'Rename', act: renameLocalModel },
+      r.spaceId && { label: 'Copy link', act: async () => { try { await navigator.clipboard.writeText(shareLinkOf(r.spaceId)); flash('Link copied.', 2500); } catch { flash(shareLinkOf(r.spaceId), 8000); } } },
       { label: 'Delete', danger: true, act: async () => { await deleteRun(r.id); b.remove(); } },
     ]);
     b.addEventListener('click', () => {
@@ -1669,6 +1638,7 @@ async function open(preset, autostart = false) {
   S.maxIters = PERF.on ? PERF.iters : INITIAL_ITERS;
   S.perfMetrics = [];
   S.holdHist = [];
+  S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0;
   S._lastReady = null;
   S.growthStopped = false;
   S.plyBlob = null; S.sogBlob = null;
@@ -1847,7 +1817,7 @@ async function startPrep() {
   // metrics tick; stale dB and splat counts flash the same way).
   S.iter = 0; S.splats = 0; S.psnrTrain = null; S.psnrHold = null;
   S.itersPerSec = 0; S.minutes = 0; S.etaAt = null;
-  S.holdHist = []; S.chartEvents = []; S.growthStopped = false;
+  S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.growthStopped = false;
   S.feats = new Map(); S.lastPairEv = null; S.shownPair = null; S.regCams = [];
   S.regPts = null; S.regPtsCount = 0; S.growNote = null;
   S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
@@ -2400,7 +2370,8 @@ function buildSceneFromSession() {
       });
     }
   }
-  const pts = (recon && recon.points) || [];
+  const capturedPoints = S.preset?.capture?.points || [];
+  const pts = capturedPoints.length ? capturedPoints : ((recon && recon.points) || []);
   const xyz = new Float32Array(pts.length * 3);
   const rgb = new Uint8Array(pts.length * 3);
   pts.forEach((p, k) => {
@@ -2510,6 +2481,8 @@ function startTraining() {
   if (chart) {
     chart.train = (S.session.lossHistory || []).map(([i, v]) => [i, v]);
     chart.hold = (S.holdHist || []).slice();
+    chart.ssimTrain = (S.ssimTrainHist || []).slice();
+    chart.ssimHold = (S.ssimHoldHist || []).slice();
     chart.maxIter = S.maxIters;
     chart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
     chart.draw();
@@ -2600,6 +2573,8 @@ function captureRunProgressDetails() {
     ? S.holdHist : ((S.restored && S.restored.stats && S.restored.stats.holds) || []);
   return {
     chart: compactRows(history, 800),
+    ssimChart: compactRows(S.ssimTrainHist || [], 800),
+    ssimHolds: compactRows(S.ssimHoldHist || [], 800),
     holds: compactRows(holds, 800),
     events: (S.chartEvents || []).slice(-300).map((e) => ({ ...e })),
     perf: {
@@ -2653,6 +2628,12 @@ function restoreRunDetails(run, session = S.session) {
   S._savedDetailSettings = progress.settings || null;
   S.chartEvents = Array.isArray(progress.events) ? progress.events.map((e) => ({ ...e })) : [];
   S.holdHist = Array.isArray(progress.holds) ? progress.holds.map((r) => Array.from(r || [])) : [];
+  const ssimHistory = Array.isArray(progress.ssimChart) && progress.ssimChart.length
+    ? progress.ssimChart : ((S.restored && S.restored.stats && S.restored.stats.ssimChart) || []);
+  S.ssimTrainHist = ssimHistory.map((r) => Array.from(r || []));
+  S.ssimHoldHist = (Array.isArray(progress.ssimHolds) ? progress.ssimHolds
+    : ((S.restored && S.restored.stats && S.restored.stats.ssimHolds) || [])).map((r) => Array.from(r || []));
+  S._ssimLastEvalAt = 0;
   S.perfMetrics = Array.isArray(progress.metrics) ? progress.metrics.map((m) => Array.from(m || [])) : [];
   const lastMetric = S.perfMetrics[S.perfMetrics.length - 1];
   if (lastMetric && Number.isFinite(+lastMetric[2])) S.itersPerSec = +lastMetric[2];
@@ -2716,6 +2697,40 @@ async function checkpointRun(reason) {
   } finally { S._ckptBusy = false; }
 }
 
+function maybeEvaluateSsim(iter = S.iter) {
+  if (S.scoreScale !== 'similarity' || S._ssimEvalBusy || !S.session?.evalGraphMetrics) return;
+  const now = performance.now();
+  if (S._ssimLastEvalAt && now - S._ssimLastEvalAt < 15000) return;
+  const session = S.session;
+  const trainer = session.trainer;
+  if (!trainer?.camMeta?.length) return;
+  const holdCi = Number.isInteger(session.holdout) ? session.holdout : -1;
+  let trainCi = trainer.camMeta.findIndex((_, i) => i !== holdCi);
+  if (trainCi < 0) trainCi = 0;
+  S._ssimEvalBusy = true;
+  S._ssimLastEvalAt = now;
+  const gen = S.gen;
+  session.evalGraphMetrics(trainCi, holdCi).then(({ train, hold }) => {
+    if (S.gen !== gen || S.session !== session || !Number.isFinite(train?.ssim)) return;
+    S.ssimTrainHist.push([iter, train.ssim]);
+    if (Number.isFinite(hold?.ssim)) S.ssimHoldHist.push([iter, hold.ssim]);
+    if (S.ssimTrainHist.length > 1000) S.ssimTrainHist = compactRows(S.ssimTrainHist, 800);
+    if (S.ssimHoldHist.length > 1000) S.ssimHoldHist = compactRows(S.ssimHoldHist, 800);
+    if (chart) {
+      chart.ssimTrain = S.ssimTrainHist.slice();
+      chart.ssimHold = S.ssimHoldHist.slice();
+      chart.draw();
+    }
+    if (dchart) {
+      dchart.ssimTrain = S.ssimTrainHist.slice();
+      dchart.ssimHold = S.ssimHoldHist.slice();
+      dchart.draw();
+    }
+  }).catch((e) => console.warn('SSIM graph evaluation failed', e)).finally(() => {
+    S._ssimEvalBusy = false;
+  });
+}
+
 function onMetrics(m) {
   S.iter = m.iter;
   S.splats = m.splats;
@@ -2773,6 +2788,8 @@ function onMetrics(m) {
       const history = (S.session && S.session.lossHistory) || [];
       dchart.train = history.map(([i, v]) => [i, v]);
       dchart.hold = (S.holdHist || []).slice();
+      dchart.ssimTrain = (S.ssimTrainHist || []).slice();
+      dchart.ssimHold = (S.ssimHoldHist || []).slice();
       dchart.maxIter = S.maxIters;
       dchart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
       dchart.draw();
@@ -2780,6 +2797,7 @@ function onMetrics(m) {
   } else if (!$('details').hidden && S.detailTab === 'perf') {
     $('d-perf').textContent = buildPerfReport();
   }
+  maybeEvaluateSsim(m.iter);
   // Local records get a compact diagnostics update alongside the headline
   // progress every twenty seconds. The complete final snapshot is written on
   // pause, finish, or when leaving the model viewer.
@@ -2861,7 +2879,7 @@ async function deviceLostRecovery() {
     await S.session.recover();
     if (S.gen !== gen) return;
     S.iter = 0; S.psnrTrain = null; S.psnrHold = null;
-    S.holdHist = []; S.chartEvents = []; S.growthStopped = false;
+    S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.growthStopped = false;
     S.plyBlob = null; S.sogBlob = null;
     buildSceneFromSession();
     mountModelCanvas();
@@ -3067,7 +3085,6 @@ async function runAvatarStages() {
       // ?handoff=1: the package goes back to the opener instead of onto the account
       ...(HANDOFF ? { handoff: handOff } : {}),
       persist: (m) => { if (S._capRec && S.gen === gen) { S._capRec.avatar = m; persistCapture(S._capRec); } },
-      arrival: { hasToken, API_BASE },
       // the thumbnail is of the avatar as it ships — the trained pose, not
       // whatever half-stride the walk preview happens to be on
       thumb: async () => { const was = S.walking; stopWalk(); const t = await renderShareThumb(); S.walking = was; return t; },
@@ -3160,7 +3177,7 @@ async function restoreSession(src) {
     S._resumeRunId = null;
     S.feats = new Map(); S.lastPairEv = null;
     S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
-    S.chartEvents = []; S.holdHist = []; S.perfMetrics = []; S.itersPerSec = 0;
+    S.chartEvents = []; S.holdHist = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.perfMetrics = []; S.itersPerSec = 0;
     S._savedGpuFacts = null; S._savedDetailSettings = null;
     // a run that was already shared knows its space: the viewer offers its
     // link and its listing, where a reload used to leave only a Download
@@ -3637,8 +3654,8 @@ function renderControls() {
   }
   const rj = S.restored && S.restored.reconJson;
   if (S._localRun && S._localRun.ownSrc) {
-    // Prefer the device-local action even if the saved recon contains stale
-    // blob: URLs: continue this run or train from the capture kept on-device.
+    // a local run of the visitor's own photos: continue on the model, or
+    // start fresh from the capture kept on this device
     const train = document.createElement('button');
     train.className = 'cbtn accent';
     train.textContent = 'Train';
@@ -3868,21 +3885,20 @@ async function continueLocalRun(viewOnly = false) {
   if (S.gen !== gen) return;
   S.iter = baseIter;
   S.psnrTrain = null; S.psnrHold = null;
-  S.holdHist = []; S.chartEvents = []; S.growthStopped = false;
+  S.holdHist = []; S.chartEvents = []; S.ssimTrainHist = []; S.ssimHoldHist = []; S._ssimLastEvalAt = 0; S.growthStopped = false;
   restoreRunDetails(lr, ses);
   buildSceneFromSession();
   mountModelCanvas();
   if (viewOnly) {
     S.maxIters = baseIter;
     S.runId = lr.id;
-    S._viewerOpen = true;
-    S.restored = { hasState: true, stats: (recon && recon.stats) || {}, reconJson: recon };
-    if (!(history.state && history.state.sj === 'viewer')) history.pushState({ sj: 'viewer' }, '');
-    $('btn-new').hidden = false;
     S.minutes = lr.minutes || 0;
     S.psnrTrain = lr.psnr ?? null;
     S.splats = g.n;
     S.trainT0 = performance.now();
+    S.restored = { hasState: true, stats: (recon && recon.stats) || {}, reconJson: recon };
+    S._viewerOpen = true;
+    $('btn-new').hidden = false;
     enterDone();
     flash(`${fmt(g.n)} splats — Compress turns this into a shareable .sog`, 6000);
     return;
@@ -3915,6 +3931,8 @@ function continueTraining() {
   if (chart) {
     chart.train = S.session.lossHistory.map(([i, v]) => [i, v]);
     chart.hold = (S.holdHist || []).slice();
+    chart.ssimTrain = (S.ssimTrainHist || []).slice();
+    chart.ssimHold = (S.ssimHoldHist || []).slice();
     chart.maxIter = S.maxIters;
     chart.draw();
   }
@@ -4105,330 +4123,54 @@ function exportActions() {
 function buildExport() {
   const wrap = document.createElement('div');
   wrap.className = 'exportwrap';
-  // the creator's own run, reopened from this device's library: it was only
-  // ever stored here, so it is still theirs to share — restored is not the
-  // same as someone else's
-  const own = (!S.share && S.restored && S._localRun && S._localRun.sog
-    && S._localRun.recon && !S._localRun.spaceId) ? S._localRun : null;
-  const shareClick = (rec) => () => {
-    if (!S.uploading) { shareDialog(rec); return; }
-    // never a dead button: the sign-in the creator walked away from comes
-    // back to the front, and closing it frees the next press
-    flash(focusSignIn()
-      ? 'Finish signing in in the Arrival.Space window — or close it and press Share again.'
-      : 'The last share is still on its way — one moment.', 8000);
-  };
   if (S.share) {
-    // a scene that is already shared: Share means its link (and the downloads)
-    wrap.innerHTML = `<button class="cbtn accent btn-share" title="Share this scene">${SHARE_ICON}Share</button>`;
+    wrap.innerHTML = `<button class="cbtn accent btn-share" title="Copy this scene's link">${SHARE_ICON}Share</button>`;
     wrap.querySelector('button').addEventListener('click', () => shareDialog(null, { link: true }));
-  } else if (S.restored && !own) {
-    wrap.innerHTML = `<button class="cbtn btn-share" title="Download">${DL_ICON}Download</button>`;
-    wrap.querySelector('button').addEventListener('click', () => shareDialog(null, { downloadsOnly: true }));
   } else {
-    wrap.innerHTML = `<button class="cbtn accent btn-share" title="Share this creation">${SHARE_ICON}Share</button>`;
-    wrap.querySelector('button').addEventListener('click', shareClick(own));
+    wrap.innerHTML = `<button class="cbtn btn-share" title="Download this model">${DL_ICON}Download</button>`;
+    wrap.querySelector('button').addEventListener('click', () => shareDialog(null, { downloadsOnly: true }));
   }
   return wrap;
 }
 
-/** Ask for the space's title (a default is prefilled), then upload. The
- *  sign-in window MUST be opened synchronously inside the Upload click —
- *  after any await it would be popup-blocked. The finished space is
- *  presented as a link, never auto-opened. */
-function uploadDialog() {
-  document.getElementById('upcard')?.remove();
-  const card = document.createElement('div');
-  card.className = 'upcard';
-  card.id = 'upcard';
-  card.innerHTML = `
-    <b>Upload to Arrival.Space</b>
-    <input id="up-title" type="text" spellcheck="false" maxlength="80">
-    <div class="upcard-row">
-      <button class="btn btn-quiet" id="up-cancel">Cancel</button>
-      <button class="btn btn-accent" id="up-go">Upload</button>
-    </div>`;
-  $('stage').appendChild(card);
-  const input = card.querySelector('#up-title');
-  input.value = S.preset.id === '__own' ? 'My splat' : S.preset.name;
-  input.focus();
-  input.select();
-  const close = () => card.remove();
-  card.querySelector('#up-cancel').addEventListener('click', close);
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') card.querySelector('#up-go').click();
-    if (e.key === 'Escape') close();
-  });
-  card.querySelector('#up-go').addEventListener('click', async () => {
-    const title = input.value.trim() || 'My splat';
-    // synchronously, inside the click: the sign-in window (about:blank now,
-    // the login page once the auth URL is built)
-    const popup = hasToken() ? null : window.open('', 'arrival-oauth', 'width=480,height=720');
-    close();
-    if (!hasToken() && !popup) {
-      flash('The sign-in window was blocked — allow popups for this site and try again.', 8000);
-      return;
-    }
-    S.uploading = true;
-    try {
-      // uploads are always SOG-compressed — 10-20x smaller on the wire and
-      // the space streams it natively
-      const blob = await getSogBlob();
-      const { spaceUrl } = await sendToArrival(blob, title, {
-        ext: 'sog',
-        popup,
-        // the solved path becomes the space's intro flight (WEB-7704)
-        cams: (S.session && S.session.recon && S.session.recon.cams) || null,
-        onStatus: (m) => flash(m, 120000),
-        onProgress: (p) => flash(`Uploading … ${p}%`, 120000),
-      });
-      flash(`${title} is live`, 300000, [
-        { label: 'Open your space ↗', href: spaceUrl, blank: true },
-      ]);
-    } catch (e) {
-      console.error(e);
-      if (popup && !popup.closed) popup.close();
-      flash(`Upload failed: ${e.message}`, 9000);
-    } finally {
-      S.uploading = false;
-    }
-  });
-}
-
-/** Share the finished run: one link that opens the viewer (tour + compare
- *  + stats) with an arrival space behind it. Same sign-in as Upload. */
+/** Local export sheet and link-copy sheet. Account login and cloud publishing
+ *  have been removed; existing public links remain shareable. */
 function shareDialog(rec = null, { downloadsOnly = false, link = false } = {}) {
-  // rec: share a STORED local scene (sog + recon + thumb from IndexedDB) —
-  // no live session required
+  downloadsOnly ||= !link;
   document.getElementById('upcard')?.remove();
   const card = document.createElement('div');
   card.className = 'upcard';
   card.id = 'upcard';
-  // preset photographs already live on public URLs — only own captures
-  // need uploading for the viewer-side comparison
-  const needsPhotos = !rec && (!(S.loadedFiles || []).length || !(S.loadedFiles || []).every((f) => f.url));
-  const photoMb = ((S.loadedFiles || []).reduce((a, f) => a + ((f.source || f).size || 0), 0) / 1e6).toFixed(0);
-  // the downloads belong to the scene on screen: a record shared from the
-  // wall has no session to export from, one reopened in the viewer has
   const acts = (S.session && (!rec || rec === S._localRun)) ? exportActions() : [];
+  const url = link && S.share ? shareLinkOf(S.share.id) : '';
   card.innerHTML = `
     <button class="card-x" id="sh-x" aria-label="Close">&times;</button>
-    <b>${downloadsOnly ? 'Download' : link ? 'Share this scene' : 'Share this creation'}</b>
+    <b>${link ? 'Share this scene' : 'Download'}</b>
     ${link && S.share ? `<div class="sh-link">
-      <input id="sh-url" type="text" readonly value="${esc(shareLinkOf(S.share.id))}">
+      <input id="sh-url" type="text" readonly value="${esc(url)}">
       <div class="upcard-row sh-linkrow">
         <a class="linkish sh-enter" href="https://arrival.space/${encodeURIComponent(S.share.id)}" target="_blank" rel="noopener">Enter the space ↗</a>
         ${navigator.share ? '<button type="button" class="btn btn-outline" id="sh-native">Share …</button>' : ''}
         <button type="button" class="btn btn-accent" id="sh-copy">Copy link</button>
       </div>
-      <label class="upcard-opt sh-manage" id="sh-manage" hidden><input type="checkbox" id="sh-listing">
-        Publish to Community</label>
     </div>` : ''}
-    <div class="sh-form" ${(downloadsOnly || link) ? 'hidden' : ''}>
-    <input id="sh-title" type="text" spellcheck="false" maxlength="80">
-    <label class="upcard-opt"><input type="checkbox" id="sh-priv" checked>
-      Publish to Community</label>   <!-- checked stores "Open" (the only privacy the gallery lists); off stores "Link Only", which still resolves -->
-    <span class="sh-hint" id="sh-hint"></span>
-    <label class="upcard-opt" id="sh-inform-row"><input type="checkbox" id="sh-inform" checked>
-      Tell my followers about it</label>
-    ${needsPhotos && (S.loadedFiles || []).length ? `
-    <label class="upcard-opt"><input type="checkbox" id="sh-photos">
-      Include the ${S.loadedFiles.length} photographs (${photoMb} MB) so viewers can compare</label>` : ''}
-    <div class="upcard-row">
-      <button class="btn btn-quiet" id="sh-cancel">Cancel</button>
-      <button class="btn btn-accent" id="sh-go">Share</button>
-    </div>
-    </div>
-    <div class="sh-work" id="sh-work" hidden>
-      <span class="sog-status" id="sh-status">Preparing …</span>
-      <div class="prep-meter"><i id="sh-bar" style="width:0%"></i></div>
-    </div>
-    <div class="sh-link" id="sh-done" hidden>
-      <input id="sh-done-url" type="text" readonly>
-      <div class="upcard-row sh-linkrow">
-        <a class="linkish sh-enter" id="sh-done-enter" target="_blank" rel="noopener">Enter the space ↗</a>
-        ${navigator.share ? '<button type="button" class="btn btn-outline" id="sh-done-native">Share …</button>' : ''}
-        <button type="button" class="btn btn-accent" id="sh-done-copy">Copy link</button>
-      </div>
-      <label class="upcard-opt sh-manage" id="sh-done-manage" hidden><input type="checkbox" id="sh-done-listing">
-        Publish to Community</label>
-    </div>
     ${acts.length ? `<div class="sh-dl">${downloadsOnly ? '' : '<span class="sh-dl-head">Or download</span>'}
       ${acts.map((a) => `<button type="button" data-dl="${a.act}"><b>${esc(a.label)}</b><span>${esc(a.sub)}</span></button>`).join('')}
-    </div>` : ''}`;
+    </div>` : '<p class="sh-hint">No downloadable files are available in this view.</p>'}`;
   $('stage').appendChild(card);
   for (const a of acts) card.querySelector(`[data-dl="${a.act}"]`).addEventListener('click', () => { card.remove(); a.run(); });
   card.querySelector('#sh-x').addEventListener('click', () => card.remove());
-  /** The Publish to Community switch, on whichever block is showing it. A
-   *  scene can be listed or unlisted long after it was made — including from
-   *  the card that just made it. */
-  const wireListing = (row, box, spaceId, privacy) => {
-    box.checked = privacy === 'Open';
-    row.hidden = false;
-    box.addEventListener('change', async () => {
-      const to = box.checked ? 'Open' : 'Link Only';
-      try {
-        const { setSharePrivacy } = await import('./share.js');
-        await setSharePrivacy(spaceId, to);
-        if (S.share && String(S.share.id) === String(spaceId)) S.share.privacy = to;
-        flash(to === 'Open' ? 'Published to Community — it shows on the wall now.' : 'Removed from Community — the link still works.', 5000);
-      } catch (e) {
-        box.checked = !box.checked;   // the box tells the truth
-        flash(`Could not change that: ${e.message}`, 6000);
-      }
-    });
-  };
-
   if (link && S.share) {
-    const url = shareLinkOf(S.share.id);
-    const urlInput = card.querySelector('#sh-url');
-    urlInput.addEventListener('focus', () => urlInput.select());
+    const input = card.querySelector('#sh-url');
+    input.addEventListener('focus', () => input.select());
     card.querySelector('#sh-copy').addEventListener('click', async (e) => {
       try { await navigator.clipboard.writeText(url); e.currentTarget.textContent = 'Copied'; }
-      catch { urlInput.select(); flash('Press Ctrl+C to copy the link.', 4000); }
+      catch { input.select(); flash('Press Ctrl+C to copy the link.', 4000); }
     });
     card.querySelector('#sh-native')?.addEventListener('click', async () => {
-      try { await navigator.share({ title: S.share.title || 'Splat.js scene', url }); } catch { /* dismissed */ }
+      try { await navigator.share({ title: S.share.title || 'Splat scene', url }); } catch { /* dismissed */ }
     });
-    // a scene of your own, open in the viewer: its listing belongs HERE, where
-    // you are looking at it — not only on the wall tile's menu
-    const listingRow = card.querySelector('#sh-manage');
-    const listingBox = card.querySelector('#sh-listing');
-    // a share made in this tab already knows what it chose — asking the server
-    // would only race it (the row is not in /splatjs/mine the instant it is
-    // written, so the toggle went missing until a reload)
-    if (S.share.privacy) wireListing(listingRow, listingBox, S.share.id, S.share.privacy);
-    else if (hasToken()) (async () => {
-      try {
-        const { fetchMine } = await import('./share.js');
-        const own = (await fetchMine() || []).find((s) => String(s.id) === String(S.share.id));
-        if (!own) return;   // someone else's scene: the link is all this card offers
-        S.share.privacy = own.privacy;
-        wireListing(listingRow, listingBox, S.share.id, own.privacy);
-      } catch (e) { /* offline, or the key went stale — the link card still works */ }
-    })();
   }
-  const input = card.querySelector('#sh-title');
-  input.value = rec ? (rec.name || 'Local Scene')
-    : (S.preset.id === '__own' ? 'My splat' : S.preset.name);
-  input.focus();
-  input.select();
-  const close = () => card.remove();
-  card.querySelector('#sh-cancel').addEventListener('click', close);
-  // followers are only told about public scenes
-  const priv = card.querySelector('#sh-priv');
-  const syncInform = () => {
-    card.querySelector('#sh-inform-row').hidden = !priv.checked;
-    // what the toggle means, in the one line it takes to say it
-    card.querySelector('#sh-hint').textContent = priv.checked
-      ? 'On the wall for everyone, and anyone with the link can open it.'
-      : 'Only people you send the link to.';
-    // and the button promises what actually happens: nothing is published
-    // when the scene is only a link
-    card.querySelector('#sh-go').textContent = priv.checked ? 'Share' : 'Get link';
-  };
-  priv.addEventListener('change', syncInform);
-  syncInform();
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') card.querySelector('#sh-go').click();
-    if (e.key === 'Escape') close();
-  });
-  card.querySelector('#sh-go').addEventListener('click', async () => {
-    const title = input.value.trim() || 'My splat';
-    const privacy = card.querySelector('#sh-priv').checked ? 'Open' : 'Link Only';
-    const includePhotos = !!card.querySelector('#sh-photos')?.checked;
-    const informFollowers = privacy === 'Open' && !!card.querySelector('#sh-inform')?.checked;
-    const popup = hasToken() ? null : window.open('', 'arrival-oauth', 'width=480,height=720');
-    if (!hasToken() && !popup) {
-      flash('The sign-in window was blocked — allow popups for this site and try again.', 8000);
-      return;
-    }
-    // the card STAYS: the work belongs where the press happened, and so does
-    // the link it produces — a result does not belong in a corner note
-    const form = card.querySelector('.sh-form');
-    const work = card.querySelector('#sh-work');
-    const head = card.querySelector('b');
-    const live = () => card.isConnected;   // they may close it mid-flight
-    const say = (m) => { if (live()) card.querySelector('#sh-status').textContent = m; };
-    const pct = (p) => { if (live()) card.querySelector('#sh-bar').style.width = `${p}%`; };
-    form.hidden = true;
-    work.hidden = false;
-    head.textContent = privacy === 'Open' ? 'Publishing your scene …' : 'Making your link …';
-    say('Preparing the model …');
-    S.uploading = true;
-    try {
-      const { shareCreation } = await import('./share.js');
-      const sog = rec ? rec.sog : await getSogBlob();
-      const thumb = rec ? (rec.thumb || null) : ((await photoThumb()) || (await renderShareThumb()));
-      const { spaceId, spaceUrl, link } = await shareCreation(S, sog, {
-        title, privacy, includePhotos, informFollowers, thumbBlob: thumb, popup,
-        device: deviceLabel(),   // local runs were trained on this very machine
-        ...(rec ? {
-          recon: rec.recon,
-          // the record's own numbers: a stored run has no live session
-          stats: {
-            splats: rec.splats, iter: rec.iter, minutes: rec.minutes || 0,
-            psnrTrain: rec.psnr ?? null, psnrTest: null,
-          },
-        } : {}),
-        onStatus: say,
-        onProgress: pct,
-      });
-      // the run on this device is now that scene: same name, and it knows its space
-      try {
-        const runId = rec ? rec.id : S.runId;
-        if (runId) { const { patchRun } = await import('./store.js'); await patchRun(runId, { name: title, spaceId }); }
-        if (rec) rec.spaceId = spaceId;
-        if (!rec && S.preset) S.preset.name = title;
-      } catch (e) { console.warn('run record not updated', e); }
-      // the scene on screen is that space now: its button becomes the link,
-      // so a second press can no longer make a second space
-      if (S.session && (!rec || rec === S._localRun)) {
-        S.share = { id: spaceId, title, privacy };   // what it chose, so the card need not ask
-        renderControls();
-      }
-      renderAccount();   // the share may have signed this visitor in
-
-      if (!live()) {   // closed while it worked — then the note is all there is
-        flash(`${title} is shared`, 300000, [
-          { label: 'View link', href: link },
-          { label: 'Enter the space ↗', href: spaceUrl, blank: true },
-          { label: 'Copy link', copy: link },
-        ]);
-        return;
-      }
-      work.hidden = true;
-      head.textContent = privacy === 'Open' ? `${title} is on the wall` : 'Your link is ready';
-      const done = card.querySelector('#sh-done');
-      card.querySelector('#sh-done-url').value = link;
-      card.querySelector('#sh-done-enter').href = spaceUrl;
-      done.hidden = false;
-      const urlEl = card.querySelector('#sh-done-url');
-      urlEl.addEventListener('focus', () => urlEl.select());
-      urlEl.select();
-      card.querySelector('#sh-done-copy').addEventListener('click', async (ev) => {
-        try { await navigator.clipboard.writeText(link); ev.currentTarget.textContent = 'Copied'; }
-        catch { urlEl.select(); flash('Press Ctrl+C to copy the link.', 4000); }
-      });
-      card.querySelector('#sh-done-native')?.addEventListener('click', async () => {
-        try { await navigator.share({ title, url: link }); } catch { /* dismissed */ }
-      });
-      // the choice made a moment ago is not final: change it right here
-      wireListing(card.querySelector('#sh-done-manage'), card.querySelector('#sh-done-listing'), spaceId, privacy);
-    } catch (e) {
-      console.error(e);
-      if (popup && !popup.closed) popup.close();
-      // back to the form, with the message where they can act on it
-      if (live()) {
-        work.hidden = true;
-        form.hidden = false;
-        head.textContent = 'Share this creation';
-      }
-      flash(`Share failed: ${e.message}`, 9000);
-    } finally {
-      S.uploading = false;
-    }
-  });
 }
 
 /** The gallery hero is the capture's FIRST PHOTOGRAPH, downscaled — the
@@ -4728,106 +4470,7 @@ function textCard(heading, value, { action = 'Save', max = 80 } = {}) {
   });
 }
 
-/** Managing a share you own: rename it, take it out of Community (the link
- *  keeps working), or delete the space outright. share.js has carried
- *  setSharePrivacy and deleteShare since the wall shipped with nothing wired
- *  to them — a creator could publish to Community and never take it back
- *  (WEB-7773). `st` is the live { id, title, privacy }; it is mutated so the
- *  menu reads true on its next open. */
-function shareMenuItems(st) {
-  const priv = { label: '', act: async () => {
-    const to = st.privacy === 'Open' ? 'Link Only' : 'Open';
-    try {
-      const { setSharePrivacy } = await import('./share.js');
-      await setSharePrivacy(st.id, to);
-      st.privacy = to;
-      priv.label = privLabel();
-      flash(to === 'Open' ? 'Published to Community.' : 'Removed from Community — the link still works.', 5000);
-      // the wall redraws so the scene actually leaves (or joins) Community in
-      // front of the creator — it stays on This device either way
-      mountWall().catch(() => {});
-    } catch (e) { flash(`Could not change the listing: ${e.message}`, 6000); }
-  } };
-  const privLabel = () => (st.privacy === 'Open' ? 'Remove from Community' : 'Publish to Community');
-  priv.label = privLabel();
-  return [
-    { label: 'Rename', act: async () => {
-      const name = await textCard('Rename this scene', st.title || '');
-      if (!name || name === st.title) return;
-      try {
-        const { renameShare } = await import('./share.js');
-        await renameShare(st.id, name);
-        st.title = name;
-        // the same scene can sit on two panes at once (This device and
-        // Community) — both captions follow, and so does the run that made it
-        for (const t of tilesOfSpace(st.id)) {
-          const el = t.querySelector('.galname');
-          const first = el && el.firstChild;
-          if (first && first.nodeType === 3) first.textContent = name;
-          else if (el) el.insertBefore(document.createTextNode(name), el.firstChild);
-        }
-        await patchRunsOfSpace(st.id, { name });
-        flash(`Renamed to ${name}.`, 4000);
-      } catch (e) { flash(`Rename failed: ${e.message}`, 6000); }
-    } },
-    { label: 'Copy link', act: async () => {
-      const url = shareLinkOf(st.id);
-      try { await navigator.clipboard.writeText(url); flash('Link copied.', 2500); }
-      catch { flash(url, 8000); }
-    } },
-    priv,
-    { label: 'Delete share', danger: true, act: async () => {
-      try {
-        const { deleteShare } = await import('./share.js');
-        await deleteShare(st.id);
-        // the run that made it keeps its model — it simply has no space now,
-        // so its tile offers Share again
-        await patchRunsOfSpace(st.id, { spaceId: null });
-        flash('The shared space is gone — its link no longer resolves.', 5000);
-        mountWall().catch(() => {});   // both panes redraw from the server
-      } catch (e) { flash(`Delete failed: ${e.message}`, 6000); }
-    } },
-  ];
-}
-
-/** What a moderator can do to somebody else's scene: take it off the wall.
- *  The link keeps resolving — unlisting is not deleting, and nothing of the
- *  creator's is destroyed. Armed twice over, like every other danger here. */
-function adminMenuItems(st) {
-  return [
-    { label: 'Copy link', act: async () => {
-      const url = shareLinkOf(st.id);
-      try { await navigator.clipboard.writeText(url); flash('Link copied.', 2500); }
-      catch { flash(url, 8000); }
-    } },
-    { label: 'Remove from Community', danger: true, act: async () => {
-      try {
-        const { setSharePrivacy } = await import('./share.js');
-        await setSharePrivacy(st.id, 'Link Only');
-        flash(`"${st.title || st.id}" is off the wall — its link still works.`, 6000);
-        mountWall().catch(() => {});
-      } catch (e) { flash(`Could not remove it: ${e.message}`, 6000); }
-    } },
-  ];
-}
-
-/** every tile on the wall that shows this space — a share tile links to it,
- *  a local run tile carries it on the record */
-const tilesOfSpace = (id) => [...document.querySelectorAll('.galtile')]
-  .filter((t) => (t.getAttribute('href') || '').includes(`space=${encodeURIComponent(id)}`)
-    || String(t.dataset.spaceId || '') === String(id));
-
-/** local run records that made this share */
-async function patchRunsOfSpace(spaceId, patch) {
-  try {
-    const { listRuns, patchRun } = await import('./store.js');
-    for (const r of await listRuns()) {
-      if (r.spaceId && String(r.spaceId) === String(spaceId)) await patchRun(r.id, patch);
-    }
-  } catch (e) { /* the library is best-effort — never block a share action */ }
-}
-
-function creationTile(it, mine, { shared = false, preset = false, state = null, admin = false } = {}) {
+function creationTile(it, { shared = false, preset = false } = {}) {
   const wrap = document.createElement('a');
   wrap.className = 'galtile';
   const img = (it.splatjs && it.splatjs.thumbUrl) || it.screenshotUrl || '';
@@ -4873,24 +4516,6 @@ function creationTile(it, mine, { shared = false, preset = false, state = null, 
       if (u.avatar) { av.style.backgroundImage = `url("${u.avatar}")`; av.textContent = ''; }
       else av.textContent = u.name.trim().charAt(0).toUpperCase();
     });
-  }
-  if (mine || admin) {
-    // the creator's own share wears the ⋯ the local runs already have;
-    // a moderator gets one on every scene on the wall
-    const menu = document.createElement('button');
-    menu.type = 'button';
-    menu.className = 'run-menu';
-    menu.title = 'Options';
-    menu.textContent = '⋯';
-    wrap.prepend(menu);
-    // the tile IS a link: a press inside the menu must not open the scene.
-    // Capture — tileMenu's own handlers stop propagation, so a bubble-phase
-    // listener here would never see the click and the anchor would navigate.
-    wrap.addEventListener('click', (e) => { if (e.target.closest('.run-menu, .tilemenu')) e.preventDefault(); }, true);
-    // one state object per space, shared by both panes: flipping the listing
-    // on the Community copy relabels the menu on the This device copy too
-    const st = state || { id: it.id, title: it.title, privacy: it.privacy };
-    tileMenu(menu, mine ? shareMenuItems(st) : adminMenuItems(st));
   }
   return wrap;
 }
@@ -4938,23 +4563,15 @@ function selectWallTab(name, { scrollToTabs = false, restoreY = null } = {}) {
 
 /** The creation wall on the start card: Scenes (public, everyone) and —
  *  when this device holds anything of the visitor's own — Local: the last
- *  capture from this browser's storage plus, signed in, their shares
- *  (management: privacy, link, delete). An empty wall stays invisible. */
+ *  capture and training runs saved in this browser. An empty wall stays invisible. */
 async function mountWall() {
   try {
-    const { fetchGallery, fetchMine } = await import('./share.js');
-    const { whoAmI } = await import('./arrival.js');
-    const [{ items }, capTile, myShares, me] = await Promise.all([
+    const { fetchGallery } = await import('./share.js');
+    const [{ items }, capTile] = await Promise.all([
       fetchGallery({ count: 48 }),   // the API's page cap; the wall shows every listed scene
       lastCaptureTile().catch(() => null),
-      hasToken() ? fetchMine().catch(() => []) : Promise.resolve([]),
-      hasToken() ? whoAmI().catch(() => null) : Promise.resolve(null),
     ]);
-    const moderates = !!(me && me.isAdmin);   // a moderator can clear any scene off the wall
-    // the run tiles carry the management of the shares they made, so they
-    // need the server's view of those shares (title + privacy) first
-    const shareById = new Map((myShares || []).map((s) => [String(s.id), { id: s.id, title: s.title, privacy: s.privacy }]));
-    const runTiles = await localRunTiles(shareById).catch(() => []);
+    const runTiles = await localRunTiles().catch(() => []);
     // the visitor's own content (capture, runs, shares) lives on its own tab
     const presetIds = presetSpaceIds();
     const own = [];
@@ -4962,15 +4579,12 @@ async function mountWall() {
     for (const t of runTiles) own.push(t);
     // the presets are benchmarks even for the account that owns them
     const runSpaces = new Set(runTiles.map((t) => t.dataset && t.dataset.spaceId).filter(Boolean));
-    for (const it of (myShares || [])) if (!presetIds.has(String(it.id)) && !runSpaces.has(String(it.id))) own.push(creationTile(it, true, { state: shareById.get(String(it.id)) }));
     if ((!items || !items.length) && !own.length) return;
     const host = $('gallery');
-    // own public shares stay in Community too — that is how everyone else sees the wall
     const rest = items || [];
     const pinOf = (x) => (x.splatjs && x.splatjs.pin) || 9e9;
     const newer = (a, b) => new Date(b.createdDate) - new Date(a.createdDate);
-    const presets = rest.filter((x) => HOME_BENCHMARK_IDS.has(String(x.id)))
-      .sort((a, b) => (pinOf(a) - pinOf(b)) || newer(a, b));
+    const presets = rest.filter((x) => HOME_BENCHMARK_IDS.has(String(x.id))).sort((a, b) => (pinOf(a) - pinOf(b)) || newer(a, b));
     const shares = rest.filter((x) => !presetIds.has(String(x.id))).sort(newer);
     // tabs: Benchmarks | Community [| This device]. The chosen tab and the
     // scroll position survive a trip into a scene (sessionStorage), so Back
@@ -4982,20 +4596,17 @@ async function mountWall() {
       <div class="galgrid" data-pane="bench"></div>
       <div class="galgrid" data-pane="community" hidden></div>`;   // own content first in the DOM too
     const pane = (k) => host.querySelector(`[data-pane="${k}"]`);
-    for (const it of presets) pane('bench').appendChild(creationTile(it, false, { preset: true }));
+    for (const it of presets) pane('bench').appendChild(creationTile(it, { preset: true }));
     const more = document.createElement('button');
     more.type = 'button';
     more.className = 'btn btn-outline galmore';
     more.textContent = 'See what people made →';
     more.addEventListener('click', () => selectWallTab('community', { scrollToTabs: true }));
     pane('bench').appendChild(more);
-    // your own scenes appear in Community exactly as everyone else sees them —
-    // and there, of all places, is where you want to be able to unlist one
     if (shares.length) for (const it of shares) {
-      const st = shareById.get(String(it.id));
-      pane('community').appendChild(creationTile(it, !!st, { shared: true, state: st, admin: moderates }));
+      pane('community').appendChild(creationTile(it, { shared: true }));
     }
-    else pane('community').innerHTML = '<p class="galempty">Nothing shared yet — yours could be the first.</p>';
+    else pane('community').innerHTML = '<p class="galempty">No community scenes found yet.</p>';
     if (own.length) for (const t of own) pane('device').appendChild(t);
     host.querySelectorAll('[role="tab"]').forEach((b) => b.addEventListener('click', () => selectWallTab(b.dataset.tab, { scrollToTabs: true })));
     host.addEventListener('click', (e) => { if (e.target.closest('a.galtile')) saveWallState(); }, true);
@@ -5319,14 +4930,13 @@ function dock(kind) {
     $('chart-scale').addEventListener('click', toggleScoreScale);
     syncScoreScaleControls();
     chart.resize();
-    syncTrainingVisualsControl();
   }
 }
 
 function syncScoreScaleControls() {
-  const next = S.scoreScale === 'db' ? 'Use %' : 'Use dB';
+  const next = S.scoreScale === 'db' ? 'Use SSIM %' : 'Use dB';
   const title = S.scoreScale === 'db'
-    ? 'Switch graph to percent similarity'
+    ? 'Switch graph to SSIM percentage'
     : 'Switch graph to PSNR in decibels';
   for (const id of ['chart-scale', 'd-chart-scale']) {
     const button = $(id);
@@ -5342,6 +4952,7 @@ function toggleScoreScale() {
   if (chart) { chart.scale = S.scoreScale; chart.draw(); }
   if (dchart) { dchart.scale = S.scoreScale; dchart.draw(); }
   syncScoreScaleControls();
+  if (S.scoreScale === 'similarity') maybeEvaluateSsim(S.iter);
 }
 
 function chartTip(h) {
@@ -5990,66 +5601,6 @@ function deviceLabel() {
   return kind ? `${kind}, ${gpu}` : gpu;
 }
 
-/** The header's account corner. Signing in is only ever about publishing —
- *  capture, solving and training never touch it — so the corner stays out of
- *  the way: the word Login, or who you are, and a second press signs out. */
-async function renderAccount() {
-  const el = $('acct');
-  if (!el) return;
-  const signedOut = () => {
-    el.className = 'tbtn';
-    el.title = 'Sign in to publish — training needs no account';
-    el.innerHTML = `${USER_ICON}Login`;
-  };
-  const signedIn = (u) => {
-    el.className = 'tbtn';
-    el.title = `Signed in as ${u.name} — press to sign out`;
-    el.innerHTML = `<i class="acct-av"${u.avatar ? ` style="background-image:url(&quot;${esc(u.avatar)}&quot;)"` : ''}>` +
-      `${u.avatar ? '' : esc(u.name.trim().charAt(0).toUpperCase())}</i>${esc(u.name)}`;
-  };
-  if (!hasToken()) { signedOut(); return; }
-  signedIn({ name: 'Account', avatar: '' });   // something is there while /user/me answers
-  const { whoAmI } = await import('./arrival.js');
-  const u = await whoAmI();
-  if (u) signedIn(u); else signedOut();        // a key the server dropped is no key
-}
-
-function wireAccount() {
-  const el = $('acct');
-  el.addEventListener('click', async () => {
-    if (hasToken()) {
-      // two presses, like every other irreversible-looking thing here
-      if (el.dataset.armed !== '1') {
-        el.dataset.armed = '1';
-        el.classList.add('armed');
-        el.innerHTML = `${USER_ICON}Sign out?`;
-        setTimeout(() => { if (el.dataset.armed === '1') { el.dataset.armed = ''; el.classList.remove('armed'); renderAccount(); } }, 3000);
-        return;
-      }
-      el.dataset.armed = '';
-      const { signOut } = await import('./arrival.js');
-      signOut();
-      await renderAccount();
-      mountWall().catch(() => {});
-      flash('Signed out on this device. What you published stays published.', 5000);
-      return;
-    }
-    // the sign-in window opens INSIDE the click or the browser blocks it
-    const popup = window.open('', 'arrival-oauth', 'width=480,height=720');
-    if (!popup) { flash('The sign-in window was blocked — allow popups for this site and try again.', 8000); return; }
-    try {
-      const { getToken } = await import('./arrival.js');
-      await getToken((m) => flash(m, 60000), popup);
-      await renderAccount();
-      mountWall().catch(() => {});
-      flash('Signed in.', 3000);
-    } catch (e) {
-      if (popup && !popup.closed) popup.close();
-      flash(`Sign-in failed: ${e.message}`, 7000);
-    }
-  });
-}
-
 function gpuFacts(preferSaved = true) {
   if (preferSaved && S._savedGpuFacts && S.state !== 'train') {
     return { ...S._savedGpuFacts, ips: S.itersPerSec || S._savedGpuFacts.ips || 0 };
@@ -6397,14 +5948,15 @@ function renderDetails() {
   // cancel the pointer stream before OrbitController can keep tracking it.
   $('d-cv').classList.toggle('camera-orbit', S.detailTab === 'cams');
   $('d-cv').hidden = vis !== 'cv';
-  $('d-chart-wrap').hidden = vis !== 'chart';
+  $('d-chart').hidden = vis !== 'chart';
   $('d-perf').hidden = vis !== 'perf';
   if (vis === 'perf') $('d-perf').textContent = S.detailTab === 'gpu' ? buildGpuReport() : buildPerfReport();
   if (vis === 'chart') {
-    if (!dchart) dchart = new Chart($('d-chart'), {});
-    dchart.scale = S.scoreScale;
+    if (!dchart) {
+      dchart = new Chart($('d-chart'), {});
+      $('d-chart-scale')?.addEventListener('click', toggleScoreScale);
+    }
     dchart.maxIter = S.maxIters;
-    syncScoreScaleControls();
     // a restored share has no live loss history — its recorded training
     // curve (recon stats) is the same line, saved at share time
     const rstats = (S.restored && S.restored.stats) || {};
@@ -6412,6 +5964,8 @@ function renderDetails() {
       ? S.session.lossHistory : (rstats.chart || []);
     dchart.train = hist.map(([i, v]) => [i, v]);
     dchart.hold = chart ? chart.hold : ((S.holdHist && S.holdHist.length ? S.holdHist : rstats.holds) || []).slice();
+    dchart.ssimTrain = (S.ssimTrainHist && S.ssimTrainHist.length ? S.ssimTrainHist : (rstats.ssimChart || [])).slice();
+    dchart.ssimHold = (S.ssimHoldHist && S.ssimHoldHist.length ? S.ssimHoldHist : (rstats.ssimHolds || [])).slice();
     dchart.events = S.chartEvents.map((e) => ({ ...e, at: e.iter / S.maxIters }));
     dchart.resize();
     dchart.draw();
@@ -6462,7 +6016,7 @@ function renderDetailsNoSession() {
   const T = gpuTab(stat);
   $('d-prev').hidden = $('d-next').hidden = true;
   $('d-cv').hidden = true;
-  $('d-chart-wrap').hidden = true;
+  $('d-chart').hidden = true;
   $('d-perf').hidden = false;
   $('d-perf').textContent = buildGpuReport();
   $('d-cap').textContent = T.cap;

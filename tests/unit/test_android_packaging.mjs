@@ -33,9 +33,21 @@ assert.match(native, /getDecorView\(\)\.setSystemUiVisibility\(0\)/,
 assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?uvOutput\.position\(0\);/,
   'camera preview must use ARCore-transformed display coordinates');
 assert.match(native, /frame\.transformDisplayUvCoords\(uvInput, uvOutput\);[\s\S]*?for \(int row = 0; row < 2; row\+\+\)[\s\S]*?int left = row \* 4, right = left \+ 2;[\s\S]*?uvOutput\.put\(left, uvOutput\.get\(right\)\);[\s\S]*?uvOutput\.put\(right, leftU\);/,
-  'only the camera preview UV pairs should be swapped across the display horizontally');
+  'the front-camera preview should be mirrored by swapping transformed UV pairs');
+assert.match(native, /world-space point cloud is still drawn from ARCore\x27s camera matrices/,
+  'mirroring the preview must not transform world-space point coordinates');
 assert.match(native, /Matrix\.multiplyMM\(mvp, 0, projection, 0, view, 0\);/,
   'coverage points must use ARCore projection and view matrices directly');
+assert.match(native, /viewpoints\.add\(new CaptureViewpoint\(matrix, focal\[0\], focal\[1\], principal\[0\], principal\[1\], imageSize\[0\], imageSize\[1\]\)\)/,
+  'successful AR captures should retain their exact world-space camera poses and intrinsics for the overlay');
+assert.match(native, /private void drawCoverage\(Frame frame\)[\s\S]*drawViewpoints\(mvp\)/,
+  'camera viewpoints and the sparse coverage cloud should share the ARCore world projection');
+assert.match(native, /private void drawViewpoints\(float\[\] viewProjection\)[\s\S]*glDrawArrays\(GLES20\.GL_LINES, 0, vertexCount\)/,
+  'captured viewpoints should be drawn as wireframe camera pyramids');
+assert.match(native, /pose\[0\] \* x \+ pose\[4\] \* y \+ pose\[8\] \* z \+ pose\[12\]/,
+  'camera frustum corners should be transformed by the captured camera-to-world pose');
+assert.match(native, /frames\.clear\(\); viewpoints\.clear\(\);/,
+  'reset capture must clear the stored camera viewpoint overlays');
 assert.doesNotMatch(native, /mvp\[offset(?: \+ 1)?\] = -mvp\[offset(?: \+ 1)?\]/,
   'coverage points must not apply a second clip-space axis reflection');
 const main = readFileSync(resolve(moduleDir, 'src/main/java/space/arrival/splatxr/MainActivity.java'), 'utf8');

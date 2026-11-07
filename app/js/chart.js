@@ -2,10 +2,9 @@
 // the moments where the optimiser changed its own setup, and an optional ghost
 // run so "what if" is a comparison instead of a claim.
 
-export function psnrToSimilarity(psnr) {
-  if (!Number.isFinite(psnr)) return 0;
-  // PSNR = -10 log10(MSE), with pixel error normalized to [0, 1].
-  return Math.max(0, Math.min(100, (1 - 10 ** (-psnr / 10)) * 100));
+export function ssimToPercent(ssim) {
+  if (!Number.isFinite(ssim)) return 0;
+  return Math.max(0, Math.min(100, ssim * 100));
 }
 
 export class Chart {
@@ -14,6 +13,7 @@ export class Chart {
     this.ctx = canvas.getContext('2d');
     this.scale = 'db';
     this.train = []; this.hold = [];
+    this.ssimTrain = []; this.ssimHold = [];
     this.ghost = null; this.events = []; this.maxIter = 40000;
     this.onHover = onHover; this.onScrub = onScrub;
     this.hover = null; this.scrubbable = false; this.mark = null;
@@ -44,7 +44,13 @@ export class Chart {
   }
 
   _displayValue(value) {
-    return this.scale === 'similarity' ? psnrToSimilarity(value) : value;
+    return this.scale === 'similarity' ? ssimToPercent(value) : value;
+  }
+
+  _activeSeries() {
+    return this.scale === 'similarity'
+      ? { train: this.ssimTrain, hold: this.ssimHold }
+      : { train: this.train, hold: this.hold };
   }
 
   _displaySeries(series) {
@@ -69,7 +75,7 @@ export class Chart {
     if (hold != null) this.hold.push([iter, hold]);
   }
 
-  reset() { this.train = []; this.hold = []; }
+  reset() { this.train = []; this.hold = []; this.ssimTrain = []; this.ssimHold = []; }
 
   draw() {
     const ctx = this.ctx, W = this.cv.width, H = this.cv.height, dpr = this.dpr || 1;
@@ -78,10 +84,13 @@ export class Chart {
     ctx.clearRect(0, 0, W, H);
     if (pw <= 0 || ph <= 0) return;
 
-    const train = this._displaySeries(this.train);
-    const hold = this._displaySeries(this.hold);
-    const ghostTrain = this._displaySeries(this.ghost?.train || []);
-    const ghostHold = this._displaySeries(this.ghost?.hold || []);
+    const active = this._activeSeries();
+    const train = this._displaySeries(active.train);
+    const hold = this._displaySeries(active.hold);
+    const ghostTrain = this._displaySeries(this.scale === 'similarity'
+      ? (this.ghost?.ssimTrain || []) : (this.ghost?.train || []));
+    const ghostHold = this._displaySeries(this.scale === 'similarity'
+      ? (this.ghost?.ssimHold || []) : (this.ghost?.hold || []));
     const ys = [...train, ...hold, ...ghostTrain, ...ghostHold].map((p) => p[1]);
     let lo = ys.length ? Math.min(...ys) : (this.scale === 'similarity' ? 90 : 10);
     let hi = ys.length ? Math.max(...ys) : (this.scale === 'similarity' ? 100 : 30);
@@ -98,8 +107,8 @@ export class Chart {
 
     // faint progress wash left of the latest sample — the chart quietly
     // doubles as a progress bar without competing with the curve
-    if (this.train.length) {
-      const px = X(this.train[this.train.length - 1][0]);
+    if (active.train.length) {
+      const px = X(active.train[active.train.length - 1][0]);
       ctx.fillStyle = 'rgba(94, 231, 214, .055)';
       ctx.fillRect(l, t, Math.max(0, Math.min(px, l + pw) - l), ph);
     }
@@ -151,7 +160,7 @@ export class Chart {
     line(train, '#2fd4c1', null, 1.8);
 
     // playhead
-    const last = this.train[this.train.length - 1];
+    const last = active.train[active.train.length - 1];
     if (last) {
       const x = X(this.mark != null ? this.mark : last[0]);
       ctx.strokeStyle = 'rgba(230,236,235,.25)'; ctx.lineWidth = 1;
@@ -163,10 +172,10 @@ export class Chart {
     }
 
     // hover readout
-    if (this.hover && this.train.length) {
+    if (this.hover && active.train.length) {
       const it = this._frac(this.hover.x) * this.maxIter;
       const near = (arr) => arr.length ? arr.reduce((a, p) => Math.abs(p[0] - it) < Math.abs(a[0] - it) ? p : a) : null;
-      const a = near(this.train), h = near(this.hold);
+      const a = near(active.train), h = near(active.hold);
       const ev = this.events.find((e) => Math.abs(e.at * this.maxIter - it) < this.maxIter * .012);
       if (a) {
         const x = X(a[0]);
@@ -176,7 +185,7 @@ export class Chart {
           xPct: (x / W) * 100,
           iter: Math.round(a[0]),
           train: this._displayValue(a[1]), hold: h ? this._displayValue(h[1]) : null,
-          unit: this.scale === 'similarity' ? '%' : 'dB', event: ev ? ev.label : null,
+          unit: this.scale === 'similarity' ? 'SSIM %' : 'dB', event: ev ? ev.label : null,
         });
       }
     }

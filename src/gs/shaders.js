@@ -2171,3 +2171,55 @@ export const makeSHAdamSrc = (mode = 'all') => {
   s = s.replace(head, '  let jw = gid.x + gid.y * nw.x * 256u;\n  let tail = bitcast<u32>(au.cfg.w);\n  let k3 = u32(au.cfg.z);\n  if (jw >= bitcast<u32>(proj[tail]) * k3) { return; }\n  let j = bitcast<u32>(proj[tail + 1u + jw / k3]) * k3 + (jw % k3);');
   return s;
 };
+
+// Read a rendered view and its target into a compact half-resolution RGB pair
+// for the chart's SSIM readout. Averaging 2x2 pixels keeps periodic CPU SSIM
+// evaluation inexpensive on mobile; the SSIM calculation itself remains the
+// standard 11x11, sigma=1.5 Gaussian-window mean.
+export const SSIM_METRIC_SRC = CAM_STRUCT + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> outImg: array<f32>;
+@group(0) @binding(2) var<storage, read> tgtImg: array<u32>;
+@group(0) @binding(3) var<storage, read_write> metric: array<f32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let W = u32(cam.size.x);
+  let H = u32(cam.size.y);
+  let outW = (W + 1u) / 2u;
+  let outH = (H + 1u) / 2u;
+  if (gid.x >= outW || gid.y >= outH) { return; }
+  var pred = vec3f(0.0);
+  var target = vec3f(0.0);
+  var count = 0.0;
+  let off = bitcast<u32>(cam.misc.w);
+  for (var dy = 0u; dy < 2u; dy++) {
+    for (var dx = 0u; dx < 2u; dx++) {
+      let x = gid.x * 2u + dx;
+      let y = gid.y * 2u + dy;
+      if (x >= W || y >= H) { continue; }
+      let pi = y * W + x;
+      let packed = tgtImg[off + pi];
+      let ta = unpack4x8unorm(packed);
+      if (ta.a <= 0.0) { continue; }
+      let p = vec3f(outImg[pi * 4u], outImg[pi * 4u + 1u], outImg[pi * 4u + 2u]);
+      pred += cam.proj.w * p + vec3f(cam.misc2.w);
+      target += mix(cam.proj.w * cam.misc.xyz + vec3f(cam.misc2.w), ta.rgb, ta.a);
+      count += 1.0;
+    }
+  }
+  let oi = (gid.y * outW + gid.x) * 8u;
+  if (count > 0.0) {
+    metric[oi] = pred.r / count;
+    metric[oi + 1u] = pred.g / count;
+    metric[oi + 2u] = pred.b / count;
+    metric[oi + 3u] = 1.0;
+    metric[oi + 4u] = target.r / count;
+    metric[oi + 5u] = target.g / count;
+    metric[oi + 6u] = target.b / count;
+    metric[oi + 7u] = 1.0;
+  } else {
+    metric[oi] = 0.0; metric[oi + 1u] = 0.0; metric[oi + 2u] = 0.0; metric[oi + 3u] = 0.0;
+    metric[oi + 4u] = 0.0; metric[oi + 5u] = 0.0; metric[oi + 6u] = 0.0; metric[oi + 7u] = 0.0;
+  }
+}
+`;
