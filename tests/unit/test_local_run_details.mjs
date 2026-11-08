@@ -68,8 +68,8 @@ assert.match(session, /if \(!this\.enabled \|\| !this\.ctx \|\| !this\.camera\) 
   'disabled session view should skip its standalone GPU render');
 assert.match(app, /dchart\.draw\(\)/,
   'the Details score graph remains rendered and refreshed during training');
-assert.match(app, /const capturedPoints = S\.preset\?\.capture\?\.points \|\| \[\][\s\S]*const pts = capturedPoints\.length \? capturedPoints/,
-  'the Cameras view should use the point cloud saved by capture rather than reconstructing it during training');
+assert.match(app, /const capturedPoints = S\.preset\?\.capture\?\.points \|\| \[\][\s\S]*const savedCloud = S\._localRun\?\.recon\?\.cloud \|\| S\.restored\?\.reconJson\?\.cloud[\s\S]*buildDisplayCloud\(capturedPoints, savedCloud, \(recon && recon\.points\) \|\| \[\]\)/,
+  'the Cameras view should preserve the captured or restored local-run cloud instead of relying only on reconstruction points');
 assert.match(sessionIo, /capture-time snapshot[\s\S]*potentially-mutated optimizer\/reconstruction state/,
   'saved model details should preserve the frozen camera-view point cloud');
 assert.match(sessionIo, /if \(S\.scene\?\.xyz\?\.length\)/,

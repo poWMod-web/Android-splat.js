@@ -18,6 +18,7 @@ import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './tr
 import { zipStore } from './zip.js';
 import { saveBlob } from './download.js';
 import { buildSessionZip, fetchModel } from './session_io.js';
+import { buildDisplayCloud } from './scene-cloud.js';
 import { REPO, DISCORD, DATA, ownSet } from './data.js';
 
 import { Viewport, camCentre, quatFromR, quatToR, qslerp } from './viewport.js';
@@ -2352,17 +2353,8 @@ function buildSceneFromSession() {
     }
   }
   const capturedPoints = S.preset?.capture?.points || [];
-  const pts = capturedPoints.length ? capturedPoints : ((recon && recon.points) || []);
-  const xyz = new Float32Array(pts.length * 3);
-  const rgb = new Uint8Array(pts.length * 3);
-  pts.forEach((p, k) => {
-    if (p.X) xyz.set(p.X, k * 3);
-    if (p.rgb) {
-      rgb[k * 3] = p.rgb[0] * 255;
-      rgb[k * 3 + 1] = p.rgb[1] * 255;
-      rgb[k * 3 + 2] = p.rgb[2] * 255;
-    }
-  });
+  const savedCloud = S._localRun?.recon?.cloud || S.restored?.reconJson?.cloud || null;
+  const { xyz, rgb } = buildDisplayCloud(capturedPoints, savedCloud, (recon && recon.points) || []);
   S.scene = {
     cams, xyz, rgb,
     center: (ses.model && ses.model.center) || [0, 0, 0],
@@ -5608,10 +5600,12 @@ function renderDetails() {
   const ses = S.session, recon = ses.recon;
   const n = S.photos.length || (ses.frames && ses.frames.length) || 0;
   const placed = recon.cams.length;
+  const pointCount = S.scene && S.scene.xyz && S.scene.xyz.length
+    ? Math.floor(S.scene.xyz.length / 3) : recon.points.length;
   $('d-sub').textContent = `${S.preset.name} · ` +
     // pano sets have no 1:1 photograph list — count placed views instead
     (n ? `${n} photographs · ${placed} placed · ` : `${placed} views placed · `) +
-    `${fmt(recon.points.length)} points · ${fmt(S.splats)} splats`;
+    `${fmt(pointCount)} points · ${fmt(S.splats)} splats`;
 
   // a restored share never ran the solve here — tabs whose stats are empty
   // (landmarks, matching, timing) simply don't appear
