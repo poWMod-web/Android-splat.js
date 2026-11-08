@@ -363,6 +363,7 @@ body { overflow: hidden; }
   display: block; width: 100%; aspect-ratio: 16 / 9;
   background: var(--stage); border: 1px solid var(--line); border-radius: var(--r);
 }
+.sheet-vis canvas[hidden] { display: none; }
 #d-cv.camera-orbit { touch-action: none; cursor: grab; }
 #d-cv.camera-orbit:active { cursor: grabbing; }
 .seg-title, .sheet-vis .seg { margin-bottom: 10px; }

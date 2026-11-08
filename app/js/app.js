@@ -3791,6 +3791,7 @@ async function continueLocalRun(viewOnly = false) {
     : { id: (recon.source && recon.source.preset) || '__url', name: `${lr.name || 'Your photos'}` };
   S.loadedFiles = files.map((f, i) => Object.assign(f, { url: srcUrls[i] || undefined }));
   S.photos = files.map((f, i) => ({ url: URL.createObjectURL(f), name: f.name, i }));
+  buildStrip();
   const baseIter = stateIter ?? (lr.iter || 0);
   // a finished run continues PAST its old horizon; a paused one resumes
   // toward the horizon it was already aiming at
@@ -5771,6 +5772,7 @@ function renderDetails() {
   // cancel the pointer stream before OrbitController can keep tracking it.
   $('d-cv').classList.toggle('camera-orbit', S.detailTab === 'cams');
   $('d-cv').hidden = vis !== 'cv';
+  $('d-chart-wrap').hidden = vis !== 'chart';
   $('d-chart').hidden = vis !== 'chart';
   $('d-perf').hidden = vis !== 'perf';
   if (vis === 'perf') $('d-perf').textContent = S.detailTab === 'gpu' ? buildGpuReport() : buildPerfReport();

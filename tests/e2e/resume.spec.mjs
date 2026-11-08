@@ -41,6 +41,7 @@ test('pause -> checkpoint -> reload -> resume, model intact and learning', async
   await page.evaluate(() =>
     [...document.querySelectorAll('.galtile')].find((t) => t.textContent.includes('paused')).click());
   await page.waitForFunction(() => window.__splat.state === 'train', null, { timeout: 240_000 });
+  await expect(page.locator('#strip-scroll .frame').first()).toBeVisible();
 
   // freeze immediately: the restored model, near-untouched
   await togglePlay(page, false);

@@ -74,5 +74,9 @@ assert.match(baseCss, /\.score \.score-scale\s*\{[\s\S]*display: block/,
   'the training scale toggle should render below the splat count');
 assert.match(html, /id="d-chart-scale"/,
   'the Details score graph should expose the same scale toggle');
+assert.match(appSource, /\$\('d-chart-wrap'\)\.hidden = vis !== 'chart'/,
+  'the score chart wrapper should be shown when the Details score tab is active');
+assert.match(appCss, /\.sheet-vis canvas\[hidden\]\s*\{\s*display:\s*none\s*;/,
+  'inactive Details canvases should stay hidden despite the general canvas display rule');
 
 console.log('PSNR and approximate SSIM graph scales: passed');

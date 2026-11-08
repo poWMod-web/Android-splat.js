@@ -29,6 +29,11 @@ assert.match(app, /restoreRunDetails\(S\._localRun, ses\)/,
   'the local Details payload should be restored when the saved model opens');
 assert.match(app, /restoreRunDetails\(lr, ses\)[\s\S]*S\._carryTrainElapsed = true/,
   'continuing a local run should carry forward its history and cumulative elapsed time');
+const continueStart = app.indexOf('async function continueLocalRun(');
+const continueEnd = app.indexOf('\nasync function ', continueStart + 1);
+assert.ok(continueStart >= 0 && continueEnd > continueStart, 'the local-run continuation function should exist');
+assert.match(app.slice(continueStart, continueEnd), /S\.photos = files\.map\([\s\S]*?buildStrip\(\);/,
+  'continuing a saved run should rebuild the bottom image-selection strip from its restored photos');
 assert.match(app, /await persistRunDetails\(runId, \{ full: true \}\)/,
   'leaving the model viewer should flush its current Details snapshot before navigation');
 assert.match(app, /if \(!S\.restored && !S\._localRun\)\s*\{[\s\S]*more\.textContent = 'Train'/,
