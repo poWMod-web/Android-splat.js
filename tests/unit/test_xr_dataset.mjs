@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { validateDataset, filterDataset, measuredSeeds, cameraForFile, storedCapture, datasetFromSelection } from '../../app/js/xr-dataset.js';
 import { parseCameras, reconFromKnownCameras } from '../../src/io/cameras.js';
 
-const json = JSON.parse(readFileSync(new URL('../../data/synthetic/cameras.json', import.meta.url)));
+const camerasFixture = new URL('../../data/synthetic/cameras.json', import.meta.url);
+if (!existsSync(camerasFixture)) {
+  console.log('SKIP missing reference fixture data/synthetic/cameras.json');
+  process.exit(0);
+}
+const json = JSON.parse(readFileSync(camerasFixture));
 const files = json.cameras.map((c) => new File(['image'], c.image, { type: 'image/png' }));
 const point = (i) => ({ X: [i / 10, 0, 1], rgb: [.3, .4, .5] });
 const pointsByFrame = Object.fromEntries(files.map((f, i) => [f.name, [point(i)]]));

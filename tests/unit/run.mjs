@@ -12,11 +12,11 @@ let failed = 0, skipped = 0;
 for (const f of files) {
   const r = spawnSync(process.execPath, [join(here, f)], { encoding: 'utf8' });
   const out = (r.stdout + r.stderr).trim().split('\n').pop() || '';
-  if (r.status === 0) {
-    console.log(`PASS  ${f}  (${out})`);
-  } else if (/SKIP/.test(r.stdout + r.stderr) || /Cannot find (module|package)/.test(r.stderr)) {
+  if (/SKIP/.test(r.stdout + r.stderr) || /Cannot find (module|package)/.test(r.stderr)) {
     skipped++;
     console.log(`SKIP  ${f}  (missing optional deps or reference data)`);
+  } else if (r.status === 0) {
+    console.log(`PASS  ${f}  (${out})`);
   } else {
     failed++;
     console.log(`FAIL  ${f}`);
