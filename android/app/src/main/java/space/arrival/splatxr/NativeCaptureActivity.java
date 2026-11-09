@@ -44,6 +44,7 @@ import com.google.ar.core.CameraConfigFilter;
 import com.google.ar.core.Config;
 import com.google.ar.core.Frame;
 import com.google.ar.core.CameraIntrinsics;
+import com.google.ar.core.Plane;
 import com.google.ar.core.PointCloud;
 import com.google.ar.core.Pose;
 import com.google.ar.core.Session;
@@ -492,6 +493,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         } catch (Exception ignored) { /* use ARCore's selected camera config */ }
         Config config = new Config(session);
         config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
+        // The export levels the world to the detected ground plane, so plane
+        // trackables must be available even though the preview never draws them.
+        config.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL);
         config.setFocusMode(Config.FocusMode.AUTO);
         if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) config.setDepthMode(Config.DepthMode.AUTOMATIC);
         session.configure(config);
@@ -559,6 +563,13 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private final List<CaptureViewpoint> viewpoints = new ArrayList<>();
         private final TravelCaptureTrigger travelTrigger = new TravelCaptureTrigger(0.10f);
         private Session arSession;
+        // Best ARCore horizontal plane seen while tracking: the export levels the
+        // dataset so this ground plane's normal becomes world +Y, cameras above it.
+        private boolean hasGroundPlane;
+        private final float[] groundNormal = new float[]{0f, 1f, 0f};
+        private final float[] groundCenter = new float[3];
+        private float groundExtentX, groundExtentZ, groundArea;
+        private boolean levelingApplied;
         private int cameraTexture = -1;
         private int bgProgram, pointProgram;
         private int bgPosition, bgUv, bgTexture;
@@ -627,6 +638,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 boolean tracking = frame.getCamera().getTrackingState() == TrackingState.TRACKING;
                 setTrackingTelemetry(tracking);
                 if (tracking) {
+                    updateGroundPlane();
                     float[] position = frame.getCamera().getPose().getTranslation();
                     boolean autoDue = autoCaptureEnabled && cloudRenderer.sampleTravel(position);
                     if (!autoCaptureEnabled) cloudRenderer.breakTravelContinuity();
@@ -645,6 +657,38 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 setTrackingTelemetry(false);
                 showStatus("AR frame error: " + safeMessage(e));
             }
+        }
+
+        /** Remember the largest stable horizontal plane: the export levels the world to it. */
+        private void updateGroundPlane() {
+            if (arSession == null) return;
+            try {
+                for (Plane plane : arSession.getAllTrackables(Plane.class)) {
+                    if (plane.getTrackingState() != TrackingState.TRACKING) continue;
+                    if (plane.getSubsumedBy() != null) continue;
+                    if (plane.getType() != Plane.Type.HORIZONTAL_UPWARD_FACING) continue;
+                    float extentX = plane.getExtentX(), extentZ = plane.getExtentZ();
+                    if (!finite(extentX, extentZ)) continue;
+                    float area = extentX * extentZ;
+                    if (!(area >= 0.04f)) continue; // ignore patches smaller than ~20 x 20 cm
+                    if (hasGroundPlane && area < groundArea * 1.2f) continue; // hysteresis: keep the stable best
+                    Pose center = plane.getCenterPose();
+                    float[] normal = new float[3], at = center.getTranslation();
+                    center.getYAxis(normal, 0); // a plane's local +Y is its surface normal
+                    if (!finite(normal[0], normal[1], normal[2], at[0], at[1], at[2])) continue;
+                    float length = (float) Math.sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+                    if (!Float.isFinite(length) || length < 1e-6f) continue;
+                    groundNormal[0] = normal[0] / length; groundNormal[1] = normal[1] / length; groundNormal[2] = normal[2] / length;
+                    groundCenter[0] = at[0]; groundCenter[1] = at[1]; groundCenter[2] = at[2];
+                    groundExtentX = extentX; groundExtentZ = extentZ; groundArea = area;
+                    hasGroundPlane = true;
+                }
+            } catch (Exception ignored) { /* plane polling must never break the preview */ }
+        }
+
+        private String groundPlaneStatus() {
+            if (!hasGroundPlane) return " \u00b7 no ground plane yet (point at the floor or table)";
+            return String.format(Locale.US, " \u00b7 ground plane %.2f m\u00b2", groundArea);
         }
 
         private void drawBackground(Frame frame) {
@@ -852,7 +896,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 updateCoverage(frame);
                 cloudRenderer.capturePosition(pose.getTranslation());
                 showStatus("Captured " + frames.size() + " / 200 · " + coverage.size() + " coverage points · " +
-                        (autoCaptureEnabled ? "auto every " + captureSpacingCm + " cm" : "manual capture"));
+                        (autoCaptureEnabled ? "auto every " + captureSpacingCm + " cm" : "manual capture") + groundPlaneStatus());
             } catch (NotYetAvailableException e) {
                 showStatus("Camera image is not ready yet. Hold steady and capture again.");
             } catch (Exception e) {
@@ -893,6 +937,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         void resetData() {
             coverage.clear(); seeds.clear(); frames.clear(); viewpoints.clear(); capturedFrameCount = 0; capturedSeedCount = 0;
+            hasGroundPlane = false; groundArea = 0f; groundExtentX = 0f; groundExtentZ = 0f; levelingApplied = false;
             refreshCaptureTelemetry();
             travelTrigger.reset();
             deleteTree(outputDir); outputDir.mkdirs();
@@ -901,6 +946,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         void writeDataset(File dir) throws Exception {
             if (frames.size() < 3) throw new IllegalStateException("Capture at least 3 frames first.");
+            JSONObject leveling = applyGroundLeveling();
             JSONObject transforms = new JSONObject();
             JSONObject first = frames.get(0);
             int w = first.getInt("w"), h = first.getInt("h");
@@ -931,8 +977,128 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             JSONObject metadata = new JSONObject()
                     .put("frames", frames.size()).put("pointCount", seeds.size())
                     .put("seedSource", seeds.isEmpty() ? "none" : "arcore-point-cloud-rgb")
-                    .put("coordinateConvention", "ARCore world meters; OpenGL camera-to-world transforms; RGB measured from matching camera image");
+                    .put("leveling", leveling)
+                    .put("coordinateConvention", "ARCore world meters; OpenGL camera-to-world transforms; RGB measured from matching camera image; world alignment in leveling (the ground plane normal becomes +Y)");
             writeText(new File(dir, "capture.json"), jsonText(metadata, 2, "capture.json"));
+        }
+
+        /** Level the exported world to the ARCore ground plane so the trained model sits
+         *  upright instead of inheriting the session world's roll. Rotates about the camera
+         *  centroid so the scene stays where it is. Returns the report stored in
+         *  capture.json under "leveling". */
+        private JSONObject applyGroundLeveling() throws Exception {
+            JSONObject report = new JSONObject();
+            float[] centroid = cameraCentroid();
+            report.put("centroid", new JSONArray(new float[]{centroid[0], centroid[1], centroid[2]}));
+            float[] up = new float[]{0f, 1f, 0f};
+            String method;
+            if (hasGroundPlane) {
+                method = "arcore-horizontal-plane";
+                up[0] = groundNormal[0]; up[1] = groundNormal[1]; up[2] = groundNormal[2];
+                // The normal must face the cameras (they orbit above the floor), never away.
+                float toward = up[0] * (centroid[0] - groundCenter[0]) +
+                        up[1] * (centroid[1] - groundCenter[1]) + up[2] * (centroid[2] - groundCenter[2]);
+                if (toward < 0) { up[0] = -up[0]; up[1] = -up[1]; up[2] = -up[2]; }
+                report.put("planeNormal", new JSONArray(new float[]{groundNormal[0], groundNormal[1], groundNormal[2]}));
+                report.put("planeCenter", new JSONArray(new float[]{groundCenter[0], groundCenter[1], groundCenter[2]}));
+                report.put("planeExtentX", groundExtentX);
+                report.put("planeExtentZ", groundExtentZ);
+                report.put("planeArea", groundArea);
+            } else {
+                // Fallback: the cameras' mean up axis. The activity is portrait-locked and
+                // the capture guide keeps the phone upright, so this levels handheld object
+                // scans with no floor in view. Its sign follows the session +Y hemisphere,
+                // so a level session can never be flipped upside down.
+                method = "camera-up-average";
+                float[] mean = new float[3];
+                for (JSONObject frame : frames) {
+                    JSONArray m = frame.getJSONArray("transform_matrix");
+                    mean[0] += (float) m.getJSONArray(0).getDouble(1);
+                    mean[1] += (float) m.getJSONArray(1).getDouble(1);
+                    mean[2] += (float) m.getJSONArray(2).getDouble(1);
+                }
+                float spread = (float) Math.sqrt(mean[0] * mean[0] + mean[1] * mean[1] + mean[2] * mean[2]) / frames.size();
+                report.put("upConsistency", spread);
+                if (!(spread >= 0.7f)) {
+                    // The cameras look every which way: no trustworthy up, keep the session world.
+                    report.put("method", "none");
+                    report.put("applied", false);
+                    report.put("reason", "no ground plane and the cameras' up axes disagree");
+                    return report;
+                }
+                float inv = 1f / (spread * frames.size());
+                up[0] = mean[0] * inv; up[1] = mean[1] * inv; up[2] = mean[2] * inv;
+                if (up[1] < 0) { up[0] = -up[0]; up[1] = -up[1]; up[2] = -up[2]; }
+            }
+            report.put("method", method);
+            report.put("up", new JSONArray(new float[]{up[0], up[1], up[2]}));
+            float cos = Math.max(-1f, Math.min(1f, up[1])); // dot(up, +Y)
+            float angleDeg = (float) Math.toDegrees(Math.acos(cos));
+            report.put("tiltDegrees", angleDeg);
+            if (!(angleDeg >= 0.5f) || levelingApplied) {
+                report.put("applied", false);
+                report.put("reason", levelingApplied ? "leveling already applied" : "session world is already level");
+                return report;
+            }
+            // Shortest-arc rotation carrying up onto +Y (Rodrigues): axis = up x Y.
+            float ax = -up[2], az = up[0]; // up x +Y has no Y component
+            float s = (float) Math.sqrt(ax * ax + az * az);
+            if (!(s > 1e-6f)) { // parallel despite the tilt gate: leave the world alone
+                report.put("applied", false);
+                report.put("reason", "up is parallel to the world axis");
+                return report;
+            }
+            float kx = ax / s, kz = az / s; // normalized axis (ky is always 0)
+            float c = cos, k1c = 1f - c; // R = cI + sK + (1-c)kk^T, row-major
+            float[] r = new float[]{
+                    c + k1c * kx * kx, -s * kz, k1c * kx * kz,
+                    s * kz, c, -s * kx,
+                    k1c * kx * kz, s * kx, c + k1c * kz * kz};
+            report.put("rotation", new JSONArray(r));
+            for (JSONObject frame : frames) {
+                JSONArray m = frame.getJSONArray("transform_matrix");
+                double[][] a = new double[3][4];
+                for (int row = 0; row < 3; row++) {
+                    JSONArray line = m.getJSONArray(row);
+                    for (int col = 0; col < 4; col++) a[row][col] = line.getDouble(col);
+                }
+                double[] p = {a[0][3] - centroid[0], a[1][3] - centroid[1], a[2][3] - centroid[2]};
+                double[][] out = new double[3][4];
+                for (int row = 0; row < 3; row++) {
+                    for (int col = 0; col < 3; col++)
+                        out[row][col] = r[row * 3] * a[0][col] + r[row * 3 + 1] * a[1][col] + r[row * 3 + 2] * a[2][col];
+                    out[row][3] = r[row * 3] * p[0] + r[row * 3 + 1] * p[1] + r[row * 3 + 2] * p[2] + centroid[row];
+                }
+                for (int row = 0; row < 3; row++) {
+                    JSONArray line = m.getJSONArray(row);
+                    for (int col = 0; col < 4; col++) line.put(col, out[row][col]);
+                }
+            }
+            for (Map.Entry<String, SeedPoint> entry : seeds.entrySet()) {
+                SeedPoint seed = entry.getValue();
+                double dx = seed.x - centroid[0], dy = seed.y - centroid[1], dz = seed.z - centroid[2];
+                entry.setValue(new SeedPoint(
+                        (float) (r[0] * dx + r[1] * dy + r[2] * dz + centroid[0]),
+                        (float) (r[3] * dx + r[4] * dy + r[5] * dz + centroid[1]),
+                        (float) (r[6] * dx + r[7] * dy + r[8] * dz + centroid[2]),
+                        seed.r, seed.g, seed.b, seed.frameName));
+            }
+            levelingApplied = true;
+            report.put("applied", true);
+            return report;
+        }
+
+        /** Mean camera centre of the captured keyframes: the pivot the leveling rotates about. */
+        private float[] cameraCentroid() throws Exception {
+            float[] c = new float[3];
+            for (JSONObject frame : frames) {
+                JSONArray m = frame.getJSONArray("transform_matrix");
+                c[0] += (float) m.getJSONArray(0).getDouble(3);
+                c[1] += (float) m.getJSONArray(1).getDouble(3);
+                c[2] += (float) m.getJSONArray(2).getDouble(3);
+            }
+            c[0] /= frames.size(); c[1] /= frames.size(); c[2] /= frames.size();
+            return c;
         }
 
         private void writePly(File file) throws Exception {

@@ -70,6 +70,21 @@ export function filterDataset(dataset, selectedNames) {
       pointsByFrame: retainedPointsByFrame, seedSource, randomSeedFallback: points.length < 8 } };
 }
 
+/** One-line provenance for the native export's world leveling (capture.json "leveling"). */
+export function levelingNote(leveling) {
+  if (!leveling || typeof leveling !== 'object') return '';
+  const tilt = Number.isFinite(leveling.tiltDegrees) ? `${leveling.tiltDegrees.toFixed(1)}\u00b0` : null;
+  if (leveling.method === 'arcore-horizontal-plane') {
+    const plane = Number.isFinite(leveling.planeArea) ? ` (${leveling.planeArea.toFixed(2)} m\u00b2 ground plane)` : '';
+    if (leveling.applied) return `World levelled to the ARCore ground plane${plane}${tilt ? `; ${tilt} tilt removed` : ''}.`;
+    return `ARCore ground plane found${plane}; the session world was already level.`;
+  }
+  if (leveling.method === 'camera-up-average' && leveling.applied) {
+    return `No ground plane in view; levelled to the cameras' average up${tilt ? ` (${tilt})` : ''}. Hold the phone upright while capturing.`;
+  }
+  return 'No ground plane in view and the camera orientations disagree; the session world is kept as captured.';
+}
+
 export function measuredSeeds(dataset) {
   const points = dataset.points || [];
   return points.length >= 8 ? points : [];

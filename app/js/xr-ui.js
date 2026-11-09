@@ -1,5 +1,5 @@
 import { probeXR, captureXR } from './xr-capture.js';
-import { validateDataset, filterDataset, cameraForFile, measuredSeeds } from './xr-dataset.js';
+import { validateDataset, filterDataset, cameraForFile, measuredSeeds, levelingNote } from './xr-dataset.js';
 import { zipStore } from './zip.js';
 import { saveBlob } from './download.js';
 
@@ -93,9 +93,10 @@ export function reviewCapture(dataset) {
       const camera = active ? cameraForFile(dataset, active) : null;
       dialog.querySelector('pre').textContent = camera ? JSON.stringify(camera, null, 2) : 'No tracked pose.\nThe original camera solve will be used.';
       const seedCount = measuredSeeds(retained).length;
-      dialog.querySelector('[data-seeds]').textContent = !dataset.transforms
+      const levelNote = levelingNote(dataset.metadata?.leveling);
+      dialog.querySelector('[data-seeds]').textContent = (!dataset.transforms
         ? 'Standard photos → original camera solve → Gaussian seed → WebGPU training.'
-        : `${selected.size} known cameras · camera solve skipped · ${seedCount ? `${seedCount.toLocaleString()} measured seed points (${dataset.metadata?.seedSource || 'provided'})` : 'no sufficient measured seeds; random-volume initialization (orbit required)'}. ${selected.size < 20 ? 'At least 20 overlapping views are recommended.' : 'Ready for direct pose input.'}`;
+        : `${selected.size} known cameras · camera solve skipped · ${seedCount ? `${seedCount.toLocaleString()} measured seed points (${dataset.metadata?.seedSource || 'provided'})` : 'no sufficient measured seeds; random-volume initialization (orbit required)'}. ${selected.size < 20 ? 'At least 20 overlapping views are recommended.' : 'Ready for direct pose input.'}`) + (levelNote ? ` ${levelNote}` : '');
       const strip = dialog.querySelector('.xr-review-strip'); strip.replaceChildren();
       for (const file of dataset.files) {
         const b = document.createElement('button'); b.type = 'button';
