@@ -3671,10 +3671,82 @@ function trainLocalChoice() {
   $('stage').appendChild(card);
   $('lt-x').addEventListener('click', () => card.remove());
   $('lt-new').addEventListener('click', () => { card.remove(); trainNew().catch((e) => { console.error(e); }); });
-  $('lt-cont').addEventListener('click', () => { card.remove(); continueLocalRun().catch((e) => {
-    console.error(e);
-    flash(`Could not continue this run: ${e.message}`, 8000);
-  }); });
+  $('lt-cont').addEventListener('click', () => {
+    card.remove();
+    // a finished run is a new training decision — reselect its resolution,
+    // budget and extra cycles first; a paused run simply resumes
+    if (r && r.status === 'finished') { continueConfigCard(r); return; }
+    continueLocalRun().catch((e) => {
+      console.error(e);
+      flash(`Could not continue this run: ${e.message}`, 8000);
+    });
+  });
+}
+
+/** Reselect the training configuration before refining a finished run —
+ *  the same knobs a new training offers where they apply to a rebuild:
+ *  training resolution, splat budget, and how many more cycles to train.
+ *  The solved cameras are reused, never re-solved. Paused runs skip this
+ *  card and resume their original configuration directly. */
+function continueConfigCard(r) {
+  document.getElementById('ltconfig')?.remove();
+  const recon = r.recon || {};
+  const fr0 = (recon.frames && recon.frames[0]) || {};
+  const prevDim = Math.max(fr0.tw || 0, fr0.th || 0) || 0;
+  const nativeDim = Math.max(fr0.fw || 0, fr0.fh || 0) || 0;
+  const prevSplats = r.splats || 0;
+  const baseIter = r.iter || recon.iter || 0;
+  const defaultExtra = Math.max(10000, Math.round((r.maxIters || 20000) / 2));
+  // resolution steps mirror the start panel (only steps the pictures can
+  // fill; Full = the pictures' own size)
+  const steps = [480, 640, 960, 1280, 1600, 1920].filter((v) => !nativeDim || v < nativeDim);
+  const resOpts = [`<option value="same" selected>Same as before${prevDim ? ` (${prevDim} px)` : ''}</option>`,
+    '<option value="auto">Auto</option>',
+    ...steps.map((v) => `<option value="${v}">${v} px</option>`),
+    `<option value="full">Full size${nativeDim ? ` (${nativeDim} px)` : ''}</option>`].join('');
+  // budgets at or above the finished size (shrinking a trained model is not
+  // offered); same-as-before keeps the run's own sizing
+  const budgets = [300000, 600000, 1000000, 2000000, 4000000].filter((v) => v >= prevSplats);
+  const splatOpts = [`<option value="" selected>Same as before${prevSplats ? ` (${fmt(prevSplats)})` : ''}</option>`,
+    ...budgets.map((v) => `<option value="${v}">${fmt(v)}</option>`)].join('');
+  // extra cycles mirror the start panel's fixed 10k–50k menu
+  const cycleSteps = [10000, 20000, 30000, 40000, 50000];
+  const nearest = cycleSteps.reduce((best, v) =>
+    Math.abs(v - defaultExtra) < Math.abs(best - defaultExtra) ? v : best, 10000);
+  const cycleOpts = cycleSteps.map((v) =>
+    `<option value="${v}"${v === nearest ? ' selected' : ''}>+${fmt(v)}</option>`).join('');
+  const card = document.createElement('div');
+  card.className = 'upcard';
+  card.id = 'ltconfig';
+  card.innerHTML = `
+    <button class="card-x lt-x" id="ltc-x" aria-label="Close">&times;</button>
+    <b>Continue training</b>
+    <span class="lt-desc">Refine <b>${esc(r.name || 'this model')}</b> further from ${fmt(baseIter)} cycles.
+    Higher resolution and a larger splat budget sharpen detail; the solved cameras are reused.</span>
+    <label class="upcard-opt"><span>Training resolution</span><select id="ltc-res">${resOpts}</select></label>
+    <label class="upcard-opt"><span>Splat budget</span><select id="ltc-splats">${splatOpts}</select></label>
+    <label class="upcard-opt"><span>Extra cycles</span><select id="ltc-iters">${cycleOpts}</select></label>
+    <div class="upcard-row">
+      <button class="btn btn-outline" id="ltc-cancel">Cancel</button>
+      <button class="btn btn-accent" id="ltc-go">Continue training</button>
+    </div>`;
+  $('stage').appendChild(card);
+  $('ltc-x').addEventListener('click', () => card.remove());
+  $('ltc-cancel').addEventListener('click', () => card.remove());
+  $('ltc-go').addEventListener('click', () => {
+    const resRaw = $('ltc-res').value;
+    const splatsRaw = parseInt($('ltc-splats').value, 10) || 0;
+    const extraIters = parseInt($('ltc-iters').value, 10) || defaultExtra;
+    card.remove();
+    continueLocalRun(false, {
+      res: resRaw === 'same' ? undefined : (resRaw === 'auto' ? 'auto' : (resRaw === 'full' ? 'full' : parseInt(resRaw, 10))),
+      splats: splatsRaw || undefined,
+      extraIters,
+    }).catch((e) => {
+      console.error(e);
+      flash(`Could not continue this run: ${e.message}`, 8000);
+    });
+  });
 }
 
 /** Continue training a stored local run: decode its sog back into raw
@@ -3682,8 +3754,11 @@ function trainLocalChoice() {
  *  for standard viewers, the trainer applies it itself), rebuild the session
  *  from the stored camera solve + the capture's photos, and run on. */
 /** viewOnly: reopen a FINISHED run from its state checkpoint straight into
- *  the done viewer (same run record, so Compress patches the sog in) */
-async function continueLocalRun(viewOnly = false) {
+ *  the done viewer (same run record, so Compress patches the sog in)
+ *  opts: { res, splats, extraIters } from the continue-config card — a
+ *  reselected training size for this continuation; unsettled knobs keep the
+ *  run's own resolution, budget and automatic horizon extension. */
+async function continueLocalRun(viewOnly = false, opts = {}) {
   const lr = S._localRun;
   if (!lr || !lr.recon || !(lr.state || lr.sog)) return;
   const recon = lr.recon;
@@ -3790,20 +3865,29 @@ async function continueLocalRun(viewOnly = false) {
   S.photos = files.map((f, i) => ({ url: URL.createObjectURL(f), name: f.name, i }));
   buildStrip();
   const baseIter = stateIter ?? (lr.iter || 0);
-  // a finished run continues PAST its old horizon; a paused one resumes
-  // toward the horizon it was already aiming at
+  // a finished run continues PAST its old horizon — by the configured extra
+  // cycles, or the automatic half-horizon when none were chosen; a paused
+  // one resumes toward the horizon it was already aiming at
+  const defaultExtra = Math.max(10000, Math.round((lr.maxIters || 20000) / 2));
   S.maxIters = lr.status !== 'finished' && lr.maxIters > baseIter
     ? lr.maxIters
-    : baseIter + Math.max(10000, Math.round((lr.maxIters || 20000) / 2));
+    : baseIter + (Number.isSafeInteger(opts.extraIters) && opts.extraIters > 0 ? opts.extraIters : defaultExtra);
   const fr0 = recon.frames[0] || {};
-  const cap = Math.max(g.n, lr.splats || 0, lr.status !== 'finished' ? lr.cap || 0 : 0);
+  // the continuation may reselect the training size (higher resolution,
+  // more splats) like a new training; unsettled knobs keep the run's own
+  const prevDim = Math.max(fr0.tw || 0, fr0.th || 0) || undefined;
+  const nativeDim = Math.max(fr0.fw || 0, fr0.fh || 0) || undefined;
+  const trainMaxDim = opts.res === 'auto' ? undefined
+    : opts.res === 'full' ? nativeDim
+    : Number.isFinite(opts.res) ? opts.res : prevDim;
+  const cap = Math.max(g.n, lr.splats || 0, lr.status !== 'finished' ? lr.cap || 0 : 0, opts.splats || 0);
   // rebuild the SAME trainer the run was made with: the recipe carries the
   // MCMC / needle / placement sets and the refine cadence; sizing is per run
   const { refineEvery: recipeRefine, ...recipeTrainer } = recipe || {};
   const ses = createSession({
     maxIters: S.maxIters, holdout: -1,
     ...(recipeRefine != null ? { refineEvery: recipeRefine } : {}),
-    frames: { trainMaxDim: Math.max(fr0.tw || 0, fr0.th || 0) || undefined },
+    frames: { trainMaxDim },
     trainer: {
       ...recipeTrainer,
       maxSplats: cap, shDeg: recipeTrainer.shDeg ?? 3,
@@ -4788,11 +4872,21 @@ function chartTip(h) {
   if (!tip) return;
   if (!h) { tip.hidden = true; return; }
   tip.hidden = false;
-  tip.style.left = `${h.xPct}%`;
-  tip.style.top = '4px';
   tip.innerHTML = `${fmt(h.iter)} · <b style="color:#2fd4c1">${h.train.toFixed(1)} ${h.unit}</b>` +
     (h.hold != null ? ` / <b style="color:#f2a03f">${h.hold.toFixed(1)} ${h.unit}</b>` : '') +
     (h.event ? `<br><span style="color:#93a1a0">${h.event}</span>` : '');
+  // the readout rides the cursor INSIDE the plot: pinned to the top edge it
+  // hung past the stage in the expanded graph and hid behind the dock.
+  // Clamped sideways, flipped below the cursor near the top.
+  const wrap = tip.parentElement;
+  const W = wrap ? wrap.clientWidth : 0, H = wrap ? wrap.clientHeight : 0;
+  if (!W || !H) { tip.style.left = `${h.xPct}%`; tip.style.top = '4px'; return; }
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  const x = Math.max(tw / 2 + 4, Math.min(W - tw / 2 - 4, (h.xPct / 100) * W));
+  const y = (Math.max(0, Math.min(100, h.yPct ?? 0)) / 100) * H;
+  tip.style.left = `${(x / W) * 100}%`;
+  tip.style.top = `${(y / H) * 100}%`;
+  tip.style.transform = y > th + 14 ? 'translate(-50%, calc(-100% - 10px))' : 'translate(-50%, 10px)';
 }
 
 // ── flash ───────────────────────────────────────────────────────────────────

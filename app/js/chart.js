@@ -183,6 +183,11 @@ export class Chart {
         ctx.beginPath(); ctx.moveTo(x, t); ctx.lineTo(x, t + ph); ctx.stroke();
         this.onHover?.({
           xPct: (x / W) * 100,
+          // where the pointer sits, so the readout can ride the cursor
+          // inside the plot instead of hanging off its top edge (the
+          // expanded graph fills the stage — anything above it is clipped
+          // behind the dock and unreadable)
+          yPct: this.hover.y * 100,
           iter: Math.round(a[0]),
           train: this._displayValue(a[1]), hold: h ? this._displayValue(h[1]) : null,
           unit: this.scale === 'similarity' ? '%' : 'dB', event: ev ? ev.label : null,
