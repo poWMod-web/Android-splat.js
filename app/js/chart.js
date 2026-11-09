@@ -6,8 +6,8 @@
 export function psnrToApproxSsimPercent(psnr) {
   if (psnr === Infinity) return 100;
   if (!Number.isFinite(psnr) || psnr <= 0) return 0;
-  const penalty = (320 / psnr) ** 1.5;
-  return Math.max(0, Math.min(100, (psnr / (psnr + penalty)) * 100));
+  const ratio = 17.5 / psnr;
+  return Math.max(0, Math.min(100, 100 / (1 + ratio ** 4)));
 }
 
 export class Chart {

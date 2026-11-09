@@ -2388,15 +2388,19 @@ function startTraining() {
   }
   // local library: every run is listed from the moment it starts — a small
   // record now, the finished result later (see finish())
-  // a checkpoint resume keeps its run identity — same tile, same slot; only
-  // fresh runs (and continuations of FINISHED runs) get a new record
+  // a continuation keeps its run identity — same tile, same slot — whether
+  // it resumes a pause or refines a finished result; only fresh runs get a
+  // new record, so a continued result replaces the previous trained state
   const resumeId = S._resumeRunId;
   S._resumeRunId = null;
   S.runId = resumeId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
   S._ckptIter = 0;
   (async () => {
     if (resumeId) {
-      // the record already exists (thumb, checkpoint, name) — just mark it live
+      // the record already exists (thumb, checkpoint, name, and for a
+      // finished run its last result) — just mark it live; the run's own
+      // checkpoints and its final result overwrite the trained state in
+      // place while the record's original camera poses stay untouched
       const { patchRun } = await import('./store.js');
       await patchRun(resumeId, {
         status: 'training', maxIters: S.maxIters,
@@ -2940,7 +2944,8 @@ function adoptSession(ses, stage = '', res = null) {
     // a person is not a scene: eye level rather than looking down from above,
     // and a little further back so the head clears the card at the top
     vp.dist = res.bounds.radius * 3.2;
-    vp.setOrbitAngles(vp.yaw, -0.12);
+    vp.pitch = -0.12;
+    vp.dirty = true;
   }
   renderControls();
   console.log(`[avatar] the viewer now shows the ${stage || 'new'} model — ${ses.trainer.n.toLocaleString()} splats`);
@@ -3848,7 +3853,12 @@ async function continueLocalRun(viewOnly = false) {
   S.minutes = Math.max(S.minutes || 0, lr.minutes || 0,
     (lr.detailProgress && lr.detailProgress.minutes) || 0);
   S._carryTrainElapsed = true;
-  if (lr.state && lr.status !== 'finished') S._resumeRunId = lr.id;
+  // every continuation — paused or finished — trains back into its own
+  // record: the saved result replaces the previous trained state there, the
+  // root camera poses it rebuilt from stay, and its photos are the capture
+  // store's blobs matched by name above, reused by reference and never
+  // re-saved, so continuing costs no extra image storage
+  S._resumeRunId = lr.id;
   startTraining();
   flash(`Continuing from ${fmt(baseIter)} cycles — +${fmt(S.maxIters - baseIter)} more.`, 6000);
 }
@@ -5010,7 +5020,9 @@ function tourStep(dt) {
   vp.target = [pos[0] + fwd[0] * d, pos[1] + fwd[1] * d, pos[2] + fwd[2] * d];
   vp.dist = d;
   const ang = vp.anglesOf(fwd);
-  vp.setOrbitAngles(ang.yaw, ang.pitch);
+  vp.yaw = ang.yaw;
+  vp.pitch = clamp(ang.pitch, -1.45, 1.45);
+  vp.dirty = true;
 }
 
 /** WASD fly: move the orbit target along the camera's own axes */
