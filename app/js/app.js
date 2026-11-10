@@ -1871,6 +1871,7 @@ async function startPrep() {
     } else {
       S.lodPlan = null;
     }
+    S.align = null;   // a new model starts unaligned
     // the ?iters override must land BEFORE anything reads the budget
     if (ITERS_OVERRIDE >= 1000) S.maxIters = ITERS_OVERRIDE;
     // MCMC set: ON by default — measured garden 20k/40k +1.12/+0.61 dB and
@@ -2183,6 +2184,7 @@ function loadFailed(what, why) {
  *  hardware trouble (seen in the wild: DXGI_ERROR_DEVICE_REMOVED at
  *  requestDevice, surfaced under capture tips). */
 function solveFailed(why) {
+  androidNotifStop(false);
   document.getElementById('failcard')?.remove();
   const c = document.createElement('div');
   c.className = 'upcard failcard';
@@ -2394,6 +2396,7 @@ function startTraining() {
   const resumeId = S._resumeRunId;
   S._resumeRunId = null;
   S.runId = resumeId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+  androidNotifStart();   // background-safe from the first cycle
   S._ckptIter = 0;
   (async () => {
     if (resumeId) {
@@ -2485,6 +2488,7 @@ function toggleTrain() {
   const f = $('t-finish');
   if (f) f.hidden = on;   // paused = the moment "stop here" makes sense
   if (!on) checkpointRun('pause').catch(() => {});
+  if (on) androidNotifStart(); else androidNotifStop(false);   // pause sheds the service; resume restarts it
 }
 
 // Local-run diagnostics are a compact companion to the saved model. The
@@ -2686,6 +2690,7 @@ function onMetrics(m) {
   S.iter = m.iter;
   S.splats = m.splats;
   S.itersPerSec = m.itersPerSec;
+  androidNotifTick();
   // LOD training: hold the model at each detail level for a polish window,
   // snapshot it, then raise the growth limit and move on
   const LP = S.lodPlan;
@@ -3043,6 +3048,7 @@ async function runAvatarStages() {
 }
 
 async function finish() {
+  androidNotifStop(true);   // the shade keeps the final score
   S.iter = S.session.trainer.iter;   // honest count — the run may end early
   S.minutes = Math.max(1, Math.round((performance.now() - S.trainT0) / 60000));
   enterDone();
@@ -3119,6 +3125,7 @@ async function hydrateLocalRunPhotos(reconJson, run) {
 async function restoreSession(src) {
   try {
     S._localRun = src.localRun || null; // set only by the local runs library
+    S.align = null;   // a fresh viewing starts unaligned; finishRestore loads the run's lock
     S.runId = S._localRun ? S._localRun.id : null;
     S._resumeRunId = null;
     S.feats = new Map(); S.lastPairEv = null;
@@ -3153,7 +3160,7 @@ async function restoreSession(src) {
         }
         await hydrateLocalRunPhotos(reconJson, S._localRun);
         const { createSogView } = await import('./pcview.js');
-        const ses = await createSogView(src.url, { radius: reconJson.sceneRadius || 10 });
+        const ses = await createSogView(src.url, { radius: reconJson.sceneRadius || 10, yUp: !!reconJson.knownCameras });
         ses.frames = (reconJson.frames || []).map((f) => ({ ...f }));
         // the Details sheet reads session.recon (cams/points) — same shape
         // the old view-only path built via useReconstruction()
@@ -3222,6 +3229,7 @@ function finishRestore(ses, reconJson, nSplats, hasState, gaussians) {
     S.psnrHold = stats.psnrHold ?? null;
     S.plyBlob = null; S.sogBlob = null;
     S.lodPlan = null;
+    S.align = storedAlign(S._localRun);
     S.state = 'done';
     restoreRunDetails(S._localRun, ses);
     syncTrainingVisualsControl();
@@ -3570,6 +3578,17 @@ function renderControls() {
     '<i>Details ›</i>';
   stats.addEventListener('click', openDetails);
   c.appendChild(stats);
+  {
+    // manual alignment: rotate the displayed model until it sits right, then
+    // lock it to the run (display only — training data and exports untouched)
+    const align = document.createElement('button');
+    align.className = 'cbtn';
+    align.id = 'c-align';
+    align.textContent = S.align && S.align.locked ? '🔒 Aligned' : 'Align';
+    align.title = 'Rotate the displayed model in 90° steps and lock it to this run';
+    align.addEventListener('click', alignCard);
+    c.appendChild(align);
+  }
   if (!S.restored && !S._localRun) {
     // a restored model has no training targets in this tab — viewing and
     // exporting work, continuing the run does not (yet)
@@ -3697,17 +3716,20 @@ function continueConfigCard(r) {
   const prevSplats = r.splats || 0;
   const baseIter = r.iter || recon.iter || 0;
   const defaultExtra = Math.max(10000, Math.round((r.maxIters || 20000) / 2));
-  // resolution steps mirror the start panel (only steps the pictures can
-  // fill; Full = the pictures' own size)
-  const steps = [480, 640, 960, 1280, 1600, 1920].filter((v) => !nativeDim || v < nativeDim);
+  const recipe0 = (recon && recon.recipe) || null;
+  const prevSh = recipe0 && Number.isInteger(recipe0.shDeg) ? recipe0.shDeg : 3;
+  const prevMcmc = !!(recipe0 && recipe0.mcmcNoise === true);
+  const prevBuf = recon.trainScale || 1;
+  // resolution: every start-panel step, like a new training (Auto, the
+  // fixed steps, Full); Same as before keeps the run's own sizing
   const resOpts = [`<option value="same" selected>Same as before${prevDim ? ` (${prevDim} px)` : ''}</option>`,
     '<option value="auto">Auto</option>',
-    ...steps.map((v) => `<option value="${v}">${v} px</option>`),
+    ...[480, 640, 960, 1280, 1600, 1920].map((v) => `<option value="${v}">${v} px</option>`),
     `<option value="full">Full size${nativeDim ? ` (${nativeDim} px)` : ''}</option>`].join('');
   // budgets at or above the finished size (shrinking a trained model is not
-  // offered); same-as-before keeps the run's own sizing
+  // offered); Same as current keeps the run's own sizing
   const budgets = [300000, 600000, 1000000, 2000000, 4000000].filter((v) => v >= prevSplats);
-  const splatOpts = [`<option value="" selected>Same as before${prevSplats ? ` (${fmt(prevSplats)})` : ''}</option>`,
+  const splatOpts = [`<option value="" selected>Same as current${prevSplats ? ` (${fmt(prevSplats)})` : ''}</option>`,
     ...budgets.map((v) => `<option value="${v}">${fmt(v)}</option>`)].join('');
   // extra cycles mirror the start panel's fixed 10k–50k menu
   const cycleSteps = [10000, 20000, 30000, 40000, 50000];
@@ -3715,6 +3737,18 @@ function continueConfigCard(r) {
     Math.abs(v - defaultExtra) < Math.abs(best - defaultExtra) ? v : best, 10000);
   const cycleOpts = cycleSteps.map((v) =>
     `<option value="${v}"${v === nearest ? ' selected' : ''}>+${fmt(v)}</option>`).join('');
+  // spherical harmonics: the run's own degree unless reselected (the decoded
+  // checkpoint is resampled to the chosen degree before training resumes)
+  const shOpts = [`<option value="" selected>Same as run (${prevSh})</option>`,
+    ...[0, 1, 2, 3].map((v) => `<option value="${v}">${v}</option>`)].join('');
+  // working buffer: the supervision grid scale, like the start panel
+  const bufOpts = [`<option value="" selected>Same as run (${prevBuf}×)</option>`,
+    ...[0.5, 1, 2].map((v) => `<option value="${v}">${v}×</option>`)].join('');
+  // LOD: a fresh halving schedule above the model's current size (needs a
+  // 1,000,000+ budget, like a new training)
+  const lodOpts = '<option value="" selected>Off</option><option value="1">On (auto levels)</option>';
+  // MCMC optimizer: the run's own set unless toggled
+  const mcmcOpts = `<option value="" selected>Same as run (${prevMcmc ? 'On' : 'Off'})</option><option value="1">On</option><option value="0">Off</option>`;
   const card = document.createElement('div');
   card.className = 'upcard';
   card.id = 'ltconfig';
@@ -3726,6 +3760,10 @@ function continueConfigCard(r) {
     <label class="upcard-opt"><span>Training resolution</span><select id="ltc-res">${resOpts}</select></label>
     <label class="upcard-opt"><span>Splat budget</span><select id="ltc-splats">${splatOpts}</select></label>
     <label class="upcard-opt"><span>Extra cycles</span><select id="ltc-iters">${cycleOpts}</select></label>
+    <label class="upcard-opt"><span>Spherical harmonics</span><select id="ltc-sh">${shOpts}</select></label>
+    <label class="upcard-opt"><span>Working buffer</span><select id="ltc-buf">${bufOpts}</select></label>
+    <label class="upcard-opt"><span>LOD levels</span><select id="ltc-lod">${lodOpts}</select></label>
+    <label class="upcard-opt"><span>MCMC optimizer</span><select id="ltc-mcmc">${mcmcOpts}</select></label>
     <div class="upcard-row">
       <button class="btn btn-outline" id="ltc-cancel">Cancel</button>
       <button class="btn btn-accent" id="ltc-go">Continue training</button>
@@ -3737,11 +3775,19 @@ function continueConfigCard(r) {
     const resRaw = $('ltc-res').value;
     const splatsRaw = parseInt($('ltc-splats').value, 10) || 0;
     const extraIters = parseInt($('ltc-iters').value, 10) || defaultExtra;
+    const shRaw = $('ltc-sh').value;
+    const bufRaw = $('ltc-buf').value;
+    const lodRaw = $('ltc-lod').value;
+    const mcmcRaw = $('ltc-mcmc').value;
     card.remove();
     continueLocalRun(false, {
       res: resRaw === 'same' ? undefined : (resRaw === 'auto' ? 'auto' : (resRaw === 'full' ? 'full' : parseInt(resRaw, 10))),
       splats: splatsRaw || undefined,
       extraIters,
+      sh: shRaw === '' ? undefined : parseInt(shRaw, 10),
+      buf: bufRaw === '' ? undefined : parseFloat(bufRaw),
+      lod: lodRaw === '1' ? true : undefined,
+      mcmc: mcmcRaw === '' ? undefined : mcmcRaw === '1',
     }).catch((e) => {
       console.error(e);
       flash(`Could not continue this run: ${e.message}`, 8000);
@@ -3755,13 +3801,19 @@ function continueConfigCard(r) {
  *  from the stored camera solve + the capture's photos, and run on. */
 /** viewOnly: reopen a FINISHED run from its state checkpoint straight into
  *  the done viewer (same run record, so Compress patches the sog in)
- *  opts: { res, splats, extraIters } from the continue-config card — a
- *  reselected training size for this continuation; unsettled knobs keep the
- *  run's own resolution, budget and automatic horizon extension. */
+ *  opts: { res, splats, extraIters, sh, buf, lod, mcmc } from the
+ *  continue-config card — a reselected configuration for this continuation;
+ *  unsettled knobs keep the run's own setup and automatic horizon extension. */
 async function continueLocalRun(viewOnly = false, opts = {}) {
   const lr = S._localRun;
   if (!lr || !lr.recon || !(lr.state || lr.sog)) return;
+  // LOD needs a 1M+ budget (the start-panel gating); reject before any teardown
+  if (opts.lod === true && Math.max(lr.splats || 0, opts.splats || 0) < 1000000) {
+    flash('LOD levels need a splat budget of at least 1,000,000 — raise the budget or leave LOD off.', 7000);
+    return;
+  }
   const recon = lr.recon;
+  S.align = storedAlign(lr);   // a continuation views the run's locked alignment
   let files;
   const srcUrls = (recon.source && recon.source.urls) || [];
   if (!lr.ownSrc && srcUrls.length && srcUrls.every(Boolean)) {
@@ -3802,6 +3854,22 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
   // the trainer recipe the run was made with (state header, else the recon
   // JSON); null = a record from before recipes = the legacy defaults
   recipe = recipe || (recon && recon.recipe) || null;
+  // a reselected SH degree resamples the decoded harmonics (low bands kept,
+  // growth zero-padded) so seedFrom rebuilds the chosen degree; unsettled,
+  // the trainer replays the run's own degree from the checkpoint
+  let contShDeg = null;
+  if (opts.sh != null) {
+    try {
+      const { convertSHDegree } = await import('./session_io.js');
+      const DEG_OF_SHK = { 0: 0, 3: 1, 8: 2, 15: 3 };
+      const curDeg = g.shK != null ? DEG_OF_SHK[g.shK] : (recipe && recipe.shDeg);
+      if (curDeg == null) throw new Error(`unfamiliar band count ${g.shK}`);
+      if (curDeg !== opts.sh) convertSHDegree(g, opts.sh);
+      contShDeg = opts.sh;
+    } catch (e) {
+      flash(`Kept the run's SH degree (${e.message}).`, 7000);
+    }
+  }
   // un-bake opacity compensation (pure fn of position, mean scale, focal,
   // camera centres — recompute and divide out in logit space); only sog/ply
   // exports carry the baking, the raw checkpoint never does. Under the
@@ -3881,16 +3949,49 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     : opts.res === 'full' ? nativeDim
     : Number.isFinite(opts.res) ? opts.res : prevDim;
   const cap = Math.max(g.n, lr.splats || 0, lr.status !== 'finished' ? lr.cap || 0 : 0, opts.splats || 0);
+  // LOD on a continuation starts a fresh halving schedule ABOVE the model's
+  // current size (snapshotting below it would mislabel the levels); without
+  // headroom there is nothing to schedule
+  if (opts.lod === true) {
+    if (cap < 1000000) {
+      flash('LOD levels need a splat budget of at least 1,000,000 — continuing without them.', 7000);
+    } else {
+      const plan = buildLODPlan(cap, 0, Math.max(10000, S.maxIters - baseIter));
+      const levels = plan ? plan.levels.filter((l) => l > g.n) : [];
+      if (!levels.length) {
+        flash('The model already fills its budget — LOD levels need headroom to grow into.', 7000);
+      } else {
+        S.lodPlan = { ...plan, levels, idx: 0, holdUntil: null, snaps: [] };
+      }
+    }
+  }
   // rebuild the SAME trainer the run was made with: the recipe carries the
   // MCMC / needle / placement sets and the refine cadence; sizing is per run
+  // and the card may reselect the SH degree or the MCMC set on top
   const { refineEvery: recipeRefine, ...recipeTrainer } = recipe || {};
+  // the card's MCMC toggle rewrites the optimizer set the same way the
+  // start panel builds it; untouched, the recipe replays the run's own set
+  if (opts.mcmc === true) {
+    Object.assign(recipeTrainer, { growRate: 0.05, mcmcNoise: true, scaleReg: 0.01, moveCap: 0.25 });
+    if ((contShDeg ?? recipeTrainer.shDeg ?? 3) > 0) recipeTrainer.shLr = 3e-4;
+    else delete recipeTrainer.shLr;
+  } else if (opts.mcmc === false) {
+    delete recipeTrainer.mcmcNoise; delete recipeTrainer.scaleReg;
+    delete recipeTrainer.moveCap; delete recipeTrainer.shLr;
+    // the placement set carries its own growth rate — classic restores that,
+    // otherwise the trainer default applies
+    if (recipeTrainer.refineV2) recipeTrainer.growRate = 0.1;
+    else delete recipeTrainer.growRate;
+  }
+  const contRefine = opts.mcmc === true ? 500 : opts.mcmc === false ? undefined : recipeRefine;
+  const bufScale = opts.buf ?? (recon.trainScale && recon.trainScale !== 1 ? recon.trainScale : undefined);
   const ses = createSession({
     maxIters: S.maxIters, holdout: -1,
-    ...(recipeRefine != null ? { refineEvery: recipeRefine } : {}),
-    frames: { trainMaxDim },
+    ...(contRefine != null ? { refineEvery: contRefine } : {}),
+    frames: { trainMaxDim, ...(bufScale != null ? { trainScale: bufScale } : {}) },
     trainer: {
       ...recipeTrainer,
-      maxSplats: cap, shDeg: recipeTrainer.shDeg ?? 3,
+      maxSplats: cap, shDeg: contShDeg ?? recipeTrainer.shDeg ?? 3,
       capMult: Math.max(2, Math.ceil(cap / Math.max(1, g.n))),
       ...(engine === 'v2' ? { engine: 'v2', refineEvery: 200 } : {}),
     },
@@ -3914,6 +4015,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
   // recipe replayed the MCMC noise: positions doubled within a few steps)
   await ses.seedFrom(g, { iter: baseIter, sceneRadius: recon.sceneRadius || undefined });
   if (S.gen !== gen) return;
+  if (S.lodPlan) ses.trainer.growLimit = S.lodPlan.levels[S.lodPlan.idx] || S.lodPlan.levels[0];
   S.iter = baseIter;
   S.psnrTrain = null; S.psnrHold = null;
   S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
@@ -4867,6 +4969,108 @@ function toggleScoreScale() {
   renderTrainingScore();
 }
 
+/** 90-degree-step alignment rotation (row-major 3x3): X first, then Y, then Z. */
+function alignMatrix(sx, sy, sz) {
+  const step = (s) => ((s % 4) + 4) % 4;
+  const rot = (axis, s) => {
+    const [c, si] = [[1, 0], [0, 1], [-1, 0], [0, -1]][step(s)];
+    if (axis === 0) return [1, 0, 0, 0, c, -si, 0, si, c];
+    if (axis === 1) return [c, 0, si, 0, 1, 0, -si, 0, c];
+    return [c, -si, 0, si, c, 0, 0, 0, 1];
+  };
+  const mul = (P, Q) => [0, 1, 2].map((i) => [0, 1, 2].map((j) =>
+    P[i * 3] * Q[j] + P[i * 3 + 1] * Q[3 + j] + P[i * 3 + 2] * Q[6 + j])).flat();
+  return mul(mul(rot(2, sz), rot(1, sy)), rot(0, sx));
+}
+
+/** Viewer-side model alignment (the Align card): rotate the DISPLAYED model
+ *  about the scene centre without touching the trained data, the cameras or
+ *  the exports. Implemented camera-side — the orbit pose is counter-rotated —
+ *  so the one funnel covers the trainer view, the SOG-lite facade, the tour
+ *  and the compare modes. Frustum overlays keep the solved cameras. */
+function applyModelAlign(pose) {
+  const a = S.align;
+  if (!a || !(a.x || a.y || a.z)) return pose;
+  const A = alignMatrix(a.x | 0, a.y | 0, a.z | 0);
+  const At = [A[0], A[3], A[6], A[1], A[4], A[7], A[2], A[5], A[8]];
+  const c = (S.scene && S.scene.center) || [0, 0, 0];
+  const R = pose.R, t = pose.t;
+  // a model point p shows at A(p-c)+c; the equivalent camera is
+  // (R·Aᵀ, t + R(c−Aᵀc))
+  const u = [0, 1, 2].map((i) =>
+    c[i] - (At[i * 3] * c[0] + At[i * 3 + 1] * c[1] + At[i * 3 + 2] * c[2]));
+  return {
+    ...pose,
+    R: [0, 1, 2].map((i) => [0, 1, 2].map((j) =>
+      R[i * 3] * At[j] + R[i * 3 + 1] * At[3 + j] + R[i * 3 + 2] * At[6 + j])).flat(),
+    t: [0, 1, 2].map((i) => t[i] + R[i * 3] * u[0] + R[i * 3 + 1] * u[1] + R[i * 3 + 2] * u[2]),
+  };
+}
+
+/** A run record's alignment lock (or null): validated 90-degree steps. */
+function storedAlign(r) {
+  const a = r && r.align;
+  return a ? { x: a.x | 0, y: a.y | 0, z: a.z | 0, locked: !!a.locked } : null;
+}
+
+/** Manual model alignment: 90-degree display rotations about the scene
+ *  centre, locked to the run record (exports keep the trained orientation). */
+function alignCard() {
+  document.getElementById('aligncard')?.remove();
+  const a = storedAlign(S._localRun) || { x: 0, y: 0, z: 0, locked: false };
+  if (S.align) Object.assign(a, { x: S.align.x | 0, y: S.align.y | 0, z: S.align.z | 0, locked: !!S.align.locked });
+  const card = document.createElement('div');
+  card.className = 'upcard';
+  card.id = 'aligncard';
+  const deg = (v) => `${(((v % 4) + 4) % 4) * 90}°`;
+  card.innerHTML = `
+    <button class="card-x lt-x" id="al-x" aria-label="Close">&times;</button>
+    <b>Align model</b>
+    <span class="lt-desc">Rotate the <b>displayed</b> model in 90° steps about the scene centre.
+    Lock it to this run${S.runId ? '' : ' for this viewing'} — exports keep the trained orientation.</span>
+    <div class="upcard-row">
+      <button class="btn btn-outline" id="al-rx">X: <b>0°</b> ⟳</button>
+      <button class="btn btn-outline" id="al-ry">Y: <b>0°</b> ⟳</button>
+      <button class="btn btn-outline" id="al-rz">Z: <b>0°</b> ⟳</button>
+    </div>
+    <div class="upcard-row">
+      <button class="btn btn-outline" id="al-reset">Reset</button>
+      <button class="btn btn-outline" id="al-lock">🔓 Unlocked</button>
+      <button class="btn btn-accent" id="al-done">Done</button>
+    </div>`;
+  $('stage').appendChild(card);
+  const paint = () => {
+    for (const k of ['x', 'y', 'z']) card.querySelector(`#al-r${k} b`).textContent = deg(a[k]);
+    card.querySelector('#al-lock').textContent = a.locked ? '🔒 Locked' : '🔓 Unlocked';
+    for (const id of ['al-rx', 'al-ry', 'al-rz', 'al-reset']) card.querySelector(`#${id}`).disabled = !!a.locked;
+  };
+  const commit = () => {
+    for (const k of ['x', 'y', 'z']) a[k] = ((a[k] % 4) + 4) % 4;
+    S.align = (a.x || a.y || a.z || a.locked) ? { ...a } : null;
+    S._viewKey = '';   // re-render through the new alignment
+    paint();
+    persistAlign();
+    if (S.state === 'done') renderControls();
+  };
+  card.querySelector('#al-rx').onclick = () => { a.x++; commit(); };
+  card.querySelector('#al-ry').onclick = () => { a.y++; commit(); };
+  card.querySelector('#al-rz').onclick = () => { a.z++; commit(); };
+  card.querySelector('#al-reset').onclick = () => { a.x = a.y = a.z = 0; commit(); };
+  card.querySelector('#al-lock').onclick = () => { a.locked = !a.locked; commit(); };
+  card.querySelector('#al-done').onclick = () => card.remove();
+  card.querySelector('#al-x').onclick = () => card.remove();
+  paint();
+}
+
+/** Persist the alignment lock to the run record (viewing-only models without
+ *  a run record keep it for the tab). */
+function persistAlign() {
+  const align = S.align ? { ...S.align } : null;
+  if (S._localRun && S._localRun.id === S.runId) S._localRun.align = align;
+  if (!S.runId) return;
+  import('./store.js').then(({ patchRun }) => patchRun(S.runId, { align })).catch(() => {});
+}
+
 function chartTip(h) {
   const tip = $('chart-tip');
   if (!tip) return;
@@ -4877,7 +5081,7 @@ function chartTip(h) {
     (h.event ? `<br><span style="color:#93a1a0">${h.event}</span>` : '');
   // the readout rides the cursor INSIDE the plot: pinned to the top edge it
   // hung past the stage in the expanded graph and hid behind the dock.
-  // Clamped sideways, flipped below the cursor near the top.
+  // Clamped sideways, floating clear above the cursor (below it near the top).
   const wrap = tip.parentElement;
   const W = wrap ? wrap.clientWidth : 0, H = wrap ? wrap.clientHeight : 0;
   if (!W || !H) { tip.style.left = `${h.xPct}%`; tip.style.top = '4px'; return; }
@@ -4886,7 +5090,7 @@ function chartTip(h) {
   const y = (Math.max(0, Math.min(100, h.yPct ?? 0)) / 100) * H;
   tip.style.left = `${(x / W) * 100}%`;
   tip.style.top = `${(y / H) * 100}%`;
-  tip.style.transform = y > th + 14 ? 'translate(-50%, calc(-100% - 10px))' : 'translate(-50%, 10px)';
+  tip.style.transform = y > th + 44 ? 'translate(-50%, calc(-100% - 28px))' : 'translate(-50%, 28px)';
 }
 
 // ── flash ───────────────────────────────────────────────────────────────────
@@ -4928,6 +5132,47 @@ function renderHud() {
     row.appendChild(chip);
   }
   hud.replaceChildren(row);
+}
+
+// ── training notification (Android) ─────────────────────────────────────────
+// A foreground-service notification carries the live score + splat count and
+// keeps the process (and its GPU work) alive while the app runs in the
+// background. Desktop browsers have no bridge — every call is feature-detected.
+const trainBridge = () => {
+  const b = globalThis.AndroidARBridge;
+  return b && typeof b.updateTrainingNotification === 'function' ? b : null;
+};
+function androidNotifStart() {
+  const b = trainBridge();
+  if (!b) return;
+  S._notifName = (S._localRun && S._localRun.name) || (S.preset && S.preset.name) || 'model';
+  S._notifT = 0;
+  try { b.startTrainingNotification(`Training ${S._notifName}`, 'Starting…'); } catch { /* best-effort */ }
+}
+function androidNotifTick() {
+  const b = trainBridge();
+  if (!b || S.state !== 'train' || !S.session || !S.session.training) return;
+  const now = performance.now();
+  if (now - (S._notifT || 0) < 2500) return;   // the shade is not a 60 fps surface
+  S._notifT = now;
+  const psnr = S.psnrHold ?? S.psnrTrain;
+  const text = `${psnr != null ? `${psnr.toFixed(1)} dB · ` : ''}${fmt(S.splats)} splats · ${fmt(S.iter)} / ${fmt(S.maxIters)}`;
+  try { b.updateTrainingNotification(`Training ${S._notifName || 'model'}`, text, S.iter | 0, S.maxIters | 0); }
+  catch { /* best-effort */ }
+}
+function androidNotifStop(finished) {
+  const b = trainBridge();
+  if (!b) return;
+  try {
+    if (finished) {
+      const psnr = S.psnrHold ?? S.psnrTrain;
+      b.finishTrainingNotification('Training complete',
+        `${psnr != null ? `${psnr.toFixed(1)} dB · ` : ''}${fmt(S.splats)} splats · ${fmt(S.iter)} cycles`);
+    } else {
+      b.cancelTrainingNotification();
+    }
+  } catch { /* best-effort */ }
+  S._notifT = 0;
 }
 
 // ── screen wake lock ────────────────────────────────────────────────────────
@@ -5272,7 +5517,7 @@ function draw() {
   // train/done: the model, rendered by the trainer at this exact pose
   // (render capped at the session's view-buffer size, blit scales up)
   const onFrame = S.atFrame >= 0;
-  const pose = vp.viewPose();
+  const pose = applyModelAlign(vp.viewPose());
   if (gpuCanvas && S.session && S.session.trainer) {
     const now = performance.now();
     if (vp.dirty) S._camMovedAt = now;

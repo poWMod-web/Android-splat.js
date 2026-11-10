@@ -43,6 +43,7 @@ The camera configuration is selected from the device's supported ARCore configur
 - CPU camera image resolution depends on the ARCore device configuration. Selecting the largest supported image size does not guarantee a particular megapixel count.
 - The native coverage colors summarize the largest angular separation from tracked camera observations, capped at 90 degrees. They are feedback for capture coverage, not a photogrammetric quality metric.
 - The APK bundles the current app and training code, but WebGPU availability and memory limits are determined by Android System WebView and the device GPU.
+- While a model trains, a foreground-service notification shows the live score, splat count and cycle progress, keeping the process and its GPU work alive in the background. Pausing sheds the service; finishing leaves one dismissible summary. The notification permission is requested when training starts.
 - The PWA/TWA path remains available for deployed HTTPS sites. It does not provide native ARCore capture by itself.
 
 ## Release packaging

@@ -1,7 +1,9 @@
 package space.arrival.splatxr;
 
 import android.app.Activity;
+import android.Manifest;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.util.Base64;
 import android.net.Uri;
 import android.os.Build;
@@ -28,6 +30,7 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_CAPTURE = 41;
     private static final int REQUEST_FILE_PICKER = 42;
     private static final int REQUEST_SAVE_FILE = 43;
+    private static final int REQUEST_NOTIFY_PERMISSION = 44;
     private ValueCallback<Uri[]> fileChooserCallback;
     private WebView webView;
     private WebViewAssetLoader assetLoader;
@@ -231,7 +234,29 @@ public final class MainActivity extends Activity {
         view.post(() -> view.evaluateJavascript(script, null));
     }
 
+    private void sendTrainingCommand(String action, String title, String text, int done, int total) {
+        try {
+            Intent intent = new Intent(this, TrainingService.class)
+                    .putExtra("action", action)
+                    .putExtra("title", title == null ? "" : title)
+                    .putExtra("text", text == null ? "" : text)
+                    .putExtra("done", done)
+                    .putExtra("total", total);
+            // progress ticks while the app sits in the background: with the
+            // training service already foreground the process counts as
+            // foreground, so foreground-service starts stay legal for updates
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
+            else startService(intent);
+        } catch (Exception ignored) { /* best-effort progress display */ }
+    }
+
+    private void stopTrainingService() {
+        try { stopService(new Intent(this, TrainingService.class)); }
+        catch (Exception ignored) { /* the service was never started */ }
+    }
+
     @Override protected void onDestroy() {
+        stopTrainingService();
         cancelFileSave();
         if (fileChooserCallback != null) {
             fileChooserCallback.onReceiveValue(null);
@@ -269,6 +294,28 @@ public final class MainActivity extends Activity {
 
         @JavascriptInterface public void cancelFileSave() {
             MainActivity.this.cancelFileSave();
+        }
+
+        @JavascriptInterface public void startTrainingNotification(String title, String text) {
+            runOnUiThread(() -> {
+                if (Build.VERSION.SDK_INT >= 33 &&
+                        checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFY_PERMISSION);
+                }
+                sendTrainingCommand("start", title, text, 0, 0);
+            });
+        }
+
+        @JavascriptInterface public void updateTrainingNotification(String title, String text, int done, int total) {
+            sendTrainingCommand("update", title, text, done, total);
+        }
+
+        @JavascriptInterface public void finishTrainingNotification(String title, String text) {
+            sendTrainingCommand("finish", title, text, 0, 0);
+        }
+
+        @JavascriptInterface public void cancelTrainingNotification() {
+            sendTrainingCommand("cancel", null, null, 0, 0);
         }
 
         @JavascriptInterface public String exportDataset() {
