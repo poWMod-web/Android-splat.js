@@ -73,4 +73,23 @@ const indexHtml = readFileSync(new URL('../../app/index.html', import.meta.url),
     'the settings panel should offer a 10–100% GPU slider');
 }
 
+// touch-hold: training yields the GPU while a finger is down on the stage,
+// and comes back at full speed on release
+{
+  assert.match(app, /st\.addEventListener\('pointerdown', \(e\) => \{ held\.add\(e\.pointerId\); updateHold\(\); \}\);/,
+    'the first stage touch should engage the hold (orbit, pinch, compare drag, tap)');
+  assert.match(app, /window\.addEventListener\('pointerup', \(e\) => \{ if \(held\.delete\(e\.pointerId\)\) updateHold\(\); \}\);/,
+    'releases should ride the window so lifting outside the stage still resumes');
+  assert.match(app, /window\.addEventListener\('pointercancel', \(e\) => \{ if \(held\.delete\(e\.pointerId\)\) updateHold\(\); \}\);/,
+    'cancelled touches should release the hold too');
+  assert.match(app, /S\._dragPaused = true;\s*S\.session\.pause\(\);/,
+    'the hold should pause a running training');
+  assert.match(app, /S\._dragPaused = false;\s*if \(S\.state === 'train'\) S\.session\.start\(\);/,
+    'the last release should resume a hold-paused training');
+  assert.match(app, /if \(!on\) \{ S\._dragPaused = false; checkpointRun\('pause'\)/,
+    'a user-pressed pause should take ownership so a release never resumes over it');
+  assert.match(sessionSrc, /this\.training = true;\n(\s*\/\/.*\n)+\s*this\._thrT = null;/,
+    'resuming should restart the throughput window instead of reading the pause gap as GPU slowness');
+}
+
 console.log('GPU usage throttle: passed');

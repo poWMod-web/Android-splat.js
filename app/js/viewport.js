@@ -102,18 +102,20 @@ export function rollAngleToUp(R, up) {
   return (Math.atan2(sin, cos) * 180) / Math.PI;
 }
 
-/** Snap a sensor roll to the nearest cardinal quarter-turn (EXIF-style):
- *  0/±90/180 within tol degrees, else null — a tilted view keeps its raw
- *  pose, where registration is exact, instead of a near-level one. */
-export function snapRollAngle(deg, tol = 15) {
+/** Nearest cardinal quarter-turn (EXIF-style), ALWAYS — a tilted view
+ *  levels to gravity within 45° instead of staying raw: the photograph
+ *  turns with the lock, so registration stays exact however far the phone
+ *  rolled, and gravity never points up. Null only when no level exists
+ *  (the camera stares straight up/down). */
+export function snapRollAngle(deg) {
   if (deg == null) return null;
-  let best = null;
-  for (const c of [0, 90, 180, -90]) {   // -180 ≡ 180
+  let best = 0, bd = Infinity;
+  for (const c of [0, 90, 180, -90]) {   // -180 ≡ 180; first wins ties
     let d = Math.abs(deg - c) % 360;
     if (d > 180) d = 360 - d;
-    if (d <= tol && (best == null || d < best.d)) best = { c, d };
+    if (d < bd) { best = c; bd = d; }
   }
-  return best ? best.c : null;
+  return best;
 }
 
 /** Roll a world-to-camera pose about its own look direction: the camera

@@ -303,9 +303,10 @@ body { overflow: hidden; }
    sliver, the play button to an egg, and the stage label to one word a line.
    The stage gets squarer; that is the right trade on a portrait screen. */
 @media (max-width: 720px) {
-  /* row 1 is exactly the play button's 40px: the chart starts 6px under the
-     button and runs to the dock's lowest pixels; the right column's third
-     line (grow note) may overhang the chart's empty top-right corner */
+  /* row 1 fits the play button plus the stop-and-keep chip below it; the
+     chart starts 6px under and runs to the dock's lowest pixels; the right
+     column's third line (grow note) may overhang the chart's empty
+     top-right corner */
   .dock-train { grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto auto; row-gap: 6px; }
   .dock-train .tcontrols { grid-row: 1; grid-column: 1; align-self: start; }
   .dock-train .tscores { grid-row: 1; grid-column: 2; gap: 16px; align-self: start; }
@@ -571,18 +572,17 @@ button.countv:hover { color: var(--accent); }
 
 /* Keep the pause and stop controls anchored without shifting score content. */
 .tmeta { position: relative; }
-.playwrap { position: relative; display: inline-flex; }
+.playwrap { position: relative; display: inline-flex; flex-direction: column; align-items: flex-start; }
 #t-finish {
-  position: static; align-self: center;
-  padding: 3px 10px; margin-left: 10px;
+  position: static;
+  margin-top: 6px; padding: 3px 10px;
   white-space: nowrap;
 }
-/* the stop-and-keep chip sits beside the pause circle, inside the dock —
-   its own margin-left spaces it; the circle keeps its left breathing room */
+/* the stop-and-keep chip sits below the pause circle, in normal flow so the
+   dock contains it — the circle keeps its left breathing room for the chip */
 .dock-train .play { margin: 0 0 0 16px; }
 @media (max-width: 720px) {
   .dock-train .play { margin: 0; }
-  #t-finish { margin-left: 8px; }
 }
 
 /* the upload dialog + the result link chip */

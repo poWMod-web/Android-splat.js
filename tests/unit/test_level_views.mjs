@@ -21,7 +21,8 @@ const near = (a, b, tol = 1e-9) => a.every((v, i) => Math.abs(v - b[i]) < tol);
   assert.equal(rollAngleToUp([1, 0, 0, 0, 0, 1, 0, -1, 0], [0, 1, 0]), null);
 }
 
-// snapRollAngle: cardinal snaps within tolerance, raw otherwise
+// snapRollAngle: nearest cardinal always — tilted views favor gravity-down
+// (photo and render turn together), only the nadir keeps its raw pose
 {
   assert.equal(snapRollAngle(null), null);
   assert.equal(snapRollAngle(0), 0);
@@ -32,10 +33,14 @@ const near = (a, b, tol = 1e-9) => a.every((v, i) => Math.abs(v - b[i]) < tol);
   assert.equal(snapRollAngle(170), 180);
   assert.equal(snapRollAngle(-170), 180);
   assert.equal(snapRollAngle(180), 180);
-  assert.equal(snapRollAngle(50), null);
-  assert.equal(snapRollAngle(-50), null);
-  assert.equal(snapRollAngle(30), null);
-  assert.equal(snapRollAngle(106), null);
+  assert.equal(snapRollAngle(50), 90);
+  assert.equal(snapRollAngle(-50), -90);
+  assert.equal(snapRollAngle(30), 0);
+  assert.equal(snapRollAngle(106), 90);
+  assert.equal(snapRollAngle(45), 0);      // ties: first cardinal wins
+  assert.equal(snapRollAngle(-45), 0);
+  assert.equal(snapRollAngle(135), 90);
+  assert.equal(snapRollAngle(-135), 180);
 }
 
 // rerollPose: position and aim pinned, image-up leveled, still a rotation

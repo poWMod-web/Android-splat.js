@@ -325,22 +325,10 @@ boot();
 function boot() {
   vp = new Viewport($('cv'));
   vp.onLeave = leaveFrame;
-  // The GPU belongs to the view while the user is orbiting: stop submitting
-  // training batches (the ~4 queued ones drain in about a second), so the
-  // camera answers the finger instead of waiting behind the training queue.
-  // Resumes on release; a user-pressed pause is left alone.
-  vp.onDragStart = () => {
-    stopTour();
-    if (S.state === 'train' && S.session && S.session.training) {
-      S._dragPaused = true;
-      S.session.pause();
-    }
-  };
-  vp.onDragEnd = () => {
-    if (!S._dragPaused) return;
-    S._dragPaused = false;
-    if (S.session && S.state === 'train') S.session.start();
-  };
+  // Touch-hold pausing lives on the stage (wireStage), not here: the
+  // viewport's drag hooks miss frame-locked compare touches, and pausing
+  // belongs to every finger on the visualization, not just orbit drags.
+  vp.onDragStart = () => { stopTour(); };
   dev = new Developer();
 
   $('btn-go').addEventListener('click', async () => {
@@ -2520,7 +2508,9 @@ function toggleTrain() {
   }
   const f = $('t-finish');
   if (f) f.hidden = on;   // paused = the moment "stop here" makes sense
-  if (!on) checkpointRun('pause').catch(() => {});
+  // a user-pressed pause takes ownership from any touch-hold: the release
+  // must not resume over it
+  if (!on) { S._dragPaused = false; checkpointRun('pause').catch(() => {}); }
   if (on) androidNotifStart(); else androidNotifStop(false);   // pause sheds the service; resume restarts it
 }
 
@@ -4844,6 +4834,27 @@ function select(i) {
 
 function wireStage() {
   const st = $('stage');
+  // Touch-hold: the GPU belongs to the view while a finger is down. Pause
+  // training on the FIRST stage touch — orbit, pinch, tap, or a
+  // frame-locked compare drag — and resume when the last finger lifts (the
+  // ~4 queued batches drain in about a second, so the camera answers the
+  // finger instead of waiting behind the training queue). Up/cancel ride
+  // the window so a release outside the stage still resumes; a user-pressed
+  // pause clears the flag in toggleTrain, so a release never resumes over it.
+  const held = new Set();
+  const updateHold = () => {
+    if (!S.session) { S._dragPaused = false; return; }
+    if (held.size && S.state === 'train' && S.session.training && !S._dragPaused) {
+      S._dragPaused = true;
+      S.session.pause();
+    } else if (!held.size && S._dragPaused) {
+      S._dragPaused = false;
+      if (S.state === 'train') S.session.start();
+    }
+  };
+  st.addEventListener('pointerdown', (e) => { held.add(e.pointerId); updateHold(); });
+  window.addEventListener('pointerup', (e) => { if (held.delete(e.pointerId)) updateHold(); });
+  window.addEventListener('pointercancel', (e) => { if (held.delete(e.pointerId)) updateHold(); });
   st.addEventListener('pointermove', (e) => {
     if (S.atFrame < 0) return;
     const r = st.getBoundingClientRect();

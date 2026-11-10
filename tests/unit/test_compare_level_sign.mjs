@@ -29,13 +29,18 @@ const PTS = [[0, 1, 5], [2, -1, 4], [-3, 0.5, 6], [0.5, 0.5, 3], [-1, -2, 7]];
 // photograph's canvas rotation, and must land exactly where the leveled
 // lock re-projects it. A sign flip anywhere in the chain misses by ~the
 // frame size, so 1e-6 is a decisive tolerance on a 640px frame.
-for (const [name, R] of [
-  ['portrait (−90)', [0, -1, 0, 1, 0, 0, 0, 0, 1]],
-  ['portrait (+90)', [0, 1, 0, -1, 0, 0, 0, 0, 1]],
-  ['upside-down (180)', [1, 0, 0, 0, 1, 0, 0, 0, 1]],
+// a tilted capture (roll −120°, past any cardinal): levels to the nearest
+// snap and registers exactly the same way
+const R_TILT = rerollPose([0, -1, 0, 1, 0, 0, 0, 0, 1], [0, 0, 0], 30).R;
+
+for (const [name, R, want] of [
+  ['portrait (−90)', [0, -1, 0, 1, 0, 0, 0, 0, 1], -90],
+  ['portrait (+90)', [0, 1, 0, -1, 0, 0, 0, 0, 1], 90],
+  ['upside-down (180)', [1, 0, 0, 0, 1, 0, 0, 0, 1], 180],
+  ['tilted (−120)', R_TILT, -90],
 ]) {
   const snap = snapRollAngle(rollAngleToUp(R, UP));
-  assert.ok(snap !== null && snap !== 0, `${name}: expected a nonzero snap`);
+  assert.equal(snap, want, `${name}: expected snap ${want}`);
 
   // the photograph's real roll decision: sensor-framed pixels (bitmap and
   // sensor agree on landscape) turn against the snap — rerollPose turns the

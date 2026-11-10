@@ -749,6 +749,10 @@ export class Session {
     if (!this.trainer) throw new Error('seed() first');
     if (this.training) return;
     this.training = true;
+    // the throughput window must not span the pause gap — otherwise the
+    // first resumed frame reads the idle seconds as GPU slowness and the
+    // batch adapter comes back shrunk instead of at full speed
+    this._thrT = null;
     this._stage({ stage: 'train', done: this.trainer.iter, total: this._maxIters() });
     this._ensureScheduler();
     this._scheduleFrame();
