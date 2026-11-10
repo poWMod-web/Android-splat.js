@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splat.js · Browser trainer</title>
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>Splat.js <span class="dim">· browser trainer</span></h1>
+    <p class="sub">No app, no AR capture — drop photos, a video, or an exported <b>.zip</b> and train a splat model right here. Everything stays on this device.</p>
+  </div>
+  <a class="back" href="../app/index.html" title="Open the full app">full app →</a>
+</header>
+
+<div id="nogl" class="warn" hidden>
+  This browser has no WebGPU, so the trainer cannot run here.
+  Use a recent Chrome, Edge, or Safari (macOS 15+ / iOS 18+) — and serve this folder over <b>http</b>, not <span class="mono">file://</span> (see README).
+</div>
+
+<main>
+  <section class="card" id="intake">
+    <h2>1 · Input</h2>
+    <label id="drop" class="drop">
+      <input id="files" type="file" multiple
+        accept="image/*,video/*,.zip,.json,application/zip,application/json">
+      <b>Drop photos, a video, or a .zip</b>
+      <span>…or click to browse. Photos + their camera JSON (transforms.json / cameras.json) can be selected together; a capture .zip is unpacked in the tab.</span>
+    </label>
+    <div class="opts">
+      <label>Camera solve
+        <select id="opt-tier">
+          <option value="quick">Quick</option>
+          <option value="standard" selected>Standard</option>
+          <option value="precise">Precise</option>
+        </select>
+      </label>
+      <label>Iterations
+        <select id="opt-iters">
+          <option value="8000">8,000 · draft</option>
+          <option value="15000">15,000</option>
+          <option value="30000" selected>30,000</option>
+          <option value="60000">60,000 · full</option>
+        </select>
+      </label>
+      <label title="Average spacing between frames picked from a video. Stable, unblurry frames still win inside each window.">Video frame spacing
+        <select id="opt-gap">
+          <option value="0" selected>Auto</option>
+          <option value="0.5">0.5 s</option>
+          <option value="1">1 s</option>
+          <option value="2">2 s</option>
+          <option value="3">3 s</option>
+          <option value="5">5 s</option>
+          <option value="10">10 s</option>
+        </select>
+      </label>
+    </div>
+    <p id="input-summary" class="summary" role="status">Nothing selected yet.</p>
+    <button id="btn-start" class="btn accent" disabled>Start training →</button>
+  </section>
+
+  <section class="card" id="run" hidden>
+    <h2>2 · Training</h2>
+    <p id="stage-label" class="stage" role="status">Preparing…</p>
+    <div class="meter"><i id="stage-bar"></i></div>
+    <p id="metrics" class="metrics"></p>
+    <div class="row">
+      <button id="btn-pause" class="btn" disabled>Pause</button>
+      <button id="btn-finish" class="btn" disabled>Finish early</button>
+      <button id="btn-ply" class="btn accent" disabled>Download .ply ↓</button>
+    </div>
+    <p id="status" class="status"></p>
+  </section>
+
+  <section class="card" id="viewer" hidden>
+    <h2>3 · Preview</h2>
+    <canvas id="view"></canvas>
+    <p class="hint">Drag to orbit · scroll to zoom · <button id="btn-recenter" class="linkish">reset view</button></p>
+  </section>
+
+  <details class="card log" id="logwrap" hidden>
+    <summary>Log</summary>
+    <pre id="log"></pre>
+  </details>
+</main>
+
+<footer>
+  <span>Photos, video frames, and the model never leave this tab. Result is a standard 3DGS <span class="mono">.ply</span>.</span>
+</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
