@@ -69,6 +69,15 @@ export class Chart {
     this.cv.width = Math.max(1, rect.width * dpr);
     this.cv.height = Math.max(1, rect.height * dpr);
     this.dpr = dpr;
+    // any layout shift (window resize, panel toggle, chart expand) leaves
+    // the pointer over a different fraction — drop the stale hover so the
+    // readout cannot re-fire detached from the cursor on the next redraw
+    this.clearHover();
+  }
+
+  clearHover() {
+    this.hover = null;
+    this.onHover?.(null);
     this.draw();
   }
 

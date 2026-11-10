@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { convertSHDegree, continuedInputDim } from '../../app/js/session_io.js';
+import { convertSHDegree, continuedInputDim, continuedBuf } from '../../app/js/session_io.js';
+import { adaptiveTrainCap } from '../../src/io/frames.js';
 
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 const sessionIo = readFileSync(new URL('../../app/js/session_io.js', import.meta.url), 'utf8');
@@ -25,8 +26,10 @@ assert.match(card, /\.\.\.\[480, 640, 960, 1280, 1600, 1920\]\.map\(\(v\) =>/,
   'the card should list every start-panel resolution step, unfiltered');
 assert.match(card, /Same as current/,
   'the splat budget should default to Same as current');
-assert.match(card, /<option value="same" selected>\$\{prevDim \? `\$\{prevDim\} px` : 'Run size'\}<\/option>/,
-  'the resolution should default to the run’s own effective size, stated plainly');
+assert.match(card, /const prevBuf = continuedBuf\(recon\.trainScale, r\.detailProgress && r\.detailProgress\.settings, prevDim \|\| undefined\);/,
+  'the card should resolve the run’s buffer from the recon or its saved settings');
+assert.match(card, /<option value="same" selected>\$\{prevInputDim \? `\$\{prevInputDim\} px` : 'Run size'\}<\/option>/,
+  'the resolution should default to the run’s own input size, in start-panel language');
 assert.match(card, /<option value="" selected>\$\{prevSh\}<\/option>/,
   'spherical harmonics should default to the run’s own degree, stated plainly');
 assert.match(card, /<option value="" selected>\$\{prevBuf\}×<\/option>/,
@@ -46,7 +49,9 @@ assert.match(cont, /opts\.extraIters[\s\S]*defaultExtra/,
   'the continuation horizon should honor configured extra cycles, defaulting to the automatic extension');
 assert.match(cont, /opts\.res === 'auto' \? undefined[\s\S]*opts\.res === 'full' \? nativeDim[\s\S]*: prevInputDim/,
   'the continuation should honor a reselected resolution, defaulting to the run’s own');
-assert.match(cont, /const prevInputDim = continuedInputDim\(prevDim, recon\.trainScale\);/,
+assert.match(cont, /const prevBuf = continuedBuf\(recon\.trainScale, lr\.detailProgress && lr\.detailProgress\.settings, prevDim\);/,
+  'the continuation should resolve the run’s buffer from the recon or its saved settings');
+assert.match(cont, /const prevInputDim = continuedInputDim\(prevDim, prevBuf\);/,
   'the default should divide the buffer back out before the multiplier runs again');
 assert.match(cont, /Math\.max\(fr0\.nw \|\| fr0\.fw \|\| 0, fr0\.nh \|\| fr0\.fh \|\| 0\)/,
   'Full size should use the file’s own pixel size, not the feature-capped dims');
@@ -56,8 +61,8 @@ assert.match(cont, /Math\.max\(g\.n, lr\.splats \|\| 0,[\s\S]*opts\.splats \|\| 
   'the continuation budget should honor a reselected splat count, never below the trained size');
 assert.match(cont, /frames: \{ trainMaxDim, \.\.\.\(bufScale != null \? \{ trainScale: bufScale \} : \{\}\) \}/,
   'the rebuilt session should train at the selected resolution and buffer scale');
-assert.match(cont, /const bufScale = opts\.buf \?\? \(recon\.trainScale/,
-  'an unsettled buffer should replay the run’s own recorded scale');
+assert.match(cont, /const bufScale = opts\.buf \?\? \(prevBuf !== 1 \? prevBuf : undefined\);/,
+  'an unsettled buffer should replay the run’s own resolved scale');
 assert.match(cont, /convertSHDegree\(g, opts\.sh\)/,
   'a reselected SH degree should resample the decoded checkpoint');
 assert.match(cont, /shDeg: contShDeg \?\? recipeTrainer\.shDeg \?\? 3/,
@@ -106,25 +111,43 @@ assert.match(cont, /ses\.trainer\.growLimit = S\.lodPlan\.levels\[S\.lodPlan\.id
   assert.throws(() => convertSHDegree({ n: 1, shK: 7, sh: new Float32Array(21) }, 1), /unknown band count/);
 }
 
-// The default-resolution round trip: the stored size is round(min(input,
-// nat) × buf); the continuation must recover the input so re-applying the
-// buffer reproduces the stored size exactly (no double multiplication).
+// The default-resolution round trip, through the REAL cap: the stored size
+// is adaptiveTrainCap(input, buf); the continuation must recover an input
+// that reproduces the stored size exactly (no double multiplication).
 {
-  const combine = (input, nat, buf) => Math.round(Math.min(input, nat) * buf);
   assert.equal(continuedInputDim(undefined, 0.5), undefined);
   assert.equal(continuedInputDim(480, undefined), 480);
   assert.equal(continuedInputDim(480, 1), 480);
   assert.equal(continuedInputDim(0, 0.5), 0);
+  const cap = (input, nat, buf) => adaptiveTrainCap(10, nat, Math.round(nat * 0.75),
+    { trainMaxDim: input, ...(buf === 1 ? {} : { trainScale: buf }) });
   for (const buf of [0.5, 1, 2]) {
     for (const nat of [960, 1920, 4000]) {
       for (let input = 240; input <= 2400; input += 17) {
-        const stored = combine(input, nat, buf);
+        const stored = cap(input, nat, buf);
         const recovered = continuedInputDim(stored, buf);
-        assert.equal(combine(recovered, nat, buf), stored,
+        assert.equal(cap(recovered, nat, buf), stored,
           `input ${input} @${nat} buf ${buf} should round-trip through the stored size`);
       }
     }
   }
+}
+
+// The replayed buffer: the recon's own trainScale (exact); else the run
+// record's saved settings when their resolution × buffer triple reproduces
+// the stored size (drifted settings fail the triple and fall back to 1).
+{
+  assert.equal(continuedBuf(0.5, null, 480), 0.5);
+  assert.equal(continuedBuf(1, null, 960), 1);
+  assert.equal(continuedBuf(undefined, null, 480), 1);
+  assert.equal(continuedBuf(undefined, { res: 960, buf: 0.5 }, 480), 0.5);
+  assert.equal(continuedBuf(undefined, { res: 960, buf: 2 }, 480), 1);
+  assert.equal(continuedBuf(undefined, { res: 1920, buf: 0.5 }, 480), 1);
+  assert.equal(continuedBuf(undefined, { res: 0, buf: 0.5 }, 480), 0.5);
+  assert.equal(continuedBuf(undefined, { res: -1, buf: 2 }, 1920), 2);
+  assert.equal(continuedBuf(undefined, {}, 480), 1);
+  assert.equal(continuedBuf(undefined, { res: 960, buf: 0.5 }, 0), 0.5);
+  assert.equal(continuedBuf(NaN, { res: 960, buf: 0.5 }, 480), 0.5);
 }
 
 console.log('continue-training configuration reselection: passed');

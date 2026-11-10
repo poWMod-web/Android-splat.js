@@ -62,6 +62,93 @@ export function qslerp(a, b, t) {
   return [0, 1, 2, 3].map((i) => a[i] * wa + bb[i] * wb);
 }
 
+// ── gravity-leveled views ───────────────────────────────────────────────
+// The orbit levels every view to gravity through its up-frame, but
+// frame-locked views (the compare modes) and the capture-path tour sit on
+// the cameras' raw poses — whose image-up is the SENSOR's. A portrait-held
+// phone points sensor-up sideways to gravity, so those views roll the world
+// 90 degrees. The helpers below re-roll a pose to gravity (position and aim
+// unchanged); the frame lock additionally snaps to a cardinal quarter-turn
+// so the photograph can follow with an exact pixel rotation.
+
+/** Rodrigues rotation of vector v about unit axis k by degrees. */
+export function rotateAboutAxis(v, k, deg) {
+  const t = (deg * Math.PI) / 180, c = Math.cos(t), s = Math.sin(t);
+  const dot = v[0] * k[0] + v[1] * k[1] + v[2] * k[2];
+  const cx = k[1] * v[2] - k[2] * v[1];
+  const cy = k[2] * v[0] - k[0] * v[2];
+  const cz = k[0] * v[1] - k[1] * v[0];
+  return [
+    v[0] * c + cx * s + k[0] * dot * (1 - c),
+    v[1] * c + cy * s + k[1] * dot * (1 - c),
+    v[2] * c + cz * s + k[2] * dot * (1 - c),
+  ];
+}
+
+/** Signed roll (degrees, canvas-clockwise-positive) from a world-to-camera
+ *  rotation's sensor image-up to gravity image-up, about the look direction.
+ *  Null when the camera stares straight up/down (no level roll exists). */
+export function rollAngleToUp(R, up) {
+  const fwd = [R[6], R[7], R[8]];
+  const us = [-R[3], -R[4], -R[5]];   // sensor image-up, world frame
+  const d = up[0] * fwd[0] + up[1] * fwd[1] + up[2] * fwd[2];
+  const gx = up[0] - fwd[0] * d, gy = up[1] - fwd[1] * d, gz = up[2] - fwd[2] * d;
+  const m = Math.hypot(gx, gy, gz);
+  if (m < 1e-6) return null;
+  const g = [gx / m, gy / m, gz / m];
+  const sin = (us[1] * g[2] - us[2] * g[1]) * fwd[0] +
+    (us[2] * g[0] - us[0] * g[2]) * fwd[1] + (us[0] * g[1] - us[1] * g[0]) * fwd[2];
+  const cos = us[0] * g[0] + us[1] * g[1] + us[2] * g[2];
+  return (Math.atan2(sin, cos) * 180) / Math.PI;
+}
+
+/** Snap a sensor roll to the nearest cardinal quarter-turn (EXIF-style):
+ *  0/±90/180 within tol degrees, else null — a tilted view keeps its raw
+ *  pose, where registration is exact, instead of a near-level one. */
+export function snapRollAngle(deg, tol = 15) {
+  if (deg == null) return null;
+  let best = null;
+  for (const c of [0, 90, 180, -90]) {   // -180 ≡ 180
+    let d = Math.abs(deg - c) % 360;
+    if (d > 180) d = 360 - d;
+    if (d <= tol && (best == null || d < best.d)) best = { c, d };
+  }
+  return best ? best.c : null;
+}
+
+/** Roll a world-to-camera pose about its own look direction: the camera
+ *  stays (position and aim), the image turns by canvas-clockwise degrees.
+ *  The capture tour passes the exact sensor roll, the frame lock its
+ *  cardinal snap — same rotation either way. */
+export function rerollPose(R, pos, deg) {
+  const fwd = [R[6], R[7], R[8]];
+  const rR = [
+    ...rotateAboutAxis([R[0], R[1], R[2]], fwd, deg),
+    ...rotateAboutAxis([R[3], R[4], R[5]], fwd, deg),
+    ...rotateAboutAxis([R[6], R[7], R[8]], fwd, deg),
+  ];
+  rR[6] = fwd[0]; rR[7] = fwd[1]; rR[8] = fwd[2];   // the axis is invariant — re-pin it bit-stable
+  return {
+    R: rR,
+    t: [
+      -(rR[0] * pos[0] + rR[1] * pos[1] + rR[2] * pos[2]),
+      -(rR[3] * pos[0] + rR[4] * pos[1] + rR[5] * pos[2]),
+      -(rR[6] * pos[0] + rR[7] * pos[1] + rR[8] * pos[2]),
+    ],
+  };
+}
+
+/** Intrinsics of an image turned by a cardinal snap (canvas-clockwise
+ *  degrees): the focal stays, the frame and principal point follow the
+ *  pixels — quarter turns only, exact, no resampling. */
+export function exifIntrinsics(w, h, cx, cy, snap) {
+  const norm = ((snap % 360) + 360) % 360;
+  if (norm === 90) return { w: h, h: w, cx: h - cy, cy: cx };
+  if (norm === 180) return { w, h, cx: w - cx, cy: h - cy };
+  if (norm === 270) return { w: h, h: w, cx: cy, cy: w - cx };
+  return { w, h, cx, cy };
+}
+
 export class Viewport {
   constructor(canvas) {
     this.cv = canvas;

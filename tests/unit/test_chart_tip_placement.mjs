@@ -20,4 +20,13 @@ assert.match(tip, /wrap\.clientWidth[\s\S]*tip\.offsetWidth[\s\S]*Math\.max\(tw 
 assert.match(tip, /translate\(-50%, calc\(-100% - 70px\)\)[\s\S]*translate\(-50%, 70px\)/,
   'the readout should float 70px clear of the cursor, flipping below it near the top');
 
+// Layout shifts (window resize, panel toggle, chart expand) move the plot
+// under a stationary cursor: the stale hover must drop, never re-fire.
+assert.match(chartSource, /clearHover\(\) \{\s*this\.hover = null;\s*this\.onHover\?\.\(null\);/,
+  'the chart should offer a hover reset that also hides the readout');
+assert.match(chartSource, /resize\(\) \{[\s\S]*?this\.clearHover\(\);/,
+  'resizing the chart should drop a stale hover');
+assert.match(appSource, /\$\('settings'\)\.hidden = !open;[\s\S]*?chart\?\.clearHover\(\);/,
+  'toggling the settings panel should drop a stale chart hover');
+
 console.log('chart hover readout placement inside the plot: passed');

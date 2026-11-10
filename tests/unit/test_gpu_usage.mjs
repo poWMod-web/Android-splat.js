@@ -59,6 +59,12 @@ const indexHtml = readFileSync(new URL('../../app/index.html', import.meta.url),
     'the slider should commit on change like every other row');
   assert.match(app, /S\.session\.opts\.gpuUsage = /,
     'dragging the slider should reach a running training live');
+  assert.match(app, /<input id="t-gpu" type="range" min="10" max="100" step="5" value="\$\{S\.settings\.gpu \?\? 100\}">/,
+    'the training dock should carry the GPU slider mid-run');
+  assert.match(app, /tGpu\.addEventListener\('input', \(\) => \{[\s\S]*?S\.session\.opts\.gpuUsage = v \/ 100;/,
+    'the dock slider should drive the live session directly');
+  assert.match(app, /if \(\$\('t-gpu'\)\) \{ \$\('t-gpu'\)\.value = String\(st\.gpu \?\? 100\);/,
+    'showSettings should mirror the persisted value into the dock');
   assert.match(app, /gpuUsage: \(st\.gpu \?\? 100\) \/ 100/,
     'fresh runs should start at the slider’s duty cycle');
   assert.match(app, /gpuUsage: \(S\.settings\.gpu \?\? 100\) \/ 100/,

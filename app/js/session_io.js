@@ -78,6 +78,24 @@ export function continuedInputDim(prevDim, prevBuf) {
   return Math.round(prevDim / prevBuf);
 }
 
+/** A continuation's replayed working buffer: the recon's own trainScale
+ *  (exact, current records); else the run record's saved settings when its
+ *  resolution × buffer triple reproduces the stored size (older records —
+ *  the check rejects settings that drifted after the run started); else the
+ *  saved buffer alone (Auto resolutions have no triple to check); else 1. */
+export function continuedBuf(trainScale, settings, prevDim) {
+  if (Number.isFinite(trainScale) && trainScale > 0) return trainScale;
+  const buf = settings ? +settings.buf : NaN;
+  if (!Number.isFinite(buf) || buf <= 0) return 1;
+  const res = settings ? +settings.res : NaN;
+  if (Number.isFinite(res) && res > 0 && Number.isFinite(prevDim) && prevDim > 0) {
+    // a saved step at or above the set's size commits as Full (-1), so a
+    // positive res always ran unclamped: res × buf is the stored size
+    if (Math.abs(res * buf - prevDim) > Math.max(2, prevDim * 0.02)) return 1;
+  }
+  return buf;
+}
+
 export function buildReconJson(S) {
   const ses = S.session;
   const recon = ses.recon;

@@ -17,11 +17,11 @@ import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } f
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './training-settings.js';
 import { zipStore } from './zip.js';
 import { saveBlob } from './download.js';
-import { buildSessionZip, fetchModel, gravityUpForKnownRun, continuedInputDim } from './session_io.js';
+import { buildSessionZip, fetchModel, gravityUpForKnownRun, continuedInputDim, continuedBuf } from './session_io.js';
 import { buildDisplayCloud } from './scene-cloud.js';
 import { REPO, DISCORD, DATA, ownSet } from './data.js';
 
-import { Viewport, camCentre, quatFromR, quatToR, qslerp } from './viewport.js';
+import { Viewport, camCentre, quatFromR, quatToR, qslerp, rollAngleToUp, snapRollAngle, rerollPose, exifIntrinsics } from './viewport.js';
 import { Developer, fitRect } from './develop.js';
 import { Chart, psnrToApproxSsimPercent } from './chart.js';
 import { bmp, readyBmp, sizedUrl } from './img.js';
@@ -494,6 +494,7 @@ function boot() {
     $('set-mcmc').value = st.mcmc === '0' ? '0' : '';
     $('set-gpu').value = String(st.gpu ?? 100);
     $('set-gpu-v').textContent = `${$('set-gpu').value}%`;
+    if ($('t-gpu')) { $('t-gpu').value = String(st.gpu ?? 100); $('t-gpu-v').textContent = `${$('t-gpu').value}%`; }
   };
   showSettings();
   // the quality knob exists twice — full row in the gear panel, quick
@@ -527,6 +528,10 @@ function boot() {
     }
     $('settings').hidden = !open;
     $('btn-settings').setAttribute('aria-expanded', String(open));
+    // the panel reflows the page under a stationary cursor — drop any stale
+    // chart hover so the readout cannot re-fire detached on the next redraw
+    chart?.clearHover();
+    dchart?.clearHover();
   });
   const readSettings = () => {
     const cyclesInput = $('set-iters'), lodInput = $('set-lod-count');
@@ -597,6 +602,8 @@ function boot() {
   $('set-gpu').addEventListener('input', () => {
     $('set-gpu-v').textContent = `${$('set-gpu').value}%`;
     if (S.session) S.session.opts.gpuUsage = parseInt($('set-gpu').value, 10) / 100;
+    const tGpu = $('t-gpu');   // the training-dock slider mirrors live
+    if (tGpu) { tGpu.value = $('set-gpu').value; $('t-gpu-v').textContent = `${tGpu.value}%`; }
   });
 
   addEventListener('resize', () => { vp.resize(); chart?.resize(); dchart?.resize(); dvp?.resize(); });
@@ -3737,10 +3744,14 @@ function continueConfigCard(r) {
   const recipe0 = (recon && recon.recipe) || null;
   const prevSh = recipe0 && Number.isInteger(recipe0.shDeg) ? recipe0.shDeg : 3;
   const prevMcmc = !!(recipe0 && recipe0.mcmcNoise === true);
-  const prevBuf = recon.trainScale || 1;
+  // the run's own input size and buffer (the recon, else its saved settings
+  // when they reproduce the stored size): the default offers the INPUT in
+  // start-panel language, not the combined input × buffer size
+  const prevBuf = continuedBuf(recon.trainScale, r.detailProgress && r.detailProgress.settings, prevDim || undefined);
+  const prevInputDim = continuedInputDim(prevDim || undefined, prevBuf);
   // resolution: every start-panel step, like a new training (Auto, the
-  // fixed steps, Full); the default replays the run's own effective size
-  const resOpts = [`<option value="same" selected>${prevDim ? `${prevDim} px` : 'Run size'}</option>`,
+  // fixed steps, Full); the default replays the run's own input size
+  const resOpts = [`<option value="same" selected>${prevInputDim ? `${prevInputDim} px` : 'Run size'}</option>`,
     '<option value="auto">Auto</option>',
     ...[480, 640, 960, 1280, 1600, 1920].map((v) => `<option value="${v}">${v} px</option>`),
     `<option value="full">Full size${nativeDim ? ` (${nativeDim} px)` : ''}</option>`].join('');
@@ -3965,7 +3976,8 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
   // through the multiplier again — else the buffer applies twice and the
   // continuation trains at (e.g.) 1/16 instead of the run's 1/4
   const prevDim = Math.max(fr0.tw || 0, fr0.th || 0) || undefined;
-  const prevInputDim = continuedInputDim(prevDim, recon.trainScale);
+  const prevBuf = continuedBuf(recon.trainScale, lr.detailProgress && lr.detailProgress.settings, prevDim);
+  const prevInputDim = continuedInputDim(prevDim, prevBuf);
   const nativeDim = Math.max(fr0.nw || fr0.fw || 0, fr0.nh || fr0.fh || 0) || undefined;
   const trainMaxDim = opts.res === 'auto' ? undefined
     : opts.res === 'full' ? nativeDim
@@ -4006,7 +4018,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     else delete recipeTrainer.growRate;
   }
   const contRefine = opts.mcmc === true ? 500 : opts.mcmc === false ? undefined : recipeRefine;
-  const bufScale = opts.buf ?? (recon.trainScale && recon.trainScale !== 1 ? recon.trainScale : undefined);
+  const bufScale = opts.buf ?? (prevBuf !== 1 ? prevBuf : undefined);
   const ses = createSession({
     maxIters: S.maxIters, holdout: -1,
     // continuations obey the GPU-usage slider like fresh runs (st here is
@@ -4776,9 +4788,22 @@ function goToFrame(i) {
     return;
   }
   S.sel = i; S.atFrame = i;
-  vp.lock = cam;
+  // gravity-leveled frame lock: the model keeps its upright orientation
+  // (position and aim move to the photo, roll levels to gravity) and the
+  // photograph turns to register — a cardinal snap, exact pixels. Untilted
+  // frames keep the raw lock, pixel-identical to before.
+  const snap = snapRollAngle(rollAngleToUp(cam.R, vp.up));
+  let roll = null;
+  if (snap) {
+    const lv = rerollPose(cam.R, camCentre(cam), snap);
+    const ex = exifIntrinsics(cam.w, cam.h, cam.cx, cam.cy, snap);
+    vp.lock = { R: lv.R, t: lv.t, f: cam.f, w: ex.w, h: ex.h, cx: ex.cx, cy: ex.cy };
+    roll = { snap, camW: cam.w, camH: cam.h };
+  } else {
+    vp.lock = cam;
+  }
   bmp(cam.url).then((b) => {
-    if (b && S.scene.cams[S.atFrame]?.url === cam.url) dev.setBitmap(b, cam.url);
+    if (b && S.scene.cams[S.atFrame]?.url === cam.url) dev.setBitmap(b, cam.url, roll);
   });
   S.fadeTo = 1;
   S.loupe.x = $('stage').clientWidth / 2;
@@ -4947,6 +4972,7 @@ function dock(kind) {
         <div class="tmeta">
           <span class="tmeta-1"><span id="t-iter">${pctOf(S.iter)}</span></span>
           <span class="tmeta-2">ETA <span id="t-eta">${etaText()}</span></span>
+          <span class="tmeta-gpu" title="Share of wall time training runs the GPU — live, no restart needed"><label for="t-gpu">GPU</label><input id="t-gpu" type="range" min="10" max="100" step="5" value="${S.settings.gpu ?? 100}"><span id="t-gpu-v">${S.settings.gpu ?? 100}%</span></span>
         </div>
       </div>
       <div class="chartwrap"><canvas id="chart"></canvas><div class="chart-tip" id="chart-tip" hidden></div></div>
@@ -4964,6 +4990,20 @@ function dock(kind) {
       $('t-finish').disabled = true;
       await S.session.finish();   // emits train-complete -> finish()
     });
+    // the GPU usage slider, mid-training edition: the same persisted knob
+    // as the settings panel, mirrored both ways, live on every input
+    const tGpu = $('t-gpu');
+    if (tGpu) {
+      tGpu.addEventListener('input', () => {
+        const v = Math.min(100, Math.max(10, parseInt(tGpu.value, 10) || 100));
+        S.settings.gpu = v;
+        $('t-gpu-v').textContent = `${tGpu.value}%`;
+        if (S.session) S.session.opts.gpuUsage = v / 100;
+        const panel = $('set-gpu');
+        if (panel) { panel.value = String(v); $('set-gpu-v').textContent = `${v}%`; }
+      });
+      tGpu.addEventListener('change', () => saveSettings());
+    }
     chart = new Chart($('chart'), { onHover: chartTip });
     chart.scale = S.scoreScale;
     chart.maxIter = S.maxIters;
@@ -5269,8 +5309,14 @@ function tourStep(dt) {
   const i = clamp(Math.floor(u), 0, T.cams.length - 2);
   const f = u - i;
 
-  // the TRUE pose, roll included, rendered via the viewport's pose override
-  const Rq = quatToR(qslerp(T.sq[i], T.sq[i + 1], f));
+  // gravity-leveled flight: position and aim follow the capture path, but
+  // roll levels to the orbit's up axis through the pose override (the raw
+  // sensor roll would swing the world sideways on portrait-held captures —
+  // and the orbit view the tour starts from is leveled, so the tour must be
+  // too). A straight up/down stare keeps the raw pose: no level roll exists.
+  const Rq0 = quatToR(qslerp(T.sq[i], T.sq[i + 1], f));
+  const level = rollAngleToUp(Rq0, vp.up);
+  const Rq = level == null ? Rq0 : rerollPose(Rq0, pos, level).R;
   vp.pose = {
     R: Rq,
     t: [
