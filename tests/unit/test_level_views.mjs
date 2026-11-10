@@ -93,8 +93,8 @@ const near = (a, b, tol = 1e-9) => a.every((v, i) => Math.abs(v - b[i]) < tol);
     'display-framed pixels should skip the turn, sensor-framed take it');
   assert.match(developSrc, /ctx\.rotate\(\(roll\.angle \* Math\.PI\) \/ 180\)/,
     'the photograph should turn by the lock’s snap');
-  assert.match(developSrc, /drawFit\(model, roll \? roll\.snap : 0\)/,
-    'the error map should turn the sensor-framed snapshot');
+  assert.match(developSrc, /drawFit\(model, roll \? -roll\.snap : 0\)/,
+    'the error map should counter-turn the sensor-framed snapshot');
   assert.match(developSrc, /drawFit\(this\.bmp, roll \? roll\.angle : 0\)/,
     'the error map should turn the photograph with the display');
 }

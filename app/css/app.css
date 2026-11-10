@@ -256,7 +256,7 @@ body { overflow: hidden; }
 
 .dock-train {
   display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 18px; align-items: center;
-  position: relative; z-index: 5;   /* the stop-and-keep chip overhangs the stage */
+  position: relative; z-index: 5;
 }
 .dock-train.chart-expanded { grid-template-columns: auto minmax(0, 1fr); }
 .dock-train.chart-expanded .tscores { grid-column: 2; justify-self: end; }
@@ -573,16 +573,16 @@ button.countv:hover { color: var(--accent); }
 .tmeta { position: relative; }
 .playwrap { position: relative; display: inline-flex; }
 #t-finish {
-  position: absolute; top: calc(100% + 5px); left: 0;
-  padding: 3px 10px;
-  white-space: nowrap; z-index: 6;         /* floats over the stage edge */
-  background: var(--panel);
+  position: static; align-self: center;
+  padding: 3px 10px; margin-left: 10px;
+  white-space: nowrap;
 }
-/* the pause circle breathes — enough on the left that the stop-and-keep
-   chip below it clears the window edge */
-.dock-train .play { margin: 0 10px 0 16px; }
+/* the stop-and-keep chip sits beside the pause circle, inside the dock —
+   its own margin-left spaces it; the circle keeps its left breathing room */
+.dock-train .play { margin: 0 0 0 16px; }
 @media (max-width: 720px) {
   .dock-train .play { margin: 0; }
+  #t-finish { margin-left: 8px; }
 }
 
 /* the upload dialog + the result link chip */

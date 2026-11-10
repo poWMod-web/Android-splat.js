@@ -46,12 +46,13 @@ export class Developer {
     // sensor dims are feature-scale — both uniform scales of one frame). A
     // square bitmap proves nothing either way and keeps the sensor turn.
     const swapped = bw !== bh && (bw > bh) !== (frame.camW > frame.camH);
-    const angle = swapped ? 0 : snap;
-    if (!angle) {
-      this.roll = null;
-      return;
-    }
-    const swap = Math.abs(angle) % 180 !== 0;
+    // the canvas turn OPPOSES the snap: rerollPose turns the camera's rows
+    // by +snap, so the image content — photograph and render alike — turns
+    // by −snap. EXIF-displayed pixels are already across and take no turn,
+    // but still report the lock's frame: the error map's sensor-framed
+    // snapshot turns underneath them regardless.
+    const angle = swapped ? 0 : -snap;
+    const swap = Math.abs(snap) % 180 !== 0;
     this.roll = {
       snap, angle,
       W: swap ? frame.camH : frame.camW,
@@ -77,8 +78,8 @@ export class Developer {
     // `model` is a dedicated same-camera render snapshot handed in by the app
     // (never the live WebGPU canvas: reading one back after presentation can
     // return blank pixels). Render and photo are the same camera image, so
-    // both just downsample to the map's working size — through the lock's
-    // cardinal turn when the view is leveled (the snapshot is always
+    // both just downsample to the map's working size — through the
+    // counter-turn when the view is leveled (the snapshot is always
     // sensor-framed; the photograph only when its pixels are).
     const roll = this.roll;
     const drawFit = (img, angle) => {
@@ -90,7 +91,7 @@ export class Developer {
       else ec.drawImage(img, -ew / 2, -eh / 2, ew, eh);
       ec.restore();
     };
-    drawFit(model, roll ? roll.snap : 0);
+    drawFit(model, roll ? -roll.snap : 0);
     const a = ec.getImageData(0, 0, ew, eh);
     ec.clearRect(0, 0, ew, eh);
     drawFit(this.bmp, roll ? roll.angle : 0);

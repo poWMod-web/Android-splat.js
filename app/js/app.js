@@ -3532,6 +3532,11 @@ function seg(items, active, onPick) {
     const b = document.createElement('button');
     b.textContent = label;
     b.setAttribute('aria-pressed', String(val === active));
+    // pointerdown, not click: the mode switches the instant the finger lands.
+    // click stays for keyboard activation (Enter/Space fire click, never
+    // pointerdown) — the follow-up click after a real press re-picks the same
+    // value, which onPick implementations must treat as a no-op.
+    b.addEventListener('pointerdown', () => onPick(val));
     b.addEventListener('click', () => onPick(val));
     d.appendChild(b);
   });
@@ -3550,6 +3555,7 @@ function renderControls() {
   if (S.atFrame >= 0) {
     c.appendChild(seg([['swipe', 'Swipe'], ['loupe', 'Loupe'], ['error', 'Error']],
       S.compare, (v) => {
+        if (S.compare === v) return;   // swallow the click that follows pointerdown
         S.compare = v;
         $('stage').dataset.cursor = cursorFor(v);
         renderControls();
@@ -4796,7 +4802,7 @@ function goToFrame(i) {
   let roll = null;
   if (snap) {
     const lv = rerollPose(cam.R, camCentre(cam), snap);
-    const ex = exifIntrinsics(cam.w, cam.h, cam.cx, cam.cy, snap);
+    const ex = exifIntrinsics(cam.w, cam.h, cam.cx, cam.cy, -snap);
     vp.lock = { R: lv.R, t: lv.t, f: cam.f, w: ex.w, h: ex.h, cx: ex.cx, cy: ex.cy };
     roll = { snap, camW: cam.w, camH: cam.h };
   } else {

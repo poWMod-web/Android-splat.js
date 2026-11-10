@@ -117,9 +117,12 @@ export function snapRollAngle(deg, tol = 15) {
 }
 
 /** Roll a world-to-camera pose about its own look direction: the camera
- *  stays (position and aim), the image turns by canvas-clockwise degrees.
- *  The capture tour passes the exact sensor roll, the frame lock its
- *  cardinal snap — same rotation either way. */
+ *  stays (position and aim) while its rows turn by canvas-clockwise
+ *  degrees — the image content counter-turns, so pass rollAngleToUp's
+ *  angle to level the view and rotate 2D followers (photo, snapshot,
+ *  principal point) by its negation. The capture tour passes the exact
+ *  sensor roll, the frame lock its cardinal snap — same rotation either
+ *  way. */
 export function rerollPose(R, pos, deg) {
   const fwd = [R[6], R[7], R[8]];
   const rR = [
