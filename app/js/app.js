@@ -4834,27 +4834,54 @@ function select(i) {
 
 function wireStage() {
   const st = $('stage');
-  // Touch-hold: the GPU belongs to the view while a finger is down. Pause
-  // training on the FIRST stage touch — orbit, pinch, tap, or a
-  // frame-locked compare drag — and resume when the last finger lifts (the
-  // ~4 queued batches drain in about a second, so the camera answers the
-  // finger instead of waiting behind the training queue). Up/cancel ride
-  // the window so a release outside the stage still resumes; a user-pressed
-  // pause clears the flag in toggleTrain, so a release never resumes over it.
+  // Touch-hold with a quiet window: while visuals show, the GPU belongs to
+  // the view from the FIRST model touch until 2s after the LAST one — every
+  // new touch refreshes the window, so training resumes only after 2s of no
+  // interaction and never re-queues a backlog between quick successive
+  // touches. Touches on UI (graph, controls hub, buttons) don't count —
+  // model touches only. Up/cancel ride the window so a release outside the
+  // stage still counts; a user-pressed pause clears the flag in toggleTrain,
+  // so the window never resumes over it.
   const held = new Set();
-  const updateHold = () => {
+  let resumeT = 0;
+  const armResume = () => {
+    clearTimeout(resumeT);
+    resumeT = setTimeout(() => {
+      resumeT = 0;
+      if (!held.size && S._dragPaused) {
+        S._dragPaused = false;
+        if (S.state === 'train') S.session.start();
+      }
+    }, 2000);
+  };
+  const noteModelTouch = () => {
     if (!S.session) { S._dragPaused = false; return; }
-    if (held.size && S.state === 'train' && S.session.training && !S._dragPaused) {
+    clearTimeout(resumeT); resumeT = 0;
+    if (S.state === 'train' && S.trainVisuals && S.session.training && !S._dragPaused) {
       S._dragPaused = true;
       S.session.pause();
-    } else if (!held.size && S._dragPaused) {
-      S._dragPaused = false;
-      if (S.state === 'train') S.session.start();
     }
   };
-  st.addEventListener('pointerdown', (e) => { held.add(e.pointerId); updateHold(); });
-  window.addEventListener('pointerup', (e) => { if (held.delete(e.pointerId)) updateHold(); });
-  window.addEventListener('pointercancel', (e) => { if (held.delete(e.pointerId)) updateHold(); });
+  // the graph and the hub live inside the stage (the expanded chart even
+  // covers it) — only canvas/model touches may hold the GPU
+  const onModel = (e) => !e.target.closest('#controls, #hud, #start, .chartwrap, button');
+  st.addEventListener('pointerdown', (e) => {
+    if (!onModel(e)) return;
+    held.add(e.pointerId);
+    noteModelTouch();
+  });
+  window.addEventListener('pointerup', (e) => {
+    if (held.delete(e.pointerId) && !held.size && S._dragPaused) armResume();
+  });
+  window.addEventListener('pointercancel', (e) => {
+    if (held.delete(e.pointerId) && !held.size && S._dragPaused) armResume();
+  });
+  // a wheel tick adjusts the model without a touch — same hold, same window
+  st.addEventListener('wheel', (e) => {
+    if (!onModel(e)) return;
+    noteModelTouch();
+    if (S._dragPaused) armResume();
+  }, { passive: true });
   st.addEventListener('pointermove', (e) => {
     if (S.atFrame < 0) return;
     const r = st.getBoundingClientRect();

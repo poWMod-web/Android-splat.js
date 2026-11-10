@@ -73,21 +73,31 @@ const indexHtml = readFileSync(new URL('../../app/index.html', import.meta.url),
     'the settings panel should offer a 10–100% GPU slider');
 }
 
-// touch-hold: training yields the GPU while a finger is down on the stage,
-// and comes back at full speed on release
+// touch-hold with a quiet window: training yields the GPU from the first
+// model touch until 2s after the last, then comes back at full speed
 {
-  assert.match(app, /st\.addEventListener\('pointerdown', \(e\) => \{ held\.add\(e\.pointerId\); updateHold\(\); \}\);/,
-    'the first stage touch should engage the hold (orbit, pinch, compare drag, tap)');
-  assert.match(app, /window\.addEventListener\('pointerup', \(e\) => \{ if \(held\.delete\(e\.pointerId\)\) updateHold\(\); \}\);/,
-    'releases should ride the window so lifting outside the stage still resumes');
-  assert.match(app, /window\.addEventListener\('pointercancel', \(e\) => \{ if \(held\.delete\(e\.pointerId\)\) updateHold\(\); \}\);/,
-    'cancelled touches should release the hold too');
+  assert.match(app, /const onModel = \(e\) => !e\.target\.closest\('#controls, #hud, #start, \.chartwrap, button'\);/,
+    'only model touches should hold the GPU — graph and hub touches must not');
+  assert.match(app, /st\.addEventListener\('pointerdown', \(e\) => \{\s*if \(!onModel\(e\)\) return;\s*held\.add\(e\.pointerId\);\s*noteModelTouch\(\);/,
+    'a model touch should engage the hold (orbit, pinch, compare drag, tap)');
+  assert.match(app, /window\.addEventListener\('pointerup', \(e\) => \{\s*if \(held\.delete\(e\.pointerId\) && !held\.size && S\._dragPaused\) armResume\(\);/,
+    'releases should ride the window so lifting outside the stage still counts');
+  assert.match(app, /window\.addEventListener\('pointercancel', \(e\) => \{\s*if \(held\.delete\(e\.pointerId\) && !held\.size && S\._dragPaused\) armResume\(\);/,
+    'cancelled touches should count toward the quiet window too');
+  assert.match(app, /st\.addEventListener\('wheel', \(e\) => \{\s*if \(!onModel\(e\)\) return;/,
+    'wheel ticks adjust the model without a touch — same hold, same window');
+  assert.match(app, /S\.state === 'train' && S\.trainVisuals && S\.session\.training && !S\._dragPaused/,
+    'the hold should engage only while training with visuals shown');
   assert.match(app, /S\._dragPaused = true;\s*S\.session\.pause\(\);/,
     'the hold should pause a running training');
+  assert.match(app, /\}, 2000\);/,
+    'training should resume after 2s of no interaction');
+  assert.match(app, /clearTimeout\(resumeT\); resumeT = 0;/,
+    'every new touch should refresh the quiet window');
   assert.match(app, /S\._dragPaused = false;\s*if \(S\.state === 'train'\) S\.session\.start\(\);/,
-    'the last release should resume a hold-paused training');
+    'the quiet window should resume a hold-paused training');
   assert.match(app, /if \(!on\) \{ S\._dragPaused = false; checkpointRun\('pause'\)/,
-    'a user-pressed pause should take ownership so a release never resumes over it');
+    'a user-pressed pause should take ownership so the window never resumes over it');
   assert.match(sessionSrc, /this\.training = true;\n(\s*\/\/.*\n)+\s*this\._thrT = null;/,
     'resuming should restart the throughput window instead of reading the pause gap as GPU slowness');
 }
