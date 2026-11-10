@@ -530,7 +530,7 @@ body { overflow: hidden; }
   flex: none; min-width: 66px; padding: 2px 4px; text-align: right;
   font: 500 12px var(--mono); color: var(--paper); border-radius: 6px;
 }
-.countv:hover { color: var(--accent); }
+button.countv:hover { color: var(--accent); }
 /* one centred group: Start, the quality dropdown to its right at the same
    height, then the gear */
 .startrow { display: flex; justify-content: center; align-items: center; }

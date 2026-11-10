@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { convertSHDegree } from '../../app/js/session_io.js';
+import { convertSHDegree, continuedInputDim } from '../../app/js/session_io.js';
 
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
+const sessionIo = readFileSync(new URL('../../app/js/session_io.js', import.meta.url), 'utf8');
 
 // Continuing a finished run reselects the training configuration first (like
 // a new training); a paused run resumes its original configuration directly.
@@ -24,12 +25,16 @@ assert.match(card, /\.\.\.\[480, 640, 960, 1280, 1600, 1920\]\.map\(\(v\) =>/,
   'the card should list every start-panel resolution step, unfiltered');
 assert.match(card, /Same as current/,
   'the splat budget should default to Same as current');
-assert.match(card, /Same as run \(\$\{prevSh\}\)/,
-  'spherical harmonics should default to the run’s own degree');
-assert.match(card, /Same as run \(\$\{prevBuf\}×\)/,
-  'the working buffer should default to the run’s own scale');
-assert.match(card, /Same as run \(\$\{prevMcmc \? 'On' : 'Off'\}\)/,
-  'the MCMC optimizer should default to the run’s own set');
+assert.match(card, /<option value="same" selected>\$\{prevDim \? `\$\{prevDim\} px` : 'Run size'\}<\/option>/,
+  'the resolution should default to the run’s own effective size, stated plainly');
+assert.match(card, /<option value="" selected>\$\{prevSh\}<\/option>/,
+  'spherical harmonics should default to the run’s own degree, stated plainly');
+assert.match(card, /<option value="" selected>\$\{prevBuf\}×<\/option>/,
+  'the working buffer should default to the run’s own scale, stated plainly');
+assert.match(card, /<option value="" selected>\$\{prevMcmc \? 'On' : 'Off'\}<\/option>/,
+  'the MCMC optimizer should default to the run’s own set, stated plainly');
+assert.ok(!/Same as (before|run)/.test(card),
+  'only the splat budget should keep a Same-as label');
 assert.match(card, /continueLocalRun\(false, \{\s*res:[\s\S]*splats:[\s\S]*extraIters,[\s\S]*sh:[\s\S]*buf:[\s\S]*lod:[\s\S]*mcmc:/,
   'confirming the card should continue with the full chosen configuration');
 
@@ -39,8 +44,14 @@ const contEnd = app.indexOf('function continueTraining(', contStart);
 const cont = app.slice(contStart, contEnd);
 assert.match(cont, /opts\.extraIters[\s\S]*defaultExtra/,
   'the continuation horizon should honor configured extra cycles, defaulting to the automatic extension');
-assert.match(cont, /opts\.res === 'auto' \? undefined[\s\S]*opts\.res === 'full' \? nativeDim[\s\S]*: prevDim/,
+assert.match(cont, /opts\.res === 'auto' \? undefined[\s\S]*opts\.res === 'full' \? nativeDim[\s\S]*: prevInputDim/,
   'the continuation should honor a reselected resolution, defaulting to the run’s own');
+assert.match(cont, /const prevInputDim = continuedInputDim\(prevDim, recon\.trainScale\);/,
+  'the default should divide the buffer back out before the multiplier runs again');
+assert.match(cont, /Math\.max\(fr0\.nw \|\| fr0\.fw \|\| 0, fr0\.nh \|\| fr0\.fh \|\| 0\)/,
+  'Full size should use the file’s own pixel size, not the feature-capped dims');
+assert.match(sessionIo, /\.\.\.\(Number\.isFinite\(f\.srcW\) \? \{ nw: f\.srcW, nh: f\.srcH \} : \{\}\)/,
+  'the recon JSON should persist each frame’s native pixel size');
 assert.match(cont, /Math\.max\(g\.n, lr\.splats \|\| 0,[\s\S]*opts\.splats \|\| 0\)/,
   'the continuation budget should honor a reselected splat count, never below the trained size');
 assert.match(cont, /frames: \{ trainMaxDim, \.\.\.\(bufScale != null \? \{ trainScale: bufScale \} : \{\}\) \}/,
@@ -93,6 +104,27 @@ assert.match(cont, /ses\.trainer\.growLimit = S\.lodPlan\.levels\[S\.lodPlan\.id
   assert.ok(flat.sh.every((v) => v === 0));
   assert.throws(() => convertSHDegree({ n: 1, shK: 15, sh: new Float32Array(45) }, 4), /SH degree must be 0-3/);
   assert.throws(() => convertSHDegree({ n: 1, shK: 7, sh: new Float32Array(21) }, 1), /unknown band count/);
+}
+
+// The default-resolution round trip: the stored size is round(min(input,
+// nat) × buf); the continuation must recover the input so re-applying the
+// buffer reproduces the stored size exactly (no double multiplication).
+{
+  const combine = (input, nat, buf) => Math.round(Math.min(input, nat) * buf);
+  assert.equal(continuedInputDim(undefined, 0.5), undefined);
+  assert.equal(continuedInputDim(480, undefined), 480);
+  assert.equal(continuedInputDim(480, 1), 480);
+  assert.equal(continuedInputDim(0, 0.5), 0);
+  for (const buf of [0.5, 1, 2]) {
+    for (const nat of [960, 1920, 4000]) {
+      for (let input = 240; input <= 2400; input += 17) {
+        const stored = combine(input, nat, buf);
+        const recovered = continuedInputDim(stored, buf);
+        assert.equal(combine(recovered, nat, buf), stored,
+          `input ${input} @${nat} buf ${buf} should round-trip through the stored size`);
+      }
+    }
+  }
 }
 
 console.log('continue-training configuration reselection: passed');

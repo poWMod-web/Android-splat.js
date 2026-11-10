@@ -4,6 +4,7 @@ import { gravityUpForKnownRun, levelingUpFromReport } from '../../app/js/session
 
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 const sessionIo = readFileSync(new URL('../../app/js/session_io.js', import.meta.url), 'utf8');
+const pcview = readFileSync(new URL('../../app/js/pcview.js', import.meta.url), 'utf8');
 
 // Known-camera runs keep the capture world's y-up frame, but phone captures
 // are portrait-held: sensor-up lies sideways to gravity, so averaging it
@@ -68,5 +69,45 @@ assert.match(app, /ses\.useReconstruction\(\{\s*known: !!reconJson\.knownCameras
   'a trainer restore should keep the known-camera frame flag');
 assert.match(app, /ses\.useReconstruction\(\{\s*known: !!recon\.knownCameras,/,
   'a continuation should keep the known-camera frame flag');
+
+// Known-camera (AR) worlds are y-up: the SOG-lite viewer maps them straight
+// across instead of the y-down half-turn. Old recons lack the marker and
+// keep the legacy flip.
+assert.match(sessionIo, /knownCameras: !!recon\.known,/,
+  'the recon JSON should record the known-camera world frame');
+assert.match(app, /createSogView\(src\.url, \{ radius: reconJson\.sceneRadius \|\| 10, yUp: !!reconJson\.knownCameras \}\)/,
+  'the lite viewer should learn the model’s world frame');
+assert.match(pcview, /createSogView\(sogUrl, \{ radius = 10, yUp = false \} = \{\}\)/,
+  'the lite viewer should default to the legacy y-down flip');
+assert.match(pcview, /setEulerAngles\(yUp \? 0 : 180, 0, 0\)/,
+  'y-up models should skip the entity half-turn');
+assert.match(pcview, /const s = yUp \? 1 : -1;/,
+  'the lite camera mapping should branch on the world frame');
+
+// The lite mapping: y-up passes positions and camera axes straight through,
+// y-down keeps the legacy (x,-y,-z) flip exactly.
+{
+  const liteCam = (R, t, s) => {
+    const C = [0, 1, 2].map((k) => -(R[k] * t[0] + R[k + 3] * t[1] + R[k + 6] * t[2]));
+    return {
+      pos: [C[0], s * C[1], s * C[2]],
+      right: [R[0], s * R[1], s * R[2]],
+      up: [-R[3], -s * R[4], -s * R[5]],
+      back: [-R[6], -s * R[7], -s * R[8]],
+    };
+  };
+  const eq = (a, b, tol = 1e-9) => a.every((v, i) => Math.abs(v - b[i]) < tol);
+  const R = [0.36, -0.48, 0.8, 0.8, 0.6, 0, -0.48, 0.64, 0.6], t = [0.5, -1.2, 0.3];
+  const C = [0, 1, 2].map((k) => -(R[k] * t[0] + R[k + 3] * t[1] + R[k + 6] * t[2]));
+  const yup = liteCam(R, t, 1), legacy = liteCam(R, t, -1);
+  assert.ok(eq(yup.pos, C), 'y-up positions should pass through');
+  assert.ok(eq(yup.right, [R[0], R[1], R[2]]), 'y-up right should pass through');
+  assert.ok(eq(yup.up, [-R[3], -R[4], -R[5]]), 'y-up up should be the negated second row');
+  assert.ok(eq(yup.back, [-R[6], -R[7], -R[8]]), 'y-up back should be the negated third row');
+  assert.ok(eq(legacy.pos, [C[0], -C[1], -C[2]]), 'legacy positions should keep the flip');
+  assert.ok(eq(legacy.right, [R[0], -R[1], -R[2]]), 'legacy right should keep the flip');
+  assert.ok(eq(legacy.up, [-R[3], R[4], R[5]]), 'legacy up should keep the flip');
+  assert.ok(eq(legacy.back, [-R[6], R[7], R[8]]), 'legacy back should keep the flip');
+}
 
 console.log('gravity up for known-camera views: passed');

@@ -68,6 +68,16 @@ export function gravityUpForKnownRun({ persisted = null, leveling = null } = {})
   return levelingUpFromReport(leveling) || [0, 1, 0];
 }
 
+/** A continuation's default input scale: the stored size is the COMBINED
+ *  size (input × buffer), so the buffer is divided back out before the value
+ *  passes through adaptiveTrainCap's multiplier again — else the buffer
+ *  applies twice and the continuation trains at (e.g.) 1/16 instead of the
+ *  run's 1/4. Unrecorded buffers (old records) replay at scale 1. */
+export function continuedInputDim(prevDim, prevBuf) {
+  if (!prevDim || !prevBuf || prevBuf === 1) return prevDim;
+  return Math.round(prevDim / prevBuf);
+}
+
 export function buildReconJson(S) {
   const ses = S.session;
   const recon = ses.recon;
@@ -120,7 +130,10 @@ export function buildReconJson(S) {
       ...(c.fy != null && c.fy !== c.f ? { fy: +c.fy.toPrecision(7) } : {}),
       cx: c.cx, cy: c.cy,
     })),
-    frames: ses.frames.map((f) => ({ name: f.name, fw: f.fw, fh: f.fh, tw: f.tw, th: f.th })),
+    frames: ses.frames.map((f) => ({ name: f.name, fw: f.fw, fh: f.fh, tw: f.tw, th: f.th,
+      // the file's own pixel size (decodeFrames srcW/srcH): Full-size
+      // continuations need true native, not the feature-capped fw/fh
+      ...(Number.isFinite(f.srcW) ? { nw: f.srcW, nh: f.srcH } : {}) })),
     source: {
       preset: S.preset && !String(S.preset.id).startsWith('__') ? S.preset.id : null,
       names: (S.loadedFiles || []).map((f) => f.name),

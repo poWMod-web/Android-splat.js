@@ -17,7 +17,7 @@ import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } f
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './training-settings.js';
 import { zipStore } from './zip.js';
 import { saveBlob } from './download.js';
-import { buildSessionZip, fetchModel, gravityUpForKnownRun } from './session_io.js';
+import { buildSessionZip, fetchModel, gravityUpForKnownRun, continuedInputDim } from './session_io.js';
 import { buildDisplayCloud } from './scene-cloud.js';
 import { REPO, DISCORD, DATA, ownSet } from './data.js';
 
@@ -166,8 +166,8 @@ function deviceDefaults() {
     // on the lean solve, desktops take the middle tier; the precise tier is
     // the High/Showcase macro's (a ten-minute solve behind a two-minute
     // draft training was the complaint, 2026-09-09)
-    ? { v: 2, res: 480, feat: 0, buf: 1, sh: 0, iters: 10000, splats: 0, lod: false, mcmc: false, solve: 'quick', av: { ...AV_DEFAULTS } }
-    : { v: 2, res: 0, feat: 0, buf: 1, sh: 3, iters: 0, splats: 0, lod: false, mcmc: false, solve: 'standard', av: { ...AV_DEFAULTS } };
+    ? { v: 2, res: 480, feat: 0, buf: 1, sh: 0, iters: 10000, splats: 0, lod: false, mcmc: false, solve: 'quick', gpu: 100, av: { ...AV_DEFAULTS } }
+    : { v: 2, res: 0, feat: 0, buf: 1, sh: 3, iters: 0, splats: 0, lod: false, mcmc: false, solve: 'standard', gpu: 100, av: { ...AV_DEFAULTS } };
 }
 function loadSettings() {
   const d = deviceDefaults();
@@ -181,6 +181,10 @@ function loadSettings() {
     // saved sh 2 predates the degree-3 default: those sessions were silently
     // training degree 3 (the old `!== 2` guard), so 3 preserves real behavior
     if (m.sh === 2) m.sh = 3;
+    // gpu: a corrupt save must neither park the throttle nor slam it —
+    // non-numbers fall back to default, anything else clamps to the slider
+    if (!Number.isFinite(+m.gpu)) m.gpu = d.gpu;
+    m.gpu = Math.min(100, Math.max(10, Math.round(m.gpu)));
     // phones: iters 0 (the old 20k default) was never an explicit choice —
     // migrate to the 10k draft default so first runs stay ~5 minutes
     if (d.iters === 10000 && m.iters === 0) m.iters = 10000;
@@ -488,6 +492,8 @@ function boot() {
       ? `0 = Auto (${maxLODLevels(st.splats)} snapshots). Choose 1–${maxLODLevels(st.splats)} earlier saved snapshots; final full detail is always included.`
       : 'Enable LOD with a splat budget of at least 1,000,000. 0 = Auto.';
     $('set-mcmc').value = st.mcmc === '0' ? '0' : '';
+    $('set-gpu').value = String(st.gpu ?? 100);
+    $('set-gpu-v').textContent = `${$('set-gpu').value}%`;
   };
   showSettings();
   // the quality knob exists twice — full row in the gear panel, quick
@@ -547,6 +553,7 @@ function boot() {
     st.lod = lodEnabled;
     st.lodLevels = lodCount;
     st.mcmc = $('set-mcmc').value;  // '' Auto | '1' on | '0' off
+    st.gpu = Math.min(100, Math.max(10, parseInt($('set-gpu').value, 10) || 100));
     showSettings();
     saveSettings();
     return true;
@@ -554,7 +561,7 @@ function boot() {
   S.commitSettings = readSettings;
   // every select in the panel persists on change — the avatar rows (and Horizontal SH) were
   // missing from this list, so their toggles changed the dropdown and nothing else (2026-09-17)
-  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-shup', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
+  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-shup', 'set-gpu', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
     const el = $(id); if (el) el.addEventListener('change', readSettings);
   }
   // the avatar route: the box on the start card. It is a property of THIS run,
@@ -583,6 +590,13 @@ function boot() {
     if (!p || p.files) return;
     $('set-count').value = p.maxCount || p.count;
     $('set-count').dispatchEvent(new Event('change'));
+  });
+  // gpu slider: live label while dragging, and a running training follows
+  // at once — the frame loop reads opts.gpuUsage every batch, so no
+  // restart; the change commit persists it like every other row
+  $('set-gpu').addEventListener('input', () => {
+    $('set-gpu-v').textContent = `${$('set-gpu').value}%`;
+    if (S.session) S.session.opts.gpuUsage = parseInt($('set-gpu').value, 10) / 100;
   });
 
   addEventListener('resize', () => { vp.resize(); chart?.resize(); dchart?.resize(); dvp?.resize(); });
@@ -1871,7 +1885,6 @@ async function startPrep() {
     } else {
       S.lodPlan = null;
     }
-    S.align = null;   // a new model starts unaligned
     // the ?iters override must land BEFORE anything reads the budget
     if (ITERS_OVERRIDE >= 1000) S.maxIters = ITERS_OVERRIDE;
     // MCMC set: ON by default — measured garden 20k/40k +1.12/+0.61 dB and
@@ -1924,6 +1937,9 @@ async function startPrep() {
     const session = createSession({
       maxIters: S.maxIters, evalHoldEvery: 2500,
       holdout: -1,
+      // the GPU-usage slider as a duty cycle: full batches with idle
+      // between them (read live, so dragging mid-run needs no restart)
+      gpuUsage: (st.gpu ?? 100) / 100,
       ...(engine === 'v2' ? { refineEvery: 200 } : (mcmcActive ? { refineEvery: 500 } : {})),
       evalSplit: EVAL.on ? EVAL.split : 0,
       initTarget: lodOn ? S.lodPlan.levels[0] : (st.splats ? Math.round(st.splats / 4) : (phoneClass ? 60000 : undefined)),
@@ -3135,7 +3151,6 @@ async function hydrateLocalRunPhotos(reconJson, run) {
 async function restoreSession(src) {
   try {
     S._localRun = src.localRun || null; // set only by the local runs library
-    S.align = null;   // a fresh viewing starts unaligned; finishRestore loads the run's lock
     S.runId = S._localRun ? S._localRun.id : null;
     S._resumeRunId = null;
     S.feats = new Map(); S.lastPairEv = null;
@@ -3241,7 +3256,6 @@ function finishRestore(ses, reconJson, nSplats, hasState, gaussians) {
     S.psnrHold = stats.psnrHold ?? null;
     S.plyBlob = null; S.sogBlob = null;
     S.lodPlan = null;
-    S.align = storedAlign(S._localRun);
     S.state = 'done';
     restoreRunDetails(S._localRun, ses);
     syncTrainingVisualsControl();
@@ -3593,17 +3607,6 @@ function renderControls() {
     '<i>Details ›</i>';
   stats.addEventListener('click', openDetails);
   c.appendChild(stats);
-  {
-    // manual alignment: rotate the displayed model until it sits right, then
-    // lock it to the run (display only — training data and exports untouched)
-    const align = document.createElement('button');
-    align.className = 'cbtn';
-    align.id = 'c-align';
-    align.textContent = S.align && S.align.locked ? '🔒 Aligned' : 'Align';
-    align.title = 'Rotate the displayed model in 90° steps and lock it to this run';
-    align.addEventListener('click', alignCard);
-    c.appendChild(align);
-  }
   if (!S.restored && !S._localRun) {
     // a restored model has no training targets in this tab — viewing and
     // exporting work, continuing the run does not (yet)
@@ -3727,7 +3730,7 @@ function continueConfigCard(r) {
   const recon = r.recon || {};
   const fr0 = (recon.frames && recon.frames[0]) || {};
   const prevDim = Math.max(fr0.tw || 0, fr0.th || 0) || 0;
-  const nativeDim = Math.max(fr0.fw || 0, fr0.fh || 0) || 0;
+  const nativeDim = Math.max(fr0.nw || fr0.fw || 0, fr0.nh || fr0.fh || 0) || 0;
   const prevSplats = r.splats || 0;
   const baseIter = r.iter || recon.iter || 0;
   const defaultExtra = Math.max(10000, Math.round((r.maxIters || 20000) / 2));
@@ -3736,8 +3739,8 @@ function continueConfigCard(r) {
   const prevMcmc = !!(recipe0 && recipe0.mcmcNoise === true);
   const prevBuf = recon.trainScale || 1;
   // resolution: every start-panel step, like a new training (Auto, the
-  // fixed steps, Full); Same as before keeps the run's own sizing
-  const resOpts = [`<option value="same" selected>Same as before${prevDim ? ` (${prevDim} px)` : ''}</option>`,
+  // fixed steps, Full); the default replays the run's own effective size
+  const resOpts = [`<option value="same" selected>${prevDim ? `${prevDim} px` : 'Run size'}</option>`,
     '<option value="auto">Auto</option>',
     ...[480, 640, 960, 1280, 1600, 1920].map((v) => `<option value="${v}">${v} px</option>`),
     `<option value="full">Full size${nativeDim ? ` (${nativeDim} px)` : ''}</option>`].join('');
@@ -3754,16 +3757,16 @@ function continueConfigCard(r) {
     `<option value="${v}"${v === nearest ? ' selected' : ''}>+${fmt(v)}</option>`).join('');
   // spherical harmonics: the run's own degree unless reselected (the decoded
   // checkpoint is resampled to the chosen degree before training resumes)
-  const shOpts = [`<option value="" selected>Same as run (${prevSh})</option>`,
+  const shOpts = [`<option value="" selected>${prevSh}</option>`,
     ...[0, 1, 2, 3].map((v) => `<option value="${v}">${v}</option>`)].join('');
   // working buffer: the supervision grid scale, like the start panel
-  const bufOpts = [`<option value="" selected>Same as run (${prevBuf}×)</option>`,
+  const bufOpts = [`<option value="" selected>${prevBuf}×</option>`,
     ...[0.5, 1, 2].map((v) => `<option value="${v}">${v}×</option>`)].join('');
   // LOD: a fresh halving schedule above the model's current size (needs a
   // 1,000,000+ budget, like a new training)
   const lodOpts = '<option value="" selected>Off</option><option value="1">On (auto levels)</option>';
   // MCMC optimizer: the run's own set unless toggled
-  const mcmcOpts = `<option value="" selected>Same as run (${prevMcmc ? 'On' : 'Off'})</option><option value="1">On</option><option value="0">Off</option>`;
+  const mcmcOpts = `<option value="" selected>${prevMcmc ? 'On' : 'Off'}</option><option value="1">On</option><option value="0">Off</option>`;
   const card = document.createElement('div');
   card.className = 'upcard';
   card.id = 'ltconfig';
@@ -3828,7 +3831,6 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     return;
   }
   const recon = lr.recon;
-  S.align = storedAlign(lr);   // a continuation views the run's locked alignment
   let files;
   const srcUrls = (recon.source && recon.source.urls) || [];
   if (!lr.ownSrc && srcUrls.length && srcUrls.every(Boolean)) {
@@ -3957,12 +3959,17 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     : baseIter + (Number.isSafeInteger(opts.extraIters) && opts.extraIters > 0 ? opts.extraIters : defaultExtra);
   const fr0 = recon.frames[0] || {};
   // the continuation may reselect the training size (higher resolution,
-  // more splats) like a new training; unsettled knobs keep the run's own
+  // more splats) like a new training; unsettled it replays the run's own
+  // input scale AND buffer. The stored size is the COMBINED size (input ×
+  // buffer), so the buffer is divided back out before the value passes
+  // through the multiplier again — else the buffer applies twice and the
+  // continuation trains at (e.g.) 1/16 instead of the run's 1/4
   const prevDim = Math.max(fr0.tw || 0, fr0.th || 0) || undefined;
-  const nativeDim = Math.max(fr0.fw || 0, fr0.fh || 0) || undefined;
+  const prevInputDim = continuedInputDim(prevDim, recon.trainScale);
+  const nativeDim = Math.max(fr0.nw || fr0.fw || 0, fr0.nh || fr0.fh || 0) || undefined;
   const trainMaxDim = opts.res === 'auto' ? undefined
     : opts.res === 'full' ? nativeDim
-    : Number.isFinite(opts.res) ? opts.res : prevDim;
+    : Number.isFinite(opts.res) ? opts.res : prevInputDim;
   const cap = Math.max(g.n, lr.splats || 0, lr.status !== 'finished' ? lr.cap || 0 : 0, opts.splats || 0);
   // LOD on a continuation starts a fresh halving schedule ABOVE the model's
   // current size (snapshotting below it would mislabel the levels); without
@@ -4002,6 +4009,9 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
   const bufScale = opts.buf ?? (recon.trainScale && recon.trainScale !== 1 ? recon.trainScale : undefined);
   const ses = createSession({
     maxIters: S.maxIters, holdout: -1,
+    // continuations obey the GPU-usage slider like fresh runs (st here is
+    // the parsed checkpoint, so the setting comes from S.settings)
+    gpuUsage: (S.settings.gpu ?? 100) / 100,
     ...(contRefine != null ? { refineEvery: contRefine } : {}),
     frames: { trainMaxDim, ...(bufScale != null ? { trainScale: bufScale } : {}) },
     trainer: {
@@ -4985,108 +4995,6 @@ function toggleScoreScale() {
   renderTrainingScore();
 }
 
-/** 90-degree-step alignment rotation (row-major 3x3): X first, then Y, then Z. */
-function alignMatrix(sx, sy, sz) {
-  const step = (s) => ((s % 4) + 4) % 4;
-  const rot = (axis, s) => {
-    const [c, si] = [[1, 0], [0, 1], [-1, 0], [0, -1]][step(s)];
-    if (axis === 0) return [1, 0, 0, 0, c, -si, 0, si, c];
-    if (axis === 1) return [c, 0, si, 0, 1, 0, -si, 0, c];
-    return [c, -si, 0, si, c, 0, 0, 0, 1];
-  };
-  const mul = (P, Q) => [0, 1, 2].map((i) => [0, 1, 2].map((j) =>
-    P[i * 3] * Q[j] + P[i * 3 + 1] * Q[3 + j] + P[i * 3 + 2] * Q[6 + j])).flat();
-  return mul(mul(rot(2, sz), rot(1, sy)), rot(0, sx));
-}
-
-/** Viewer-side model alignment (the Align card): rotate the DISPLAYED model
- *  about the scene centre without touching the trained data, the cameras or
- *  the exports. Implemented camera-side — the orbit pose is counter-rotated —
- *  so the one funnel covers the trainer view, the SOG-lite facade, the tour
- *  and the compare modes. Frustum overlays keep the solved cameras. */
-function applyModelAlign(pose) {
-  const a = S.align;
-  if (!a || !(a.x || a.y || a.z)) return pose;
-  const A = alignMatrix(a.x | 0, a.y | 0, a.z | 0);
-  const At = [A[0], A[3], A[6], A[1], A[4], A[7], A[2], A[5], A[8]];
-  const c = (S.scene && S.scene.center) || [0, 0, 0];
-  const R = pose.R, t = pose.t;
-  // a model point p shows at A(p-c)+c; the equivalent camera is
-  // (R·Aᵀ, t + R(c−Aᵀc))
-  const u = [0, 1, 2].map((i) =>
-    c[i] - (At[i * 3] * c[0] + At[i * 3 + 1] * c[1] + At[i * 3 + 2] * c[2]));
-  return {
-    ...pose,
-    R: [0, 1, 2].map((i) => [0, 1, 2].map((j) =>
-      R[i * 3] * At[j] + R[i * 3 + 1] * At[3 + j] + R[i * 3 + 2] * At[6 + j])).flat(),
-    t: [0, 1, 2].map((i) => t[i] + R[i * 3] * u[0] + R[i * 3 + 1] * u[1] + R[i * 3 + 2] * u[2]),
-  };
-}
-
-/** A run record's alignment lock (or null): validated 90-degree steps. */
-function storedAlign(r) {
-  const a = r && r.align;
-  return a ? { x: a.x | 0, y: a.y | 0, z: a.z | 0, locked: !!a.locked } : null;
-}
-
-/** Manual model alignment: 90-degree display rotations about the scene
- *  centre, locked to the run record (exports keep the trained orientation). */
-function alignCard() {
-  document.getElementById('aligncard')?.remove();
-  const a = storedAlign(S._localRun) || { x: 0, y: 0, z: 0, locked: false };
-  if (S.align) Object.assign(a, { x: S.align.x | 0, y: S.align.y | 0, z: S.align.z | 0, locked: !!S.align.locked });
-  const card = document.createElement('div');
-  card.className = 'upcard';
-  card.id = 'aligncard';
-  const deg = (v) => `${(((v % 4) + 4) % 4) * 90}°`;
-  card.innerHTML = `
-    <button class="card-x lt-x" id="al-x" aria-label="Close">&times;</button>
-    <b>Align model</b>
-    <span class="lt-desc">Rotate the <b>displayed</b> model in 90° steps about the scene centre.
-    Lock it to this run${S.runId ? '' : ' for this viewing'} — exports keep the trained orientation.</span>
-    <div class="upcard-row">
-      <button class="btn btn-outline" id="al-rx">X: <b>0°</b> ⟳</button>
-      <button class="btn btn-outline" id="al-ry">Y: <b>0°</b> ⟳</button>
-      <button class="btn btn-outline" id="al-rz">Z: <b>0°</b> ⟳</button>
-    </div>
-    <div class="upcard-row">
-      <button class="btn btn-outline" id="al-reset">Reset</button>
-      <button class="btn btn-outline" id="al-lock">🔓 Unlocked</button>
-      <button class="btn btn-accent" id="al-done">Done</button>
-    </div>`;
-  $('stage').appendChild(card);
-  const paint = () => {
-    for (const k of ['x', 'y', 'z']) card.querySelector(`#al-r${k} b`).textContent = deg(a[k]);
-    card.querySelector('#al-lock').textContent = a.locked ? '🔒 Locked' : '🔓 Unlocked';
-    for (const id of ['al-rx', 'al-ry', 'al-rz', 'al-reset']) card.querySelector(`#${id}`).disabled = !!a.locked;
-  };
-  const commit = () => {
-    for (const k of ['x', 'y', 'z']) a[k] = ((a[k] % 4) + 4) % 4;
-    S.align = (a.x || a.y || a.z || a.locked) ? { ...a } : null;
-    S._viewKey = '';   // re-render through the new alignment
-    paint();
-    persistAlign();
-    if (S.state === 'done') renderControls();
-  };
-  card.querySelector('#al-rx').onclick = () => { a.x++; commit(); };
-  card.querySelector('#al-ry').onclick = () => { a.y++; commit(); };
-  card.querySelector('#al-rz').onclick = () => { a.z++; commit(); };
-  card.querySelector('#al-reset').onclick = () => { a.x = a.y = a.z = 0; commit(); };
-  card.querySelector('#al-lock').onclick = () => { a.locked = !a.locked; commit(); };
-  card.querySelector('#al-done').onclick = () => card.remove();
-  card.querySelector('#al-x').onclick = () => card.remove();
-  paint();
-}
-
-/** Persist the alignment lock to the run record (viewing-only models without
- *  a run record keep it for the tab). */
-function persistAlign() {
-  const align = S.align ? { ...S.align } : null;
-  if (S._localRun && S._localRun.id === S.runId) S._localRun.align = align;
-  if (!S.runId) return;
-  import('./store.js').then(({ patchRun }) => patchRun(S.runId, { align })).catch(() => {});
-}
-
 function chartTip(h) {
   const tip = $('chart-tip');
   if (!tip) return;
@@ -5539,7 +5447,7 @@ function draw() {
   // train/done: the model, rendered by the trainer at this exact pose
   // (render capped at the session's view-buffer size, blit scales up)
   const onFrame = S.atFrame >= 0;
-  const pose = applyModelAlign(vp.viewPose());
+  const pose = vp.viewPose();
   if (gpuCanvas && S.session && S.session.trainer) {
     const now = performance.now();
     if (vp.dirty) S._camMovedAt = now;

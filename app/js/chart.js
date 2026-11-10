@@ -6,7 +6,7 @@
 export function psnrToApproxSsimPercent(psnr) {
   if (psnr === Infinity) return 100;
   if (!Number.isFinite(psnr) || psnr <= 0) return 0;
-  const ratio = 17.5 / psnr;
+  const ratio = 18 / psnr;
   return Math.max(0, Math.min(100, 100 / (1 + ratio ** 4)));
 }
 

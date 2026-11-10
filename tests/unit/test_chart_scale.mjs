@@ -8,13 +8,13 @@ const html = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf
 const appCss = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
 const baseCss = readFileSync(new URL('../../app/css/base.css', import.meta.url), 'utf8');
 
-const formula = (psnr) => 100 / (1 + (17.5 / psnr) ** 4);
+const formula = (psnr) => 100 / (1 + (18 / psnr) ** 4);
 for (const psnr of [10, 20, 30, 45]) {
   assert.ok(Math.abs(psnrToApproxSsimPercent(psnr) - formula(psnr)) < 1e-10,
     `PSNR ${psnr} should use the requested approximation`);
 }
-assert.ok(Math.abs(psnrToApproxSsimPercent(17.5) - 50) < 1e-10,
-  'PSNR 17.5 dB is the midpoint of the approximation and should read 50%');
+assert.ok(Math.abs(psnrToApproxSsimPercent(18) - 50) < 1e-10,
+  'PSNR 18 dB is the midpoint of the approximation and should read 50%');
 assert.ok(psnrToApproxSsimPercent(10) < psnrToApproxSsimPercent(20) &&
   psnrToApproxSsimPercent(20) < psnrToApproxSsimPercent(30),
   'the approximation should rise monotonically with PSNR');
@@ -34,7 +34,7 @@ assert.deepEqual(scoreChart._displaySeries(scoreChart.train), [
   [0, formula(20)], [100, formula(30)],
 ], 'the graph should apply the requested PSNR-to-SSIM approximation to each sample');
 
-assert.match(chartSource, /const ratio = 17\.5 \/ psnr/,
+assert.match(chartSource, /const ratio = 18 \/ psnr/,
   'the graph should implement the requested approximation formula');
 assert.match(chartSource, /100 \/ \(1 \+ ratio \*\* 4\)/,
   'the graph should use the fourth-power logistic form of the approximation');

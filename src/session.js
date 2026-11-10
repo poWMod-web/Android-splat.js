@@ -101,6 +101,9 @@ export function undistortFrames(frames, recon) {
  * @property {GPUDevice} [device]        host-owned WebGPU device to share
  * @property {number} [maxIters=60000]   auto-stop; trainer schedules scale to it
  * @property {number} [itersPerFrame=15] training batch per animation frame
+ * @property {number} [gpuUsage=1]  GPU-usage fraction (the slider): full
+ *   batches with duty-cycle idle between them — 0.5 trains half the wall
+ *   time; 1 (or unset) is full speed
  * @property {number} [initTarget=60000] initial Gaussian count (grows during training)
  * @property {number|'auto'|null} [holdout='auto']  frame excluded from training
  *   and scored as the novel-view metric; 'auto' picks a sharp mid-sequence frame
@@ -114,6 +117,26 @@ export function undistortFrames(frames, recon) {
  * @property {object} [trainer]          extra GSTrainer options (shDeg, ...)
  * @property {object} [frames]           FrameOptions passed to load()
  */
+
+/** Duty cycle of the GPU-usage throttle: the fraction of wall time the
+ *  training loop runs. Unset/garbage = 1 (full speed, legacy behavior);
+ *  0 or below = a crawl (one full batch per idle window, still moving). */
+export function gpuDuty(usage) {
+  if (usage == null) return 1;
+  const u = Number(usage);
+  if (!Number.isFinite(u) || u >= 1) return 1;
+  if (u <= 0) return 0.001;
+  return u;
+}
+
+/** Idle ms after a busyMs batch so busy/(busy+idle) equals the requested
+ *  GPU usage. Capped: one slow frame (refine, first batch) never parks
+ *  the loop for longer than the cap window. */
+export function gpuIdleMs(busyMs, usage) {
+  const d = gpuDuty(usage);
+  if (d >= 1) return 0;
+  return Math.min(2000, Math.max(0, busyMs) * (1 - d) / d);
+}
 
 class Emitter {
   constructor() { this.map = new Map(); }
@@ -938,12 +961,22 @@ export class Session {
         // ~120ms so the compositor (which shares the GPU) gets a slot every
         // frame or two instead of stalling behind 0.4s of dispatches
         const chunk = (this.opts.gpuChunkMs ?? 400) / 1000;
-        this._batch = Math.min(this._batch, Math.max(8, Math.round(this._ips * chunk)));
+        // _ips is wall-time (throttle idle included): divide the requested
+        // duty back out, so the usage slider only ever adds idle between
+        // batches and never shrinks the batches themselves
+        this._batch = Math.min(this._batch, Math.max(8, Math.round(this._ips * chunk / gpuDuty(this.opts.gpuUsage))));
       }
       if (this.perf) {
         this.perf.frames.push([Math.round(now), trainer.iter, batch, trainer.n,
           +tEnc.toFixed(1), +tView.toFixed(1), +tStall.toFixed(1), +tMet.toFixed(1), +dt.toFixed(1)]);
       }
+      // GPU-usage throttle (the slider): duty-cycle idle AFTER the full
+      // batch — the adapters above keep every submitted batch at saturating
+      // size, and the pause between batches is what yields the GPU to the
+      // system. Read live so the slider bites on the next batch; before the
+      // reschedule check so a pause during the sleep still stops the loop.
+      const idleMs = gpuIdleMs(dt, this.opts.gpuUsage);
+      if (idleMs > 0) await new Promise((r) => setTimeout(r, idleMs));
     } else {
       this.view._tick(this._frameCount, this.training);
       await trainer.device.queue.onSubmittedWorkDone();
