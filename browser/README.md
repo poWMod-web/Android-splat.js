@@ -1,9 +1,12 @@
 # Splat.js · browser trainer
 
-The browser-only version of the program: drop in photos, a video, or an
-exported `.zip` and train a splat model in the tab — no app install, no
-AR capture hardware, nothing uploaded anywhere. The result is a standard
-3DGS `.ply` that opens in any splat viewer.
+Part of **Android-Splat.js** — a fork of
+[arrival-space/splat.js](https://github.com/arrival-space/splat.js) (see the
+[project overview](../README.md)). This folder is the browser-only build:
+drop in photos, a video, or an exported `.zip` and train a splat model in
+the tab — no app install, no AR capture hardware, nothing uploaded
+anywhere. The result is a standard 3DGS `.ply` that opens in any splat
+viewer.
 
 It is intentionally small: five files, no build step, no dependencies
 beyond the shared engine in `../src` (imported as relative ES modules,
