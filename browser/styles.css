@@ -1,0 +1,156 @@
+/* browser/styles.css — standalone styling for the browser-only trainer. */
+
+:root {
+  --bg: #070909;
+  --card: #0e1212;
+  --line: #1e2a2a;
+  --ink: #e8efef;
+  --dim: #93a3a3;
+  --accent: #35d0a5;
+  --accent-ink: #04110c;
+  --warn: #ffb454;
+  --error: #ff7a7a;
+  --radius: 14px;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 1.4rem 1.2rem 0.4rem;
+}
+.top h1 { margin: 0; font-size: 1.35rem; letter-spacing: 0.01em; }
+.top h1 .dim { color: var(--dim); font-weight: 400; }
+.top .sub { margin: 0.3rem 0 0; color: var(--dim); max-width: 60ch; }
+.top .back { color: var(--accent); text-decoration: none; white-space: nowrap; }
+.top .back:hover { text-decoration: underline; }
+
+.mono { font-family: ui-monospace, monospace; font-size: 0.92em; }
+.warn {
+  max-width: 880px;
+  margin: 0.8rem auto 0;
+  padding: 0.7rem 1rem;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: #221806;
+  color: var(--warn);
+}
+
+main {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 0.8rem 1.2rem 2rem;
+  display: grid;
+  gap: 1rem;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem 1.2rem;
+}
+.card h2 { margin: 0 0 0.7rem; font-size: 1rem; color: var(--dim); font-weight: 600; }
+
+.drop {
+  display: block;
+  border: 1.5px dashed #33504a;
+  border-radius: var(--radius);
+  padding: 1.4rem 1rem;
+  text-align: center;
+  cursor: pointer;
+}
+.drop input { display: none; }
+.drop b { display: block; font-size: 1.05rem; }
+.drop span { display: block; margin-top: 0.35rem; color: var(--dim); font-size: 0.9rem; }
+.drop.over { border-color: var(--accent); background: #0a1a15; }
+
+.opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem 1.4rem;
+  margin-top: 1rem;
+}
+.opts label { display: grid; gap: 0.25rem; color: var(--dim); font-size: 0.85rem; }
+select, .btn {
+  font: inherit;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #131a1a;
+  color: var(--ink);
+  padding: 0.5rem 0.7rem;
+}
+select:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.summary { color: var(--dim); min-height: 1.4em; }
+.stage { margin: 0.2rem 0 0.5rem; }
+.meter {
+  height: 10px;
+  border-radius: 6px;
+  background: #131a1a;
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.meter i { display: block; height: 100%; width: 0%; background: var(--accent); transition: width 0.25s; }
+.metrics { color: var(--dim); min-height: 1.4em; }
+
+.row { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.6rem; }
+.btn { cursor: pointer; }
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn.accent { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 650; }
+.btn.accent:hover:not(:disabled) { filter: brightness(1.08); }
+
+.status { min-height: 1.4em; color: var(--dim); }
+.status.error { color: var(--error); }
+
+#view {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 10px;
+  background: #000;
+  cursor: grab;
+  touch-action: none;
+}
+#view:active { cursor: grabbing; }
+.hint { color: var(--dim); font-size: 0.9rem; margin-bottom: 0; }
+.linkish {
+  background: none; border: none; padding: 0;
+  color: var(--accent); cursor: pointer; font: inherit;
+}
+.linkish:hover { text-decoration: underline; }
+
+.log summary { cursor: pointer; color: var(--dim); font-weight: 600; }
+.log pre {
+  margin: 0.7rem 0 0;
+  max-height: 300px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 12px/1.5 ui-monospace, monospace;
+  color: var(--dim);
+}
+
+footer {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 0 1.2rem 2rem;
+  color: var(--dim);
+  font-size: 0.85rem;
+}
+
+@media (max-width: 560px) {
+  .top { padding-top: 1rem; }
+  .card { padding: 0.9rem 0.8rem 1rem; }
+}

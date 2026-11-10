@@ -40,6 +40,62 @@ export function trainRecipe(ses) {
   return t;
 }
 
+/** Capture-world gravity in the DATA frame, from a capture.json leveling
+ *  report (row-major rotation R): leveling rotates the world by R, so the
+ *  capture world's +Y — gravity, ARCore sessions are gravity-aligned — sits
+ *  at R·Y in the data frame. Null unless the report applied a rotation. */
+export function levelingUpFromReport(leveling) {
+  const r = leveling && leveling.applied === true && leveling.rotation;
+  if (!Array.isArray(r) || r.length !== 9 || !r.every(Number.isFinite)) return null;
+  const g = [r[1], r[4], r[7]];   // R·[0,1,0] is the rotation's middle column
+  const m = Math.hypot(g[0], g[1], g[2]);
+  return m > 1e-6 ? [g[0] / m, g[1] / m, g[2] / m] : null;
+}
+
+const validUp = (v) => Array.isArray(v) && v.length === 3 && v.every(Number.isFinite) &&
+  Math.hypot(v[0], v[1], v[2]) > 1e-6;
+
+/** The orbit's up axis for a known-camera run: capture-world gravity in the
+ *  data frame. The cameras' own up axes CANNOT serve — phone captures are
+ *  portrait-held, so sensor-up lies sideways to gravity and averaging it
+ *  levels the horizon 90° off. Solver runs keep detectUp (their frame is
+ *  arbitrary), so this helper is only called for known-camera runs. */
+export function gravityUpForKnownRun({ persisted = null, leveling = null } = {}) {
+  if (validUp(persisted)) {
+    const m = Math.hypot(persisted[0], persisted[1], persisted[2]);
+    return [persisted[0] / m, persisted[1] / m, persisted[2] / m];
+  }
+  return levelingUpFromReport(leveling) || [0, 1, 0];
+}
+
+/** A continuation's default input scale: the stored size is the COMBINED
+ *  size (input × buffer), so the buffer is divided back out before the value
+ *  passes through adaptiveTrainCap's multiplier again — else the buffer
+ *  applies twice and the continuation trains at (e.g.) 1/16 instead of the
+ *  run's 1/4. Unrecorded buffers (old records) replay at scale 1. */
+export function continuedInputDim(prevDim, prevBuf) {
+  if (!prevDim || !prevBuf || prevBuf === 1) return prevDim;
+  return Math.round(prevDim / prevBuf);
+}
+
+/** A continuation's replayed working buffer: the recon's own trainScale
+ *  (exact, current records); else the run record's saved settings when its
+ *  resolution × buffer triple reproduces the stored size (older records —
+ *  the check rejects settings that drifted after the run started); else the
+ *  saved buffer alone (Auto resolutions have no triple to check); else 1. */
+export function continuedBuf(trainScale, settings, prevDim) {
+  if (Number.isFinite(trainScale) && trainScale > 0) return trainScale;
+  const buf = settings ? +settings.buf : NaN;
+  if (!Number.isFinite(buf) || buf <= 0) return 1;
+  const res = settings ? +settings.res : NaN;
+  if (Number.isFinite(res) && res > 0 && Number.isFinite(prevDim) && prevDim > 0) {
+    // a saved step at or above the set's size commits as Full (-1), so a
+    // positive res always ran unclamped: res × buf is the stored size
+    if (Math.abs(res * buf - prevDim) > Math.max(2, prevDim * 0.02)) return 1;
+  }
+  return buf;
+}
+
 export function buildReconJson(S) {
   const ses = S.session;
   const recon = ses.recon;
@@ -69,6 +125,17 @@ export function buildReconJson(S) {
     app: 'splat.js',
     name: S.preset && S.preset.name || 'splat',
     recipe: trainRecipe(ses),
+    // known-camera (ARCore/WebXR import) runs keep the capture world's y-up
+    // frame; solver runs keep the SfM frame. Viewers use this to orient the
+    // model instead of guessing from the coordinates.
+    knownCameras: !!recon.known,
+    trainScale: ses.opts?.frames?.trainScale ?? 1,
+    // gravity in the data frame (see gravityUpForKnownRun): the orbit's up
+    // axis when this run is viewed back. Solver runs omit it (detectUp).
+    ...(recon.known ? { levelingUp: r6(gravityUpForKnownRun({
+      persisted: S._localRun?.recon?.levelingUp,
+      leveling: S.preset?.capture?.metadata?.leveling,
+    })) } : {}),
     iter: ses.trainer.iter,
     splats: ses.trainer.n,
     shK: ses.trainer.shK,
@@ -81,7 +148,10 @@ export function buildReconJson(S) {
       ...(c.fy != null && c.fy !== c.f ? { fy: +c.fy.toPrecision(7) } : {}),
       cx: c.cx, cy: c.cy,
     })),
-    frames: ses.frames.map((f) => ({ name: f.name, fw: f.fw, fh: f.fh, tw: f.tw, th: f.th })),
+    frames: ses.frames.map((f) => ({ name: f.name, fw: f.fw, fh: f.fh, tw: f.tw, th: f.th,
+      // the file's own pixel size (decodeFrames srcW/srcH): Full-size
+      // continuations need true native, not the feature-capped fw/fh
+      ...(Number.isFinite(f.srcW) ? { nw: f.srcW, nh: f.srcH } : {}) })),
     source: {
       preset: S.preset && !String(S.preset.id).startsWith('__') ? S.preset.id : null,
       names: (S.loadedFiles || []).map((f) => f.name),
@@ -109,6 +179,35 @@ const decimate = (arr, max) => {
   for (let i = 0; i < arr.length; i += step) out.push(arr[Math.floor(i)]);
   return out;
 };
+
+const SHK_OF_DEGREE = { 0: 0, 1: 3, 2: 8, 3: 15 };
+
+/** Resample decoded gaussians' spherical harmonics to another degree (0-3):
+ *  lowering keeps the low bands, raising zero-pads them. The SH buffer is
+ *  channel-major per splat ([R_0..R_{K-1}, G_0.., B_0..], coefficients in
+ *  increasing band order — the shaders read sh[sb + ch*K + k]), so a lower
+ *  degree is a per-channel prefix. Mutates and returns g. Used when
+ *  continuing a run at a different SH degree than it trained with. */
+export function convertSHDegree(g, degree) {
+  const newK = SHK_OF_DEGREE[degree];
+  if (newK == null) throw new Error(`SH degree must be 0-3, got ${degree}`);
+  const oldK = g.shK ?? (g.sh ? null : 0);
+  if (oldK == null || ![0, 3, 8, 15].includes(oldK)) {
+    throw new Error(`cannot resample SH from unknown band count ${g.shK}`);
+  }
+  if (oldK === newK) return g;
+  const n = g.n, keep = Math.min(oldK, newK);
+  const out = new Float32Array(n * newK * 3);
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < 3; c++) {
+      const src = (i * 3 + c) * oldK, dst = (i * 3 + c) * newK;
+      for (let k = 0; k < keep; k++) out[dst + k] = g.sh[src + k];
+    }
+  }
+  g.sh = newK ? out : null;
+  g.shK = newK;
+  return g;
+}
 
 /** The trainer's exact float state as one binary blob. */
 export async function packState(ses) {

@@ -25,7 +25,7 @@
 //   trainer.stepOnce();
 //   const bytes   = toPly(await trainer.readGaussians());
 
-export { createSession, Session, undistortFrames, camPosition } from './session.js';
+export { createSession, Session, undistortFrames, camPosition, gpuDuty, gpuIdleMs, gpuBurstMs } from './session.js';
 export { createGpu } from './gpu/context.js';
 export { decodeFrames, processSource, adaptiveTrainCap, FEAT_MAX_DIM, TRAIN_MAX_DIM } from './io/frames.js';
 export { extractSharpFrames, isVideoFile, planSelection, suggestSpan } from './io/video.js';

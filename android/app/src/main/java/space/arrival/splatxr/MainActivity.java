@@ -1,7 +1,12 @@
 package space.arrival.splatxr;
 
 import android.app.Activity;
+import android.Manifest;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.util.Base64;
 import android.net.Uri;
 import android.os.Build;
@@ -15,6 +20,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 
+import androidx.core.content.ContextCompat;
 import androidx.webkit.WebViewAssetLoader;
 
 import org.json.JSONArray;
@@ -28,12 +34,25 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_CAPTURE = 41;
     private static final int REQUEST_FILE_PICKER = 42;
     private static final int REQUEST_SAVE_FILE = 43;
+    private static final int REQUEST_NOTIFY_PERMISSION = 44;
+    /** The training notification's Pause/Resume button: the service fires it,
+     *  the activity turns it into a WebView toggle call. */
+    public static final String ACTION_TOGGLE_TRAINING = "space.arrival.splatxr.TOGGLE_TRAINING";
     private ValueCallback<Uri[]> fileChooserCallback;
     private WebView webView;
     private WebViewAssetLoader assetLoader;
     private final Object fileSaveLock = new Object();
     private OutputStream fileSaveStream;
     private boolean fileSavePickerPending;
+    private final BroadcastReceiver toggleTrainingReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context ctx, Intent intent) {
+            if (webView == null) return;
+            webView.post(() -> {
+                try { webView.evaluateJavascript("window.__splatxrNotifToggle&&window.__splatxrNotifToggle()", null); }
+                catch (Exception ignored) { /* the shade toggle must never crash the app */ }
+            });
+        }
+    };
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -85,6 +104,16 @@ public final class MainActivity extends Activity {
         applySafeAreaInsets(host);
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
         webView.loadUrl("https://appassets.androidplatform.net/assets/app/index.html");
+
+        // the notification's Pause/Resume button (a dynamic receiver: nothing
+        // to declare, nothing exported). ContextCompat carries the
+        // NOT_EXPORTED flag back to minSdk — a bare registerReceiver fails
+        // Android 14+ lint (UnspecifiedRegisterReceiverFlag) on every path.
+        try {
+            IntentFilter toggleFilter = new IntentFilter(ACTION_TOGGLE_TRAINING);
+            ContextCompat.registerReceiver(this, toggleTrainingReceiver, toggleFilter,
+                    ContextCompat.RECEIVER_NOT_EXPORTED);
+        } catch (Exception ignored) { /* shade control is best-effort */ }
     }
 
     private void applySafeAreaInsets(FrameLayout content) {
@@ -231,7 +260,45 @@ public final class MainActivity extends Activity {
         view.post(() -> view.evaluateJavascript(script, null));
     }
 
+    private void sendTrainingCommand(String action, String title, String text, int done, int total) {
+        try {
+            Intent intent = new Intent(this, TrainingService.class)
+                    .putExtra("action", action)
+                    .putExtra("title", title == null ? "" : title)
+                    .putExtra("text", text == null ? "" : text)
+                    .putExtra("done", done)
+                    .putExtra("total", total);
+            // Only "start" raises a foreground service. Updates, the finish
+            // summary and cancels go to the already-foreground service with
+            // a plain start — if it died mid-training they no-op instead of
+            // hanging a foreground start the service never answers (which
+            // the platform kills the app for).
+            if ("start".equals(action) && Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
+            else startService(intent);
+        } catch (Exception ignored) { /* best-effort progress display */ }
+    }
+
+    /** Flip the notification's Pause/Resume button (the service stays up so
+     *  the other button is always one tap away in the shade). */
+    private void sendTrainingPaused(boolean paused) {
+        try {
+            Intent intent = new Intent(this, TrainingService.class)
+                    .putExtra("action", "paused")
+                    .putExtra("paused", paused);
+            // the service is already foreground (start raised it): a plain
+            // start, like updates — never a second foreground start
+            startService(intent);
+        } catch (Exception ignored) { /* shade control is best-effort */ }
+    }
+
+    private void stopTrainingService() {
+        try { stopService(new Intent(this, TrainingService.class)); }
+        catch (Exception ignored) { /* the service was never started */ }
+    }
+
     @Override protected void onDestroy() {
+        try { unregisterReceiver(toggleTrainingReceiver); } catch (Exception ignored) { /* never registered */ }
+        stopTrainingService();
         cancelFileSave();
         if (fileChooserCallback != null) {
             fileChooserCallback.onReceiveValue(null);
@@ -269,6 +336,32 @@ public final class MainActivity extends Activity {
 
         @JavascriptInterface public void cancelFileSave() {
             MainActivity.this.cancelFileSave();
+        }
+
+        @JavascriptInterface public void startTrainingNotification(String title, String text) {
+            runOnUiThread(() -> {
+                if (Build.VERSION.SDK_INT >= 33 &&
+                        checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFY_PERMISSION);
+                }
+                sendTrainingCommand("start", title, text, 0, 0);
+            });
+        }
+
+        @JavascriptInterface public void updateTrainingNotification(String title, String text, int done, int total) {
+            sendTrainingCommand("update", title, text, done, total);
+        }
+
+        @JavascriptInterface public void finishTrainingNotification(String title, String text) {
+            sendTrainingCommand("finish", title, text, 0, 0);
+        }
+
+        @JavascriptInterface public void cancelTrainingNotification() {
+            sendTrainingCommand("cancel", null, null, 0, 0);
+        }
+
+        @JavascriptInterface public void setTrainingPaused(boolean paused) {
+            sendTrainingPaused(paused);
         }
 
         @JavascriptInterface public String exportDataset() {

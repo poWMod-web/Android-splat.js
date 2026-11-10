@@ -6,8 +6,8 @@
 export function psnrToApproxSsimPercent(psnr) {
   if (psnr === Infinity) return 100;
   if (!Number.isFinite(psnr) || psnr <= 0) return 0;
-  const penalty = (320 / psnr) ** 1.5;
-  return Math.max(0, Math.min(100, (psnr / (psnr + penalty)) * 100));
+  const ratio = 18 / psnr;
+  return Math.max(0, Math.min(100, 100 / (1 + ratio ** 4)));
 }
 
 export class Chart {
@@ -69,6 +69,15 @@ export class Chart {
     this.cv.width = Math.max(1, rect.width * dpr);
     this.cv.height = Math.max(1, rect.height * dpr);
     this.dpr = dpr;
+    // any layout shift (window resize, panel toggle, chart expand) leaves
+    // the pointer over a different fraction — drop the stale hover so the
+    // readout cannot re-fire detached from the cursor on the next redraw
+    this.clearHover();
+  }
+
+  clearHover() {
+    this.hover = null;
+    this.onHover?.(null);
     this.draw();
   }
 
@@ -183,6 +192,11 @@ export class Chart {
         ctx.beginPath(); ctx.moveTo(x, t); ctx.lineTo(x, t + ph); ctx.stroke();
         this.onHover?.({
           xPct: (x / W) * 100,
+          // where the pointer sits, so the readout can ride the cursor
+          // inside the plot instead of hanging off its top edge (the
+          // expanded graph fills the stage — anything above it is clipped
+          // behind the dock and unreadable)
+          yPct: this.hover.y * 100,
           iter: Math.round(a[0]),
           train: this._displayValue(a[1]), hold: h ? this._displayValue(h[1]) : null,
           unit: this.scale === 'similarity' ? '%' : 'dB', event: ev ? ev.label : null,

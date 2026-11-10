@@ -17,11 +17,11 @@ import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } f
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './training-settings.js';
 import { zipStore } from './zip.js';
 import { saveBlob } from './download.js';
-import { buildSessionZip, fetchModel } from './session_io.js';
+import { buildSessionZip, fetchModel, gravityUpForKnownRun, continuedInputDim, continuedBuf } from './session_io.js';
 import { buildDisplayCloud } from './scene-cloud.js';
 import { REPO, DISCORD, DATA, ownSet } from './data.js';
 
-import { Viewport, camCentre, quatFromR, quatToR, qslerp } from './viewport.js';
+import { Viewport, camCentre, quatFromR, quatToR, qslerp, rollAngleToUp, snapRollAngle, rerollPose, exifIntrinsics } from './viewport.js';
 import { Developer, fitRect } from './develop.js';
 import { Chart, psnrToApproxSsimPercent } from './chart.js';
 import { bmp, readyBmp, sizedUrl } from './img.js';
@@ -166,8 +166,8 @@ function deviceDefaults() {
     // on the lean solve, desktops take the middle tier; the precise tier is
     // the High/Showcase macro's (a ten-minute solve behind a two-minute
     // draft training was the complaint, 2026-09-09)
-    ? { v: 2, res: 480, feat: 0, buf: 1, sh: 0, iters: 10000, splats: 0, lod: false, mcmc: false, solve: 'quick', av: { ...AV_DEFAULTS } }
-    : { v: 2, res: 0, feat: 0, buf: 1, sh: 3, iters: 0, splats: 0, lod: false, mcmc: false, solve: 'standard', av: { ...AV_DEFAULTS } };
+    ? { v: 2, res: 480, feat: 0, buf: 1, sh: 0, iters: 10000, splats: 0, lod: false, mcmc: false, solve: 'quick', gpu: 100, av: { ...AV_DEFAULTS } }
+    : { v: 2, res: 0, feat: 0, buf: 1, sh: 3, iters: 0, splats: 0, lod: false, mcmc: false, solve: 'standard', gpu: 100, av: { ...AV_DEFAULTS } };
 }
 function loadSettings() {
   const d = deviceDefaults();
@@ -181,6 +181,10 @@ function loadSettings() {
     // saved sh 2 predates the degree-3 default: those sessions were silently
     // training degree 3 (the old `!== 2` guard), so 3 preserves real behavior
     if (m.sh === 2) m.sh = 3;
+    // gpu: a corrupt save must neither park the throttle nor slam it —
+    // non-numbers fall back to default, anything else clamps to the slider
+    if (!Number.isFinite(+m.gpu)) m.gpu = d.gpu;
+    m.gpu = Math.min(100, Math.max(10, Math.round(m.gpu)));
     // phones: iters 0 (the old 20k default) was never an explicit choice —
     // migrate to the 10k draft default so first runs stay ~5 minutes
     if (d.iters === 10000 && m.iters === 0) m.iters = 10000;
@@ -321,22 +325,10 @@ boot();
 function boot() {
   vp = new Viewport($('cv'));
   vp.onLeave = leaveFrame;
-  // The GPU belongs to the view while the user is orbiting: stop submitting
-  // training batches (the ~4 queued ones drain in about a second), so the
-  // camera answers the finger instead of waiting behind the training queue.
-  // Resumes on release; a user-pressed pause is left alone.
-  vp.onDragStart = () => {
-    stopTour();
-    if (S.state === 'train' && S.session && S.session.training) {
-      S._dragPaused = true;
-      S.session.pause();
-    }
-  };
-  vp.onDragEnd = () => {
-    if (!S._dragPaused) return;
-    S._dragPaused = false;
-    if (S.session && S.state === 'train') S.session.start();
-  };
+  // Touch-hold pausing lives on the stage (wireStage), not here: the
+  // viewport's drag hooks miss frame-locked compare touches, and pausing
+  // belongs to every finger on the visualization, not just orbit drags.
+  vp.onDragStart = () => { stopTour(); };
   dev = new Developer();
 
   $('btn-go').addEventListener('click', async () => {
@@ -488,6 +480,9 @@ function boot() {
       ? `0 = Auto (${maxLODLevels(st.splats)} snapshots). Choose 1–${maxLODLevels(st.splats)} earlier saved snapshots; final full detail is always included.`
       : 'Enable LOD with a splat budget of at least 1,000,000. 0 = Auto.';
     $('set-mcmc').value = st.mcmc === '0' ? '0' : '';
+    $('set-gpu').value = String(st.gpu ?? 100);
+    $('set-gpu-v').textContent = `${$('set-gpu').value}%`;
+    if ($('t-gpu')) { $('t-gpu').value = String(st.gpu ?? 100); $('t-gpu-v').textContent = `${$('t-gpu').value}%`; }
   };
   showSettings();
   // the quality knob exists twice — full row in the gear panel, quick
@@ -521,6 +516,10 @@ function boot() {
     }
     $('settings').hidden = !open;
     $('btn-settings').setAttribute('aria-expanded', String(open));
+    // the panel reflows the page under a stationary cursor — drop any stale
+    // chart hover so the readout cannot re-fire detached on the next redraw
+    chart?.clearHover();
+    dchart?.clearHover();
   });
   const readSettings = () => {
     const cyclesInput = $('set-iters'), lodInput = $('set-lod-count');
@@ -547,6 +546,7 @@ function boot() {
     st.lod = lodEnabled;
     st.lodLevels = lodCount;
     st.mcmc = $('set-mcmc').value;  // '' Auto | '1' on | '0' off
+    st.gpu = Math.min(100, Math.max(10, parseInt($('set-gpu').value, 10) || 100));
     showSettings();
     saveSettings();
     return true;
@@ -554,7 +554,7 @@ function boot() {
   S.commitSettings = readSettings;
   // every select in the panel persists on change — the avatar rows (and Horizontal SH) were
   // missing from this list, so their toggles changed the dropdown and nothing else (2026-09-17)
-  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-shup', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
+  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-shup', 'set-gpu', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
     const el = $(id); if (el) el.addEventListener('change', readSettings);
   }
   // the avatar route: the box on the start card. It is a property of THIS run,
@@ -583,6 +583,15 @@ function boot() {
     if (!p || p.files) return;
     $('set-count').value = p.maxCount || p.count;
     $('set-count').dispatchEvent(new Event('change'));
+  });
+  // gpu slider: live label while dragging, and a running training follows
+  // at once — the frame loop reads opts.gpuUsage every batch, so no
+  // restart; the change commit persists it like every other row
+  $('set-gpu').addEventListener('input', () => {
+    $('set-gpu-v').textContent = `${$('set-gpu').value}%`;
+    if (S.session) S.session.opts.gpuUsage = parseInt($('set-gpu').value, 10) / 100;
+    const tGpu = $('t-gpu');   // the training-dock slider mirrors live
+    if (tGpu) { tGpu.value = $('set-gpu').value; $('t-gpu-v').textContent = `${tGpu.value}%`; }
   });
 
   addEventListener('resize', () => { vp.resize(); chart?.resize(); dchart?.resize(); dvp?.resize(); });
@@ -1363,7 +1372,9 @@ function videoReview(card, ctx) {
     const { frames, duration, thumbs, cap } = ctx;
     const full = { start: frames[0].t, end: frames[frames.length - 1].t };
     let range = ctx.suggested ? { ...ctx.suggested } : { ...full };
-    let plan = ctx.plan(ctx.suggested ? range : null);
+    let gapSec = null;   // preferred average spacing (null = natural density)
+    const gap = () => (gapSec == null ? {} : { targetGapSec: gapSec });
+    let plan = ctx.plan(ctx.suggested ? range : null, gap());
     S.videoReview = ctx;   // console / e2e access
     const fmt = (t) => `${t.toFixed(1)} s`;
     card.innerHTML = `
@@ -1372,6 +1383,7 @@ function videoReview(card, ctx) {
       <div class="vid-legend"><span><i class="focus"></i>sharpness</span><span><i class="pick"></i>picked frame</span><span><i class="blur"></i>blur dip</span><span><i class="cut"></i>cut</span><span><i class="range"></i>range used</span></div>
       <canvas class="vid-tl" id="vid-tl"></canvas>
       <canvas class="vid-strip" id="vid-strip"></canvas>
+      <div class="vid-gap"><label for="vid-gap-sel">Average spacing</label><select id="vid-gap-sel"><option value="">Auto</option><option value="0.5">0.5 s</option><option value="1">1 s</option><option value="2">2 s</option><option value="5">5 s</option><option value="10">10 s</option></select></div>
       <div class="vid-read"><b id="vid-n"></b><span id="vid-span"></span><button class="linkish" id="vid-reset" hidden>whole video</button></div>
       <div class="upcard-row"><p class="fine" id="vid-hint"></p><span style="display:flex;gap:8px"><button class="btn btn-outline" id="vid-cancel">Cancel</button><button class="btn btn-accent" id="vid-use">Use these frames</button></span></div>`;
     const tl = $('vid-tl'), strip = $('vid-strip');
@@ -1516,7 +1528,7 @@ function videoReview(card, ctx) {
       let b = Math.min(full.end, Math.max(r.end, a + minLen));
       if (b - a < minLen) { a = Math.max(full.start, b - minLen); }
       range = { start: a, end: b };
-      plan = ctx.plan(whole() ? null : range);
+      plan = ctx.plan(whole() ? null : range, gap());
       S.videoPlan = plan;
       redraw();
     }
@@ -1568,6 +1580,13 @@ function videoReview(card, ctx) {
     tl.addEventListener('pointerup', onUp);
     tl.addEventListener('pointercancel', onUp);
     $('vid-reset').onclick = () => setRange({ ...full });
+    $('vid-gap-sel').onchange = () => {
+      const v = $('vid-gap-sel').value;
+      gapSec = v === '' ? null : +v;
+      plan = ctx.plan(whole() ? null : range, gap());
+      S.videoPlan = plan;
+      redraw();
+    };
     $('vid-cancel').onclick = $('vid-x').onclick = () => { cleanup(); resolve(null); };
     const onKey = (e) => { if (e.key === 'Escape') { cleanup(); resolve(null); } };
     window.addEventListener('keydown', onKey);
@@ -1923,6 +1942,9 @@ async function startPrep() {
     const session = createSession({
       maxIters: S.maxIters, evalHoldEvery: 2500,
       holdout: -1,
+      // the GPU-usage slider as a duty cycle: full batches with idle
+      // between them (read live, so dragging mid-run needs no restart)
+      gpuUsage: (st.gpu ?? 100) / 100,
       ...(engine === 'v2' ? { refineEvery: 200 } : (mcmcActive ? { refineEvery: 500 } : {})),
       evalSplit: EVAL.on ? EVAL.split : 0,
       initTarget: lodOn ? S.lodPlan.levels[0] : (st.splats ? Math.round(st.splats / 4) : (phoneClass ? 60000 : undefined)),
@@ -2183,6 +2205,7 @@ function loadFailed(what, why) {
  *  hardware trouble (seen in the wild: DXGI_ERROR_DEVICE_REMOVED at
  *  requestDevice, surfaced under capture tips). */
 function solveFailed(why) {
+  androidNotifStop(false);
   document.getElementById('failcard')?.remove();
   const c = document.createElement('div');
   c.className = 'upcard failcard';
@@ -2361,7 +2384,17 @@ function buildSceneFromSession() {
     radius: (ses.model && ses.model.radius) || 1,
   };
   vp.setScene(S.scene);
-  vp.detectUp(cams);
+  if (recon && recon.known) {
+    // known-camera runs keep the capture world's y-up frame — level to its
+    // gravity, not to the cameras' sensor-up (portrait-held phones point it
+    // sideways, which used to roll the view 90°)
+    vp.setUp(gravityUpForKnownRun({
+      persisted: S._localRun && S._localRun.recon && S._localRun.recon.levelingUp,
+      leveling: S.preset && S.preset.capture && S.preset.capture.metadata && S.preset.capture.metadata.leveling,
+    }));
+  } else {
+    vp.detectUp(cams);
+  }
   paintStrip();
 }
 
@@ -2388,15 +2421,20 @@ function startTraining() {
   }
   // local library: every run is listed from the moment it starts — a small
   // record now, the finished result later (see finish())
-  // a checkpoint resume keeps its run identity — same tile, same slot; only
-  // fresh runs (and continuations of FINISHED runs) get a new record
+  // a continuation keeps its run identity — same tile, same slot — whether
+  // it resumes a pause or refines a finished result; only fresh runs get a
+  // new record, so a continued result replaces the previous trained state
   const resumeId = S._resumeRunId;
   S._resumeRunId = null;
   S.runId = resumeId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+  androidNotifStart();   // background-safe from the first cycle
   S._ckptIter = 0;
   (async () => {
     if (resumeId) {
-      // the record already exists (thumb, checkpoint, name) — just mark it live
+      // the record already exists (thumb, checkpoint, name, and for a
+      // finished run its last result) — just mark it live; the run's own
+      // checkpoints and its final result overwrite the trained state in
+      // place while the record's original camera poses stay untouched
       const { patchRun } = await import('./store.js');
       await patchRun(resumeId, {
         status: 'training', maxIters: S.maxIters,
@@ -2480,7 +2518,14 @@ function toggleTrain() {
   }
   const f = $('t-finish');
   if (f) f.hidden = on;   // paused = the moment "stop here" makes sense
-  if (!on) checkpointRun('pause').catch(() => {});
+  // a user-pressed pause takes ownership from any touch-hold: the release
+  // must not resume over it
+  if (!on) { S._dragPaused = false; checkpointRun('pause').catch(() => {}); }
+  // Shade control: where the bridge can flip the notification's button the
+  // service stays up across the pause (Resume in the shade); old bridges
+  // shed it and restart it instead.
+  if (on) { if (!notifSetPaused(false)) androidNotifStart(); }
+  else if (!notifSetPaused(true)) androidNotifStop(false);
 }
 
 // Local-run diagnostics are a compact companion to the saved model. The
@@ -2682,6 +2727,7 @@ function onMetrics(m) {
   S.iter = m.iter;
   S.splats = m.splats;
   S.itersPerSec = m.itersPerSec;
+  androidNotifTick();
   // LOD training: hold the model at each detail level for a polish window,
   // snapshot it, then raise the growth limit and move on
   const LP = S.lodPlan;
@@ -2940,7 +2986,8 @@ function adoptSession(ses, stage = '', res = null) {
     // a person is not a scene: eye level rather than looking down from above,
     // and a little further back so the head clears the card at the top
     vp.dist = res.bounds.radius * 3.2;
-    vp.setOrbitAngles(vp.yaw, -0.12);
+    vp.pitch = -0.12;
+    vp.dirty = true;
   }
   renderControls();
   console.log(`[avatar] the viewer now shows the ${stage || 'new'} model — ${ses.trainer.n.toLocaleString()} splats`);
@@ -3038,6 +3085,7 @@ async function runAvatarStages() {
 }
 
 async function finish() {
+  androidNotifStop(true);   // the shade keeps the final score
   S.iter = S.session.trainer.iter;   // honest count — the run may end early
   S.minutes = Math.max(1, Math.round((performance.now() - S.trainT0) / 60000));
   enterDone();
@@ -3148,11 +3196,12 @@ async function restoreSession(src) {
         }
         await hydrateLocalRunPhotos(reconJson, S._localRun);
         const { createSogView } = await import('./pcview.js');
-        const ses = await createSogView(src.url, { radius: reconJson.sceneRadius || 10 });
+        const ses = await createSogView(src.url, { radius: reconJson.sceneRadius || 10, yUp: !!reconJson.knownCameras });
         ses.frames = (reconJson.frames || []).map((f) => ({ ...f }));
         // the Details sheet reads session.recon (cams/points) — same shape
         // the old view-only path built via useReconstruction()
         ses.recon = {
+          known: !!reconJson.knownCameras,
           cams: (reconJson.cams || []).map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
           // the Details header counts these; the recon carries a decimated
           // cloud, so at least report its size instead of a flat zero
@@ -3175,6 +3224,7 @@ async function restoreSession(src) {
     const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter) });
     if (reconJson) {
       ses.useReconstruction({
+        known: !!reconJson.knownCameras,
         cams: reconJson.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
         points: [],
         k1: reconJson.k1 || 0, k2: reconJson.k2 || 0,
@@ -3330,7 +3380,10 @@ function finishRestore(ses, reconJson, nSplats, hasState, gaussians) {
       center, radius,
     };
     vp.setScene(S.scene);
-    if (cams.length) vp.detectUp(cams);
+    // known-camera restores level to the capture world's gravity (persisted
+    // per run); solver restores measure up from the cameras as before
+    if (reconJson && reconJson.knownCameras) vp.setUp(gravityUpForKnownRun({ persisted: reconJson.levelingUp }));
+    else if (cams.length) vp.detectUp(cams);
     mountModelCanvas();
     S.atFrame = -1; S.fadeTo = 0;
     vp.lock = null; vp.freeF = null;
@@ -3483,6 +3536,11 @@ function seg(items, active, onPick) {
     const b = document.createElement('button');
     b.textContent = label;
     b.setAttribute('aria-pressed', String(val === active));
+    // pointerdown, not click: the mode switches the instant the finger lands.
+    // click stays for keyboard activation (Enter/Space fire click, never
+    // pointerdown) — the follow-up click after a real press re-picks the same
+    // value, which onPick implementations must treat as a no-op.
+    b.addEventListener('pointerdown', () => onPick(val));
     b.addEventListener('click', () => onPick(val));
     d.appendChild(b);
   });
@@ -3501,6 +3559,7 @@ function renderControls() {
   if (S.atFrame >= 0) {
     c.appendChild(seg([['swipe', 'Swipe'], ['loupe', 'Loupe'], ['error', 'Error']],
       S.compare, (v) => {
+        if (S.compare === v) return;   // swallow the click that follows pointerdown
         S.compare = v;
         $('stage').dataset.cursor = cursorFor(v);
         renderControls();
@@ -3666,10 +3725,113 @@ function trainLocalChoice() {
   $('stage').appendChild(card);
   $('lt-x').addEventListener('click', () => card.remove());
   $('lt-new').addEventListener('click', () => { card.remove(); trainNew().catch((e) => { console.error(e); }); });
-  $('lt-cont').addEventListener('click', () => { card.remove(); continueLocalRun().catch((e) => {
-    console.error(e);
-    flash(`Could not continue this run: ${e.message}`, 8000);
-  }); });
+  $('lt-cont').addEventListener('click', () => {
+    card.remove();
+    // a finished run is a new training decision — reselect its resolution,
+    // budget and extra cycles first; a paused run simply resumes
+    if (r && r.status === 'finished') { continueConfigCard(r); return; }
+    continueLocalRun().catch((e) => {
+      console.error(e);
+      flash(`Could not continue this run: ${e.message}`, 8000);
+    });
+  });
+}
+
+/** Reselect the training configuration before refining a finished run —
+ *  the same knobs a new training offers where they apply to a rebuild:
+ *  training resolution, splat budget, and how many more cycles to train.
+ *  The solved cameras are reused, never re-solved. Paused runs skip this
+ *  card and resume their original configuration directly. */
+function continueConfigCard(r) {
+  document.getElementById('ltconfig')?.remove();
+  const recon = r.recon || {};
+  const fr0 = (recon.frames && recon.frames[0]) || {};
+  const prevDim = Math.max(fr0.tw || 0, fr0.th || 0) || 0;
+  const nativeDim = Math.max(fr0.nw || fr0.fw || 0, fr0.nh || fr0.fh || 0) || 0;
+  const prevSplats = r.splats || 0;
+  const baseIter = r.iter || recon.iter || 0;
+  const defaultExtra = Math.max(10000, Math.round((r.maxIters || 20000) / 2));
+  const recipe0 = (recon && recon.recipe) || null;
+  const prevSh = recipe0 && Number.isInteger(recipe0.shDeg) ? recipe0.shDeg : 3;
+  const prevMcmc = !!(recipe0 && recipe0.mcmcNoise === true);
+  // the run's own input size and buffer (the recon, else its saved settings
+  // when they reproduce the stored size): the default offers the INPUT in
+  // start-panel language, not the combined input × buffer size
+  const prevBuf = continuedBuf(recon.trainScale, r.detailProgress && r.detailProgress.settings, prevDim || undefined);
+  const prevInputDim = continuedInputDim(prevDim || undefined, prevBuf);
+  // resolution: every start-panel step, like a new training (Auto, the
+  // fixed steps, Full); the default replays the run's own input size
+  const resOpts = [`<option value="same" selected>${prevInputDim ? `${prevInputDim} px` : 'Run size'}</option>`,
+    '<option value="auto">Auto</option>',
+    ...[480, 640, 960, 1280, 1600, 1920].map((v) => `<option value="${v}">${v} px</option>`),
+    `<option value="full">Full size${nativeDim ? ` (${nativeDim} px)` : ''}</option>`].join('');
+  // budgets at or above the finished size (shrinking a trained model is not
+  // offered); Same as current keeps the run's own sizing
+  const budgets = [300000, 600000, 1000000, 2000000, 4000000].filter((v) => v >= prevSplats);
+  const splatOpts = [`<option value="" selected>Same as current${prevSplats ? ` (${fmt(prevSplats)})` : ''}</option>`,
+    ...budgets.map((v) => `<option value="${v}">${fmt(v)}</option>`)].join('');
+  // extra cycles mirror the start panel's fixed 10k–50k menu
+  const cycleSteps = [10000, 20000, 30000, 40000, 50000];
+  const nearest = cycleSteps.reduce((best, v) =>
+    Math.abs(v - defaultExtra) < Math.abs(best - defaultExtra) ? v : best, 10000);
+  const cycleOpts = cycleSteps.map((v) =>
+    `<option value="${v}"${v === nearest ? ' selected' : ''}>+${fmt(v)}</option>`).join('');
+  // spherical harmonics: the run's own degree unless reselected (the decoded
+  // checkpoint is resampled to the chosen degree before training resumes)
+  const shOpts = [`<option value="" selected>${prevSh}</option>`,
+    ...[0, 1, 2, 3].map((v) => `<option value="${v}">${v}</option>`)].join('');
+  // working buffer: the supervision grid scale, like the start panel
+  const bufOpts = [`<option value="" selected>${prevBuf}×</option>`,
+    ...[0.5, 1, 2].map((v) => `<option value="${v}">${v}×</option>`)].join('');
+  // LOD: a fresh halving schedule above the model's current size (needs a
+  // 1,000,000+ budget, like a new training)
+  const lodOpts = '<option value="" selected>Off</option><option value="1">On (auto levels)</option>';
+  // MCMC optimizer: the run's own set unless toggled
+  const mcmcOpts = `<option value="" selected>${prevMcmc ? 'On' : 'Off'}</option><option value="1">On</option><option value="0">Off</option>`;
+  const card = document.createElement('div');
+  card.className = 'upcard';
+  card.id = 'ltconfig';
+  card.innerHTML = `
+    <button class="card-x lt-x" id="ltc-x" aria-label="Close">&times;</button>
+    <b>Continue training</b>
+    <span class="lt-desc">Refine <b>${esc(r.name || 'this model')}</b> further from ${fmt(baseIter)} cycles.
+    Higher resolution and a larger splat budget sharpen detail; the solved cameras are reused.</span>
+    <label class="upcard-opt"><span>Training resolution</span><select id="ltc-res">${resOpts}</select></label>
+    <label class="upcard-opt"><span>Splat budget</span><select id="ltc-splats">${splatOpts}</select></label>
+    <label class="upcard-opt"><span>Extra cycles</span><select id="ltc-iters">${cycleOpts}</select></label>
+    <label class="upcard-opt"><span>Spherical harmonics</span><select id="ltc-sh">${shOpts}</select></label>
+    <label class="upcard-opt"><span>Working buffer</span><select id="ltc-buf">${bufOpts}</select></label>
+    <label class="upcard-opt"><span>LOD levels</span><select id="ltc-lod">${lodOpts}</select></label>
+    <label class="upcard-opt"><span>MCMC optimizer</span><select id="ltc-mcmc">${mcmcOpts}</select></label>
+    <div class="upcard-row">
+      <button class="btn btn-outline" id="ltc-cancel">Cancel</button>
+      <button class="btn btn-accent" id="ltc-go">Continue training</button>
+    </div>`;
+  $('stage').appendChild(card);
+  $('ltc-x').addEventListener('click', () => card.remove());
+  $('ltc-cancel').addEventListener('click', () => card.remove());
+  $('ltc-go').addEventListener('click', () => {
+    const resRaw = $('ltc-res').value;
+    const splatsRaw = parseInt($('ltc-splats').value, 10) || 0;
+    const extraIters = parseInt($('ltc-iters').value, 10) || defaultExtra;
+    const shRaw = $('ltc-sh').value;
+    const bufRaw = $('ltc-buf').value;
+    const lodRaw = $('ltc-lod').value;
+    const mcmcRaw = $('ltc-mcmc').value;
+    card.remove();
+    continueLocalRun(false, {
+      res: resRaw === 'same' ? undefined : (resRaw === 'auto' ? 'auto' : (resRaw === 'full' ? 'full' : parseInt(resRaw, 10))),
+      splats: splatsRaw || undefined,
+      extraIters,
+      sh: shRaw === '' ? undefined : parseInt(shRaw, 10),
+      buf: bufRaw === '' ? undefined : parseFloat(bufRaw),
+      lod: lodRaw === '1' ? true : undefined,
+      mcmc: mcmcRaw === '' ? undefined : mcmcRaw === '1',
+    }).catch((e) => {
+      console.error(e);
+      flash(`Could not continue this run: ${e.message}`, 8000);
+    });
+  });
 }
 
 /** Continue training a stored local run: decode its sog back into raw
@@ -3677,10 +3839,18 @@ function trainLocalChoice() {
  *  for standard viewers, the trainer applies it itself), rebuild the session
  *  from the stored camera solve + the capture's photos, and run on. */
 /** viewOnly: reopen a FINISHED run from its state checkpoint straight into
- *  the done viewer (same run record, so Compress patches the sog in) */
-async function continueLocalRun(viewOnly = false) {
+ *  the done viewer (same run record, so Compress patches the sog in)
+ *  opts: { res, splats, extraIters, sh, buf, lod, mcmc } from the
+ *  continue-config card — a reselected configuration for this continuation;
+ *  unsettled knobs keep the run's own setup and automatic horizon extension. */
+async function continueLocalRun(viewOnly = false, opts = {}) {
   const lr = S._localRun;
   if (!lr || !lr.recon || !(lr.state || lr.sog)) return;
+  // LOD needs a 1M+ budget (the start-panel gating); reject before any teardown
+  if (opts.lod === true && Math.max(lr.splats || 0, opts.splats || 0) < 1000000) {
+    flash('LOD levels need a splat budget of at least 1,000,000 — raise the budget or leave LOD off.', 7000);
+    return;
+  }
   const recon = lr.recon;
   let files;
   const srcUrls = (recon.source && recon.source.urls) || [];
@@ -3722,6 +3892,22 @@ async function continueLocalRun(viewOnly = false) {
   // the trainer recipe the run was made with (state header, else the recon
   // JSON); null = a record from before recipes = the legacy defaults
   recipe = recipe || (recon && recon.recipe) || null;
+  // a reselected SH degree resamples the decoded harmonics (low bands kept,
+  // growth zero-padded) so seedFrom rebuilds the chosen degree; unsettled,
+  // the trainer replays the run's own degree from the checkpoint
+  let contShDeg = null;
+  if (opts.sh != null) {
+    try {
+      const { convertSHDegree } = await import('./session_io.js');
+      const DEG_OF_SHK = { 0: 0, 3: 1, 8: 2, 15: 3 };
+      const curDeg = g.shK != null ? DEG_OF_SHK[g.shK] : (recipe && recipe.shDeg);
+      if (curDeg == null) throw new Error(`unfamiliar band count ${g.shK}`);
+      if (curDeg !== opts.sh) convertSHDegree(g, opts.sh);
+      contShDeg = opts.sh;
+    } catch (e) {
+      flash(`Kept the run's SH degree (${e.message}).`, 7000);
+    }
+  }
   // un-bake opacity compensation (pure fn of position, mean scale, focal,
   // camera centres — recompute and divide out in logit space); only sog/ply
   // exports carry the baking, the raw checkpoint never does. Under the
@@ -3785,23 +3971,74 @@ async function continueLocalRun(viewOnly = false) {
   S.photos = files.map((f, i) => ({ url: URL.createObjectURL(f), name: f.name, i }));
   buildStrip();
   const baseIter = stateIter ?? (lr.iter || 0);
-  // a finished run continues PAST its old horizon; a paused one resumes
-  // toward the horizon it was already aiming at
+  // a finished run continues PAST its old horizon — by the configured extra
+  // cycles, or the automatic half-horizon when none were chosen; a paused
+  // one resumes toward the horizon it was already aiming at
+  const defaultExtra = Math.max(10000, Math.round((lr.maxIters || 20000) / 2));
   S.maxIters = lr.status !== 'finished' && lr.maxIters > baseIter
     ? lr.maxIters
-    : baseIter + Math.max(10000, Math.round((lr.maxIters || 20000) / 2));
+    : baseIter + (Number.isSafeInteger(opts.extraIters) && opts.extraIters > 0 ? opts.extraIters : defaultExtra);
   const fr0 = recon.frames[0] || {};
-  const cap = Math.max(g.n, lr.splats || 0, lr.status !== 'finished' ? lr.cap || 0 : 0);
+  // the continuation may reselect the training size (higher resolution,
+  // more splats) like a new training; unsettled it replays the run's own
+  // input scale AND buffer. The stored size is the COMBINED size (input ×
+  // buffer), so the buffer is divided back out before the value passes
+  // through the multiplier again — else the buffer applies twice and the
+  // continuation trains at (e.g.) 1/16 instead of the run's 1/4
+  const prevDim = Math.max(fr0.tw || 0, fr0.th || 0) || undefined;
+  const prevBuf = continuedBuf(recon.trainScale, lr.detailProgress && lr.detailProgress.settings, prevDim);
+  const prevInputDim = continuedInputDim(prevDim, prevBuf);
+  const nativeDim = Math.max(fr0.nw || fr0.fw || 0, fr0.nh || fr0.fh || 0) || undefined;
+  const trainMaxDim = opts.res === 'auto' ? undefined
+    : opts.res === 'full' ? nativeDim
+    : Number.isFinite(opts.res) ? opts.res : prevInputDim;
+  const cap = Math.max(g.n, lr.splats || 0, lr.status !== 'finished' ? lr.cap || 0 : 0, opts.splats || 0);
+  // LOD on a continuation starts a fresh halving schedule ABOVE the model's
+  // current size (snapshotting below it would mislabel the levels); without
+  // headroom there is nothing to schedule
+  if (opts.lod === true) {
+    if (cap < 1000000) {
+      flash('LOD levels need a splat budget of at least 1,000,000 — continuing without them.', 7000);
+    } else {
+      const plan = buildLODPlan(cap, 0, Math.max(10000, S.maxIters - baseIter));
+      const levels = plan ? plan.levels.filter((l) => l > g.n) : [];
+      if (!levels.length) {
+        flash('The model already fills its budget — LOD levels need headroom to grow into.', 7000);
+      } else {
+        S.lodPlan = { ...plan, levels, idx: 0, holdUntil: null, snaps: [] };
+      }
+    }
+  }
   // rebuild the SAME trainer the run was made with: the recipe carries the
   // MCMC / needle / placement sets and the refine cadence; sizing is per run
+  // and the card may reselect the SH degree or the MCMC set on top
   const { refineEvery: recipeRefine, ...recipeTrainer } = recipe || {};
+  // the card's MCMC toggle rewrites the optimizer set the same way the
+  // start panel builds it; untouched, the recipe replays the run's own set
+  if (opts.mcmc === true) {
+    Object.assign(recipeTrainer, { growRate: 0.05, mcmcNoise: true, scaleReg: 0.01, moveCap: 0.25 });
+    if ((contShDeg ?? recipeTrainer.shDeg ?? 3) > 0) recipeTrainer.shLr = 3e-4;
+    else delete recipeTrainer.shLr;
+  } else if (opts.mcmc === false) {
+    delete recipeTrainer.mcmcNoise; delete recipeTrainer.scaleReg;
+    delete recipeTrainer.moveCap; delete recipeTrainer.shLr;
+    // the placement set carries its own growth rate — classic restores that,
+    // otherwise the trainer default applies
+    if (recipeTrainer.refineV2) recipeTrainer.growRate = 0.1;
+    else delete recipeTrainer.growRate;
+  }
+  const contRefine = opts.mcmc === true ? 500 : opts.mcmc === false ? undefined : recipeRefine;
+  const bufScale = opts.buf ?? (prevBuf !== 1 ? prevBuf : undefined);
   const ses = createSession({
     maxIters: S.maxIters, holdout: -1,
-    ...(recipeRefine != null ? { refineEvery: recipeRefine } : {}),
-    frames: { trainMaxDim: Math.max(fr0.tw || 0, fr0.th || 0) || undefined },
+    // continuations obey the GPU-usage slider like fresh runs (st here is
+    // the parsed checkpoint, so the setting comes from S.settings)
+    gpuUsage: (S.settings.gpu ?? 100) / 100,
+    ...(contRefine != null ? { refineEvery: contRefine } : {}),
+    frames: { trainMaxDim, ...(bufScale != null ? { trainScale: bufScale } : {}) },
     trainer: {
       ...recipeTrainer,
-      maxSplats: cap, shDeg: recipeTrainer.shDeg ?? 3,
+      maxSplats: cap, shDeg: contShDeg ?? recipeTrainer.shDeg ?? 3,
       capMult: Math.max(2, Math.ceil(cap / Math.max(1, g.n))),
       ...(engine === 'v2' ? { engine: 'v2', refineEvery: 200 } : {}),
     },
@@ -3813,6 +4050,7 @@ async function continueLocalRun(viewOnly = false) {
   await ses.load(files);
   if (S.gen !== gen) return;
   ses.useReconstruction({
+    known: !!recon.knownCameras,
     cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
     points: [],
     k1: recon.k1 || 0, k2: recon.k2 || 0,
@@ -3825,6 +4063,7 @@ async function continueLocalRun(viewOnly = false) {
   // recipe replayed the MCMC noise: positions doubled within a few steps)
   await ses.seedFrom(g, { iter: baseIter, sceneRadius: recon.sceneRadius || undefined });
   if (S.gen !== gen) return;
+  if (S.lodPlan) ses.trainer.growLimit = S.lodPlan.levels[S.lodPlan.idx] || S.lodPlan.levels[0];
   S.iter = baseIter;
   S.psnrTrain = null; S.psnrHold = null;
   S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
@@ -3848,7 +4087,12 @@ async function continueLocalRun(viewOnly = false) {
   S.minutes = Math.max(S.minutes || 0, lr.minutes || 0,
     (lr.detailProgress && lr.detailProgress.minutes) || 0);
   S._carryTrainElapsed = true;
-  if (lr.state && lr.status !== 'finished') S._resumeRunId = lr.id;
+  // every continuation — paused or finished — trains back into its own
+  // record: the saved result replaces the previous trained state there, the
+  // root camera poses it rebuilt from stay, and its photos are the capture
+  // store's blobs matched by name above, reused by reference and never
+  // re-saved, so continuing costs no extra image storage
+  S._resumeRunId = lr.id;
   startTraining();
   flash(`Continuing from ${fmt(baseIter)} cycles — +${fmt(S.maxIters - baseIter)} more.`, 6000);
 }
@@ -4165,7 +4409,7 @@ async function renderShareThumb() {
     cv.width = W; cv.height = H;
     ses.view.attach(cv);
     ses.view.setCamera({ R: c.R, t: c.t, f: c.f * (W / c.w), cx: W / 2, cy: H / 2, w: W, h: H });
-    ses.view.renderNow();
+    ses.view.renderNow(true);
     await ses.trainer.device.queue.onSubmittedWorkDone();
     const out = document.createElement('canvas');
     out.width = W; out.height = H;
@@ -4503,7 +4747,7 @@ async function ensureErrRender(key) {
     cv.width = meta.w; cv.height = meta.h;
     ses.view.attach(cv);
     ses.view.lookThrough(cam.ci);
-    ses.view.renderNow();
+    ses.view.renderNow(true);
     await ses.trainer.device.queue.onSubmittedWorkDone();
     if (S.gen !== gen) return;
     const snap = (S._errSnap ??= document.createElement('canvas'));
@@ -4554,9 +4798,22 @@ function goToFrame(i) {
     return;
   }
   S.sel = i; S.atFrame = i;
-  vp.lock = cam;
+  // gravity-leveled frame lock: the model keeps its upright orientation
+  // (position and aim move to the photo, roll levels to gravity) and the
+  // photograph turns to register — a cardinal snap, exact pixels. Untilted
+  // frames keep the raw lock, pixel-identical to before.
+  const snap = snapRollAngle(rollAngleToUp(cam.R, vp.up));
+  let roll = null;
+  if (snap) {
+    const lv = rerollPose(cam.R, camCentre(cam), snap);
+    const ex = exifIntrinsics(cam.w, cam.h, cam.cx, cam.cy, -snap);
+    vp.lock = { R: lv.R, t: lv.t, f: cam.f, w: ex.w, h: ex.h, cx: ex.cx, cy: ex.cy };
+    roll = { snap, camW: cam.w, camH: cam.h };
+  } else {
+    vp.lock = cam;
+  }
   bmp(cam.url).then((b) => {
-    if (b && S.scene.cams[S.atFrame]?.url === cam.url) dev.setBitmap(b, cam.url);
+    if (b && S.scene.cams[S.atFrame]?.url === cam.url) dev.setBitmap(b, cam.url, roll);
   });
   S.fadeTo = 1;
   S.loupe.x = $('stage').clientWidth / 2;
@@ -4591,6 +4848,54 @@ function select(i) {
 
 function wireStage() {
   const st = $('stage');
+  // Touch-hold with a quiet window: while visuals show, the GPU belongs to
+  // the view from the FIRST model touch until 2s after the LAST one — every
+  // new touch refreshes the window, so training resumes only after 2s of no
+  // interaction and never re-queues a backlog between quick successive
+  // touches. Touches on UI (graph, controls hub, buttons) don't count —
+  // model touches only. Up/cancel ride the window so a release outside the
+  // stage still counts; a user-pressed pause clears the flag in toggleTrain,
+  // so the window never resumes over it.
+  const held = new Set();
+  let resumeT = 0;
+  const armResume = () => {
+    clearTimeout(resumeT);
+    resumeT = setTimeout(() => {
+      resumeT = 0;
+      if (!held.size && S._dragPaused) {
+        S._dragPaused = false;
+        if (S.state === 'train') S.session.start();
+      }
+    }, 2000);
+  };
+  const noteModelTouch = () => {
+    if (!S.session) { S._dragPaused = false; return; }
+    clearTimeout(resumeT); resumeT = 0;
+    if (S.state === 'train' && S.trainVisuals && S.session.training && !S._dragPaused) {
+      S._dragPaused = true;
+      S.session.pause();
+    }
+  };
+  // the graph and the hub live inside the stage (the expanded chart even
+  // covers it) — only canvas/model touches may hold the GPU
+  const onModel = (e) => !e.target.closest('#controls, #hud, #start, .chartwrap, button');
+  st.addEventListener('pointerdown', (e) => {
+    if (!onModel(e)) return;
+    held.add(e.pointerId);
+    noteModelTouch();
+  });
+  window.addEventListener('pointerup', (e) => {
+    if (held.delete(e.pointerId) && !held.size && S._dragPaused) armResume();
+  });
+  window.addEventListener('pointercancel', (e) => {
+    if (held.delete(e.pointerId) && !held.size && S._dragPaused) armResume();
+  });
+  // a wheel tick adjusts the model without a touch — same hold, same window
+  st.addEventListener('wheel', (e) => {
+    if (!onModel(e)) return;
+    noteModelTouch();
+    if (S._dragPaused) armResume();
+  }, { passive: true });
   st.addEventListener('pointermove', (e) => {
     if (S.atFrame < 0) return;
     const r = st.getBoundingClientRect();
@@ -4725,6 +5030,7 @@ function dock(kind) {
         <div class="tmeta">
           <span class="tmeta-1"><span id="t-iter">${pctOf(S.iter)}</span></span>
           <span class="tmeta-2">ETA <span id="t-eta">${etaText()}</span></span>
+          <span class="tmeta-gpu" title="Share of wall time training runs the GPU — live, no restart needed"><label for="t-gpu">GPU</label><input id="t-gpu" type="range" min="10" max="100" step="5" value="${S.settings.gpu ?? 100}"><span id="t-gpu-v">${S.settings.gpu ?? 100}%</span></span>
         </div>
       </div>
       <div class="chartwrap"><canvas id="chart"></canvas><div class="chart-tip" id="chart-tip" hidden></div></div>
@@ -4742,6 +5048,20 @@ function dock(kind) {
       $('t-finish').disabled = true;
       await S.session.finish();   // emits train-complete -> finish()
     });
+    // the GPU usage slider, mid-training edition: the same persisted knob
+    // as the settings panel, mirrored both ways, live on every input
+    const tGpu = $('t-gpu');
+    if (tGpu) {
+      tGpu.addEventListener('input', () => {
+        const v = Math.min(100, Math.max(10, parseInt(tGpu.value, 10) || 100));
+        S.settings.gpu = v;
+        $('t-gpu-v').textContent = `${tGpu.value}%`;
+        if (S.session) S.session.opts.gpuUsage = v / 100;
+        const panel = $('set-gpu');
+        if (panel) { panel.value = String(v); $('set-gpu-v').textContent = `${v}%`; }
+      });
+      tGpu.addEventListener('change', () => saveSettings());
+    }
     chart = new Chart($('chart'), { onHover: chartTip });
     chart.scale = S.scoreScale;
     chart.maxIter = S.maxIters;
@@ -4778,11 +5098,21 @@ function chartTip(h) {
   if (!tip) return;
   if (!h) { tip.hidden = true; return; }
   tip.hidden = false;
-  tip.style.left = `${h.xPct}%`;
-  tip.style.top = '4px';
   tip.innerHTML = `${fmt(h.iter)} · <b style="color:#2fd4c1">${h.train.toFixed(1)} ${h.unit}</b>` +
     (h.hold != null ? ` / <b style="color:#f2a03f">${h.hold.toFixed(1)} ${h.unit}</b>` : '') +
     (h.event ? `<br><span style="color:#93a1a0">${h.event}</span>` : '');
+  // the readout rides the cursor INSIDE the plot: pinned to the top edge it
+  // hung past the stage in the expanded graph and hid behind the dock.
+  // Clamped sideways, floating 70px clear of the cursor (below it near the top).
+  const wrap = tip.parentElement;
+  const W = wrap ? wrap.clientWidth : 0, H = wrap ? wrap.clientHeight : 0;
+  if (!W || !H) { tip.style.left = `${h.xPct}%`; tip.style.top = '4px'; return; }
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  const x = Math.max(tw / 2 + 4, Math.min(W - tw / 2 - 4, (h.xPct / 100) * W));
+  const y = (Math.max(0, Math.min(100, h.yPct ?? 0)) / 100) * H;
+  tip.style.left = `${(x / W) * 100}%`;
+  tip.style.top = `${(y / H) * 100}%`;
+  tip.style.transform = y > th + 86 ? 'translate(-50%, calc(-100% - 70px))' : 'translate(-50%, 70px)';
 }
 
 // ── flash ───────────────────────────────────────────────────────────────────
@@ -4825,6 +5155,65 @@ function renderHud() {
   }
   hud.replaceChildren(row);
 }
+
+// ── training notification (Android) ─────────────────────────────────────────
+// A foreground-service notification carries the live score + splat count and
+// keeps the process (and its GPU work) alive while the app runs in the
+// background. Desktop browsers have no bridge — every call is feature-detected.
+const trainBridge = () => {
+  const b = globalThis.AndroidARBridge;
+  return b && typeof b.updateTrainingNotification === 'function' ? b : null;
+};
+function androidNotifStart() {
+  const b = trainBridge();
+  if (!b) return;
+  S._notifName = (S._localRun && S._localRun.name) || (S.preset && S.preset.name) || 'model';
+  S._notifT = 0;
+  try { b.startTrainingNotification(`Training ${S._notifName}`, 'Starting…'); } catch { /* best-effort */ }
+}
+/** The live score for the notification shade, in the user's chosen unit. */
+function notifScore() {
+  const psnr = S.psnrHold ?? S.psnrTrain;
+  if (psnr == null) return '';
+  return S.scoreScale === 'similarity'
+    ? `${psnrToApproxSsimPercent(psnr).toFixed(1)} % · `
+    : `${psnr.toFixed(1)} dB · `;
+}
+function androidNotifTick() {
+  const b = trainBridge();
+  if (!b || S.state !== 'train' || !S.session || !S.session.training) return;
+  const now = performance.now();
+  if (now - (S._notifT || 0) < 2500) return;   // the shade is not a 60 fps surface
+  S._notifT = now;
+  const text = `${notifScore()}${fmt(S.splats)} splats · ${fmt(S.iter)} / ${fmt(S.maxIters)}`;
+  try { b.updateTrainingNotification(`Training ${S._notifName || 'model'}`, text, S.iter | 0, S.maxIters | 0); }
+  catch { /* best-effort */ }
+}
+function androidNotifStop(finished) {
+  const b = trainBridge();
+  if (!b) return;
+  try {
+    if (finished) {
+      b.finishTrainingNotification('Training complete',
+        `${notifScore()}${fmt(S.splats)} splats · ${fmt(S.iter)} cycles`);
+    } else {
+      b.cancelTrainingNotification();
+    }
+  } catch { /* best-effort */ }
+  S._notifT = 0;
+}
+
+/** Flip the notification's Pause/Resume button — false when the bridge is
+ *  too old, so the caller falls back to shedding/restarting the service. */
+function notifSetPaused(paused) {
+  const b = trainBridge();
+  if (!b || typeof b.setTrainingPaused !== 'function') return false;
+  try { b.setTrainingPaused(paused); } catch { return false; }
+  return true;
+}
+// The shade's Pause/Resume button calls in here (MainActivity turns the
+// broadcast into this toggle) — the same path as the in-app button.
+globalThis.__splatxrNotifToggle = () => { if (S.state === 'train') toggleTrain(); };
 
 // ── screen wake lock ────────────────────────────────────────────────────────
 // a long run gets no touches, and phones dim and lock the screen — hold a
@@ -4990,8 +5379,14 @@ function tourStep(dt) {
   const i = clamp(Math.floor(u), 0, T.cams.length - 2);
   const f = u - i;
 
-  // the TRUE pose, roll included, rendered via the viewport's pose override
-  const Rq = quatToR(qslerp(T.sq[i], T.sq[i + 1], f));
+  // gravity-leveled flight: position and aim follow the capture path, but
+  // roll levels to the orbit's up axis through the pose override (the raw
+  // sensor roll would swing the world sideways on portrait-held captures —
+  // and the orbit view the tour starts from is leveled, so the tour must be
+  // too). A straight up/down stare keeps the raw pose: no level roll exists.
+  const Rq0 = quatToR(qslerp(T.sq[i], T.sq[i + 1], f));
+  const level = rollAngleToUp(Rq0, vp.up);
+  const Rq = level == null ? Rq0 : rerollPose(Rq0, pos, level).R;
   vp.pose = {
     R: Rq,
     t: [
@@ -5010,7 +5405,9 @@ function tourStep(dt) {
   vp.target = [pos[0] + fwd[0] * d, pos[1] + fwd[1] * d, pos[2] + fwd[2] * d];
   vp.dist = d;
   const ang = vp.anglesOf(fwd);
-  vp.setOrbitAngles(ang.yaw, ang.pitch);
+  vp.yaw = ang.yaw;
+  vp.pitch = clamp(ang.pitch, -1.45, 1.45);
+  vp.dirty = true;
 }
 
 /** WASD fly: move the orbit target along the camera's own axes */

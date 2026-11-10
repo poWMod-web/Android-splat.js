@@ -521,6 +521,9 @@ select.sel {
 .tmeta { display: flex; flex-direction: column; gap: 1px; padding-left: 4px; }
 .tmeta-1 { font: 500 18px var(--mono); font-variant-numeric: tabular-nums; color: var(--accent); line-height: 24px; white-space: nowrap; }
 .tmeta-2 { font: 400 12.5px var(--mono); color: var(--dim); line-height: 17px; white-space: nowrap; }
+.tmeta-gpu { display: flex; align-items: center; gap: 6px; font: 400 11px var(--mono); color: var(--dim); line-height: 17px; white-space: nowrap; }
+.tmeta-gpu input[type="range"] { width: 76px; margin: 0; accent-color: var(--accent); }
+.tmeta-gpu span:last-child { min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
 /* the growth note lives under the splat count now (right column) — a
    fixed-height slot holding an nbsp when quiet, so nothing ever shifts */
 .tmeta-grow { display: block; height: 14px; line-height: 14px; margin-top: -1px; font: 500 12px var(--mono); color: var(--accent); white-space: nowrap; text-align: right; }

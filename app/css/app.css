@@ -256,7 +256,7 @@ body { overflow: hidden; }
 
 .dock-train {
   display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 18px; align-items: center;
-  position: relative; z-index: 5;   /* the stop-and-keep chip overhangs the stage */
+  position: relative; z-index: 5;
 }
 .dock-train.chart-expanded { grid-template-columns: auto minmax(0, 1fr); }
 .dock-train.chart-expanded .tscores { grid-column: 2; justify-self: end; }
@@ -303,9 +303,10 @@ body { overflow: hidden; }
    sliver, the play button to an egg, and the stage label to one word a line.
    The stage gets squarer; that is the right trade on a portrait screen. */
 @media (max-width: 720px) {
-  /* row 1 is exactly the play button's 40px: the chart starts 6px under the
-     button and runs to the dock's lowest pixels; the right column's third
-     line (grow note) may overhang the chart's empty top-right corner */
+  /* row 1 fits the play button plus the stop-and-keep chip below it; the
+     chart starts 6px under and runs to the dock's lowest pixels; the right
+     column's third line (grow note) may overhang the chart's empty
+     top-right corner */
   .dock-train { grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto auto; row-gap: 6px; }
   .dock-train .tcontrols { grid-row: 1; grid-column: 1; align-self: start; }
   .dock-train .tscores { grid-row: 1; grid-column: 2; gap: 16px; align-self: start; }
@@ -530,7 +531,7 @@ body { overflow: hidden; }
   flex: none; min-width: 66px; padding: 2px 4px; text-align: right;
   font: 500 12px var(--mono); color: var(--paper); border-radius: 6px;
 }
-.countv:hover { color: var(--accent); }
+button.countv:hover { color: var(--accent); }
 /* one centred group: Start, the quality dropdown to its right at the same
    height, then the gear */
 .startrow { display: flex; justify-content: center; align-items: center; }
@@ -571,16 +572,15 @@ body { overflow: hidden; }
 
 /* Keep the pause and stop controls anchored without shifting score content. */
 .tmeta { position: relative; }
-.playwrap { position: relative; display: inline-flex; }
+.playwrap { position: relative; display: inline-flex; flex-direction: column; align-items: flex-start; }
 #t-finish {
-  position: absolute; top: calc(100% + 5px); left: 0;
-  padding: 3px 10px;
-  white-space: nowrap; z-index: 6;         /* floats over the stage edge */
-  background: var(--panel);
+  position: static;
+  margin-top: 6px; padding: 3px 10px;
+  white-space: nowrap;
 }
-/* the pause circle breathes — enough on the left that the stop-and-keep
-   chip below it clears the window edge */
-.dock-train .play { margin: 0 10px 0 16px; }
+/* the stop-and-keep chip sits below the pause circle, in normal flow so the
+   dock contains it — the circle keeps its left breathing room for the chip */
+.dock-train .play { margin: 0 0 0 16px; }
 @media (max-width: 720px) {
   .dock-train .play { margin: 0; }
 }
@@ -941,6 +941,8 @@ a.cbtn { text-decoration: none; }
 .stage #vidcard .vid-tl { display: block; width: 100%; height: clamp(160px, 38vh, 440px); border-radius: 10px; background: rgba(7, 9, 9, .8); border: 1px solid var(--line); touch-action: none; cursor: crosshair; }
 .stage #vidcard .vid-strip { display: block; width: 100%; height: clamp(64px, 15vh, 170px); border-radius: 8px; background: rgba(7, 9, 9, .8); border: 1px solid var(--line); }
 .vid-read { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font: 400 14px var(--mono); color: var(--muted); }
+.vid-gap { display: flex; align-items: center; gap: 10px; font: 400 12px var(--mono); color: var(--muted); }
+.vid-gap select { flex: none; background: var(--panel-2); color: var(--paper); border: 1px solid var(--line-2); border-radius: 8px; padding: 5px 8px; font: 500 12px var(--mono); outline: none; }
 .vid-read b { font: 600 17px var(--ui); color: var(--paper); }
 .vid-read .linkish { cursor: pointer; background: none; border: 0; }
 .vid-legend { display: flex; gap: 16px; flex-wrap: wrap; font: 400 12.5px var(--mono); color: var(--dim); }

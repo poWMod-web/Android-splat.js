@@ -4,6 +4,11 @@
 // this frame's own pose. This module lays that frame's photograph over it and
 // takes some of it away again — a wipe, a hole, or a difference map. It never
 // renders the model itself.
+//
+// A gravity-leveled frame lock (portrait-held captures) turns the model view
+// by a cardinal snap; the photograph turns with it — an exact quarter-turn
+// about the frame centre, the same centred-principal-point assumption the
+// lock itself renders with.
 
 export function fitRect(iw, ih, w, h, pad = 0) {
   const s = Math.min((w - pad * 2) / iw, (h - pad * 2) / ih);
@@ -15,16 +20,44 @@ export class Developer {
   constructor() {
     this.bmp = null;
     this.url = null;
+    this.roll = null;   // { snap, angle, W, H } — cardinal photo derotation, or null
     this.err = document.createElement('canvas');
     this.errKey = '';
   }
 
-  /** hand it an already-decoded photograph (the app keeps one shared cache) */
-  setBitmap(bitmap, url) {
-    if (this.url === url) return;
-    this.url = url;
-    this.bmp = bitmap;
-    this.errKey = '';
+  /** Hand it an already-decoded photograph (the app keeps one shared cache).
+   *  frame carries the lock's cardinal snap ({ snap, camW, camH }) so a
+   *  leveled view's photograph can turn to register with the render. Pixels
+   *  already across in the display frame (portrait bitmap against landscape
+   *  sensor dims) need no turn — only sensor-framed ones do. */
+  setBitmap(bitmap, url, frame = null) {
+    if (this.url !== url) {
+      this.url = url;
+      this.bmp = bitmap;
+      this.errKey = '';
+    }
+    const snap = (frame && frame.snap) || 0;
+    if (!snap || !bitmap || !frame || !frame.camW || !frame.camH) {
+      this.roll = null;
+      return;
+    }
+    const bw = bitmap.width, bh = bitmap.height;
+    // aspect decides (never exact pixels: the bitmap is display-capped, the
+    // sensor dims are feature-scale — both uniform scales of one frame). A
+    // square bitmap proves nothing either way and keeps the sensor turn.
+    const swapped = bw !== bh && (bw > bh) !== (frame.camW > frame.camH);
+    // the canvas turn OPPOSES the snap: rerollPose turns the camera's rows
+    // by +snap, so the image content — photograph and render alike — turns
+    // by −snap. EXIF-displayed pixels are already across and take no turn,
+    // but still report the lock's frame: the error map's sensor-framed
+    // snapshot turns underneath them regardless.
+    const angle = swapped ? 0 : -snap;
+    const swap = Math.abs(snap) % 180 !== 0;
+    this.roll = {
+      snap, angle,
+      W: swap ? frame.camH : frame.camW,
+      H: swap ? frame.camW : frame.camH,
+    };
   }
 
   get ready() { return !!this.bmp; }
@@ -45,11 +78,23 @@ export class Developer {
     // `model` is a dedicated same-camera render snapshot handed in by the app
     // (never the live WebGPU canvas: reading one back after presentation can
     // return blank pixels). Render and photo are the same camera image, so
-    // both just downsample to the map's working size.
-    ec.drawImage(model, 0, 0, ew, eh);
+    // both just downsample to the map's working size — through the
+    // counter-turn when the view is leveled (the snapshot is always
+    // sensor-framed; the photograph only when its pixels are).
+    const roll = this.roll;
+    const drawFit = (img, angle) => {
+      if (!angle) { ec.drawImage(img, 0, 0, ew, eh); return; }
+      ec.save();
+      ec.translate(ew / 2, eh / 2);
+      ec.rotate((angle * Math.PI) / 180);
+      if (Math.abs(angle) % 180 !== 0) ec.drawImage(img, -eh / 2, -ew / 2, eh, ew);
+      else ec.drawImage(img, -ew / 2, -eh / 2, ew, eh);
+      ec.restore();
+    };
+    drawFit(model, roll ? -roll.snap : 0);
     const a = ec.getImageData(0, 0, ew, eh);
     ec.clearRect(0, 0, ew, eh);
-    ec.drawImage(this.bmp, 0, 0, ew, eh);
+    drawFit(this.bmp, roll ? roll.angle : 0);
     const b = ec.getImageData(0, 0, ew, eh);
 
     const out = ec.createImageData(ew, eh);
@@ -74,8 +119,22 @@ export class Developer {
    * @returns the fit rect, so callers can align overlays
    */
   render(ctx, w, h, o) {
-    const r = fitRect(this.bmp.width, this.bmp.height, w, h, 0);
-    const drawPhoto = () => ctx.drawImage(this.bmp, r.x, r.y, r.w, r.h);
+    const roll = this.roll;
+    const r = roll
+      ? fitRect(roll.W, roll.H, w, h, 0)
+      : fitRect(this.bmp.width, this.bmp.height, w, h, 0);
+    const drawPhoto = () => {
+      if (!roll) { ctx.drawImage(this.bmp, r.x, r.y, r.w, r.h); return; }
+      // the exact quarter-turn about the frame centre — the lock's own
+      // centred-principal-point assumption, so the two register
+      ctx.save();
+      ctx.translate(r.x + r.w / 2, r.y + r.h / 2);
+      ctx.rotate((roll.angle * Math.PI) / 180);
+      const swap = Math.abs(roll.angle) % 180 !== 0;
+      const dw = swap ? r.h : r.w, dh = swap ? r.w : r.h;
+      ctx.drawImage(this.bmp, -dw / 2, -dh / 2, dw, dh);
+      ctx.restore();
+    };
 
     if (o.mode === 'render') return r;              // the model is already there
     if (o.mode === 'photo') { drawPhoto(); return r; }
