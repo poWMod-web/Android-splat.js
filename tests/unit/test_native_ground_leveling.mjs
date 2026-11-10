@@ -16,7 +16,7 @@ assert.match(java, /if \(tracking\) \{\s*updateGroundPlane\(\);/,
 assert.match(java, /getAllTrackables\(Plane\.class\)/, 'planes should be polled from the session');
 assert.match(java, /HORIZONTAL_UPWARD_FACING/, 'only horizontal upward planes should level the world');
 assert.match(java, /getSubsumedBy\(\) != null/, 'subsumed planes should be skipped');
-assert.match(java, /getYAxis\(normal, 0\)/, "the plane normal should be the plane pose's +Y axis");
+assert.match(java, /center\.getYAxis\(\)/, "the plane normal should be the plane pose's +Y axis");
 assert.match(java, /area >= 0\.04f/, 'plane patches smaller than ~20x20 cm should be ignored');
 assert.match(java, /area < groundArea \* 1\.2f/, 'the best plane should win with hysteresis');
 assert.match(java, /manual capture"\) \+ groundPlaneStatus\(\)/,

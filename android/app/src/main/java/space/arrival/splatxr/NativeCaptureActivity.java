@@ -673,8 +673,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                     if (!(area >= 0.04f)) continue; // ignore patches smaller than ~20 x 20 cm
                     if (hasGroundPlane && area < groundArea * 1.2f) continue; // hysteresis: keep the stable best
                     Pose center = plane.getCenterPose();
-                    float[] normal = new float[3], at = center.getTranslation();
-                    center.getYAxis(normal, 0); // a plane's local +Y is its surface normal
+                    float[] normal = center.getYAxis(); // a plane's local +Y is its surface normal
+                    float[] at = center.getTranslation();
+                    if (normal == null || normal.length < 3 || at == null || at.length < 3) continue;
                     if (!finite(normal[0], normal[1], normal[2], at[0], at[1], at[2])) continue;
                     float length = (float) Math.sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
                     if (!Float.isFinite(length) || length < 1e-6f) continue;
