@@ -380,7 +380,7 @@ async function reviewPicks(frames, sel, opts, extra) {
   const r = await opts.review({
     frames, shots: sel.shots, shot: sel.shot, picks: sel.picks, budget: sel.budget, cap,
     suggested: suggestSpan(frames, opts),
-    plan: (range) => planSelection(frames, opts, range),
+    plan: (range, over = {}) => planSelection(frames, { ...opts, ...over }, range),
     ...extra,
   });
   if (r === null) throw new Error('cancelled');
@@ -400,7 +400,13 @@ function selectFramesContinuous(frames, opts = {}) {
     for (let i = 0; i < frames.length; i++) { frames[i].blur = false; frames[i].picked = set.has(i); }
     return { picks, budget: 0 };
   }
-  const maxFrames = opts.maxFrames ?? defaultMaxFrames();
+  let maxFrames = opts.maxFrames ?? defaultMaxFrames();
+  // preferred average spacing: this segment holds span/gap frames — still
+  // motion-paced with the sharpest of each window, never above the cap
+  if (opts.targetGapSec > 0 && frames.length > 1) {
+    const span = frames[frames.length - 1].t - frames[0].t;
+    if (span > 0) maxFrames = Math.max(3, Math.min(maxFrames, Math.round(span / opts.targetGapSec)));
+  }
   const minFrames = Math.min(maxFrames, opts.minFrames ?? 24);
   const minGap = opts.minGapSec ?? 0.15, maxGap = opts.maxGapSec ?? 0.25;
   markOutliers(frames, opts.outlierWindow ?? 15, opts.outlierSensitivity ?? 0.6);

@@ -187,7 +187,12 @@ export function initXRUI({ onCapture, flash }) {
       try {
         const dataset = await importNativeCapture();
         const reviewed = await reviewCapture(dataset);
-        if (reviewed) await onCapture(reviewed);
+        if (!reviewed) return;
+        await onCapture(reviewed);
+        // the frames now live in the app as Blobs (IndexedDB) — the native
+        // copies are redundant, so drop them instead of leaving up to 200
+        // JPEGs in app storage until the next capture
+        try { nativeBridge.resetCaptureSession(); } catch { /* best-effort */ }
       } catch (e) {
         console.error('[SplatXR] Native capture import failed:', e);
         showXRHelp(e.message || 'Native ARCore capture could not be imported.');

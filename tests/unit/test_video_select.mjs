@@ -73,6 +73,32 @@ const mk = (n, f) => Array.from({ length: n }, (_, i) => ({ t: i / 30, focus: 80
   check('floor keeps >= 0.1 s between picks', t.slice(1).every((v, i) => v - t[i] >= 0.099));
 }
 
+// 8. preferred average spacing: span/gap frames, still motion-paced with the
+//    sharpest of each window, never above the cap, never below a floor of 3
+{
+  const frames = mk(900, () => ({ motion: 0.01 }));   // 30 s @30fps
+  for (const [gap, lo, hi] of [[1, 24, 36], [2, 12, 18], [5, 4, 9]]) {
+    const r = selectFrames(frames, { maxFrames: 300, targetGapSec: gap });
+    const ts = r.picks.map((p) => frames[p].t);
+    const avg = (ts[ts.length - 1] - ts[0]) / (ts.length - 1);
+    check(`gap ${gap}s -> ~${30 / gap} picks`, r.picks.length >= lo && r.picks.length <= hi, `${r.picks.length} picks`);
+    check(`gap ${gap}s averages ${gap}s`, Math.abs(avg - gap) < 0.35, `avg ${avg.toFixed(2)}s`);
+  }
+  const capped = selectFrames(frames, { maxFrames: 20, targetGapSec: 0.1 });
+  check('spacing never beats the cap', capped.picks.length <= 20, `${capped.picks.length} picks`);
+  const short = selectFrames(mk(60, () => ({ motion: 0.01 })), { maxFrames: 300, targetGapSec: 5 });
+  check('short clip keeps a floor of 3', short.picks.length === 3, `${short.picks.length} picks`);
+  const dips = mk(900, (i) => ({ motion: 0.01, focus: i % 30 === 15 ? 200 : 800 }));
+  const rd = selectFrames(dips, { maxFrames: 300, targetGapSec: 1 });
+  check('spaced picks still dodge blur dips', rd.picks.every((p) => dips[p].focus > 400),
+    `${rd.picks.filter((p) => dips[p].focus <= 400).length} dips picked`);
+  const same = mk(900, () => ({ motion: 0.01 }));
+  const ignored = selectFrames(same, { maxFrames: 300, targetGapSec: 0 });
+  const natural = selectFrames(same, { maxFrames: 300 });
+  check('gap 0 means natural density', ignored.picks.length === natural.picks.length,
+    `${ignored.picks.length} vs ${natural.picks.length}`);
+}
+
 if (failures) { console.log(`${failures} failure(s)`); process.exit(1); }
 console.log('VIDEO SELECT TESTS PASSED');
 

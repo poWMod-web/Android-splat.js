@@ -50,6 +50,14 @@ assert.match(service, /if \(intent == null\) \{ stopSelf\(\); return START_NOT_S
   'a restart without a command should stop instead of going zombie');
 assert.match(service, /releaseWakeLock\(\);/,
   'every teardown path should release the wake lock');
+assert.match(service, /case "paused":/,
+  'the service should handle the paused-state command');
+assert.match(service, /builder\.addAction\(lastPaused \? android\.R\.drawable\.ic_media_play : android\.R\.drawable\.ic_media_pause,/,
+  'the ongoing notification should carry a Pause/Resume action');
+assert.match(service, /PendingIntent\.getBroadcast\(this, 1, toggle,/,
+  'the shade button should fire a broadcast instead of opening the app');
+assert.match(service, /if \(lastPaused\) releaseWakeLock\(\); else acquireWakeLock\(\);/,
+  'a shade pause should free the CPU while keeping the notification up');
 
 // The bridge: four feature-detected entry points, a runtime notification
 // permission request, and cleanup when the activity dies.
@@ -67,6 +75,16 @@ assert.match(main, /if \("start"\.equals\(action\) && Build\.VERSION\.SDK_INT >=
   'only the start command should raise a foreground service; the rest are plain starts');
 assert.match(main, /stopTrainingService\(\);/,
   'destroying the activity should stop the training service');
+assert.match(main, /ACTION_TOGGLE_TRAINING = "space\.arrival\.splatxr\.TOGGLE_TRAINING"/,
+  'the activity should own the shade-toggle broadcast action');
+assert.match(main, /setTrainingPaused\(boolean paused\)/,
+  'the bridge should flip the notification paused state');
+assert.match(main, /registerReceiver\(toggleTrainingReceiver, toggleFilter/,
+  'the activity should listen for shade toggles');
+assert.match(main, /unregisterReceiver\(toggleTrainingReceiver\)/,
+  'the activity should drop the shade listener on destroy');
+assert.match(main, /evaluateJavascript\("window\.__splatxrNotifToggle&&window\.__splatxrNotifToggle\(\)", null\)/,
+  'a shade toggle should reach the page as a JS call');
 
 // The web side: start with training, tick live stats throttled, pause sheds
 // the service, finish and failure settle the shade. No bridge, no-op.
@@ -90,8 +108,14 @@ assert.match(app, /function notifScore\(\) \{[\s\S]*?S\.scoreScale === 'similari
   'the notification score should follow the dB/% switch');
 assert.match(app, /\$\{notifScore\(\)\}\$\{fmt\(S\.splats\)\} splats/,
   'progress ticks and the finish summary should share the unit-aware score');
-assert.match(app, /if \(on\) androidNotifStart\(\); else androidNotifStop\(false\);/,
-  'pausing should shed the service and resuming should restart it');
+assert.match(app, /if \(on\) \{ if \(!notifSetPaused\(false\)\) androidNotifStart\(\); \}/,
+  'resuming should flip the shade button, restarting the service only on old bridges');
+assert.match(app, /else if \(!notifSetPaused\(true\)\) androidNotifStop\(false\);/,
+  'pausing should keep the shade up with Resume, shedding only on old bridges');
+assert.match(app, /function notifSetPaused\(paused\) \{[\s\S]*?typeof b\.setTrainingPaused !== 'function'/,
+  'the shade flip should be feature-detected per method for old APKs');
+assert.match(app, /globalThis\.__splatxrNotifToggle = \(\) => \{ if \(S\.state === 'train'\) toggleTrain\(\); \};/,
+  'the shade button should toggle training through the same path as the in-app button');
 assert.match(app, /androidNotifStop\(true\);   \/\/ the shade keeps the final score/,
   'finishing should leave the final score in the shade');
 assert.match(app, /function solveFailed\(why\) \{\s*androidNotifStop\(false\);/,

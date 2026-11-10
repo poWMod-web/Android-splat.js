@@ -1372,7 +1372,9 @@ function videoReview(card, ctx) {
     const { frames, duration, thumbs, cap } = ctx;
     const full = { start: frames[0].t, end: frames[frames.length - 1].t };
     let range = ctx.suggested ? { ...ctx.suggested } : { ...full };
-    let plan = ctx.plan(ctx.suggested ? range : null);
+    let gapSec = null;   // preferred average spacing (null = natural density)
+    const gap = () => (gapSec == null ? {} : { targetGapSec: gapSec });
+    let plan = ctx.plan(ctx.suggested ? range : null, gap());
     S.videoReview = ctx;   // console / e2e access
     const fmt = (t) => `${t.toFixed(1)} s`;
     card.innerHTML = `
@@ -1381,6 +1383,7 @@ function videoReview(card, ctx) {
       <div class="vid-legend"><span><i class="focus"></i>sharpness</span><span><i class="pick"></i>picked frame</span><span><i class="blur"></i>blur dip</span><span><i class="cut"></i>cut</span><span><i class="range"></i>range used</span></div>
       <canvas class="vid-tl" id="vid-tl"></canvas>
       <canvas class="vid-strip" id="vid-strip"></canvas>
+      <div class="vid-gap"><label for="vid-gap-sel">Average spacing</label><select id="vid-gap-sel"><option value="">Auto</option><option value="0.5">0.5 s</option><option value="1">1 s</option><option value="2">2 s</option><option value="5">5 s</option><option value="10">10 s</option></select></div>
       <div class="vid-read"><b id="vid-n"></b><span id="vid-span"></span><button class="linkish" id="vid-reset" hidden>whole video</button></div>
       <div class="upcard-row"><p class="fine" id="vid-hint"></p><span style="display:flex;gap:8px"><button class="btn btn-outline" id="vid-cancel">Cancel</button><button class="btn btn-accent" id="vid-use">Use these frames</button></span></div>`;
     const tl = $('vid-tl'), strip = $('vid-strip');
@@ -1525,7 +1528,7 @@ function videoReview(card, ctx) {
       let b = Math.min(full.end, Math.max(r.end, a + minLen));
       if (b - a < minLen) { a = Math.max(full.start, b - minLen); }
       range = { start: a, end: b };
-      plan = ctx.plan(whole() ? null : range);
+      plan = ctx.plan(whole() ? null : range, gap());
       S.videoPlan = plan;
       redraw();
     }
@@ -1577,6 +1580,13 @@ function videoReview(card, ctx) {
     tl.addEventListener('pointerup', onUp);
     tl.addEventListener('pointercancel', onUp);
     $('vid-reset').onclick = () => setRange({ ...full });
+    $('vid-gap-sel').onchange = () => {
+      const v = $('vid-gap-sel').value;
+      gapSec = v === '' ? null : +v;
+      plan = ctx.plan(whole() ? null : range, gap());
+      S.videoPlan = plan;
+      redraw();
+    };
     $('vid-cancel').onclick = $('vid-x').onclick = () => { cleanup(); resolve(null); };
     const onKey = (e) => { if (e.key === 'Escape') { cleanup(); resolve(null); } };
     window.addEventListener('keydown', onKey);
@@ -2511,7 +2521,11 @@ function toggleTrain() {
   // a user-pressed pause takes ownership from any touch-hold: the release
   // must not resume over it
   if (!on) { S._dragPaused = false; checkpointRun('pause').catch(() => {}); }
-  if (on) androidNotifStart(); else androidNotifStop(false);   // pause sheds the service; resume restarts it
+  // Shade control: where the bridge can flip the notification's button the
+  // service stays up across the pause (Resume in the shade); old bridges
+  // shed it and restart it instead.
+  if (on) { if (!notifSetPaused(false)) androidNotifStart(); }
+  else if (!notifSetPaused(true)) androidNotifStop(false);
 }
 
 // Local-run diagnostics are a compact companion to the saved model. The
@@ -5188,6 +5202,18 @@ function androidNotifStop(finished) {
   } catch { /* best-effort */ }
   S._notifT = 0;
 }
+
+/** Flip the notification's Pause/Resume button — false when the bridge is
+ *  too old, so the caller falls back to shedding/restarting the service. */
+function notifSetPaused(paused) {
+  const b = trainBridge();
+  if (!b || typeof b.setTrainingPaused !== 'function') return false;
+  try { b.setTrainingPaused(paused); } catch { return false; }
+  return true;
+}
+// The shade's Pause/Resume button calls in here (MainActivity turns the
+// broadcast into this toggle) — the same path as the in-app button.
+globalThis.__splatxrNotifToggle = () => { if (S.state === 'train') toggleTrain(); };
 
 // ── screen wake lock ────────────────────────────────────────────────────────
 // a long run gets no touches, and phones dim and lock the screen — hold a

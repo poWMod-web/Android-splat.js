@@ -2,7 +2,10 @@ package space.arrival.splatxr;
 
 import android.app.Activity;
 import android.Manifest;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.util.Base64;
 import android.net.Uri;
@@ -31,12 +34,24 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_PICKER = 42;
     private static final int REQUEST_SAVE_FILE = 43;
     private static final int REQUEST_NOTIFY_PERMISSION = 44;
+    /** The training notification's Pause/Resume button: the service fires it,
+     *  the activity turns it into a WebView toggle call. */
+    public static final String ACTION_TOGGLE_TRAINING = "space.arrival.splatxr.TOGGLE_TRAINING";
     private ValueCallback<Uri[]> fileChooserCallback;
     private WebView webView;
     private WebViewAssetLoader assetLoader;
     private final Object fileSaveLock = new Object();
     private OutputStream fileSaveStream;
     private boolean fileSavePickerPending;
+    private final BroadcastReceiver toggleTrainingReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context ctx, Intent intent) {
+            if (webView == null) return;
+            webView.post(() -> {
+                try { webView.evaluateJavascript("window.__splatxrNotifToggle&&window.__splatxrNotifToggle()", null); }
+                catch (Exception ignored) { /* the shade toggle must never crash the app */ }
+            });
+        }
+    };
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -88,6 +103,14 @@ public final class MainActivity extends Activity {
         applySafeAreaInsets(host);
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
         webView.loadUrl("https://appassets.androidplatform.net/assets/app/index.html");
+
+        // the notification's Pause/Resume button (a dynamic receiver: nothing
+        // to declare, nothing exported)
+        try {
+            IntentFilter toggleFilter = new IntentFilter(ACTION_TOGGLE_TRAINING);
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(toggleTrainingReceiver, toggleFilter, Context.RECEIVER_NOT_EXPORTED);
+            else registerReceiver(toggleTrainingReceiver, toggleFilter);
+        } catch (Exception ignored) { /* shade control is best-effort */ }
     }
 
     private void applySafeAreaInsets(FrameLayout content) {
@@ -252,12 +275,26 @@ public final class MainActivity extends Activity {
         } catch (Exception ignored) { /* best-effort progress display */ }
     }
 
+    /** Flip the notification's Pause/Resume button (the service stays up so
+     *  the other button is always one tap away in the shade). */
+    private void sendTrainingPaused(boolean paused) {
+        try {
+            Intent intent = new Intent(this, TrainingService.class)
+                    .putExtra("action", "paused")
+                    .putExtra("paused", paused);
+            // the service is already foreground (start raised it): a plain
+            // start, like updates — never a second foreground start
+            startService(intent);
+        } catch (Exception ignored) { /* shade control is best-effort */ }
+    }
+
     private void stopTrainingService() {
         try { stopService(new Intent(this, TrainingService.class)); }
         catch (Exception ignored) { /* the service was never started */ }
     }
 
     @Override protected void onDestroy() {
+        try { unregisterReceiver(toggleTrainingReceiver); } catch (Exception ignored) { /* never registered */ }
         stopTrainingService();
         cancelFileSave();
         if (fileChooserCallback != null) {
@@ -318,6 +355,10 @@ public final class MainActivity extends Activity {
 
         @JavascriptInterface public void cancelTrainingNotification() {
             sendTrainingCommand("cancel", null, null, 0, 0);
+        }
+
+        @JavascriptInterface public void setTrainingPaused(boolean paused) {
+            sendTrainingPaused(paused);
         }
 
         @JavascriptInterface public String exportDataset() {

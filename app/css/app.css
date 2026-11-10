@@ -941,6 +941,8 @@ a.cbtn { text-decoration: none; }
 .stage #vidcard .vid-tl { display: block; width: 100%; height: clamp(160px, 38vh, 440px); border-radius: 10px; background: rgba(7, 9, 9, .8); border: 1px solid var(--line); touch-action: none; cursor: crosshair; }
 .stage #vidcard .vid-strip { display: block; width: 100%; height: clamp(64px, 15vh, 170px); border-radius: 8px; background: rgba(7, 9, 9, .8); border: 1px solid var(--line); }
 .vid-read { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font: 400 14px var(--mono); color: var(--muted); }
+.vid-gap { display: flex; align-items: center; gap: 10px; font: 400 12px var(--mono); color: var(--muted); }
+.vid-gap select { flex: none; background: var(--panel-2); color: var(--paper); border: 1px solid var(--line-2); border-radius: 8px; padding: 5px 8px; font: 500 12px var(--mono); outline: none; }
 .vid-read b { font: 600 17px var(--ui); color: var(--paper); }
 .vid-read .linkish { cursor: pointer; background: none; border: 0; }
 .vid-legend { display: flex; gap: 16px; flex-wrap: wrap; font: 400 12.5px var(--mono); color: var(--dim); }

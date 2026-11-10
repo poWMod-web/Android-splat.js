@@ -24,6 +24,12 @@ public final class TrainingService extends Service {
 
     private boolean foreground;
     private PowerManager.WakeLock wakeLock;
+    // the last-shown progress, so the paused flag can rebuild the same
+    // notification with its button flipped
+    private String lastTitle = "";
+    private String lastText = "";
+    private int lastDone, lastTotal;
+    private boolean lastPaused;
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
@@ -33,15 +39,32 @@ public final class TrainingService extends Service {
         if (action == null) action = "";
         switch (action) {
             case "start":
-                startForegroundTraining(
-                        intent.getStringExtra("title"), intent.getStringExtra("text"));
+                lastTitle = intent.getStringExtra("title");
+                lastText = intent.getStringExtra("text");
+                lastDone = 0; lastTotal = 0; lastPaused = false;
+                startForegroundTraining(lastTitle, lastText);
                 break;
             case "update":
                 if (foreground) {
-                    showOngoing(intent.getStringExtra("title"), intent.getStringExtra("text"),
-                            intent.getIntExtra("done", 0), intent.getIntExtra("total", 0), false);
+                    lastTitle = intent.getStringExtra("title");
+                    lastText = intent.getStringExtra("text");
+                    lastDone = intent.getIntExtra("done", 0);
+                    lastTotal = intent.getIntExtra("total", 0);
+                    showOngoing(lastTitle, lastText, lastDone, lastTotal, false);
                 } else {
                     stopSelf(); // delivered to a dead service: linger nothing
+                }
+                break;
+            case "paused":
+                // the shade (or the app) flipped training state: keep the
+                // foreground notification so the other button stays one tap
+                // away, but only hold the CPU awake while running
+                lastPaused = intent.getBooleanExtra("paused", false);
+                if (foreground) {
+                    if (lastPaused) releaseWakeLock(); else acquireWakeLock();
+                    showOngoing(lastTitle, lastText, lastDone, lastTotal, false);
+                } else {
+                    stopSelf();
                 }
                 break;
             case "finish":
@@ -148,6 +171,18 @@ public final class TrainingService extends Service {
                 .setOnlyAlertOnce(true);
         if (Build.VERSION.SDK_INT < 26) builder.setPriority(Notification.PRIORITY_LOW);
         if (ongoing && total > 0 && done >= 0) builder.setProgress(total, Math.min(done, total), false);
+        if (ongoing) {
+            // Pause / Resume without opening the app: a broadcast the
+            // activity turns into a WebView toggle call, so the shade
+            // button works while the app sits in the background
+            Intent toggle = new Intent(MainActivity.ACTION_TOGGLE_TRAINING);
+            toggle.setPackage(getPackageName());
+            PendingIntent togglePi = PendingIntent.getBroadcast(this, 1, toggle,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            builder.addAction(lastPaused ? android.R.drawable.ic_media_play : android.R.drawable.ic_media_pause,
+                    lastPaused ? "Resume" : "Pause", togglePi);
+            if (lastPaused && text != null && !text.isEmpty()) builder.setContentText(text + " · Paused");
+        }
         return builder.build();
     }
 
