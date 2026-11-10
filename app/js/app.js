@@ -4395,7 +4395,7 @@ async function renderShareThumb() {
     cv.width = W; cv.height = H;
     ses.view.attach(cv);
     ses.view.setCamera({ R: c.R, t: c.t, f: c.f * (W / c.w), cx: W / 2, cy: H / 2, w: W, h: H });
-    ses.view.renderNow();
+    ses.view.renderNow(true);
     await ses.trainer.device.queue.onSubmittedWorkDone();
     const out = document.createElement('canvas');
     out.width = W; out.height = H;
@@ -4733,7 +4733,7 @@ async function ensureErrRender(key) {
     cv.width = meta.w; cv.height = meta.h;
     ses.view.attach(cv);
     ses.view.lookThrough(cam.ci);
-    ses.view.renderNow();
+    ses.view.renderNow(true);
     await ses.trainer.device.queue.onSubmittedWorkDone();
     if (S.gen !== gen) return;
     const snap = (S._errSnap ??= document.createElement('canvas'));

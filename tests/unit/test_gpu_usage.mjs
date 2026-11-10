@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { gpuDuty, gpuIdleMs } from '../../src/session.js';
+import { gpuDuty, gpuIdleMs, gpuBurstMs } from '../../src/session.js';
 
 const sessionSrc = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
@@ -90,6 +90,39 @@ const indexHtml = readFileSync(new URL('../../app/index.html', import.meta.url),
     'a user-pressed pause should take ownership so a release never resumes over it');
   assert.match(sessionSrc, /this\.training = true;\n(\s*\/\/.*\n)+\s*this\._thrT = null;/,
     'resuming should restart the throughput window instead of reading the pause gap as GPU slowness');
+}
+
+// duty honesty: bursts shrink with the slider and the sleep drains first,
+// so 10% is genuinely GPU-free instead of backlog-hot
+{
+  assert.equal(gpuBurstMs(400, undefined), 400);
+  assert.equal(gpuBurstMs(400, 1), 400);       // full duty: exactly the old bound
+  assert.equal(gpuBurstMs(400, 0.5), 200);
+  assert.equal(gpuBurstMs(400, 0.1), 40);
+  assert.equal(gpuBurstMs(120, 0.1), 12);
+  assert.match(sessionSrc, /const chunk = gpuBurstMs\(this\.opts\.gpuChunkMs \?\? 400, this\.opts\.gpuUsage\) \/ 1000;/,
+    'the batch cap should bound duty-scaled bursts, not full-size ones');
+  assert.match(sessionSrc, /if \(duty < 1 && this\._fences\.length\) \{/,
+    'the honesty drain should run below full duty and never at it');
+  assert.match(sessionSrc, /gpuIdleMs\(dt, this\.opts\.gpuUsage\) \* 0\.25/,
+    'the drain should be bounded by a fraction of the coming idle');
+  assert.match(sessionSrc, /if \(drained\) this\._fences\.length = 0;/,
+    'a successful drain should empty the ring so the sleep starts GPU-free');
+  const drainAt = sessionSrc.indexOf('const drained = await Promise.race([');
+  assert.ok(drainAt > 0 && drainAt < sessionSrc.indexOf('const ideal = batch', drainAt),
+    'the drain should land before the measurement the adapters and idle are computed from');
+}
+
+// latest-wins view renders: orbiting must not queue stale frames behind the GPU
+{
+  assert.match(sessionSrc, /renderNow\(force = false\) \{/,
+    'renderNow should take a force flag for synchronous snapshots');
+  assert.match(sessionSrc, /if \(this\._renderInFlight && !force\) \{ this\._dirty = true; return; \}/,
+    'a render in flight should defer to the newest camera instead of queueing');
+  assert.match(sessionSrc, /this\._renderInFlight = t;/,
+    'each submitted render should arm the gate');
+  assert.equal((app.match(/\.renderNow\(true\)/g) || []).length, 2,
+    'both canvas-readback snapshots should force their renders');
 }
 
 console.log('GPU usage throttle: passed');

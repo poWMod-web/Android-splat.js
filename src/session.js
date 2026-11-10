@@ -138,6 +138,14 @@ export function gpuIdleMs(busyMs, usage) {
   return Math.min(2000, Math.max(0, busyMs) * (1 - d) / d);
 }
 
+/** Burst bound for one batch's GPU work: the chunk cap scaled by duty. A
+ *  full-size burst at low duty would run through the whole "idle" window
+ *  as backlog and the system would never get the GPU; at full duty this
+ *  is exactly the old bound (provable no-op). */
+export function gpuBurstMs(chunkMs, usage) {
+  return chunkMs * gpuDuty(usage);
+}
+
 class Emitter {
   constructor() { this.map = new Map(); }
   on(type, fn) {
@@ -947,27 +955,47 @@ export class Session {
       this._fences.push(trainer.device.queue.onSubmittedWorkDone());
       const s0 = performance.now();
       // fence ring depth trades UI latency for fence-latency overlap
-      // (phones run 2: the compositor shares the GPU with training, and
-      // 4 x 0.4s of queued dispatches is the "whole system stalls" feel)
+      // (4 x 0.4s of queued dispatches is the "whole system stalls" feel —
+      // hosts sharing the GPU with a compositor can pass a lower fenceRing)
       if (this._fences.length > (this.opts.fenceRing ?? 4)) await this._fences.shift();
       const tStall = performance.now() - s0;
 
+      // Duty honesty: the ring above keeps several batches in flight, so
+      // the throttle sleep below would merely run the backlog while the
+      // GPU never frees up (10% delivered ~100% heat). Drain the in-flight
+      // queue first so the sleep is genuinely GPU-free — bounded by a
+      // quarter of the coming idle, so a late fence (Safari resolves
+      // hundreds of ms after the GPU is already idle) fails open to
+      // pipelined behavior instead of stalling every frame. Skipped
+      // entirely at full duty (duty 1 never sleeps: provable no-op).
+      let dt = Math.max(5, performance.now() - t0);
+      const duty = gpuDuty(this.opts.gpuUsage);
+      if (duty < 1 && this._fences.length) {
+        const budget = Math.max(0, gpuIdleMs(dt, this.opts.gpuUsage) * 0.25);
+        const w0 = performance.now();
+        const drained = await Promise.race([
+          this._fences[this._fences.length - 1].then(() => true, () => true),
+          new Promise((r) => setTimeout(() => r(false), budget)),
+        ]);
+        dt = Math.max(5, dt + (performance.now() - w0));
+        if (drained) this._fences.length = 0;
+      }
+
       // adapt the batch to the measured cadence (steady-state ~= GPU time of
-      // one batch); damped so it settles instead of oscillating
-      const dt = Math.max(5, performance.now() - t0);
+      // one batch, the honesty drain included); damped so it settles
       const ideal = batch * (120 / dt);
       this._batch = Math.max(4, Math.min(64, (this._batch ?? 15) * 0.7 + ideal * 0.3));
       // throughput cap: ~0.4s of measured GPU work per batch. The dt adapter
       // reads 5ms frames when fences resolve stale and pushes the batch to
       // the clamp — fine on a desktop, ten queued seconds on a phone.
       if (this._ips != null) {
-        // gpuChunkMs bounds how much GPU work one batch queues — phones run
-        // ~120ms so the compositor (which shares the GPU) gets a slot every
-        // frame or two instead of stalling behind 0.4s of dispatches
-        const chunk = (this.opts.gpuChunkMs ?? 400) / 1000;
+        // gpuChunkMs bounds how much GPU work one batch queues at full
+        // duty; below, the bound scales with the slider (gpuBurstMs) so a
+        // burst never outruns its idle window as backlog
+        const chunk = gpuBurstMs(this.opts.gpuChunkMs ?? 400, this.opts.gpuUsage) / 1000;
         // _ips is wall-time (throttle idle included): divide the requested
-        // duty back out, so the usage slider only ever adds idle between
-        // batches and never shrinks the batches themselves
+        // duty back out against the duty-scaled bound, so batches stay
+        // saturating at full duty and shrink with the slider below
         this._batch = Math.min(this._batch, Math.max(8, Math.round(this._ips * chunk / gpuDuty(this.opts.gpuUsage))));
       }
       if (this.perf) {
@@ -1154,6 +1182,7 @@ class SessionView {
     this.camera = null;   // { R, t, f, cx, cy, w, h } at canvas resolution
     this.enabled = true;  // app viewport is optional; the trainer's own loss renderer is not
     this._dirty = false;
+    this._renderInFlight = null;   // latest-wins gate (see renderNow)
     this._offset = 0;     // training-target offset when looking through a frame
   }
 
@@ -1196,10 +1225,22 @@ class SessionView {
     if (!this.s.training && this.s._sched) this.s._scheduleFrame();
   }
 
-  renderNow() {
+  /** Render the current camera now — latest-wins: while a render is still
+   *  in flight (continuous orbiting submits faster than the GPU drains),
+   *  mark dirty and return instead of queueing stale frames behind it;
+   *  the host's next frame (or the loop's tick) retries with the newest
+   *  camera. `force` submits unconditionally for synchronous snapshots
+   *  that read the canvas back immediately. */
+  renderNow(force = false) {
     if (!this.enabled || !this.ctx || !this.camera) return;
-    this.s.trainer.renderView(this.camera, this.ctx, 0, this._offset);
+    if (this._renderInFlight && !force) { this._dirty = true; return; }
     this._dirty = false;
+    this.s.trainer.renderView(this.camera, this.ctx, 0, this._offset);
+    const t = this.s.trainer.device.queue.onSubmittedWorkDone();
+    this._renderInFlight = t;
+    t.then(
+      () => { if (this._renderInFlight === t) this._renderInFlight = null; },
+      () => { if (this._renderInFlight === t) this._renderInFlight = null; });
     // any render satisfies the auto-refresh — a host that renders on its own
     // cadence keeps pushing this back and the tick below never double-fires
     this._lastAuto = performance.now();
