@@ -79,8 +79,8 @@ assert.match(main, /ACTION_TOGGLE_TRAINING = "space\.arrival\.splatxr\.TOGGLE_TR
   'the activity should own the shade-toggle broadcast action');
 assert.match(main, /setTrainingPaused\(boolean paused\)/,
   'the bridge should flip the notification paused state');
-assert.match(main, /registerReceiver\(toggleTrainingReceiver, toggleFilter/,
-  'the activity should listen for shade toggles');
+assert.match(main, /ContextCompat\.registerReceiver\(this, toggleTrainingReceiver, toggleFilter,\s*ContextCompat\.RECEIVER_NOT_EXPORTED\)/,
+  'the shade listener should register NOT_EXPORTED via ContextCompat (bare registerReceiver fails Android 14+ lint)');
 assert.match(main, /unregisterReceiver\(toggleTrainingReceiver\)/,
   'the activity should drop the shade listener on destroy');
 assert.match(main, /evaluateJavascript\("window\.__splatxrNotifToggle&&window\.__splatxrNotifToggle\(\)", null\)/,

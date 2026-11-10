@@ -57,4 +57,5 @@ tasks.named('preBuild').configure { dependsOn tasks.named('syncWebAssets') }
 dependencies {
     implementation 'com.google.ar:core:1.41.0'
     implementation 'androidx.webkit:webkit:1.12.1'
+    implementation 'androidx.core:core:1.15.0'
 }

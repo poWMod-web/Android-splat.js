@@ -20,6 +20,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 
+import androidx.core.content.ContextCompat;
 import androidx.webkit.WebViewAssetLoader;
 
 import org.json.JSONArray;
@@ -105,11 +106,13 @@ public final class MainActivity extends Activity {
         webView.loadUrl("https://appassets.androidplatform.net/assets/app/index.html");
 
         // the notification's Pause/Resume button (a dynamic receiver: nothing
-        // to declare, nothing exported)
+        // to declare, nothing exported). ContextCompat carries the
+        // NOT_EXPORTED flag back to minSdk — a bare registerReceiver fails
+        // Android 14+ lint (UnspecifiedRegisterReceiverFlag) on every path.
         try {
             IntentFilter toggleFilter = new IntentFilter(ACTION_TOGGLE_TRAINING);
-            if (Build.VERSION.SDK_INT >= 33) registerReceiver(toggleTrainingReceiver, toggleFilter, Context.RECEIVER_NOT_EXPORTED);
-            else registerReceiver(toggleTrainingReceiver, toggleFilter);
+            ContextCompat.registerReceiver(this, toggleTrainingReceiver, toggleFilter,
+                    ContextCompat.RECEIVER_NOT_EXPORTED);
         } catch (Exception ignored) { /* shade control is best-effort */ }
     }
 
