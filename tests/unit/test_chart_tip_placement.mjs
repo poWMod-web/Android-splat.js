@@ -17,7 +17,7 @@ assert.match(tip, /h\.yPct/,
   'the readout should anchor to the cursor height, not the plot top edge');
 assert.match(tip, /wrap\.clientWidth[\s\S]*tip\.offsetWidth[\s\S]*Math\.max\(tw \/ 2/,
   'the readout should clamp sideways inside the plot');
-assert.match(tip, /translate\(-50%, calc\(-100% - 28px\)\)[\s\S]*translate\(-50%, 28px\)/,
-  'the readout should float clear above the cursor, flipping below it near the top');
+assert.match(tip, /translate\(-50%, calc\(-100% - 70px\)\)[\s\S]*translate\(-50%, 70px\)/,
+  'the readout should float 70px clear of the cursor, flipping below it near the top');
 
 console.log('chart hover readout placement inside the plot: passed');

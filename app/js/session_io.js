@@ -40,6 +40,34 @@ export function trainRecipe(ses) {
   return t;
 }
 
+/** Capture-world gravity in the DATA frame, from a capture.json leveling
+ *  report (row-major rotation R): leveling rotates the world by R, so the
+ *  capture world's +Y — gravity, ARCore sessions are gravity-aligned — sits
+ *  at R·Y in the data frame. Null unless the report applied a rotation. */
+export function levelingUpFromReport(leveling) {
+  const r = leveling && leveling.applied === true && leveling.rotation;
+  if (!Array.isArray(r) || r.length !== 9 || !r.every(Number.isFinite)) return null;
+  const g = [r[1], r[4], r[7]];   // R·[0,1,0] is the rotation's middle column
+  const m = Math.hypot(g[0], g[1], g[2]);
+  return m > 1e-6 ? [g[0] / m, g[1] / m, g[2] / m] : null;
+}
+
+const validUp = (v) => Array.isArray(v) && v.length === 3 && v.every(Number.isFinite) &&
+  Math.hypot(v[0], v[1], v[2]) > 1e-6;
+
+/** The orbit's up axis for a known-camera run: capture-world gravity in the
+ *  data frame. The cameras' own up axes CANNOT serve — phone captures are
+ *  portrait-held, so sensor-up lies sideways to gravity and averaging it
+ *  levels the horizon 90° off. Solver runs keep detectUp (their frame is
+ *  arbitrary), so this helper is only called for known-camera runs. */
+export function gravityUpForKnownRun({ persisted = null, leveling = null } = {}) {
+  if (validUp(persisted)) {
+    const m = Math.hypot(persisted[0], persisted[1], persisted[2]);
+    return [persisted[0] / m, persisted[1] / m, persisted[2] / m];
+  }
+  return levelingUpFromReport(leveling) || [0, 1, 0];
+}
+
 export function buildReconJson(S) {
   const ses = S.session;
   const recon = ses.recon;
@@ -74,6 +102,12 @@ export function buildReconJson(S) {
     // model instead of guessing from the coordinates.
     knownCameras: !!recon.known,
     trainScale: ses.opts?.frames?.trainScale ?? 1,
+    // gravity in the data frame (see gravityUpForKnownRun): the orbit's up
+    // axis when this run is viewed back. Solver runs omit it (detectUp).
+    ...(recon.known ? { levelingUp: r6(gravityUpForKnownRun({
+      persisted: S._localRun?.recon?.levelingUp,
+      leveling: S.preset?.capture?.metadata?.leveling,
+    })) } : {}),
     iter: ses.trainer.iter,
     splats: ses.trainer.n,
     shK: ses.trainer.shK,

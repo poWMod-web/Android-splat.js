@@ -1,11 +1,13 @@
 package space.arrival.splatxr;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
@@ -38,6 +40,8 @@ public final class TrainingService extends Service {
                 if (foreground) {
                     showOngoing(intent.getStringExtra("title"), intent.getStringExtra("text"),
                             intent.getIntExtra("done", 0), intent.getIntExtra("total", 0), false);
+                } else {
+                    stopSelf(); // delivered to a dead service: linger nothing
                 }
                 break;
             case "finish":
@@ -72,26 +76,43 @@ public final class TrainingService extends Service {
         // On-device model training is not one of the platform's fixed
         // foreground-service types, so this service runs as specialUse on
         // Android 14+ (declared in the manifest with its subtype property).
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-        } else {
-            startForeground(NOTIF_ID, notification);
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else {
+                startForeground(NOTIF_ID, notification);
+            }
+        } catch (Exception e) {
+            // The platform refused the foreground start (a background launch
+            // on Android 12+, a missing declaration): stop quietly instead of
+            // crashing — training itself runs in the WebView either way.
+            teardown();
+            return;
         }
         foreground = true;
     }
 
     private void showOngoing(String title, String text, int done, int total, boolean alert) {
-        notifications().notify(NOTIF_ID, buildNotification(title, text, done, total, true));
+        try {
+            notifications().notify(NOTIF_ID, buildNotification(title, text, done, total, true));
+        } catch (Exception ignored) { /* progress display must never crash training */ }
     }
 
     private void showDone(String title, String text) {
-        // finished training leaves one dismissible summary in the shade
-        notifications().notify(DONE_ID, buildNotification(title, text, 0, 0, false));
+        // Finished training leaves one dismissible summary in the shade —
+        // unless notifications were denied, where posting throws a
+        // SecurityException and takes the app down with it (Stop & keep
+        // crashed exactly here on permission-denied devices).
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) return;
+        try {
+            notifications().notify(DONE_ID, buildNotification(title, text, 0, 0, false));
+        } catch (Exception ignored) { /* a summary must never crash the app */ }
     }
 
     private void teardown() {
-        notifications().cancel(NOTIF_ID);
-        stopForeground(true);
+        try { notifications().cancel(NOTIF_ID); } catch (Exception ignored) { /* already gone */ }
+        try { stopForeground(true); } catch (Exception ignored) { /* never foregrounded */ }
         releaseWakeLock();
         foreground = false;
         stopSelf();

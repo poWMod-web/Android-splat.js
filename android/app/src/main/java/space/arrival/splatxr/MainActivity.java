@@ -242,10 +242,12 @@ public final class MainActivity extends Activity {
                     .putExtra("text", text == null ? "" : text)
                     .putExtra("done", done)
                     .putExtra("total", total);
-            // progress ticks while the app sits in the background: with the
-            // training service already foreground the process counts as
-            // foreground, so foreground-service starts stay legal for updates
-            if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
+            // Only "start" raises a foreground service. Updates, the finish
+            // summary and cancels go to the already-foreground service with
+            // a plain start — if it died mid-training they no-op instead of
+            // hanging a foreground start the service never answers (which
+            // the platform kills the app for).
+            if ("start".equals(action) && Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
             else startService(intent);
         } catch (Exception ignored) { /* best-effort progress display */ }
     }

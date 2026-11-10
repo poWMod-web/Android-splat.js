@@ -38,6 +38,14 @@ assert.match(service, /notifications\(\)\.notify\(DONE_ID/,
   'a finish should leave one dismissible summary notification');
 assert.match(service, /public void onTaskRemoved\(Intent rootIntent\) \{/,
   'swiping the app away should tear the service down');
+assert.match(service, /checkSelfPermission\(Manifest\.permission\.POST_NOTIFICATIONS\)[\s\S]*?!= PackageManager\.PERMISSION_GRANTED\) return;/,
+  'the finish summary should be skipped when notifications are denied instead of crashing');
+assert.match(service, /catch \(Exception ignored\) \{ \/\* progress display must never crash training \*\/ \}/,
+  'progress posts should never crash the app');
+assert.match(service, /catch \(Exception ignored\) \{ \/\* a summary must never crash the app \*\/ \}/,
+  'the finish summary should never crash the app');
+assert.match(service, /startForeground\(NOTIF_ID, notification[\s\S]*?catch \(Exception e\) \{[\s\S]*?teardown\(\);/,
+  'a refused foreground start should stop quietly instead of crashing');
 assert.match(service, /if \(intent == null\) \{ stopSelf\(\); return START_NOT_STICKY; \}/,
   'a restart without a command should stop instead of going zombie');
 assert.match(service, /releaseWakeLock\(\);/,
@@ -55,8 +63,8 @@ assert.match(main, /cancelTrainingNotification\(\)/,
   'the bridge should cancel the notification');
 assert.match(main, /Manifest\.permission\.POST_NOTIFICATIONS/,
   'starting training should request the notification permission on Android 13+');
-assert.match(main, /if \(Build\.VERSION\.SDK_INT >= 26\) startForegroundService\(intent\);\s*else startService\(intent\);/,
-  'commands should start foreground where the platform requires it');
+assert.match(main, /if \("start"\.equals\(action\) && Build\.VERSION\.SDK_INT >= 26\) startForegroundService\(intent\);\s*else startService\(intent\);/,
+  'only the start command should raise a foreground service; the rest are plain starts');
 assert.match(main, /stopTrainingService\(\);/,
   'destroying the activity should stop the training service');
 
@@ -78,6 +86,10 @@ assert.match(app, /now - \(S\._notifT \|\| 0\) < 2500/,
   'notification updates should be throttled');
 assert.match(app, /\$\{fmt\(S\.splats\)\} splats · \$\{fmt\(S\.iter\)\} \/ \$\{fmt\(S\.maxIters\)\}/,
   'the notification should carry splats and the cycle count');
+assert.match(app, /function notifScore\(\) \{[\s\S]*?S\.scoreScale === 'similarity'[\s\S]*?psnrToApproxSsimPercent\(psnr\)\.toFixed\(1\)\} %/,
+  'the notification score should follow the dB/% switch');
+assert.match(app, /\$\{notifScore\(\)\}\$\{fmt\(S\.splats\)\} splats/,
+  'progress ticks and the finish summary should share the unit-aware score');
 assert.match(app, /if \(on\) androidNotifStart\(\); else androidNotifStop\(false\);/,
   'pausing should shed the service and resuming should restart it');
 assert.match(app, /androidNotifStop\(true\);   \/\/ the shade keeps the final score/,

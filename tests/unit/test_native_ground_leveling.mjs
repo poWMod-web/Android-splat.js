@@ -27,6 +27,10 @@ assert.match(java, /JSONObject leveling = applyGroundLeveling\(\);/,
 assert.match(java, /if \(toward < 0\) \{ up\[0\] = -up\[0\]; up\[1\] = -up\[1\]; up\[2\] = -up\[2\]; \}/,
   'the plane normal should face the cameras (up, never upside down)');
 assert.match(java, /spread >= 0\.7f/, 'the camera-up fallback should require agreeing cameras');
+assert.match(java, /Math\.abs\(up\[1\]\) >= 0\.5f/,
+  'the camera-up fallback should refuse a near-horizontal mean up (portrait captures point sensor-up sideways)');
+assert.match(java, /average up is horizontal \(portrait capture\)/,
+  'the horizontal rejection should be recorded in the leveling report');
 assert.match(java, /if \(up\[1\] < 0\) \{ up\[0\] = -up\[0\]; up\[1\] = -up\[1\]; up\[2\] = -up\[2\]; \}/,
   'the fallback should keep the session +Y hemisphere (never flip a level world)');
 assert.match(java, /angleDeg >= 0\.5f/, 'an already-level world should be left alone');
@@ -118,5 +122,8 @@ assert.equal(levelingNote({ method: 'camera-up-average', applied: true, tiltDegr
   "No ground plane in view; levelled to the cameras' average up (12.3°). Hold the phone upright while capturing.");
 assert.equal(levelingNote({ method: 'none', applied: false }),
   'No ground plane in view and the camera orientations disagree; the session world is kept as captured.');
+assert.equal(levelingNote({ method: 'none', applied: false,
+  reason: 'the cameras\' average up is horizontal (portrait capture); the AR world is already gravity-aligned' }),
+  'Portrait capture: the cameras\' average up lies sideways, so the gravity-aligned AR world is kept as captured.');
 
 console.log('native ARCore ground-plane leveling: passed');

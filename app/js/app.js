@@ -17,7 +17,7 @@ import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } f
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './training-settings.js';
 import { zipStore } from './zip.js';
 import { saveBlob } from './download.js';
-import { buildSessionZip, fetchModel } from './session_io.js';
+import { buildSessionZip, fetchModel, gravityUpForKnownRun } from './session_io.js';
 import { buildDisplayCloud } from './scene-cloud.js';
 import { REPO, DISCORD, DATA, ownSet } from './data.js';
 
@@ -2363,7 +2363,17 @@ function buildSceneFromSession() {
     radius: (ses.model && ses.model.radius) || 1,
   };
   vp.setScene(S.scene);
-  vp.detectUp(cams);
+  if (recon && recon.known) {
+    // known-camera runs keep the capture world's y-up frame — level to its
+    // gravity, not to the cameras' sensor-up (portrait-held phones point it
+    // sideways, which used to roll the view 90°)
+    vp.setUp(gravityUpForKnownRun({
+      persisted: S._localRun && S._localRun.recon && S._localRun.recon.levelingUp,
+      leveling: S.preset && S.preset.capture && S.preset.capture.metadata && S.preset.capture.metadata.leveling,
+    }));
+  } else {
+    vp.detectUp(cams);
+  }
   paintStrip();
 }
 
@@ -3165,6 +3175,7 @@ async function restoreSession(src) {
         // the Details sheet reads session.recon (cams/points) — same shape
         // the old view-only path built via useReconstruction()
         ses.recon = {
+          known: !!reconJson.knownCameras,
           cams: (reconJson.cams || []).map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
           // the Details header counts these; the recon carries a decimated
           // cloud, so at least report its size instead of a flat zero
@@ -3187,6 +3198,7 @@ async function restoreSession(src) {
     const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter) });
     if (reconJson) {
       ses.useReconstruction({
+        known: !!reconJson.knownCameras,
         cams: reconJson.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
         points: [],
         k1: reconJson.k1 || 0, k2: reconJson.k2 || 0,
@@ -3343,7 +3355,10 @@ function finishRestore(ses, reconJson, nSplats, hasState, gaussians) {
       center, radius,
     };
     vp.setScene(S.scene);
-    if (cams.length) vp.detectUp(cams);
+    // known-camera restores level to the capture world's gravity (persisted
+    // per run); solver restores measure up from the cameras as before
+    if (reconJson && reconJson.knownCameras) vp.setUp(gravityUpForKnownRun({ persisted: reconJson.levelingUp }));
+    else if (cams.length) vp.detectUp(cams);
     mountModelCanvas();
     S.atFrame = -1; S.fadeTo = 0;
     vp.lock = null; vp.freeF = null;
@@ -4003,6 +4018,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
   await ses.load(files);
   if (S.gen !== gen) return;
   ses.useReconstruction({
+    known: !!recon.knownCameras,
     cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
     points: [],
     k1: recon.k1 || 0, k2: recon.k2 || 0,
@@ -5081,7 +5097,7 @@ function chartTip(h) {
     (h.event ? `<br><span style="color:#93a1a0">${h.event}</span>` : '');
   // the readout rides the cursor INSIDE the plot: pinned to the top edge it
   // hung past the stage in the expanded graph and hid behind the dock.
-  // Clamped sideways, floating clear above the cursor (below it near the top).
+  // Clamped sideways, floating 70px clear of the cursor (below it near the top).
   const wrap = tip.parentElement;
   const W = wrap ? wrap.clientWidth : 0, H = wrap ? wrap.clientHeight : 0;
   if (!W || !H) { tip.style.left = `${h.xPct}%`; tip.style.top = '4px'; return; }
@@ -5090,7 +5106,7 @@ function chartTip(h) {
   const y = (Math.max(0, Math.min(100, h.yPct ?? 0)) / 100) * H;
   tip.style.left = `${(x / W) * 100}%`;
   tip.style.top = `${(y / H) * 100}%`;
-  tip.style.transform = y > th + 44 ? 'translate(-50%, calc(-100% - 28px))' : 'translate(-50%, 28px)';
+  tip.style.transform = y > th + 86 ? 'translate(-50%, calc(-100% - 70px))' : 'translate(-50%, 70px)';
 }
 
 // ── flash ───────────────────────────────────────────────────────────────────
@@ -5149,14 +5165,21 @@ function androidNotifStart() {
   S._notifT = 0;
   try { b.startTrainingNotification(`Training ${S._notifName}`, 'Starting…'); } catch { /* best-effort */ }
 }
+/** The live score for the notification shade, in the user's chosen unit. */
+function notifScore() {
+  const psnr = S.psnrHold ?? S.psnrTrain;
+  if (psnr == null) return '';
+  return S.scoreScale === 'similarity'
+    ? `${psnrToApproxSsimPercent(psnr).toFixed(1)} % · `
+    : `${psnr.toFixed(1)} dB · `;
+}
 function androidNotifTick() {
   const b = trainBridge();
   if (!b || S.state !== 'train' || !S.session || !S.session.training) return;
   const now = performance.now();
   if (now - (S._notifT || 0) < 2500) return;   // the shade is not a 60 fps surface
   S._notifT = now;
-  const psnr = S.psnrHold ?? S.psnrTrain;
-  const text = `${psnr != null ? `${psnr.toFixed(1)} dB · ` : ''}${fmt(S.splats)} splats · ${fmt(S.iter)} / ${fmt(S.maxIters)}`;
+  const text = `${notifScore()}${fmt(S.splats)} splats · ${fmt(S.iter)} / ${fmt(S.maxIters)}`;
   try { b.updateTrainingNotification(`Training ${S._notifName || 'model'}`, text, S.iter | 0, S.maxIters | 0); }
   catch { /* best-effort */ }
 }
@@ -5165,9 +5188,8 @@ function androidNotifStop(finished) {
   if (!b) return;
   try {
     if (finished) {
-      const psnr = S.psnrHold ?? S.psnrTrain;
       b.finishTrainingNotification('Training complete',
-        `${psnr != null ? `${psnr.toFixed(1)} dB · ` : ''}${fmt(S.splats)} splats · ${fmt(S.iter)} cycles`);
+        `${notifScore()}${fmt(S.splats)} splats · ${fmt(S.iter)} cycles`);
     } else {
       b.cancelTrainingNotification();
     }

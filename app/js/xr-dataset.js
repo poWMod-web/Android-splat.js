@@ -82,6 +82,9 @@ export function levelingNote(leveling) {
   if (leveling.method === 'camera-up-average' && leveling.applied) {
     return `No ground plane in view; levelled to the cameras' average up${tilt ? ` (${tilt})` : ''}. Hold the phone upright while capturing.`;
   }
+  if (leveling.method === 'none' && /horizontal/i.test(leveling.reason || '')) {
+    return 'Portrait capture: the cameras\' average up lies sideways, so the gravity-aligned AR world is kept as captured.';
+  }
   return 'No ground plane in view and the camera orientations disagree; the session world is kept as captured.';
 }
 

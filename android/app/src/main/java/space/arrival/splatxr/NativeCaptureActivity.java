@@ -1006,10 +1006,11 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 report.put("planeExtentZ", groundExtentZ);
                 report.put("planeArea", groundArea);
             } else {
-                // Fallback: the cameras' mean up axis. The activity is portrait-locked and
-                // the capture guide keeps the phone upright, so this levels handheld object
-                // scans with no floor in view. Its sign follows the session +Y hemisphere,
-                // so a level session can never be flipped upside down.
+                // Fallback: the cameras' mean up axis — for LANDSCAPE-held phones,
+                // whose sensor-up tracks gravity. A portrait-held phone (the
+                // activity's locked orientation) points sensor-up sideways to
+                // gravity, so levelling to it would roll the world 90 degrees;
+                // those captures keep the AR world, which is gravity-aligned.
                 method = "camera-up-average";
                 float[] mean = new float[3];
                 for (JSONObject frame : frames) {
@@ -1030,6 +1031,15 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 float inv = 1f / (spread * frames.size());
                 up[0] = mean[0] * inv; up[1] = mean[1] * inv; up[2] = mean[2] * inv;
                 if (up[1] < 0) { up[0] = -up[0]; up[1] = -up[1]; up[2] = -up[2]; }
+                if (!(Math.abs(up[1]) >= 0.5f)) {
+                    // Near-horizontal mean up: a portrait (or otherwise rolled)
+                    // capture, whose sensor-up is sideways to gravity. Mapping it
+                    // onto +Y would bake a ~90-degree roll into every pose and seed.
+                    report.put("method", "none");
+                    report.put("applied", false);
+                    report.put("reason", "the cameras' average up is horizontal (portrait capture); the AR world is already gravity-aligned");
+                    return report;
+                }
             }
             report.put("method", method);
             report.put("up", new JSONArray(new float[]{up[0], up[1], up[2]}));
