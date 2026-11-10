@@ -52,7 +52,7 @@ const capture = readFileSync(new URL('../../app/js/xr-capture.js', import.meta.u
 assert.match(capture, /auto: false/);
 assert.doesNotMatch(capture, /data-action="auto" checked/);
 assert.doesNotMatch(capture, /AUTO_INTERVAL_MS|lastAutoTime|AUTO_MIN_ROTATION|shouldAutoCapture/);
-assert.match(capture, /state\.auto && state\.distanceTrigger\.sample\(position\)/);
+assert.match(capture, /state\.auto && state\.autoRunning && state\.distanceTrigger\.sample\(position\)/);
 assert.match(capture, /type="number" data-action="distance"/);
 assert.match(capture, /value="\$\{spacingCm\}"/);
 assert.match(capture, /CAPTURE_SPACING_KEY/);

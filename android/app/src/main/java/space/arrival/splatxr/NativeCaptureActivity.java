@@ -88,7 +88,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     private TextView seedsLabel;
     private TextView finishLabel;
     private EditText spacingInput;
+    private CaptureShutterView shutterView;
     private volatile boolean autoCaptureEnabled;
+    private volatile boolean autoCaptureRunning;
     private volatile int captureSpacingCm = 10;
     private boolean installRequested;
     private boolean sessionResumed;
@@ -183,7 +185,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         root.addView(topBar, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
 
         guideText = controlText(
-                "Manual capture is ready. Press Shutter for each photo, or enable auto-capture to take one every " + captureSpacingCm + " cm traveled. Move slowly and aim for 20 or more overlapping views. Rotating in place does not trigger automatic photos.",
+                "Manual capture is ready. Press Shutter for each photo, or check Auto-capture and press Start to take one every " + captureSpacingCm + " cm traveled. Move slowly and aim for 20 or more overlapping views. Rotating in place does not trigger automatic photos.",
                 12, Color.rgb(230, 236, 235));
         guideText.setGravity(Gravity.CENTER);
         guideText.setLineSpacing(dp(2), 1f);
@@ -233,15 +235,20 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         FrameLayout.LayoutParams autoParams = new FrameLayout.LayoutParams(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL);
         controlBar.addView(autoPanel, autoParams);
 
-        CaptureShutterView shutter = new CaptureShutterView(this);
-        shutter.setOnClickListener(v -> {
+        shutterView = new CaptureShutterView(this);
+        shutterView.setOnClickListener(v -> {
             if (session == null || !sessionResumed) { showStatus("AR tracking is not ready yet."); return; }
+            if (autoCaptureEnabled) {
+                // auto mode: the center button starts/stops the automatic run
+                setAutoCaptureRunning(!autoCaptureRunning);
+                return;
+            }
             captureRequested.set(true);
             showStatus("Shutter armed; waiting for the next tracked camera frame…");
         });
         int shutterSize = dp(76);
         FrameLayout.LayoutParams shutterParams = new FrameLayout.LayoutParams(shutterSize, shutterSize, Gravity.CENTER);
-        controlBar.addView(shutter, shutterParams);
+        controlBar.addView(shutterView, shutterParams);
 
         finishLabel = controlText("Finish (0/3)", 12, Color.rgb(47, 212, 193));
         finishLabel.setGravity(Gravity.CENTER);
@@ -257,9 +264,11 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         autoToggle.setOnCheckedChangeListener((view, enabled) -> {
             autoCaptureEnabled = enabled;
+            autoCaptureRunning = false;   // checking arms the mode; the center button starts it
             glView.queueEvent(cloudRenderer::resetDistanceBaseline);
+            updateShutterLabel();
             showStatus(enabled
-                    ? "Auto-capture enabled: one photo every " + captureSpacingCm + " cm traveled. Move slowly."
+                    ? "Auto-capture armed: press Start, then move slowly for one photo every " + captureSpacingCm + " cm."
                     : "Manual capture enabled. Press Shutter to take a photo.");
         });
         spacingInput.setOnFocusChangeListener((view, hasFocus) -> { if (!hasFocus) commitCaptureSpacing(); });
@@ -358,10 +367,16 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
     private final class CaptureShutterView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private String label = "Shutter";
         CaptureShutterView(Context context) {
             super(context);
             setClickable(true);
             setContentDescription("Take photo");
+        }
+        void setLabel(String text, String description) {
+            label = text;
+            setContentDescription(description);
+            invalidate();
         }
         @Override protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
@@ -385,7 +400,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             paint.setTextSize(dp(11));
             paint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
             paint.setTextAlign(Paint.Align.CENTER);
-            canvas.drawText("Shutter", cx, cy+dp(4), paint);
+            canvas.drawText(label, cx, cy+dp(4), paint);
         }
         @Override public boolean onTouchEvent(android.view.MotionEvent event) {
             if (event.getAction() == android.view.MotionEvent.ACTION_DOWN) { setPressed(true); invalidate(); return true; }
@@ -396,6 +411,23 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             return true;
         }
         @Override public boolean performClick() { super.performClick(); return true; }
+    }
+
+    /** The center button in auto mode: start/stop the automatic run. */
+    private void setAutoCaptureRunning(boolean running) {
+        autoCaptureRunning = running;
+        glView.queueEvent(cloudRenderer::resetDistanceBaseline);
+        updateShutterLabel();
+        showStatus(running
+                ? "Auto-capture started: one photo every " + captureSpacingCm + " cm traveled. Move slowly."
+                : "Auto-capture stopped. Press Start to resume, or uncheck Auto-capture for manual shots.");
+    }
+
+    private void updateShutterLabel() {
+        if (shutterView == null) return;
+        if (!autoCaptureEnabled) shutterView.setLabel("Shutter", "Take photo");
+        else if (autoCaptureRunning) shutterView.setLabel("Stop", "Stop auto-capture");
+        else shutterView.setLabel("Start", "Start auto-capture");
     }
 
     private int dp(float px) { return Math.round(px * getResources().getDisplayMetrics().density); }
@@ -476,7 +508,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 sessionResumed = true;
                 glView.onResume();
             }
-            showStatus("Manual capture is ready. Press Shutter for each photo, or enable auto-capture to take one every " + captureSpacingCm + " cm traveled. Move slowly and aim for 20 or more overlapping views. Rotating in place does not trigger automatic photos.");
+            showStatus("Manual capture is ready. Press Shutter for each photo, or check Auto-capture and press Start to take one every " + captureSpacingCm + " cm traveled. Move slowly and aim for 20 or more overlapping views. Rotating in place does not trigger automatic photos.");
         } catch (Exception e) {
             showStatus("ARCore unavailable: " + safeMessage(e));
             Toast.makeText(this, "Install or update Google Play Services for AR, then try again.", Toast.LENGTH_LONG).show();
@@ -640,8 +672,8 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 if (tracking) {
                     updateGroundPlane();
                     float[] position = frame.getCamera().getPose().getTranslation();
-                    boolean autoDue = autoCaptureEnabled && cloudRenderer.sampleTravel(position);
-                    if (!autoCaptureEnabled) cloudRenderer.breakTravelContinuity();
+                    boolean autoDue = autoCaptureEnabled && autoCaptureRunning && cloudRenderer.sampleTravel(position);
+                    if (!autoCaptureEnabled || !autoCaptureRunning) cloudRenderer.breakTravelContinuity();
                     boolean manualDue = captureRequested.getAndSet(false);
                     if (manualDue || autoDue) capture(frame);
                     // Render accumulated capture samples each preview frame, but only
