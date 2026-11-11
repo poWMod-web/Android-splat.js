@@ -8,13 +8,13 @@
 // measured PSNR or an SSIM estimate from that score, and Export writes a real .ply. The UI talks to ONE object — the
 // splat.js Session — plus the trainer's rendered canvas.
 
-import { createSession, parseCameras, gaussiansToPly, undistortFrames, solveTierOpts } from '../../src/index.js';
+import { createSession, parseCameras, gaussiansToPly, undistortFrames, solveTierOpts, litSample } from '../../src/index.js';
 import { extractSharpFrames, isVideoFile } from '../../src/io/video.js';
 import { recordCaptureVideo, cameraSupported } from './camera.js';
 import { saveLastCapture, loadLastCapture } from './store.js';
 import { initXRUI, reviewCapture, exportCapture } from './xr-ui.js';
 import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } from './xr-dataset.js';
-import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './training-settings.js';
+import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from '../../src/training-settings.js';
 import { zipStore } from './zip.js';
 import { saveBlob } from './download.js';
 import { buildSessionZip, fetchModel, gravityUpForKnownRun, continuedInputDim, continuedBuf } from './session_io.js';
@@ -156,9 +156,26 @@ const AV_DEFAULTS = {   // ALL OFF by default (the user, 2026-09-17: "pretty hap
   needle: false,  // needle term 0.03
 };   // no 'cap' toggle: an avatar never limits its splats — the ceiling is always the allocation maximum
 const AV_KEYS = Object.keys(AV_DEFAULTS);
-function deviceDefaults() {
-  const phone = matchMedia('(any-pointer: coarse)').matches &&
+/** Coarse pointer + small screen: the phone class that sizes auto budgets,
+ *  the seed target, and the memory-saver decode path. */
+function isPhoneClass() {
+  return matchMedia('(any-pointer: coarse)').matches &&
     Math.min(screen.width, screen.height) <= 820;
+}
+/** Where the GPU training core lives: the worker keeps encodes/submits off
+ *  the UI thread — but its OffscreenCanvas view path never presented
+ *  reliably on phone WebViews (black + laggy where main's main-thread
+ *  canvas is smooth on the same phone, 2026-11), so phones train locally
+ *  like main. ?trainworker=1 forces the worker back for A/B;
+ *  ?trainworker=0 forces local anywhere. */
+function trainWorkerOpt() {
+  const q = new URLSearchParams(location.search).get('trainworker');
+  if (q === '1' || q === 'true') return true;
+  if (q === '0' || q === 'false') return false;
+  return isPhoneClass() ? false : 'auto';
+}
+function deviceDefaults() {
+  const phone = isPhoneClass();
   return phone
     // 10k cycles: a phone's first run should hit the magic moment in a few
     // minutes — the done screen offers more cycles for anyone who wants them
@@ -265,13 +282,184 @@ let vp, dev, chart, dchart, dvp;
 let gpuCanvas = null;
 
 function mountModelCanvas() {
+  document.getElementById('cv-model-cap')?.remove();   // snapshot fallback goes with the canvas
+  S._capView = null;
   document.getElementById('cv-model')?.remove();
   gpuCanvas = document.createElement('canvas');
   gpuCanvas.id = 'cv-model';
   $('stage').insertBefore(gpuCanvas, $('cv'));
-  S.session.view.attach(gpuCanvas);
+  quietView(S.session.view.attach(gpuCanvas));
   gpuCanvas.style.display = S.state === 'train' && !S.trainVisuals ? 'none' : '';
   S._viewKey = '';
+}
+
+/** Remote view calls reject when the worker is troubled; the session's
+ *  view-error event carries the surfaced handling (re-mount) — these call
+ *  sites just must not turn them into unhandled rejections. */
+function quietView(p) {
+  if (p && typeof p.catch === 'function') p.catch(() => {});
+}
+
+/** A view-error means the worker missed some view state (or the canvas
+ *  transfer never landed). A FRESH canvas element re-attaches cleanly (a
+ *  transferred one can never move again) and resync re-pushes enabled +
+ *  camera behind the attach. Budgeted: a worker that fails every attach
+ *  would otherwise remount forever — past the budget training continues
+ *  without visuals, loudly. */
+function remountModelCanvas(why) {
+  if (!S.session || !S.session.view || !S.session.view.resync) return;
+  // a live snapshot view already covers this failure — leave it alone
+  if (S._capView && S._capView.active && !S._capView.dead) return;
+  S._viewRemounts = (S._viewRemounts || 0) + 1;
+  if (S._viewRemounts > 3) {
+    // the canvas path is fundamentally broken on this device — fall back
+    // to worker renders blitted as pixels (no worker canvas needed)
+    engageCaptureView(why);
+    return;
+  }
+  try {
+    mountModelCanvas();
+    syncTrainingVisualsControl();   // re-assert enabled/display on the fresh canvas
+    quietView(S.session.view.resync());
+  } catch { /* the next view-error retries within budget */ }
+}
+
+/** Snapshot view: when the worker's canvas path is broken (OffscreenCanvas
+ *  WebGPU contexts don't exist on every WebView), the worker can still
+ *  rasterize — renderCapture needs no canvas. Blit its pixels to a 2D
+ *  canvas in the stage at the refresh cadence. Sticky for the run. */
+function engageCaptureView(why) {
+  if (!S.session || !S.session.view || (S._capView && S._capView.active)) return;
+  S._capView = { active: true, dead: false, busy: false, fails: 0, canvas: null };
+  if (gpuCanvas) gpuCanvas.style.display = 'none';
+  // stop the canvas RPCs (and their no-present streak): the snapshot path
+  // doesn't use them — capture() reads the main-side camera directly
+  try { S.session.view.setEnabled(false); } catch { /* remote sends never throw sync */ }
+  let cap = document.getElementById('cv-model-cap');
+  if (!cap) {
+    cap = document.createElement('canvas');
+    cap.id = 'cv-model-cap';
+    $('stage').insertBefore(cap, $('cv'));
+  }
+  S._capView.canvas = cap;
+  S._viewKey = '';
+  flash(`Live view unavailable (${why || 'GPU view failed'}) — snapshot view instead.`, 7000);
+}
+
+/** Snapshot-view refresh: one worker renderCapture blitted to the 2D
+ *  fallback canvas (see engageCaptureView). Same key/refresh cadence as
+ *  the canvas path, lower pixel budget (every refresh is a full readback). */
+function drawCaptureView(capView, vp, w, h, pose) {
+  const now = performance.now();
+  if (vp.dirty) S._camMovedAt = now;
+  const training = S.state === 'train' && S.session.training;
+  const sc = Math.min(1, Math.sqrt(Math.min(S.viewPixBudget || 2560 * 1440, 0.5e6) / (w * h)));
+  const gw = Math.max(2, Math.round(w * sc)), gh = Math.max(2, Math.round(h * sc));
+  const key = `${gw}x${gh}|${Math.round(pose.f)}|` +
+    pose.R.map((v) => Math.round(v * 8192)).join(',') + '|' +
+    pose.t.map((v) => Math.round(v * 8192)).join(',');
+  const refreshMs = Math.max(800, 25000 / Math.max(1, S.itersPerSec || 100));
+  if (capView.busy) return;
+  if (key === S._viewKey && !S.walking && !(training && now - (S._lastViewAt || 0) > refreshMs)) return;
+  S._viewKey = key;
+  S._lastViewAt = now;
+  const cap = capView.canvas;
+  if (!cap) return;
+  if (cap.width !== gw || cap.height !== gh) { cap.width = gw; cap.height = gh; }
+  const cam = { R: pose.R, t: pose.t, f: pose.f * sc, cx: pose.cx * sc, cy: pose.cy * sc, w: gw, h: gh };
+  quietView(S.session.view.setCamera(cam));   // syncs the main-side camera capture() reads
+  capView.busy = true;
+  S.session.view.capture().then((shot) => {
+    capView.busy = false;
+    if (S._capView !== capView || capView.canvas !== cap) return;   // superseded
+    if (!shot || !shot.rgba || !shot.w || !shot.h) throw new Error('empty capture');
+    capView.fails = 0;
+    const data = shot.rgba instanceof Uint8ClampedArray ? shot.rgba : new Uint8ClampedArray(shot.rgba);
+    cap.getContext('2d').putImageData(new ImageData(data, shot.w, shot.h), 0, 0);
+  }).catch((e) => {
+    capView.busy = false;
+    if (S._capView !== capView) return;
+    if (++capView.fails >= 3) {
+      capView.dead = true;
+      if (capView.canvas) capView.canvas.style.display = 'none';
+      if (!S._viewFailedFlash) {
+        S._viewFailedFlash = true;
+        flash(`Visuals unavailable — training continues without them (${(e && e.message) || 'capture failed'}).`, 9000);
+      }
+    }
+  });
+}
+
+/** Silent-black watchdog: renders can be ACCEPTED (no error, no streak)
+ *  while the screen stays black — a worker canvas that never composites
+ *  (seen on Android WebViews even with in-rAF submits). Once per run per
+ *  canvas, shortly after the canvas path goes live, the raster is probed:
+ *  content in the probe but black in the placeholder means the present is
+ *  broken and the pixel-blit snapshot view takes over (its capture is
+ *  proven working by the probe itself). A black probe twice running says
+ *  the raster renders nothing for this camera instead — the snapshot
+ *  couldn't help, so it surfaces as words. A lit placeholder disarms
+ *  silently: healthy views are never touched. */
+function armPresentWatchdog() {
+  if (!S.session || !S.session._remote) return;   // local views present in-thread
+  if (S.state !== 'train' && S.state !== 'done') return;
+  if (S._capView && S._capView.active) return;
+  if (!gpuCanvas || !S.session.view || !S.session.view.enabled) return;
+  if (S._presentWd && S._presentWd.canvas === gpuCanvas) return;   // already owns this canvas
+  clearTimeout(S._presentWd && S._presentWd.timer);
+  const canvas = gpuCanvas, gen = S.gen;
+  S._presentWd = { canvas, timer: setTimeout(() => presentWatchdogFire(canvas, gen, 0), 8000) };
+}
+
+async function presentWatchdogFire(canvas, gen, blackProbes) {
+  if (S._presentWd) S._presentWd.timer = null;
+  if (S.gen !== gen || !S.session) return;
+  if (S.state !== 'train' && S.state !== 'done') return;
+  if ((S._capView && S._capView.active) || gpuCanvas !== canvas) return;
+  const view = S.session.view;
+  // one rehearing for anything unconcluded (black raster, missing camera,
+  // failed probe, unsized canvas): a spent arm RELEASES the canvas instead
+  // of disarming silently, so a later transition re-arms the check — a
+  // one-shot that judged nothing used to own the canvas forever (2026-11)
+  const rehear = () => {
+    if (blackProbes < 1) {
+      S._presentWd = { canvas, timer: setTimeout(() => presentWatchdogFire(canvas, gen, 1), 15000) };
+      return true;
+    }
+    S._presentWd = null;
+    return false;
+  };
+  // the view went quiet before the check ran (visuals hidden): release —
+  // the next Show visuals re-arms through its transition
+  if (!view || !view.enabled || typeof view._diagnoseNoPresent !== 'function') { S._presentWd = null; return; }
+  if (!canvas.width || !canvas.height) { rehear(); return; }   // never sized — nothing attached yet
+  let d;
+  try {
+    d = await view._diagnoseNoPresent();
+  } catch { rehear(); return; }   // the probe failed: rehear once, then the error paths own it
+  if (S.gen !== gen || (S._capView && S._capView.active) || gpuCanvas !== canvas) return;
+  if (!d || d.kind === 'unknown') { rehear(); return; }   // no camera to probe yet — rehear, then release
+  if (d.kind !== 'presentation') {
+    // black twice running (15s apart) before crying raster: early training
+    // frames can be genuinely dark while the model finds itself
+    if (rehear()) return;
+    flash(`Model view is black — ${d.summary}.`, 9000);
+    return;
+  }
+  // the raster renders — is the placeholder showing it? (drawImage of a
+  // WebGPU canvas isn't promised everywhere: unverifiable keeps the canvas)
+  let lit = false;
+  try {
+    const w = 64, h = Math.max(1, Math.round(64 * canvas.height / Math.max(1, canvas.width)));
+    const scratch = document.createElement('canvas');
+    scratch.width = w; scratch.height = h;
+    const sctx = scratch.getContext('2d', { willReadFrequently: true });
+    sctx.drawImage(canvas, 0, 0, w, h);
+    const s = litSample(sctx.getImageData(0, 0, w, h).data);
+    lit = s.lit >= 3 && s.frac > 0.001;
+  } catch { return; }
+  if (lit) return;   // healthy: the present works, disarm silently
+  engageCaptureView('the live canvas stays black on this device');
 }
 
 function syncTrainingVisualsControl() {
@@ -284,8 +472,12 @@ function syncTrainingVisualsControl() {
     button.textContent = S.trainVisuals ? 'Hide visuals' : 'Show visuals';
     button.setAttribute('aria-pressed', String(!!S.trainVisuals));
   }
-  if (gpuCanvas) gpuCanvas.style.display = visualsActive ? '' : 'none';
-  if (S.session && S.session.view && S.session.view.setEnabled) S.session.view.setEnabled(visualsActive);
+  // snapshot view active: the dead canvas stays hidden and the worker view
+  // stays disabled (its renders would only refuse) — pixels come from capture()
+  const capActive = !!(S._capView && S._capView.active && !S._capView.dead);
+  if (gpuCanvas) gpuCanvas.style.display = !capActive && visualsActive ? '' : 'none';
+  if (S._capView && S._capView.canvas) S._capView.canvas.style.display = capActive && visualsActive ? '' : 'none';
+  if (S.session && S.session.view && S.session.view.setEnabled) S.session.view.setEnabled(capActive ? false : visualsActive);
   const stage = $('stage'), dock = $('dock');
   const plot = dock?.querySelector('.chartwrap') || stage?.querySelector('.chartwrap-expanded');
   const expandPlot = training && !S.trainVisuals && !detailOpen;
@@ -308,6 +500,10 @@ function syncTrainingVisualsControl() {
   // The canvas CSS fills its new container. Redraw its backing pixels after
   // reparenting instead of letting the old dock-sized bitmap get stretched.
   if (plotMoved) requestAnimationFrame(() => chart?.resize());
+  // every transition into the live canvas path (Show visuals, done screen,
+  // fresh mount, remount) gets its silent-black check; the arm itself is
+  // idempotent per canvas
+  armPresentWatchdog();
 }
 
 function toggleTrainingVisuals() {
@@ -460,6 +656,7 @@ function boot() {
     $('set-feat').value = st.feat ? String(st.feat) : '';
     $('set-solve').value = st.solve === 'quick' ? 'quick' : 'standard';   // 'precise' (an alias) shows as Standard
     $('set-buf').value = String(st.buf);
+    $('set-buf-hint').hidden = st.buf !== 2;
     $('set-sh').value = String(st.sh);
     $('set-shup').value = st.shup ? '1' : '0';
     for (const k of AV_KEYS) { const el = $('set-av-' + k); if (!el) continue; el.value = k === 'crops' ? String(st.av && st.av.crops || 'face') : (st.av && st.av[k] === false ? '0' : '1'); }
@@ -1613,7 +1810,7 @@ async function open(preset, autostart = false) {
   S.trainVisuals = false;
   S._carryTrainElapsed = false;
   S._savedGpuFacts = null; S._savedDetailSettings = null;
-  S._localRun = null;
+  S._localRun = null; S._securing = null;
   S.runId = null; S._resumeRunId = null;
   syncTrainingVisualsControl();
   S.picking = false; S.pending = null;
@@ -1652,6 +1849,8 @@ async function open(preset, autostart = false) {
   S._viewKey = '';
   document.getElementById('cv-model')?.remove();
   gpuCanvas = null;
+  clearTimeout(S._presentWd && S._presentWd.timer);
+  S._presentWd = null;
   setStartStyle(true);
   $('btn-go').disabled = !!S.noGpu;
   $('btn-settings').disabled = false;
@@ -1918,8 +2117,13 @@ async function startPrep() {
     // Auto splat budget: sized from the CYCLE budget, not just the solve —
     // the measured capacity law (~15 splats/cycle classic, ~35 under MCMC),
     // clamped to the device class. Explicit user choices always win.
-    const phoneClass = matchMedia('(any-pointer: coarse)').matches &&
-      Math.min(screen.width, screen.height) <= 820;
+    const phoneClass = isPhoneClass();
+    // 2× working buffer on a phone: the crash the user would otherwise meet
+    // mid-run is an OOM device loss — say it upfront, while Start is still
+    // the decision point (desktops with headroom are spared the nag)
+    if (st.buf === 2 && phoneClass) {
+      flash('Working buffer 2× roughly quadruples GPU working memory — on this phone the run may abort for lack of memory. 1× trains the same photos safely.', 8000);
+    }
     if (!st.splats) {
       trainerOpts.maxSplats = Math.max(150000, Math.min(phoneClass ? 600000 : 2000000,
         Math.round(S.maxIters * (mcmcActive ? 35 : 15))));
@@ -1986,6 +2190,7 @@ async function startPrep() {
       // orbit's 208 frames decoded at 706 px under the default budget (2026-09-15)
       frames: knownCapture ? { ...(frames || {}), disablePano: true } : (phoneClass ? { featMaxDim: 960, ...(frames || {}) } : (S.avatarOpts && S.avatarOpts.budget ? { targetBudgetBytes: 1.1e9, ...(frames || {}) } : frames)),
       trainer: Object.keys(trainerOpts).length ? trainerOpts : undefined,
+      trainWorker: trainWorkerOpt(),
     });
     S.session = session;
     session.on('stage', (e) => { if (S.gen === gen) onStage(e); });
@@ -2042,10 +2247,7 @@ async function startPrep() {
           'the set doesn\'t connect well enough to reconstruct.'
         : `Only ${placed} of ${S.photos.length} images could be placed — ` +
           'that is unusual for this test set. Reloading the page and retrying usually clears it.');
-      S.state = 'ready';
-      syncTrainingVisualsControl();
-      dock('');
-      backToSetup();
+      trainDeadEnd();
       return;
     }
     if (placed < S.photos.length) {
@@ -2150,11 +2352,32 @@ async function startPrep() {
     solveFailed(/parallax|overlap|initialization|matches|register/i.test(e.message)
       ? 'The photos don\'t overlap enough to connect into one scene.'
       : (e.message || 'An unexpected error occurred during reconstruction.'));
-    S.state = 'ready';
-    syncTrainingVisualsControl();
-    dock('');
-    backToSetup();
+    trainDeadEnd();
   }
+}
+
+/** Unrecoverable training failure: the train screen is dead (faulted
+ *  session, stopped loop) — leaving it up wedges play/chart/hub until the
+ *  user navigates back by hand (seen: full-resolution device loss with a
+ *  failed recovery, and continuations that die rebuilding at higher
+ *  resolution). Tear down to the setup card exactly like the pipeline's own
+ *  catch: dispose, reset, clear the dock, back to setup. The caller flashes
+ *  or cards the WHY on top (the card is body-level and survives this). */
+function trainDeadEnd() {
+  try { S.session && S.session.dispose(); } catch { /* already down */ }
+  S.session = null;
+  clearTimeout(S._presentWd && S._presentWd.timer);
+  S._presentWd = null;
+  document.getElementById('cv-model')?.remove();
+  document.getElementById('cv-model-cap')?.remove();
+  gpuCanvas = null;
+  S._capView = null;
+  S.gen++;
+  S.state = 'ready';
+  S.trainVisuals = false;
+  syncTrainingVisualsControl();
+  dock('');
+  backToSetup();
 }
 
 /** After a failed solve: back to the setup card the run started from — with
@@ -2210,7 +2433,7 @@ function solveFailed(why) {
   const c = document.createElement('div');
   c.className = 'upcard failcard';
   c.id = 'failcard';
-  const gpuTrouble = /DXGI|DEVICE_REMOVED|D3D12|requestDevice|GPUAdapter|WebGPU|graphics device|device lost|Vulkan/i.test(why);
+  const gpuTrouble = /DXGI|DEVICE_REMOVED|D3D12|requestDevice|GPUAdapter|WebGPU|GPUQueue|GPUBuffer|GPUDevice|writeBuffer|graphics device|device lost|Vulkan|out.?of.?memory|training worker failed|detached/i.test(why);
   c.innerHTML = gpuTrouble ? `
     <b>Your graphics device stalled</b>
     <p class="fail-why">${esc(why)}</p>
@@ -2399,6 +2622,17 @@ function buildSceneFromSession() {
 }
 
 // ── training ────────────────────────────────────────────────────────────────
+/** The library tile's name for a run of this set (shared by the save at
+ *  run start and the in-memory adoption at finish — the two must agree). */
+function localRunName(preset) {
+  const pid = String((preset && preset.id) || '');
+  let name = (preset && preset.name) || 'Your photos';
+  if ((pid === '__own' || pid === '__last') && (name === 'Your photos' || pid === '__last')) {
+    name = 'Local Scene';
+  }
+  return name;
+}
+
 function startTraining() {
   S.state = 'train';
   S.trainVisuals = false;
@@ -2407,6 +2641,7 @@ function startTraining() {
   S._carryTrainElapsed = false;
   S.trainT0 = performance.now() - carryMinutes * 60000;
   S.etaAt = null;   // the countdown re-anchors on this run's own pace
+  S._viewRemounts = 0; S._viewFailedFlash = false;   // fresh view-error budget
   // dual-GPU desktops: WebGPU can land on the integrated GPU even when a
   // dedicated card sits idle (seen in the wild: 3 h for a run a 3070 does in
   // minutes — the NVIDIA control panel does NOT govern this). Say so once.
@@ -2425,6 +2660,7 @@ function startTraining() {
   // it resumes a pause or refines a finished result; only fresh runs get a
   // new record, so a continued result replaces the previous trained state
   const resumeId = S._resumeRunId;
+  S._securing = null;   // the previous run's finish work, if any, is history now
   S._resumeRunId = null;
   S.runId = resumeId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
   androidNotifStart();   // background-safe from the first cycle
@@ -2448,10 +2684,7 @@ function startTraining() {
     const pid = String((S.preset && S.preset.id) || '');
     // own scenes are SCENES, not photos — a continued run keeps the name it
     // already carries; the tile's description holds the capture details
-    let runName = (S.preset && S.preset.name) || 'Your photos';
-    if ((pid === '__own' || pid === '__last') && (runName === 'Your photos' || pid === '__last')) {
-      runName = 'Local Scene';
-    }
+    let runName = localRunName(S.preset);
     const { saveRun, patchRun } = await import('./store.js');
     await saveRun({
       id: runId, name: runName,
@@ -2671,21 +2904,24 @@ function restoreRunDetails(run, session = S.session) {
 // pausing means the browser may be closed, and the Yours tile continues the
 // run bit-exactly from where it stopped. The blob is dropped again the moment
 // the run finishes properly — the sog takes over.
+/** Crash-safe checkpoint. Returns the secured { state, recon } on success
+ *  (finish() adopts them into the in-memory run record — no second GPU
+ *  readback, no store round-trip), null when there was nothing to keep. */
 async function checkpointRun(reason) {
-  if (!S.runId || !S.session || !S.session.trainer) return;
+  if (!S.runId || !S.session || !S.session.trainer) return null;
   // 'finish' runs in the done state, BEFORE the export chain: the result is
   // secured even if sog compression or the device dies right after training
-  if (reason === 'finish' ? S.state !== 'done' : S.state !== 'train') return;
+  if (reason === 'finish' ? S.state !== 'done' : S.state !== 'train') return null;
   const it = S.session.trainer.iter | 0;
-  if (it < 200 || S._ckptBusy) return;   // nothing worth keeping yet
+  if (it < 200 || S._ckptBusy) return null;   // nothing worth keeping yet
   // hidden fires on every tab switch — only rewrite after real progress
-  if (reason === 'hidden' && it - (S._ckptIter || 0) < 500) return;
+  if (reason === 'hidden' && it - (S._ckptIter || 0) < 500) return null;
   S._ckptBusy = true;
   const gen = S.gen;
   try {
     const { packState, buildReconJson } = await import('./session_io.js');
     const state = new Blob([await packState(S.session)]);
-    if (S.gen !== gen) return;
+    if (S.gen !== gen) return null;
     const recon = buildReconJson(S);
     const detailProgress = captureRunProgressDetails();
     const { patchRun } = await import('./store.js');
@@ -2700,9 +2936,11 @@ async function checkpointRun(reason) {
     });
     S._ckptIter = it;
     if (reason === 'pause') flash('Progress saved on this device — safe to close, continue anytime from Yours.', 6000);
+    return { state, recon };
   } catch (e) {
     console.warn('checkpoint failed', e);   // best-effort: never disturb a run
   } finally { S._ckptBusy = false; }
+  return null;
 }
 
 function formatTrainingScore(psnr) {
@@ -2721,6 +2959,35 @@ function renderTrainingScore() {
   if (holdEl) holdEl.textContent = formatTrainingScore(S.psnrHold);
   const holdUnit = $('t-hunit');
   if (holdUnit) holdUnit.textContent = unit;
+}
+
+// Score plotting rides the next animation frame: metrics arrive mid-frame
+// from the training loop, so painting the chart + details panels
+// synchronously freezes the frame that delivered them. Data pushes stay
+// synchronous — only the painting defers, coalesced so a burst of readouts
+// still paints once. The train-length gate preserves the chart's
+// first-samples rule (pushes only happen past the ramp, so a non-empty
+// series means the gate already cleared).
+let metricsRaf = 0;
+function queueMetricsPaint() {
+  if (metricsRaf) return;
+  metricsRaf = requestAnimationFrame(() => {
+    metricsRaf = 0;
+    if (chart && chart.train.length) chart.draw();
+    if ($('details').hidden) return;
+    if (S.detailTab === 'score') {
+      if (dchart) {
+        const history = (S.session && S.session.lossHistory) || [];
+        dchart.train = history.map(([i, v]) => [i, v]);
+        dchart.hold = (S.holdHist || []).slice();
+        dchart.maxIter = S.maxIters;
+        dchart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
+        dchart.draw();
+      }
+    } else if (S.detailTab === 'perf') {
+      $('d-perf').textContent = buildPerfReport();
+    }
+  });
 }
 
 function onMetrics(m) {
@@ -2758,7 +3025,7 @@ function onMetrics(m) {
     chart.push(m.iter, m.psnrTrain, m.psnrHold ?? null);
     chart.maxIter = S.maxIters;
     chart.events = S.chartEvents.map((e) => ({ ...e, at: e.iter / S.maxIters }));
-    chart.draw();
+    queueMetricsPaint();
   }
   // re-anchor the countdown on every fresh pace measurement
   if (m.itersPerSec > 0 && S.maxIters) {
@@ -2774,18 +3041,9 @@ function onMetrics(m) {
       renderTrainingScore();
     }
   }
-  if (!$('details').hidden && S.detailTab === 'score') {
-    if (dchart) {
-      const history = (S.session && S.session.lossHistory) || [];
-      dchart.train = history.map(([i, v]) => [i, v]);
-      dchart.hold = (S.holdHist || []).slice();
-      dchart.maxIter = S.maxIters;
-      dchart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
-      dchart.draw();
-    }
-  } else if (!$('details').hidden && S.detailTab === 'perf') {
-    $('d-perf').textContent = buildPerfReport();
-  }
+  // the details panels repaint on the same deferred, coalesced frame as the
+  // chart — rebuilding them synchronously here is the same hitch
+  if (!$('details').hidden && (S.detailTab === 'score' || S.detailTab === 'perf')) queueMetricsPaint();
   // Local records get a compact diagnostics update alongside the headline
   // progress every twenty seconds. The complete final snapshot is written on
   // pause, finish, or when leaving the model viewer.
@@ -2829,13 +3087,50 @@ function onTrainEvent(e) {
   }
   if (e.kind === 'train-complete') finish();
   if (e.kind === 'device-lost') deviceLostRecovery();
+  if (e.kind === 'worker-error') {
+    // the worker realm faulted (canvas transfers died with it) — the same
+    // reboot as a lost device, with its own message
+    if (S.state !== 'train') return;
+    deviceLostRecovery('The training worker crashed — restarting the run. Photos and the camera solve are kept.');
+  }
+  if (e.kind === 'train-error') {
+    // the session already stopped the loop, so play resumes it — repair the
+    // stale pause icon and say how to continue
+    if (S.state !== 'train') return;
+    const b = $('t-play');
+    if (b) {
+      b.dataset.state = 'play';
+      b.innerHTML = '<svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M8 4.8v14.4l12.4-7.2z"/></svg>';
+    }
+    const f = $('t-finish');
+    if (f) f.hidden = false;
+    if (!notifSetPaused(true)) androidNotifStop(false);
+    flash(`Training stopped: ${e.message || 'unknown error'} — press play to resume.`, 9000);
+  }
+  if (e.kind === 'view-error') {
+    if (S.state !== 'train' && S.state !== 'done') return;
+    remountModelCanvas(e.message);
+  }
+  if (e.kind === 'train-stall') {
+    // non-fatal: the frame still owns the loop if it lands — but the user
+    // must know the run is stuck instead of watching "Starting" forever
+    if (S.state !== 'train') return;
+    flash(`Training stalled: a frame has run ${Math.max(1, Math.round((e.frameMs || 60000) / 1000))}s+ without completing (iteration ${fmt(e.iter)}). The GPU may be overwhelmed — pause and try fewer/smaller photos.`, 12000);
+    const b = trainBridge();
+    if (b) {
+      try {
+        b.updateTrainingNotification(`Training ${S._notifName || 'model'}`,
+          `Stalled at ${fmt(e.iter)} — GPU overwhelmed`, S.iter | 0, S.maxIters | 0);
+      } catch { /* best-effort */ }
+    }
+  }
 }
 
 /** iOS (and crashing drivers) reclaim the WebGPU device from backgrounded
  *  tabs. The trained splats lived on it; photos + camera solve are CPU-side.
  *  Mid-training: rebuild and train again. Done: the .ply blob was cached at
  *  completion, so export and upload still work. */
-async function deviceLostRecovery() {
+async function deviceLostRecovery(msg) {
   if (S._recovering) return;
   const gen = S.gen;
   if (S.state === 'done') {
@@ -2850,7 +3145,7 @@ async function deviceLostRecovery() {
   S._recovering = true;
   document.getElementById('cv-model')?.remove();   // its context died with the device
   gpuCanvas = null;
-  flash('The system put the GPU to sleep while the tab was in the background — restarting training. Photos and the camera solve are kept.', 15000);
+  flash(msg || 'The system put the GPU to sleep while the tab was in the background — restarting training. Photos and the camera solve are kept.', 15000);
   try {
     // iOS won't hand out a new device while hidden — wait for the tab back
     if (document.visibilityState === 'hidden') {
@@ -2871,11 +3166,15 @@ async function deviceLostRecovery() {
     S.plyBlob = null; S.sogBlob = null;
     buildSceneFromSession();
     mountModelCanvas();
+    quietView(S.session.view.resync && S.session.view.resync());
     startTraining();
   } catch (err) {
     console.error(err);
     if (S.gen === gen) {
-      solveFailed('The graphics device was lost and could not be brought back — reload the page to train again.');
+      solveFailed('The graphics device was lost and could not be brought back — ' +
+        'you are back at the setup screen. Your photos are kept; a lower Training resolution ' +
+        '(the gear) or fewer photos usually train fine.');
+      trainDeadEnd();
     }
   } finally {
     S._recovering = false;
@@ -2973,7 +3272,7 @@ function adoptSession(ses, stage = '', res = null) {
   S.plyBlob = null; S.sogBlob = null; S._sogJob = null;   // the cached exports were the old model
   S._viewKey = '';                      // re-render at the same pose
   if (gpuCanvas && ses.view) {
-    try { ses.view.attach(gpuCanvas); } catch (e) { console.warn('view attach', e); }
+    try { quietView(ses.view.attach(gpuCanvas)); } catch (e) { console.warn('view attach', e); }
   }
   // Isolate hands back the person's own extent (cut.js bounds). The intro
   // flight was orbiting at arm's length inside a room that no longer exists —
@@ -3111,25 +3410,56 @@ async function finish() {
   // result. They are on demand: Compress (or Share / Download .sog) runs the
   // ONE compression job (getSogBlob), scoring runs when Details opens.
   const gen = S.gen;
-  while (S._ckptBusy) await new Promise((r) => setTimeout(r, 200));   // a 'hidden' write in flight
-  try { await checkpointRun('finish'); } catch { /* best-effort */ }
-  if (S.runId && S.gen === gen) {
-    try {
-      const thumb = await renderShareThumb();
-      if (S.gen !== gen) return;
-      const { patchRun } = await import('./store.js');
-      await patchRun(S.runId, {
-        status: 'finished', iter: S.iter, splats: S.splats,
-        // app runs train every photo (holdout -1): train PSNR is the number
+  // Securing is async (GPU readback + store writes) while the done screen
+  // is already live: the Train button below awaits this before offering
+  // the finished-run path, so an immediate tap still gets the config card
+  // and the history instead of a blind live resume.
+  S._securing = (async () => {
+    while (S._ckptBusy) await new Promise((r) => setTimeout(r, 200));   // a 'hidden' write in flight
+    let ckpt = null;
+    try { ckpt = await checkpointRun('finish'); } catch { /* best-effort */ }
+    if (S.gen !== gen) return;
+    if (S.runId && S.gen === gen) {
+      try {
+        const thumb = await renderShareThumb();
+        if (S.gen !== gen) return;
+        const { patchRun } = await import('./store.js');
+        await patchRun(S.runId, {
+          status: 'finished', iter: S.iter, splats: S.splats,
+          // app runs train every photo (holdout -1): train PSNR is the number
+          psnr: S.psnrHold ?? S.psnrTrain ?? null, minutes: S.minutes,
+          detailSolve: captureRunSolveDetails(),
+          detailProgress: captureRunProgressDetails(),
+          detailGpu: gpuFacts(false),
+          ...(thumb ? { thumb } : {}),
+        });
+        flash('Result saved on this device — it stays under Yours', 5000);
+      } catch (e) { console.warn('local save failed', e); }
+    }
+    // adopted LAST, after every store write: the done screen's Train then
+    // follows the same finished-run path as Yours (config card, history
+    // restore, rebuild-continue) instead of the blind live resume — own
+    // photos only, whose pixels stay reachable in the capture store.
+    // (Adopting before the tail would let an immediate tap rebuild while
+    // the finish patch is still in flight, landing 'finished' over live
+    // training; adopted-after-tail, S._localRun existing means secured.)
+    const pid = String((S.preset && S.preset.id) || '');
+    if (ckpt && S.runId && S.gen === gen && (pid === '__own' || pid === '__last')) {
+      S._localRun = {
+        id: S.runId, name: localRunName(S.preset),
+        status: 'finished', createdAt: Date.now(), updatedAt: Date.now(),
+        iter: S.iter, maxIters: S.maxIters, splats: S.splats || 0,
         psnr: S.psnrHold ?? S.psnrTrain ?? null, minutes: S.minutes,
+        frames: (S.photos || []).length, ownSrc: true,
+        state: ckpt.state, recon: ckpt.recon,
         detailSolve: captureRunSolveDetails(),
         detailProgress: captureRunProgressDetails(),
         detailGpu: gpuFacts(false),
-        ...(thumb ? { thumb } : {}),
-      });
-      flash('Result saved on this device — it stays under Yours', 5000);
-    } catch (e) { console.warn('local save failed', e); }
-  }
+      };
+      if (S.state === 'done') renderControls();   // swap the quick Train for the run's own
+    }
+  })();
+  try { await S._securing; } catch { /* best-effort */ }
   if (PERF.on) perfCard();
 }
 
@@ -3221,7 +3551,7 @@ async function restoreSession(src) {
     const { gaussians, reconJson, state } = got;
     await hydrateLocalRunPhotos(reconJson, S._localRun);
     const iter = (state && state.iter) || (reconJson && reconJson.iter) || 0;
-    const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter) });
+    const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter), trainWorker: trainWorkerOpt() });
     if (reconJson) {
       ses.useReconstruction({
         known: !!reconJson.knownCameras,
@@ -3631,7 +3961,7 @@ function renderControls() {
     more.className = 'cbtn';
     more.textContent = 'Train';
     more.title = 'Continue training — the schedules stretch to the longer run';
-    more.addEventListener('click', continueTraining);
+    more.addEventListener('click', trainAfterDone);
     c.appendChild(more);
   }
   if (S.share) {
@@ -3955,155 +4285,190 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
   gpuCanvas = null;
   S.gen++;
   const gen = S.gen;
-  S.session = null; S.share = null; S.restored = null;
-  S._viewerOpen = false;
-  S._fromSpace = null;
-  S._thumbsUrl = null; S._thumbPack = null;
-  if (history.state && history.state.sj) history.replaceState(null, '');
-  S.plyBlob = null; S.sogBlob = null;
-  // keep the source identity: own captures stay '__own' (the next resume goes
-  // back to the capture store), URL-backed runs keep their preset/urls so a
-  // pause during THIS run checkpoints a resumable source list again
-  S.preset = lr.ownSrc
-    ? { id: '__own', name: `${lr.name || 'Your photos'}` }
-    : { id: (recon.source && recon.source.preset) || '__url', name: `${lr.name || 'Your photos'}` };
-  S.loadedFiles = files.map((f, i) => Object.assign(f, { url: srcUrls[i] || undefined }));
-  S.photos = files.map((f, i) => ({ url: URL.createObjectURL(f), name: f.name, i }));
-  buildStrip();
-  const baseIter = stateIter ?? (lr.iter || 0);
-  // a finished run continues PAST its old horizon — by the configured extra
-  // cycles, or the automatic half-horizon when none were chosen; a paused
-  // one resumes toward the horizon it was already aiming at
-  const defaultExtra = Math.max(10000, Math.round((lr.maxIters || 20000) / 2));
-  S.maxIters = lr.status !== 'finished' && lr.maxIters > baseIter
-    ? lr.maxIters
-    : baseIter + (Number.isSafeInteger(opts.extraIters) && opts.extraIters > 0 ? opts.extraIters : defaultExtra);
-  const fr0 = recon.frames[0] || {};
-  // the continuation may reselect the training size (higher resolution,
-  // more splats) like a new training; unsettled it replays the run's own
-  // input scale AND buffer. The stored size is the COMBINED size (input ×
-  // buffer), so the buffer is divided back out before the value passes
-  // through the multiplier again — else the buffer applies twice and the
-  // continuation trains at (e.g.) 1/16 instead of the run's 1/4
-  const prevDim = Math.max(fr0.tw || 0, fr0.th || 0) || undefined;
-  const prevBuf = continuedBuf(recon.trainScale, lr.detailProgress && lr.detailProgress.settings, prevDim);
-  const prevInputDim = continuedInputDim(prevDim, prevBuf);
-  const nativeDim = Math.max(fr0.nw || fr0.fw || 0, fr0.nh || fr0.fh || 0) || undefined;
-  const trainMaxDim = opts.res === 'auto' ? undefined
-    : opts.res === 'full' ? nativeDim
-    : Number.isFinite(opts.res) ? opts.res : prevInputDim;
-  const cap = Math.max(g.n, lr.splats || 0, lr.status !== 'finished' ? lr.cap || 0 : 0, opts.splats || 0);
-  // LOD on a continuation starts a fresh halving schedule ABOVE the model's
-  // current size (snapshotting below it would mislabel the levels); without
-  // headroom there is nothing to schedule
-  if (opts.lod === true) {
-    if (cap < 1000000) {
-      flash('LOD levels need a splat budget of at least 1,000,000 — continuing without them.', 7000);
-    } else {
-      const plan = buildLODPlan(cap, 0, Math.max(10000, S.maxIters - baseIter));
-      const levels = plan ? plan.levels.filter((l) => l > g.n) : [];
-      if (!levels.length) {
-        flash('The model already fills its budget — LOD levels need headroom to grow into.', 7000);
+  try {
+    S.session = null; S.share = null; S.restored = null;
+    S._viewerOpen = false;
+    S._fromSpace = null;
+    S._thumbsUrl = null; S._thumbPack = null;
+    if (history.state && history.state.sj) history.replaceState(null, '');
+    S.plyBlob = null; S.sogBlob = null;
+    // keep the source identity: own captures stay '__own' (the next resume goes
+    // back to the capture store), URL-backed runs keep their preset/urls so a
+    // pause during THIS run checkpoints a resumable source list again
+    S.preset = lr.ownSrc
+      ? { id: '__own', name: `${lr.name || 'Your photos'}` }
+      : { id: (recon.source && recon.source.preset) || '__url', name: `${lr.name || 'Your photos'}` };
+    S.loadedFiles = files.map((f, i) => Object.assign(f, { url: srcUrls[i] || undefined }));
+    S.photos = files.map((f, i) => ({ url: URL.createObjectURL(f), name: f.name, i }));
+    buildStrip();
+    const baseIter = stateIter ?? (lr.iter || 0);
+    // a finished run continues PAST its old horizon — by the configured extra
+    // cycles, or the automatic half-horizon when none were chosen; a paused
+    // one resumes toward the horizon it was already aiming at
+    const defaultExtra = Math.max(10000, Math.round((lr.maxIters || 20000) / 2));
+    S.maxIters = lr.status !== 'finished' && lr.maxIters > baseIter
+      ? lr.maxIters
+      : baseIter + (Number.isSafeInteger(opts.extraIters) && opts.extraIters > 0 ? opts.extraIters : defaultExtra);
+    const fr0 = recon.frames[0] || {};
+    // the continuation may reselect the training size (higher resolution,
+    // more splats) like a new training; unsettled it replays the run's own
+    // input scale AND buffer. The stored size is the COMBINED size (input ×
+    // buffer), so the buffer is divided back out before the value passes
+    // through the multiplier again — else the buffer applies twice and the
+    // continuation trains at (e.g.) 1/16 instead of the run's 1/4
+    const prevDim = Math.max(fr0.tw || 0, fr0.th || 0) || undefined;
+    const prevBuf = continuedBuf(recon.trainScale, lr.detailProgress && lr.detailProgress.settings, prevDim);
+    const prevInputDim = continuedInputDim(prevDim, prevBuf);
+    const nativeDim = Math.max(fr0.nw || fr0.fw || 0, fr0.nh || fr0.fh || 0) || undefined;
+    const trainMaxDim = opts.res === 'auto' ? undefined
+      : opts.res === 'full' ? nativeDim
+      : Number.isFinite(opts.res) ? opts.res : prevInputDim;
+    const cap = Math.max(g.n, lr.splats || 0, lr.status !== 'finished' ? lr.cap || 0 : 0, opts.splats || 0);
+    // LOD on a continuation starts a fresh halving schedule ABOVE the model's
+    // current size (snapshotting below it would mislabel the levels); without
+    // headroom there is nothing to schedule
+    if (opts.lod === true) {
+      if (cap < 1000000) {
+        flash('LOD levels need a splat budget of at least 1,000,000 — continuing without them.', 7000);
       } else {
-        S.lodPlan = { ...plan, levels, idx: 0, holdUntil: null, snaps: [] };
+        const plan = buildLODPlan(cap, 0, Math.max(10000, S.maxIters - baseIter));
+        const levels = plan ? plan.levels.filter((l) => l > g.n) : [];
+        if (!levels.length) {
+          flash('The model already fills its budget — LOD levels need headroom to grow into.', 7000);
+        } else {
+          S.lodPlan = { ...plan, levels, idx: 0, holdUntil: null, snaps: [] };
+        }
       }
     }
+    // rebuild the SAME trainer the run was made with: the recipe carries the
+    // MCMC / needle / placement sets and the refine cadence; sizing is per run
+    // and the card may reselect the SH degree or the MCMC set on top
+    const { refineEvery: recipeRefine, ...recipeTrainer } = recipe || {};
+    // the card's MCMC toggle rewrites the optimizer set the same way the
+    // start panel builds it; untouched, the recipe replays the run's own set
+    if (opts.mcmc === true) {
+      Object.assign(recipeTrainer, { growRate: 0.05, mcmcNoise: true, scaleReg: 0.01, moveCap: 0.25 });
+      if ((contShDeg ?? recipeTrainer.shDeg ?? 3) > 0) recipeTrainer.shLr = 3e-4;
+      else delete recipeTrainer.shLr;
+    } else if (opts.mcmc === false) {
+      delete recipeTrainer.mcmcNoise; delete recipeTrainer.scaleReg;
+      delete recipeTrainer.moveCap; delete recipeTrainer.shLr;
+      // the placement set carries its own growth rate — classic restores that,
+      // otherwise the trainer default applies
+      if (recipeTrainer.refineV2) recipeTrainer.growRate = 0.1;
+      else delete recipeTrainer.growRate;
+    }
+    const contRefine = opts.mcmc === true ? 500 : opts.mcmc === false ? undefined : recipeRefine;
+    const bufScale = opts.buf ?? (prevBuf !== 1 ? prevBuf : undefined);
+    // same OOM warning as a fresh run: the continue card reselects the
+    // buffer, so this decision point needs the message too
+    if ((bufScale ?? 1) === 2 && isPhoneClass()) {
+      flash('Working buffer 2× roughly quadruples GPU working memory — on this phone the run may abort for lack of memory. 1× trains the same photos safely.', 8000);
+    }
+    const ses = createSession({
+      maxIters: S.maxIters, holdout: -1,
+      // continuations obey the GPU-usage slider like fresh runs (st here is
+      // the parsed checkpoint, so the setting comes from S.settings)
+      gpuUsage: (S.settings.gpu ?? 100) / 100,
+      ...(contRefine != null ? { refineEvery: contRefine } : {}),
+      frames: { trainMaxDim, ...(bufScale != null ? { trainScale: bufScale } : {}) },
+      trainer: {
+        ...recipeTrainer,
+        maxSplats: cap, shDeg: contShDeg ?? recipeTrainer.shDeg ?? 3,
+        capMult: Math.max(2, Math.ceil(cap / Math.max(1, g.n))),
+        ...(engine === 'v2' ? { engine: 'v2', refineEvery: 200 } : {}),
+      },
+      trainWorker: trainWorkerOpt(),
+    });
+    S.session = ses;
+    ses.on('stage', (e) => { if (S.gen === gen) onStage(e); });
+    ses.on('metrics', (e) => { if (S.gen === gen) onMetrics(e); });
+    ses.on('event', (e) => { if (S.gen === gen) onTrainEvent(e); });
+    await ses.load(files);
+    if (S.gen !== gen) return;
+    ses.useReconstruction({
+      known: !!recon.knownCameras,
+      cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
+      points: [],
+      k1: recon.k1 || 0, k2: recon.k2 || 0,
+      ...(recon.fFeat ? { fFeat: recon.fFeat } : {}),
+    });
+    if (undistortFrames(ses.frames, ses.recon)) { /* targets match the original run */ }
+    // the recon JSON carries the run's scene radius — without it seedFrom
+    // falls back to 10 and every radius-scaled quantity (position lr, min/max
+    // scale, Langevin noise) is wrong on resume (e2e resume caught it once the
+    // recipe replayed the MCMC noise: positions doubled within a few steps)
+    await ses.seedFrom(g, { iter: baseIter, sceneRadius: recon.sceneRadius || undefined });
+    if (S.gen !== gen) return;
+    if (S.lodPlan) ses.trainer.growLimit = S.lodPlan.levels[S.lodPlan.idx] || S.lodPlan.levels[0];
+    S.iter = baseIter;
+    S.psnrTrain = null; S.psnrHold = null;
+    S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
+    restoreRunDetails(lr, ses);
+    buildSceneFromSession();
+    mountModelCanvas();
+    if (viewOnly) {
+      S.maxIters = baseIter;
+      S.runId = lr.id;
+      S.minutes = lr.minutes || 0;
+      S.psnrTrain = lr.psnr ?? null;
+      S.splats = g.n;
+      S.trainT0 = performance.now();
+      S.restored = { hasState: true, stats: (recon && recon.stats) || {}, reconJson: recon };
+      S._viewerOpen = true;
+      $('btn-new').hidden = false;
+      enterDone();
+      flash(`${fmt(g.n)} splats — Compress turns this into a shareable .sog`, 6000);
+      return;
+    }
+    S.minutes = Math.max(S.minutes || 0, lr.minutes || 0,
+      (lr.detailProgress && lr.detailProgress.minutes) || 0);
+    S._carryTrainElapsed = true;
+    // every continuation — paused or finished — trains back into its own
+    // record: the saved result replaces the previous trained state there, the
+    // root camera poses it rebuilt from stay, and its photos are the capture
+    // store's blobs matched by name above, reused by reference and never
+    // re-saved, so continuing costs no extra image storage
+    S._resumeRunId = lr.id;
+    startTraining();
+    flash(`Continuing from ${fmt(baseIter)} cycles — +${fmt(S.maxIters - baseIter)} more.`, 6000);
+  } catch (e) {
+    if (S.gen !== gen) throw e;   // superseded mid-flight: another screen owns the UI now
+    trainDeadEnd();
+    throw e;   // the caller flashes "Could not continue this run: …" on top
   }
-  // rebuild the SAME trainer the run was made with: the recipe carries the
-  // MCMC / needle / placement sets and the refine cadence; sizing is per run
-  // and the card may reselect the SH degree or the MCMC set on top
-  const { refineEvery: recipeRefine, ...recipeTrainer } = recipe || {};
-  // the card's MCMC toggle rewrites the optimizer set the same way the
-  // start panel builds it; untouched, the recipe replays the run's own set
-  if (opts.mcmc === true) {
-    Object.assign(recipeTrainer, { growRate: 0.05, mcmcNoise: true, scaleReg: 0.01, moveCap: 0.25 });
-    if ((contShDeg ?? recipeTrainer.shDeg ?? 3) > 0) recipeTrainer.shLr = 3e-4;
-    else delete recipeTrainer.shLr;
-  } else if (opts.mcmc === false) {
-    delete recipeTrainer.mcmcNoise; delete recipeTrainer.scaleReg;
-    delete recipeTrainer.moveCap; delete recipeTrainer.shLr;
-    // the placement set carries its own growth rate — classic restores that,
-    // otherwise the trainer default applies
-    if (recipeTrainer.refineV2) recipeTrainer.growRate = 0.1;
-    else delete recipeTrainer.growRate;
+}
+
+/** Done screen's Train before the finished record adopts (or when the run has
+ *  none — a restore, a demo, a sub-200-cycle stub): an immediate tap waits
+ *  for the securing pass, then takes the finished-run path (config card +
+ *  history) like Yours does; only a record-less session falls back to the
+ *  blind live resume. */
+async function trainAfterDone() {
+  if (!S.session || S.state !== 'done') return;
+  if (S._localRun) { trainLocalChoice(); return; }
+  if (S._securing) {
+    const gen = S.gen;
+    flash('Securing the finished result first…', 4000);
+    try { await S._securing; } catch { /* best-effort: fall through to live resume */ }
+    if (S.gen !== gen) return;
+    if (S._localRun && S.state === 'done' && S.session) { trainLocalChoice(); return; }
   }
-  const contRefine = opts.mcmc === true ? 500 : opts.mcmc === false ? undefined : recipeRefine;
-  const bufScale = opts.buf ?? (prevBuf !== 1 ? prevBuf : undefined);
-  const ses = createSession({
-    maxIters: S.maxIters, holdout: -1,
-    // continuations obey the GPU-usage slider like fresh runs (st here is
-    // the parsed checkpoint, so the setting comes from S.settings)
-    gpuUsage: (S.settings.gpu ?? 100) / 100,
-    ...(contRefine != null ? { refineEvery: contRefine } : {}),
-    frames: { trainMaxDim, ...(bufScale != null ? { trainScale: bufScale } : {}) },
-    trainer: {
-      ...recipeTrainer,
-      maxSplats: cap, shDeg: contShDeg ?? recipeTrainer.shDeg ?? 3,
-      capMult: Math.max(2, Math.ceil(cap / Math.max(1, g.n))),
-      ...(engine === 'v2' ? { engine: 'v2', refineEvery: 200 } : {}),
-    },
-  });
-  S.session = ses;
-  ses.on('stage', (e) => { if (S.gen === gen) onStage(e); });
-  ses.on('metrics', (e) => { if (S.gen === gen) onMetrics(e); });
-  ses.on('event', (e) => { if (S.gen === gen) onTrainEvent(e); });
-  await ses.load(files);
-  if (S.gen !== gen) return;
-  ses.useReconstruction({
-    known: !!recon.knownCameras,
-    cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
-    points: [],
-    k1: recon.k1 || 0, k2: recon.k2 || 0,
-    ...(recon.fFeat ? { fFeat: recon.fFeat } : {}),
-  });
-  if (undistortFrames(ses.frames, ses.recon)) { /* targets match the original run */ }
-  // the recon JSON carries the run's scene radius — without it seedFrom
-  // falls back to 10 and every radius-scaled quantity (position lr, min/max
-  // scale, Langevin noise) is wrong on resume (e2e resume caught it once the
-  // recipe replayed the MCMC noise: positions doubled within a few steps)
-  await ses.seedFrom(g, { iter: baseIter, sceneRadius: recon.sceneRadius || undefined });
-  if (S.gen !== gen) return;
-  if (S.lodPlan) ses.trainer.growLimit = S.lodPlan.levels[S.lodPlan.idx] || S.lodPlan.levels[0];
-  S.iter = baseIter;
-  S.psnrTrain = null; S.psnrHold = null;
-  S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
-  restoreRunDetails(lr, ses);
-  buildSceneFromSession();
-  mountModelCanvas();
-  if (viewOnly) {
-    S.maxIters = baseIter;
-    S.runId = lr.id;
-    S.minutes = lr.minutes || 0;
-    S.psnrTrain = lr.psnr ?? null;
-    S.splats = g.n;
-    S.trainT0 = performance.now();
-    S.restored = { hasState: true, stats: (recon && recon.stats) || {}, reconJson: recon };
-    S._viewerOpen = true;
-    $('btn-new').hidden = false;
-    enterDone();
-    flash(`${fmt(g.n)} splats — Compress turns this into a shareable .sog`, 6000);
-    return;
-  }
-  S.minutes = Math.max(S.minutes || 0, lr.minutes || 0,
-    (lr.detailProgress && lr.detailProgress.minutes) || 0);
-  S._carryTrainElapsed = true;
-  // every continuation — paused or finished — trains back into its own
-  // record: the saved result replaces the previous trained state there, the
-  // root camera poses it rebuilt from stay, and its photos are the capture
-  // store's blobs matched by name above, reused by reference and never
-  // re-saved, so continuing costs no extra image storage
-  S._resumeRunId = lr.id;
-  startTraining();
-  flash(`Continuing from ${fmt(baseIter)} cycles — +${fmt(S.maxIters - baseIter)} more.`, 6000);
+  continueTraining();
 }
 
 /** Resume from done: raise the horizon, restore the curve, back to train. */
-function continueTraining() {
+async function continueTraining() {
   if (!S.session || S.state !== 'done') return;
+  const gen = S.gen;
   stopTour();
   S.plyBlob = null; S.sogBlob = null;   // the cached export goes stale the moment training resumes
   S.etaAt = null;
-  S.maxIters = S.session.continueFor(MORE_ITERS);
+  // continueFor is async (the remote horizon crosses the worker first) —
+  // awaiting it is what keeps S.maxIters a number: assigning the promise
+  // used to NaN the chart's x-scale and blank the restored history
+  S.maxIters = await S.session.continueFor(MORE_ITERS);
+  if (S.gen !== gen || !S.session || S.state !== 'done') return;
   S.state = 'train';
   S.trainVisuals = false;
   syncTrainingVisualsControl();
@@ -4395,6 +4760,9 @@ async function photoThumb() {
 async function renderShareThumb() {
   try {
     const ses = S.session;
+    // remote training owns the view (and a transferred canvas has no
+    // main-side pixels to drawImage) — this scratch flow is local-only
+    if (!ses || !ses.trainer || !ses.trainer.device) return null;
     // the hero is the first registered camera's own view — the shot the
     // creator opened the capture with
     const c = S.scene.cams.find((k) => k.R) || null;
@@ -4407,14 +4775,14 @@ async function renderShareThumb() {
     const H = Math.round(W / ar);
     const cv = document.createElement('canvas');
     cv.width = W; cv.height = H;
-    ses.view.attach(cv);
-    ses.view.setCamera({ R: c.R, t: c.t, f: c.f * (W / c.w), cx: W / 2, cy: H / 2, w: W, h: H });
-    ses.view.renderNow(true);
+    quietView(ses.view.attach(cv));
+    quietView(ses.view.setCamera({ R: c.R, t: c.t, f: c.f * (W / c.w), cx: W / 2, cy: H / 2, w: W, h: H }));
+    quietView(ses.view.renderNow(true));
     await ses.trainer.device.queue.onSubmittedWorkDone();
     const out = document.createElement('canvas');
     out.width = W; out.height = H;
     out.getContext('2d').drawImage(cv, 0, 0);
-    if (gpuCanvas) { ses.view.attach(gpuCanvas); S._viewKey = ''; }
+    if (gpuCanvas) { quietView(ses.view.attach(gpuCanvas)); S._viewKey = ''; }
     return await new Promise((res) => out.toBlob(res, 'image/webp', 0.85));
   } catch (e) {
     console.error(e);
@@ -4592,7 +4960,7 @@ function closeViewerToHome() {
   document.getElementById('ltchoice')?.remove();
   gpuCanvas = null;
   S.gen++;
-  S.session = null; S.share = null; S.restored = null; S._localRun = null;
+  S.session = null; S.share = null; S.restored = null; S._localRun = null; S._securing = null;
   S.runId = null; S._resumeRunId = null;
   S._viewerOpen = false;
   S._fromSpace = null;
@@ -4738,6 +5106,9 @@ async function ensureErrRender(key) {
   if (S.atFrame < 0) return;
   const cam = S.scene.cams[S.atFrame];
   if (!cam || cam.ci < 0) return;
+  // remote training owns the view (and a transferred canvas has no
+  // main-side pixels to snapshot) — this scratch flow is local-only
+  if (!S.session || !S.session.trainer || !S.session.trainer.device) return;
   S._errRenderBusy = true;
   const gen = S.gen;
   try {
@@ -4745,9 +5116,9 @@ async function ensureErrRender(key) {
     const meta = ses.trainer.camMeta[cam.ci];
     const cv = (S._errScratch ??= document.createElement('canvas'));
     cv.width = meta.w; cv.height = meta.h;
-    ses.view.attach(cv);
-    ses.view.lookThrough(cam.ci);
-    ses.view.renderNow(true);
+    quietView(ses.view.attach(cv));
+    quietView(ses.view.lookThrough(cam.ci));
+    quietView(ses.view.renderNow(true));
     await ses.trainer.device.queue.onSubmittedWorkDone();
     if (S.gen !== gen) return;
     const snap = (S._errSnap ??= document.createElement('canvas'));
@@ -4760,7 +5131,7 @@ async function ensureErrRender(key) {
     S._errRenderBusy = false;
     // hand the view back to the stage and force a fresh pose render
     if (S.gen === gen && gpuCanvas && S.session) {
-      S.session.view.attach(gpuCanvas);
+      quietView(S.session.view.attach(gpuCanvas));
       S._viewKey = '';
     }
   }
@@ -4849,13 +5220,13 @@ function select(i) {
 function wireStage() {
   const st = $('stage');
   // Touch-hold with a quiet window: while visuals show, the GPU belongs to
-  // the view from the FIRST model touch until 2s after the LAST one — every
-  // new touch refreshes the window, so training resumes only after 2s of no
-  // interaction and never re-queues a backlog between quick successive
-  // touches. Touches on UI (graph, controls hub, buttons) don't count —
-  // model touches only. Up/cancel ride the window so a release outside the
-  // stage still counts; a user-pressed pause clears the flag in toggleTrain,
-  // so the window never resumes over it.
+  // the view from the FIRST model touch until 500ms after the LAST one —
+  // every new touch refreshes the window, so training resumes only after
+  // 500ms of no interaction and never re-queues a backlog between quick
+  // successive touches. Touches on UI (graph, controls hub, buttons) don't
+  // count — model touches only. Up/cancel ride the window so a release
+  // outside the stage still counts; a user-pressed pause clears the flag in
+  // toggleTrain, so the window never resumes over it.
   const held = new Set();
   let resumeT = 0;
   const armResume = () => {
@@ -4866,7 +5237,7 @@ function wireStage() {
         S._dragPaused = false;
         if (S.state === 'train') S.session.start();
       }
-    }, 2000);
+    }, 500);
   };
   const noteModelTouch = () => {
     if (!S.session) { S._dragPaused = false; return; }
@@ -5553,18 +5924,25 @@ function draw() {
   // During training the optimizer keeps its own compute/render path. These
   // app-level presentation passes (model viewport, camera overlays and image
   // comparison) are optional and sleep by default; the score chart is separate.
+  const capView = S._capView && S._capView.active && !S._capView.dead ? S._capView : null;
   if (S.state === 'train' && (!S.trainVisuals || !$('details').hidden)) {
     if (gpuCanvas) gpuCanvas.style.display = 'none';
+    if (capView && capView.canvas) capView.canvas.style.display = 'none';
     ctx.clearRect(0, 0, cv.width, cv.height);
     return;
   }
-  if (gpuCanvas && gpuCanvas.style.display === 'none') gpuCanvas.style.display = '';
+  if (capView && capView.canvas) {
+    if (capView.canvas.style.display === 'none') capView.canvas.style.display = '';
+    if (gpuCanvas) gpuCanvas.style.display = 'none';
+  } else if (gpuCanvas && gpuCanvas.style.display === 'none') gpuCanvas.style.display = '';
 
   // train/done: the model, rendered by the trainer at this exact pose
   // (render capped at the session's view-buffer size, blit scales up)
   const onFrame = S.atFrame >= 0;
   const pose = vp.viewPose();
-  if (gpuCanvas && S.session && S.session.trainer) {
+  if (capView && S.session && S.session.trainer) {
+    drawCaptureView(capView, vp, w, h, pose);
+  } else if (gpuCanvas && S.session && S.session.trainer) {
     const now = performance.now();
     if (vp.dirty) S._camMovedAt = now;
     const training = S.state === 'train' && S.session.training;
@@ -5575,7 +5953,11 @@ function draw() {
     // The SOG viewer renders far cheaper than the compute rasterizer, so it
     // affords a much higher moving budget (less visible softness while
     // rotating), highest where a mouse implies desktop-class GPU.
-    const sogView = !(S.session.trainer && S.session.trainer.device);
+    // Remote training rasterizes on the worker with the SAME compute kernel
+    // as local (RemoteTrainer just has no .device to read) — only the
+    // SOG-lite stand-in earns the cheap-viewer budget (2026-11: the worker
+    // view rendered up to 2x the pixels of main's on the same phone).
+    const sogView = !(S.session.trainer && (S.session.trainer.device || S.session._remote));
     const moveBudget = sogView
       ? (matchMedia('(pointer: fine)').matches ? 2.8e6 : 1.8e6)
       : 1.3e6;
@@ -5596,13 +5978,13 @@ function draw() {
       S._lastViewAt = now;
       if (gpuCanvas.width !== gw || gpuCanvas.height !== gh) {
         gpuCanvas.width = gw; gpuCanvas.height = gh;
-        S.session.view.attach(gpuCanvas);
+        quietView(S.session.view.attach(gpuCanvas));
       }
-      S.session.view.setCamera({
+      quietView(S.session.view.setCamera({
         R: pose.R, t: pose.t,
         f: pose.f * sc, cx: pose.cx * sc, cy: pose.cy * sc, w: gw, h: gh,
-      });
-      S.session.view.renderNow();
+      }));
+      quietView(S.session.view.renderNow());
     }
   }
 

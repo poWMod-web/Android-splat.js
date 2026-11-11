@@ -150,4 +150,28 @@ assert.match(cont, /ses\.trainer\.growLimit = S\.lodPlan\.levels\[S\.lodPlan\.id
   assert.equal(continuedBuf(NaN, { res: 960, buf: 0.5 }, 480), 0.5);
 }
 
+// A fresh run's done screen must reach the same finished-run path: finish()
+// adopts the secured record in memory (Train then offers the config card +
+// history like Yours), and an immediate tap waits for the securing pass
+// instead of taking the blind live resume.
+assert.match(app, /S\._securing = \(async \(\) => \{/,
+  'finish should expose its securing work for the Train gate');
+assert.match(app, /status: 'finished', createdAt: Date\.now\(\), updatedAt: Date\.now\(\),/,
+  'finish should adopt the finished record in memory');
+assert.match(app, /if \(S\.state === 'done'\) renderControls\(\);   \/\/ swap the quick Train for the run's own/,
+  'adopting the record should re-render the done controls');
+assert.match(app, /more\.addEventListener\('click', trainAfterDone\);/,
+  'the pre-secure Train button should go through the securing gate');
+assert.match(app, /if \(S\._localRun\) \{ trainLocalChoice\(\); return; \}/,
+  'an adopted record should take the finished-run choice dialog');
+assert.match(app, /try \{ await S\._securing; \} catch/,
+  'an immediate tap should wait for the securing pass first');
+// The blind live resume stays for record-less sessions only — and it must
+// await the horizon: assigning continueFor's promise used to NaN the
+// chart's x-scale and blank the restored history (2026-11).
+assert.match(app, /async function continueTraining\(\) \{/,
+  'the live resume should be async');
+assert.match(app, /S\.maxIters = await S\.session\.continueFor\(MORE_ITERS\);/,
+  'the live resume should await the horizon (a number, never a promise)');
+
 console.log('continue-training configuration reselection: passed');

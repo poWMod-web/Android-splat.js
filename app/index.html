@@ -138,12 +138,13 @@
           <option value="quick">Quick</option>
           <option value="standard">Standard</option>
         </select></div>
-      <div class="setrow" title="Render grid relative to the training resolution. 2× removes edge ringing at sharp viewing sizes (~1.7× slower); 0.5× quarters the raster work."><label for="set-buf">Working buffer</label>
+      <div class="setrow" title="Render grid relative to the training resolution. 2× removes edge ringing at sharp viewing sizes (~1.7× slower) but roughly quadruples GPU working memory — on phones the run may abort for lack of memory; 0.5× quarters the raster work."><label for="set-buf">Working buffer</label>
         <select id="set-buf">
           <option value="0.5">0.5×</option>
           <option value="1">1×</option>
           <option value="2">2×</option>
         </select></div>
+      <p class="set-hint" id="set-buf-hint" hidden>2× roughly quadruples GPU working memory — on phones the run may abort for lack of memory. 1× trains the same photos safely.</p>
       <div class="setrow" title="View-dependent colour detail. 0 = flat colours (faster, smaller file); 3 = full."><label for="set-sh">Spherical harmonics</label>
         <select id="set-sh">
           <option value="0">0</option>

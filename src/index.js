@@ -25,7 +25,7 @@
 //   trainer.stepOnce();
 //   const bytes   = toPly(await trainer.readGaussians());
 
-export { createSession, Session, undistortFrames, camPosition, gpuDuty, gpuIdleMs, gpuBurstMs } from './session.js';
+export { createSession, Session, undistortFrames, camPosition, gpuDuty, gpuIdleMs, gpuBurstMs, litSample } from './session.js';
 export { createGpu } from './gpu/context.js';
 export { decodeFrames, processSource, adaptiveTrainCap, FEAT_MAX_DIM, TRAIN_MAX_DIM } from './io/frames.js';
 export { extractSharpFrames, isVideoFile, planSelection, suggestSpan } from './io/video.js';
@@ -35,6 +35,7 @@ export { gaussiansToPly, bakeOpacityCompensation } from './io/ply.js';
 export { runSfM, SOLVE_TIERS, solveTierOpts } from './sfm/sfm.js';
 export { initGaussians } from './gs/init.js';
 export { GSTrainer } from './gs/trainer.js';
+export { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from './training-settings.js';
 
 import { runSfM } from './sfm/sfm.js';
 import { initGaussians } from './gs/init.js';

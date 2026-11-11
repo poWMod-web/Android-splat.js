@@ -2176,6 +2176,17 @@ export const makeSHAdamSrc = (mode = 'all') => {
 // for the chart's SSIM readout. Averaging 2x2 pixels keeps periodic CPU SSIM
 // evaluation inexpensive on mobile; the SSIM calculation itself remains the
 // standard 11x11, sigma=1.5 Gaussian-window mean.
+// Plan item (1): merged submits keep ONE shared tile-counter buffer — the
+// per-step reset is a GPU dispatch (ordered with the passes) instead of a
+// queue write (which would land before every pass of the merged submit).
+export const TILE_ZERO_SRC = /* wgsl */ `
+@group(0) @binding(0) var<storage, read_write> cnt : array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  if (gid.x < arrayLength(&cnt)) { cnt[gid.x] = 0u; }
+}
+`;
 export const SSIM_METRIC_SRC = CAM_STRUCT + /* wgsl */ `
 @group(0) @binding(1) var<storage, read> outImg: array<f32>;
 @group(0) @binding(2) var<storage, read> tgtImg: array<u32>;
