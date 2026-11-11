@@ -92,8 +92,17 @@ A live preview orbits the model as it trains (drag to orbit, scroll to
 zoom), with the score curve beside it and a Details sheet (Score / Perf
 / Cameras / GPU) below. **Pause** halts the loop without losing
 anything, **Finish early** keeps the model as it stands, and **Download
-.ply** saves the standard 3DGS file once training ends. The log details
-every stage.
+.ply** saves the standard 3DGS file once training ends. **Session ↓**
+packs the resumable session (compressed model + poses + raw state —
+drop it back to continue exactly), and **Photos ↓** zips the run's
+source images. The log details every stage.
+
+## Preview: tour + filmstrip
+
+**Tour the cameras** flies the capture path at constant speed (a grab
+takes over anytime); the filmstrip under the preview jumps the orbit to
+any photo's own viewpoint. Restored models without their photos show
+neither — they carry no pixels to fly or strip.
 
 ## Yours + last capture (on this device)
 

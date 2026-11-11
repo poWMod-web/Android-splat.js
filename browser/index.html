@@ -156,6 +156,8 @@
       <button id="btn-pause" class="btn" disabled>Pause</button>
       <button id="btn-finish" class="btn" disabled>Finish early</button>
       <button id="btn-ply" class="btn accent" disabled>Download .ply ↓</button>
+      <button id="btn-session" class="btn" disabled>Session ↓</button>
+      <button id="btn-photos" class="btn" disabled>Photos ↓</button>
       <button id="btn-continue" class="btn accent" hidden>Continue training →</button>
     </div>
     <div id="needphotos" class="needphotos" hidden>
@@ -169,7 +171,8 @@
   <section class="card" id="viewer" hidden>
     <h2>3 · Preview</h2>
     <canvas id="view"></canvas>
-    <p class="hint">Drag to orbit · scroll to zoom · <button id="btn-recenter" class="linkish">reset view</button></p>
+    <p class="hint">Drag to orbit · scroll to zoom · <button id="btn-recenter" class="linkish">reset view</button> · <button id="btn-tour" class="linkish">tour the cameras</button></p>
+    <div id="strip" class="strip" hidden></div>
   </section>
 
     <details class="card" id="details" hidden>

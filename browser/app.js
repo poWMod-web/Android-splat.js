@@ -13,7 +13,10 @@ import {
 import { readZip } from './zip.js';
 import { validateDataset, measuredSeeds, levelingNote } from './app/js/xr-dataset.js';
 import { gravityUpForKnownRun, decodeModel, parseState, parsePlyGaussians,
-  sogToGaussians, continuedInputDim, continuedBuf, buildReconJson } from './app/js/session_io.js';
+  sogToGaussians, continuedInputDim, continuedBuf, buildReconJson, buildSessionZip } from './app/js/session_io.js';
+import { plyToSog } from './app/js/sog.js';
+import { zipStore } from './app/js/zip.js';
+import { saveBlob } from './app/js/download.js';
 import { Chart, psnrToApproxSsimPercent } from './app/js/chart.js';
 import { saveRun, patchRun, listRuns, deleteRun,
   saveLastCapture, loadLastCapture, deleteLastCapture } from './app/js/store.js';
@@ -27,7 +30,8 @@ const ui = {
   iters: $('opt-iters'), gpu: $('opt-gpu'), gpuV: $('opt-gpu-v'), gap: $('opt-gap'),
   summary: $('input-summary'), start: $('btn-start'),
   run: $('run'), stage: $('stage-label'), bar: $('stage-bar'), metrics: $('metrics'),
-  pause: $('btn-pause'), finish: $('btn-finish'), ply: $('btn-ply'), cont: $('btn-continue'),
+  pause: $('btn-pause'), finish: $('btn-finish'), ply: $('btn-ply'), sess: $('btn-session'),
+  imgs: $('btn-photos'), cont: $('btn-continue'), tour: $('btn-tour'), strip: $('strip'),
   needphotos: $('needphotos'), photosHint: $('photos-hint'), photosFile: $('photos-file'),
   lodlinks: $('lodlinks'), status: $('status'),
   viewer: $('viewer'), view: $('view'), recenter: $('btn-recenter'),
@@ -63,6 +67,11 @@ const S = {
   runId: null,      // the library record this run secures into (null = none yet)
   loadedFiles: [],  // [{ name, url|null }] — the recon's photo source list
   lastPersist: 0,   // last progress patch to the library record
+  tour: null,       // the camera fly-through, while it plays
+  stripUrls: [],    // object URLs behind the photo strip (revoked on reset)
+  photoBlobs: [],   // the run's photo Files/sources (photos.zip, strip)
+  sogBlob: null,    // the compressed model, built once per run on demand
+  _sogJob: null,
 };
 
 const fmt = (n) => n == null || Number.isNaN(n) ? '—' : Math.round(n).toLocaleString('en-US');
@@ -523,6 +532,8 @@ async function run() {
   ui.run.hidden = false;
   ensureChart().resize();
   ui.ply.disabled = true;
+  ui.sess.disabled = true;
+  ui.imgs.disabled = true;
   ui.pause.disabled = true;
   ui.finish.disabled = true;
   ui.pause.textContent = 'Pause';
@@ -649,6 +660,7 @@ async function run() {
 
     setStage('Decoding photos …', 0);
     await session.load(files);
+    setPhotoSources(files);
     if (capture) {
       S.phase = 'solve';
       setStage('Using the known cameras (solve skipped) …', 0);
@@ -1323,6 +1335,8 @@ async function presentRestored({ gaussians, reconJson, state }, label) {
   ui.pause.disabled = true;
   ui.finish.disabled = true;
   ui.ply.disabled = false;
+  ui.sess.disabled = true;   // no live trainer state to pack — continue first
+  ui.imgs.disabled = true;   // restores carry no photo pixels
   ui.cont.hidden = !reconJson;
   setStatus(!reconJson
     ? 'Bare model, no cameras — orbit it, or download the .ply.'
@@ -1404,6 +1418,8 @@ async function continueRun(files, urls = null) {
   ui.cont.hidden = true;
   ui.needphotos.hidden = true;
   ui.ply.disabled = true;
+  ui.sess.disabled = true;
+  ui.imgs.disabled = true;
   setStatus('');
   try {
     if (S.session) { try { S.session.dispose(); } catch { /* view-only facade */ } }
@@ -1447,6 +1463,7 @@ async function continueRun(files, urls = null) {
     const wasBaked = recipe ? recipe.mipComp !== false : true;
     setStage('Decoding photos …', 0);
     await ses.load(files);
+    setPhotoSources(files);
     ses.useReconstruction({
       known: !!recon.knownCameras,
       cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
@@ -1521,6 +1538,7 @@ function completeRun(e) {
   ui.pause.disabled = true;
   ui.finish.disabled = true;
   ui.ply.disabled = false;
+  ui.sess.disabled = false;
   setStatus('Training finished — download the .ply, or keep orbiting the preview.');
   S.minutes = minutesLive();
   secureFinishedRun();
@@ -1539,6 +1557,14 @@ function resetRun() {
   S.psnrTrain = null; S.psnrHold = null; S.itersPerSec = 0; S.etaAt = null; S.minutes = 0;
   S.trainT0 = 0; S.runSettings = null; S.runName = ''; S.gpuFacts = null;
   S.runId = null; S.loadedFiles = []; S.lastPersist = 0;
+  stopTour();
+  for (const u of S.stripUrls || []) { try { URL.revokeObjectURL(u); } catch { /* gone */ } }
+  S.stripUrls = []; S.photoBlobs = [];
+  S.sogBlob = null; S._sogJob = null;
+  ui.strip.replaceChildren();
+  ui.strip.hidden = true;
+  ui.sess.disabled = true;
+  ui.imgs.disabled = true;
   chart?.reset();
   ui.details.hidden = true;
   ui.cont.hidden = true;
@@ -1587,6 +1613,7 @@ const camCentre = ({ R, t }) => [
 ];
 
 function setupViewer(session) {
+  stopTour();   // the orbit is rebuilt below — a playing tour would aim the old one
   const metas = session.trainer.camMeta || [];
   const meta = metas.length ? metas[Math.floor(metas.length / 2)] : null;
   const cv = ui.view;
@@ -1617,6 +1644,7 @@ function setupViewer(session) {
     cx: meta ? meta.cx : cv.width / 2, cy: meta ? meta.cy : cv.height / 2 };
   if (meta) frameOrbitFromCamera(Math.floor(metas.length / 2));
   else { S.orbit.yaw = 0.6; S.orbit.pitch = 0.35; applyOrbit(); }
+  renderStrip();
   wireOrbit();
 }
 
@@ -1636,15 +1664,19 @@ function frameOrbitFromCamera(ci) {
   applyOrbit();
 }
 
-function applyOrbit() {
-  const o = S.orbit, s = S.session;
-  if (!o || !s) return;
+function orbitFwd(o) {
   const cp = Math.cos(o.pitch);
-  const fwd = norm([
+  return norm([
     o.up[0] * Math.sin(o.pitch) + cp * (o.A[0] * Math.cos(o.yaw) + o.B[0] * Math.sin(o.yaw)),
     o.up[1] * Math.sin(o.pitch) + cp * (o.A[1] * Math.cos(o.yaw) + o.B[1] * Math.sin(o.yaw)),
     o.up[2] * Math.sin(o.pitch) + cp * (o.A[2] * Math.cos(o.yaw) + o.B[2] * Math.sin(o.yaw)),
   ]);
+}
+
+function applyOrbit() {
+  const o = S.orbit, s = S.session;
+  if (!o || !s) return;
+  const fwd = orbitFwd(o);
   const pos = sub(o.center, [fwd[0] * o.dist, fwd[1] * o.dist, fwd[2] * o.dist]);
   const r = norm(cross(fwd, o.up));
   const u = cross(r, fwd);
@@ -1661,6 +1693,7 @@ function wireOrbit() {
   let drag = null;
   cv.style.touchAction = 'none';
   cv.addEventListener('pointerdown', (e) => {
+    stopTour();   // a grab takes over from the fly-through
     drag = { x: e.clientX, y: e.clientY };
     cv.setPointerCapture(e.pointerId);
   });
@@ -1680,6 +1713,184 @@ function wireOrbit() {
       S.orbit.radius * 0.4, S.orbit.radius * 8);
     applyOrbit();
   }, { passive: false });
+}
+
+// ── tour + strip: fly the capture, or jump to any photo ─────────────────────
+
+const vdist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+/** The camera fly-through as a resampled path: co-located cameras collapse
+ *  (a pano rig's six orientations share one position — flying "through"
+ *  them whips the view), real breaks in the capture split the walk and the
+ *  longest leg flies, positions pre-smooth over ±3 neighbours, and a
+ *  Catmull-Rom through the smoothed nodes resamples into an arc-length
+ *  table so playback walks at exactly constant velocity. Same path math as
+ *  the full app's tour; the browser flies it orbit-style (leveled, aimed
+ *  at the model) instead of through a roll-carrying pose. */
+function tourPath(cams) {
+  cams = (cams || []).filter((c) => c.R);
+  if (cams.length < 2) return null;
+  const centres = cams.map(camCentre);
+  const gaps = [];
+  for (let i = 1; i < centres.length; i++) {
+    const d = vdist(centres[i], centres[i - 1]);
+    if (d > 1e-9) gaps.push(d);
+  }
+  gaps.sort((a, b) => a - b);
+  const medGap = gaps[gaps.length >> 1] || 1e-3;
+  const dedup = [];
+  for (let i = 0; i < cams.length; i++) {
+    const last = dedup[dedup.length - 1];
+    if (!last || vdist(centres[i], camCentre(last)) > 0.15 * medGap) dedup.push(cams[i]);
+  }
+  const segs = [[dedup[0]]];
+  for (let i = 1; i < dedup.length; i++) {
+    if (vdist(camCentre(dedup[i - 1]), camCentre(dedup[i])) > 4 * medGap) segs.push([]);
+    segs[segs.length - 1].push(dedup[i]);
+  }
+  const leg = segs.reduce((best, s) => (s.length > best.length ? s : best), []);
+  const n = leg.length;
+  if (n < 2) return null;
+  const raw = leg.map(camCentre);
+  const pts = raw.map((_, i) => {
+    const acc = [0, 0, 0];
+    let w = 0;
+    for (let k = -3; k <= 3; k++) {
+      const j = clamp(i + k, 0, raw.length - 1), wt = 4 - Math.abs(k);
+      for (let c = 0; c < 3; c++) acc[c] += raw[j][c] * wt;
+      w += wt;
+    }
+    return [acc[0] / w, acc[1] / w, acc[2] / w];
+  });
+  const P = (k) => pts[clamp(k, 0, n - 1)];
+  const cr = (i, f) => {
+    const p0 = P(i - 1), p1 = P(i), p2 = P(i + 1), p3 = P(i + 2);
+    const t2 = f * f, t3 = t2 * f;
+    return [0, 1, 2].map((k) => 0.5 * ((2 * p1[k]) + (-p0[k] + p2[k]) * f +
+      (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2 +
+      (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3));
+  };
+  const samples = [], cum = [0];
+  const SUB = 8;
+  for (let i = 0; i < n - 1; i++) {
+    for (let k = 0; k < SUB; k++) samples.push(cr(i, k / SUB));
+  }
+  samples.push(cr(n - 2, 1));
+  for (let k = 1; k < samples.length; k++) cum.push(cum[k - 1] + vdist(samples[k - 1], samples[k]));
+  return { samples, cum, total: cum[cum.length - 1] || 1e-6, count: n };
+}
+
+function startTour() {
+  const s = S.session, o = S.orbit;
+  if (!s || !o || !s.recon || !(s.recon.cams || []).some((c) => c.R)) return;
+  stopTour();
+  const path = tourPath(s.recon.cams);
+  if (!path) return;
+  // pick up from wherever the view is — no jump-cut into the path
+  const eye = orbitEye(o);
+  let best = 0, bd = Infinity;
+  path.samples.forEach((p, k) => {
+    const dd = (p[0] - eye[0]) ** 2 + (p[1] - eye[1]) ** 2 + (p[2] - eye[2]) ** 2;
+    if (dd < bd) { bd = dd; best = k; }
+  });
+  const duration = clamp(1.4 * path.count, 10, 30);
+  S.tour = {
+    ...path, speed: path.total / duration, s: path.cum[best],
+    k: Math.min(best, path.cum.length - 2), dir: 1, last: performance.now(), raf: 0,
+  };
+  ui.tour.textContent = 'stop the tour';
+  S.tour.raf = requestAnimationFrame(tourTick);
+}
+
+function stopTour() {
+  const T = S.tour;
+  if (!T) return;
+  S.tour = null;
+  if (T.raf) cancelAnimationFrame(T.raf);
+  ui.tour.textContent = 'tour the cameras';
+}
+
+function tourTick() {
+  const T = S.tour, o = S.orbit;
+  if (!T || !o) return;
+  const now = performance.now();
+  const dt = Math.min(0.1, Math.max(0, (now - T.last) / 1000));
+  T.last = now;
+  T.s += dt * T.speed * T.dir;               // constant velocity, ping-pong
+  if (T.s >= T.total) { T.s = T.total; T.dir = -1; }
+  if (T.s <= 0) { T.s = 0; T.dir = 1; }
+  while (T.k < T.cum.length - 2 && T.cum[T.k + 1] < T.s) T.k++;
+  while (T.k > 0 && T.cum[T.k] > T.s) T.k--;
+  const span = Math.max(1e-9, T.cum[T.k + 1] - T.cum[T.k]);
+  const a = (T.s - T.cum[T.k]) / span;
+  const A = T.samples[T.k], B = T.samples[T.k + 1];
+  aimOrbitAt([A[0] + (B[0] - A[0]) * a, A[1] + (B[1] - A[1]) * a, A[2] + (B[2] - A[2]) * a]);
+  T.raf = requestAnimationFrame(tourTick);
+}
+
+function orbitEye(o) {
+  const fwd = orbitFwd(o);
+  return sub(o.center, [fwd[0] * o.dist, fwd[1] * o.dist, fwd[2] * o.dist]);
+}
+
+/** Aim the orbit from a path eye: the tour flies the capture positions
+ *  while the leveled orbit keeps aiming at the model. */
+function aimOrbitAt(eye) {
+  const o = S.orbit;
+  if (!o) return;
+  const fwd = norm(sub(o.center, eye));
+  const d = dot(fwd, o.up);
+  const h = sub(fwd, [o.up[0] * d, o.up[1] * d, o.up[2] * d]);
+  o.yaw = Math.atan2(dot(h, o.A), dot(h, o.B));
+  o.pitch = Math.asin(clamp(d, -1, 1));
+  o.dist = clamp(vdist(o.center, eye), o.radius * 0.4, o.radius * 8);
+  applyOrbit();
+}
+
+/** The filmstrip: every photo that trained this run, in frame order — a
+ *  click frames the orbit from that photo's own camera. Restores carry no
+ *  photo pixels, so the strip stays hidden for them. */
+function renderStrip() {
+  const s = S.session;
+  ui.strip.replaceChildren();
+  const n = s && s.frames ? s.frames.length : 0;
+  if (!s || !n || !(S.stripUrls || []).some(Boolean)) { ui.strip.hidden = true; return; }
+  s.frames.forEach((f, i) => {
+    if (!S.stripUrls[i]) return;
+    const b = document.createElement('button');
+    b.className = 'thumb';
+    b.title = f.name || `photo ${i + 1}`;
+    const img = document.createElement('img');
+    img.src = S.stripUrls[i];
+    img.alt = '';
+    img.loading = 'lazy';
+    b.append(img);
+    b.addEventListener('click', () => jumpToFrame(i));
+    ui.strip.append(b);
+  });
+  ui.strip.hidden = !ui.strip.children.length;
+}
+
+/** Frame i photographed through camMeta[k] — camMeta and recon.cams share
+ *  their order, so the camera is found by imgIdx. */
+function jumpToFrame(i) {
+  const s = S.session;
+  if (!s) return;
+  stopTour();
+  const cams = (s.recon && s.recon.cams) || [];
+  const k = cams.findIndex((c) => c.imgIdx === i);
+  frameOrbitFromCamera(k >= 0 ? k : i);
+}
+
+/** The run's photo pixels, kept for the strip + the photos export (a File
+ *  is its own blob; video frames ride on .source — same as the full app). */
+function setPhotoSources(files) {
+  for (const u of S.stripUrls || []) { try { URL.revokeObjectURL(u); } catch { /* gone */ } }
+  S.photoBlobs = [...files];
+  S.stripUrls = files.map((f) => {
+    try { return URL.createObjectURL(f.source || f); } catch { return null; }
+  });
+  ui.imgs.disabled = !S.photoBlobs.length;
 }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
@@ -1709,7 +1920,12 @@ syncQuality();
 ui.recenter.addEventListener('click', () => {
   const s = S.session;
   if (!s || !S.orbit) return;
+  stopTour();
   frameOrbitFromCamera(Math.floor(s.trainer.camMeta.length / 2));
+});
+ui.tour.addEventListener('click', () => {
+  if (S.tour) stopTour();
+  else startTour();
 });
 ui.pause.addEventListener('click', () => {
   const s = S.session;
@@ -1792,6 +2008,64 @@ ui.ply.addEventListener('click', async () => {
     ui.ply.disabled = false;
   }
 });
+/** The compressed model, built once per run: GPU k-means over the .ply.
+ *  On demand only — finishing never waits on it, like the full app. */
+async function getSogBlob() {
+  if (S.sogBlob) return S.sogBlob;
+  if (S._sogJob) return S._sogJob;
+  return (S._sogJob = (async () => {
+    try {
+      setStatus('Compressing the model …');
+      const ply = await S.session.exportPlyBlob();
+      const blob = await plyToSog(new Uint8Array(await ply.arrayBuffer()), {
+        onProgress: ({ label, frac }) => {
+          if (label) setStage(`Compressing · ${label}`, frac);
+        },
+      });
+      S.sogBlob = blob;
+      return blob;
+    } finally {
+      S._sogJob = null;   // a failure clears the job so a retry works
+    }
+  })());
+}
+ui.sess.addEventListener('click', async () => {
+  const s = S.session;
+  if (!s || S.restored) return;   // the raw state needs its live trainer
+  ui.sess.disabled = true;
+  try {
+    const sog = await getSogBlob();
+    setStatus('Packing the session …');
+    const zip = await buildSessionZip(reconFacade(), sog);
+    await saveBlob(zip, `splat-session-${Date.now()}.zip`, 'application/zip');
+    setStatus(`Session saved (${(zip.size / 1e6).toFixed(1)} MB) — drop it back to resume exactly.`);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Session export failed: ${e.message}`, 'error');
+  } finally {
+    ui.sess.disabled = false;
+  }
+});
+ui.imgs.addEventListener('click', async () => {
+  if (!S.photoBlobs.length) return;
+  ui.imgs.disabled = true;
+  try {
+    setStatus('Packing the photos …');
+    const entries = [];
+    for (const f of S.photoBlobs) {
+      const blob = f.source || f;
+      entries.push({ name: f.name, data: new Uint8Array(await blob.arrayBuffer()) });
+    }
+    const zip = zipStore(entries);
+    await saveBlob(zip, `photos-${Date.now()}.zip`, 'application/zip');
+    setStatus(`${entries.length} photos saved in a ZIP.`);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Photos export failed: ${e.message}`, 'error');
+  } finally {
+    ui.imgs.disabled = false;
+  }
+});
 
 if (!navigator.gpu) {
   ui.nogl.hidden = false;
@@ -1817,4 +2091,4 @@ if (typeof location !== 'undefined') {
 
 // pure intake helpers, exported for the Node tests (the module is otherwise
 // a UI entry point, not a library)
-export { assembleCapture, sortByCapture, modelFromEntries, matchPhotosByName, runNameFor, describeRun };
+export { assembleCapture, sortByCapture, modelFromEntries, matchPhotosByName, runNameFor, describeRun, tourPath };

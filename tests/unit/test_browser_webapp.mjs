@@ -31,7 +31,8 @@ for (const id of ['nogl', 'drop', 'opt-q', 'opt-res', 'opt-feat', 'opt-tier',
     'photos-file', 'lodlinks', 'status', 'viewer', 'btn-recenter',
     'logwrap', 'log', 'chart', 'btn-scale', 'details', 'tab-score', 'tab-perf',
     'tab-cams', 'tab-gpu', 'detail-body', 'lastcap', 'lastcap-text', 'lastcap-use',
-    'lastcap-forget', 'library', 'runs']) {
+    'lastcap-forget', 'library', 'runs', 'btn-tour', 'strip', 'btn-session',
+    'btn-photos']) {
   assert.ok(html.includes(`id="${id}"`), `index.html owns #${id}`);
 }
 
