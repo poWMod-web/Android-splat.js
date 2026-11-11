@@ -230,6 +230,27 @@ class Emitter {
   }
 }
 
+/** Plateau test for score-driven refine cadence: least-squares slope of
+ *  train PSNR over the trailing `window` iters stays under `slope`
+ *  dB/kiter. Needs minPoints finite samples spanning most of the window —
+ *  anything less is "still warming up", never a plateau. Flat OR falling
+ *  trips it: a stalled score wants fresh capacity, a falling one triage. */
+export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.08, minPoints = 4 } = {}) {
+  if (!Array.isArray(history) || !history.length) return false;
+  const pts = [];
+  for (const [i, p] of history) {
+    if (Number.isFinite(i) && Number.isFinite(p) && i >= nowIter - window && i <= nowIter) pts.push([i, p]);
+  }
+  if (pts.length < minPoints) return false;
+  if (pts[pts.length - 1][0] - pts[0][0] < window * 0.75) return false;
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (const [i, p] of pts) { sx += i; sy += p; sxx += i * i; sxy += i * p; }
+  const n = pts.length;
+  const denom = n * sxx - sx * sx;
+  if (!(denom > 0)) return false;
+  return (n * sxy - sx * sy) / denom * 1000 < slope;
+}
+
 export class Session {
   /** @param {SessionOptions} [opts] */
   constructor(opts = {}) {
@@ -1441,9 +1462,22 @@ export class Session {
 
       const tEnc = performance.now() - t0;
 
-      // periodic refinement: relocate dead splats + grow capacity (MCMC-lite)
-      if (trainer.iter > 1500 &&
-          trainer.iter - (trainer.lastRefine || 0) >= (this.opts.refineEvery ?? 2500)) {
+      // periodic refinement: relocate dead splats + grow capacity (MCMC-lite).
+      // Cadence is score-driven: a plateaued PSNR pulls the next refine
+      // forward (past a minimum gap, so a flat score can't storm); the
+      // refineEvery cadence stays as the maximum gap, so fast-rising early
+      // training — and any metric outage — still refines on schedule.
+      const refineEvery = this.opts.refineEvery ?? 2500;
+      const sinceRefine = trainer.iter - (trainer.lastRefine || 0);
+      let plateau = false;
+      if (this.opts.refinePlateau !== false && trainer.iter > 1500 &&
+          sinceRefine >= (this.opts.plateauMinGap ?? 400)) {
+        plateau = scorePlateaued(this.lossHistory, trainer.iter, {
+          window: this.opts.plateauWindow ?? 1200,
+          slope: this.opts.plateauSlope ?? 0.08,
+        });
+      }
+      if (trainer.iter > 1500 && (sinceRefine >= refineEvery || plateau)) {
         trainer.lastRefine = trainer.iter;
         const r0 = performance.now();
         // awaited: refine reads six buffers and writes them all back — steps
@@ -1456,7 +1490,8 @@ export class Session {
         }
         if (r.moved || r.grown) {
           this._log(`refine @${trainer.iter}: relocated ${r.moved}, grew +${r.grown} -> ${r.n} splats`
-            + (r.dead != null ? ` (dead ${r.dead}, last round ${r.survived}/${r.lastReloc} survived)` : ''));
+            + (r.dead != null ? ` (dead ${r.dead}, last round ${r.survived}/${r.lastReloc} survived)` : '')
+            + (plateau ? ' [score plateaued]' : ''));
           this._em.emit('event', { kind: 'refine', iter: trainer.iter, ...r });
         }
       }
@@ -1605,6 +1640,15 @@ export class Session {
     if (mse != null && mse > 0) {
       m.psnrTrain = -10 * Math.log10(mse);
       this.lossHistory.push([trainer.iter, m.psnrTrain]);
+    }
+    // tile-sort overflow used to be silent (dropped tiles render as
+    // background): the count is cumulative on the trainer in both the
+    // local and worker paths, so any increase is news, once per increase
+    const ov = trainer.entryOverflowTiles || 0;
+    if (ov > (this._lastOverflow || 0)) {
+      this._lastOverflow = ov;
+      this._log(`WARNING: tile-sort overflow — ${ov} tiles dropped so far; the splat budget is too large for this adapter's entry binding`);
+      this._em.emit('event', { kind: 'overflow', iter: trainer.iter, tiles: ov });
     }
     const holdEvery = this.opts.evalHoldEvery ?? 4000;
     // (7) hidden tabs skip the holdout eval (training continues); the stale

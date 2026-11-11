@@ -522,6 +522,10 @@ function wireSession(session) {
         S.chartEvents.push({ iter: e.iter, kind: 'refine', label: 'refine' });
         log(`refine @${fmt(e.iter)}: ${fmt(e.kept)} kept`);
       }
+      else if (e.kind === 'overflow' && S._ovWarned !== (S.runId ?? 'live')) {
+        S._ovWarned = S.runId ?? 'live';
+        log(`WARNING: tile-sort overflow — ${e.tiles} tiles dropped so far; lower the splat budget for this device.`);
+      }
     });
 }
 
@@ -626,7 +630,9 @@ async function run() {
     // classic, ~35 under MCMC), clamped to the device class
     const phone = phoneClass();
     if (!st.splats) {
-      trainerOpts.maxSplats = Math.max(150000, Math.min(phone ? 600000 : 2000000,
+      // mobile ceiling is 1M like the full app (past it the SH binding at
+      // deg 3 and the tile-sort entries bind instead — overflow warns)
+      trainerOpts.maxSplats = Math.max(150000, Math.min(phone ? 1000000 : 2000000,
         Math.round(S.maxIters * (mcmcActive ? 35 : 15))));
       trainerOpts.capMult = 8; // growth must reach the computed cap from a lean seed
     }

@@ -2125,7 +2125,10 @@ async function startPrep() {
       flash('Working buffer 2× roughly quadruples GPU working memory — on this phone the run may abort for lack of memory. 1× trains the same photos safely.', 8000);
     }
     if (!st.splats) {
-      trainerOpts.maxSplats = Math.max(150000, Math.min(phoneClass ? 600000 : 2000000,
+      // mobile ceiling is 1M: past it the SH binding (deg 3 clamps at 745k
+      // in the engine) and the tile-sort entries (~16.7/splat at 1M) bind
+      // instead — overflow past that point warns, it never fails silent
+      trainerOpts.maxSplats = Math.max(150000, Math.min(phoneClass ? 1000000 : 2000000,
         Math.round(S.maxIters * (mcmcActive ? 35 : 15))));
       trainerOpts.capMult = 8; // growth must reach the computed cap from a lean seed
     }
@@ -3084,6 +3087,10 @@ function onTrainEvent(e) {
   if (e.kind === 'refine' && e.grown === 0 && !S.growthStopped && e.iter > S.maxIters * 0.7) {
     S.growthStopped = true;
     S.chartEvents.push({ iter: e.iter, kind: 'stop', label: 'Growth stops' });
+  }
+  if (e.kind === 'overflow' && S._ovWarned !== (S.runId ?? 'live')) {
+    S._ovWarned = S.runId ?? 'live';
+    flash(`Tile-sort overflow — ${e.tiles} tiles dropped so far. Lower the splat budget for this device.`, 8000);
   }
   if (e.kind === 'train-complete') finish();
   if (e.kind === 'device-lost') deviceLostRecovery();
