@@ -91,6 +91,20 @@ select, .btn {
   padding: 0.5rem 0.7rem;
 }
 select:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.opts input[type="number"] {
+  font: inherit;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #131a1a;
+  color: var(--ink);
+  padding: 0.5rem 0.7rem;
+  max-width: 7rem;
+}
+.opts input[type="number"]:disabled { opacity: 0.45; }
+.rangewrap { display: flex; align-items: center; gap: 0.5rem; }
+.rangewrap input[type="range"] { accent-color: var(--accent); flex: 1; min-width: 6rem; }
+.rangewrap b { font-weight: 600; min-width: 3.2em; text-align: right; color: var(--ink); }
+.lodlinks a { margin-right: 0.8rem; }
 
 .summary { color: var(--dim); min-height: 1.4em; }
 .stage { margin: 0.2rem 0 0.5rem; }
@@ -130,6 +144,15 @@ select:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); out
   color: var(--accent); cursor: pointer; font: inherit;
 }
 .linkish:hover { text-decoration: underline; }
+
+.lastcap { display: flex; align-items: center; flex-wrap: wrap; gap: 0.6rem; color: var(--dim); }
+.runs { display: grid; gap: 0.7rem; }
+.run { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem; border: 1px solid var(--line); border-radius: 10px; background: #131a1a; }
+.run img { width: 96px; height: 54px; object-fit: cover; border-radius: 6px; background: #000; }
+.runmeta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.15rem; }
+.runmeta b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runmeta span { color: var(--dim); font-size: 0.85rem; }
+.btn.danger:hover:not(:disabled) { border-color: var(--error); color: var(--error); }
 
 .log summary { cursor: pointer; color: var(--dim); font-weight: 600; }
 .log pre {
