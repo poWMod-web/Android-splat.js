@@ -48,10 +48,11 @@ capture route, and any capture can be exported for training elsewhere.
 ## What the app does
 
 - **ARCore capture.** Manual shutter by default, optional distance-based
-  auto-capture (2–200 cm spacing, 10 cm default), a red-to-green coverage
-  cloud with camera viewpoints to guide the path, and ground leveling from
-  the largest horizontal plane seen. At least 3 overlapping views; 20–200
-  recommended. Requires Google Play Services for AR.
+  auto-capture (2–200 cm spacing, 10 cm default; checking arms it and the
+  center button starts/stops the run), a red-to-green coverage cloud with
+  camera viewpoints to guide the path, and ground leveling from the largest
+  horizontal plane seen. At least 3 overlapping views; 20–200 recommended.
+  Requires Google Play Services for AR.
 - **Known-pose training.** `load()` → `useKnownCameras(parseCameras(...))` →
   `seed()` → `start()` — the solve is bypassed entirely. Measured seed
   points initialize the model; with fewer than 8 the run falls back to a

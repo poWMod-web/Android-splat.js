@@ -200,7 +200,7 @@ function createOverlay(doc, spacingCm = DEFAULT_CAPTURE_SPACING_M * 100) {
       <span class="xr-seed" data-role="seed">Seeds: none measured</span>
     </div>
     <div class="xr-guide" data-role="guide">
-      Manual capture is ready. Press Shutter for each photo, or enable auto-capture to take one every ${spacingCm} cm traveled.
+      Manual capture is ready. Press Shutter for each photo, or check Auto-capture and press Start to take one every ${spacingCm} cm traveled.
       Move slowly and aim for 20 or more overlapping views. Rotating in place does not trigger automatic photos.
     </div>
     <div class="xr-controls">
@@ -250,6 +250,7 @@ async function runCapture({
       voxelKeys: new Set(),
       nextFileNumber: 1,
       auto: false,
+      autoRunning: false,
       manualRequests: 0,
       spacingCm,
       distanceTrigger: new DistanceCaptureTrigger(spacingCm / 100),
@@ -292,11 +293,21 @@ async function runCapture({
       if (poseLabel) poseLabel.textContent = `Tracking: ${text}`;
     };
 
+    // the shutter doubles as the auto run's Start/Stop while auto mode is on
+    const updateShutter = () => {
+      if (!shutter) return;
+      const label = !state.auto ? 'Shutter' : state.autoRunning ? 'Stop' : 'Start';
+      shutter.textContent = label;
+      shutter.setAttribute('aria-label',
+        !state.auto ? 'Take photo' : state.autoRunning ? 'Stop auto-capture' : 'Start auto-capture');
+    };
     overlay.addEventListener('beforexrselect', (event) => event.preventDefault());
     autoInput?.addEventListener('change', () => {
       state.auto = !!autoInput.checked;
+      state.autoRunning = false;   // checking arms the mode; the shutter starts it
       state.distanceTrigger.reset();
-      setStatus(state.auto ? `Auto-capture enabled: one photo every ${state.spacingCm} cm traveled. Move slowly.` : 'Manual capture enabled. Press Shutter to take a photo.');
+      updateShutter();
+      setStatus(state.auto ? `Auto-capture armed: press Start, then move slowly for one photo every ${state.spacingCm} cm.` : 'Manual capture enabled. Press Shutter to take a photo.');
     });
     distanceInput?.addEventListener('change', () => {
       distanceInput.setCustomValidity('');
@@ -311,11 +322,21 @@ async function runCapture({
       state.spacingCm = value;
       state.distanceTrigger.setSpacingMeters(value / 100);
       storeCaptureSpacingCm(doc, value);
-      if (guide) guide.textContent = `Manual capture is ready. Press Shutter for each photo, or enable auto-capture to take one every ${value} cm traveled. Move slowly and aim for 20 or more overlapping views. Rotating in place does not trigger automatic photos.`;
+      if (guide) guide.textContent = `Manual capture is ready. Press Shutter for each photo, or check Auto-capture and press Start to take one every ${value} cm traveled. Move slowly and aim for 20 or more overlapping views. Rotating in place does not trigger automatic photos.`;
       setStatus(state.auto ? `Auto-capture updated: one photo every ${value} cm traveled.` : `Auto-capture distance set to ${value} cm. Auto-capture is still off.`);
     });
     shutter?.addEventListener('click', () => {
       if (state.stopped || visibleCount() >= MAX_FRAMES) return;
+      if (state.auto) {
+        // auto mode: the shutter starts/stops the automatic run
+        state.autoRunning = !state.autoRunning;
+        state.distanceTrigger.reset();
+        updateShutter();
+        setStatus(state.autoRunning
+          ? `Auto-capture started: one photo every ${state.spacingCm} cm traveled. Move slowly.`
+          : 'Auto-capture stopped. Press Start to resume, or uncheck Auto-capture for manual shots.');
+        return;
+      }
       state.manualRequests += 1;
       setStatus('Shutter armed; waiting for the next tracked camera frame…');
     });
@@ -400,7 +421,7 @@ async function runCapture({
         setPoseLabel(`active · ${position.map((value) => value.toFixed(2)).join(', ')} m`);
 
         const manual = state.manualRequests > 0;
-        const auto = state.auto && state.distanceTrigger.sample(position);
+        const auto = state.auto && state.autoRunning && state.distanceTrigger.sample(position);
         if (!manual && !auto) return;
         // PNG encoding can lag a mobile GPU; do not accumulate full-size raw frames.
         if (state.pending.size >= 2) { setStatus('Saving photos… hold steady, then keep moving.'); return; }
@@ -427,7 +448,7 @@ async function runCapture({
           setStatus('This frame had no readable camera texture; it was not captured.');
           return;
         }
-        if (state.auto) state.distanceTrigger.captured(position);
+        if (state.auto && state.autoRunning) state.distanceTrigger.captured(position);
         scheduleEncode(snapshot);
         updateUi();
         setStatus(manual ? 'Photo queued.' : 'Auto-captured a tracked frame. Keep moving slowly.');
