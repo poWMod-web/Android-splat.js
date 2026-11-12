@@ -13,7 +13,8 @@ import {
 import { readZip } from './zip.js';
 import { validateDataset, measuredSeeds, levelingNote } from './app/js/xr-dataset.js';
 import { gravityUpForKnownRun, decodeModel, parseState, parsePlyGaussians,
-  sogToGaussians, continuedInputDim, continuedBuf, buildReconJson, buildSessionZip } from './app/js/session_io.js';
+  sogToGaussians, continuedInputDim, continuedBuf, buildReconJson, buildSessionZip,
+  convertSHDegree } from './app/js/session_io.js';
 import { plyToSog } from './app/js/sog.js';
 import { zipStore } from './app/js/zip.js';
 import { saveBlob } from './app/js/download.js';
@@ -179,6 +180,7 @@ const MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'i
   tiff: 'image/tiff', heic: 'image/heic', heif: 'image/heif' };
 const isZipFile = (f) => /\.zip$/i.test(f.name || '') || f.type === 'application/zip';
 const baseName = (p) => String(p).split(/[\\/]/).pop();
+const DEG_OF_SHK = { 0: 0, 3: 1, 8: 2, 15: 3 };
 
 function stageFiles(list) {
   resetRun();
@@ -1324,6 +1326,12 @@ async function presentRestored({ gaussians, reconJson, state }, label) {
   S.phase = 'done';
   S.maxIters = Math.max(1, iter);
   S.runName = label;
+  // the settings panel opens on the run's own SH degree (reselectable
+  // before Continue) — the default the full app's config card shows
+  if (reconJson && gaussians.shK != null && DEG_OF_SHK[gaussians.shK] != null) {
+    ui.sh.value = String(DEG_OF_SHK[gaussians.shK]);
+    syncQuality();
+  }
   setupViewer(ses);
   const stats = (reconJson && reconJson.stats) || {};
   // the saved curve replays on the chart — the finished run reads as trained
@@ -1444,6 +1452,24 @@ async function continueRun(files, urls = null) {
     if ((bufScale ?? 1) === 2 && phoneClass()) {
       log('Working buffer 2× roughly quadruples GPU working memory — on this phone the run may abort for lack of memory. 1× trains the same photos safely.');
     }
+    // a reselected SH degree resamples the decoded harmonics (low bands kept,
+    // growth zero-padded) so the continuation trains the chosen degree —
+    // same as the full app; unsettled, the run's own degree replays
+    let contShDeg = null;
+    if (st.sh != null) {
+      try {
+        const curDeg = g.shK != null ? DEG_OF_SHK[g.shK] : recipeTrainer.shDeg;
+        if (curDeg == null) throw new Error(`unfamiliar band count ${g.shK}`);
+        if (curDeg !== st.sh) {
+          convertSHDegree(g, st.sh);
+          log(`SH degree ${curDeg} → ${st.sh} for the continuation (low bands kept, new bands start at zero)`);
+        }
+        contShDeg = st.sh;
+      } catch (e) {
+        log(`keeping the run's SH degree (${e.message})`);
+      }
+    }
+    if ((contShDeg ?? recipeTrainer.shDeg ?? 3) > 0) recipeTrainer.shLr = 3e-4;
     log(`continuing from ${fmt(baseIter)} cycles — +${fmt(extra)} more · cap ${fmt(cap)} · ${engine}` +
       `${prevDim ? ` · ${prevDim}px input` : ''}${!hasState ? ' · unbaking export opacities' : ''}`);
     const ses = createSession({
@@ -1453,7 +1479,7 @@ async function continueRun(files, urls = null) {
       frames: { trainMaxDim, ...(bufScale != null ? { trainScale: bufScale } : {}) },
       trainer: {
         ...recipeTrainer,
-        maxSplats: cap, shDeg: recipeTrainer.shDeg ?? 3,
+        maxSplats: cap, shDeg: contShDeg ?? recipeTrainer.shDeg ?? 3,
         capMult: Math.max(2, Math.ceil(cap / Math.max(1, g.n))),
         ...(engine === 'v2' ? { engine: 'v2', refineEvery: 200 } : {}),
       },

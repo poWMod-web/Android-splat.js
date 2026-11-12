@@ -1825,7 +1825,7 @@ export class GSTrainer {
     const d = this.device;
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const canGrow = this.iter < (this.opts.growUntil ?? 0.5 * this.horizon) && this.n < limit;
+    const canGrow = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon) && this.n < limit;
     if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n };
 
     d.queue.writeBuffer(this.uniGather, 0, new Uint32Array([this.n, 1, this.opts.statMax ? 1 : 0, 0]));
@@ -2011,7 +2011,7 @@ export class GSTrainer {
     if (this.opts.refineV2 !== true) return this._refineLegacy(rng);
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const canGrow = this.iter < (this.opts.growUntil ?? 0.75 * this.horizon) && this.n < limit;
+    const canGrow = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon) && this.n < limit;
     if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n };
     const d = this.device;
 
@@ -2286,7 +2286,7 @@ export class GSTrainer {
 
   async _refineLegacy(rng = this.rand) {
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
-    const canGrow = this.iter < (this.opts.growUntil ?? 0.75 * this.horizon) && this.n < Math.min(this.cap, this.growLimit || this.cap);
+    const canGrow = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon) && this.n < Math.min(this.cap, this.growLimit || this.cap);
     if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n };
     const d = this.device;
     // capacity-pooled densification: the live-rows readback reuses the
@@ -2492,7 +2492,7 @@ export class GSTrainer {
     // growLimit: a soft, raisable ceiling below cap — LOD training holds the
     // model at each detail level, snapshots it, then lets it grow on
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const grown = this.iter < (this.opts.growUntil ?? 0.75 * this.horizon)
+    const grown = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon)
       ? Math.max(0, Math.min(Math.ceil(this.n * (this.opts.growRate ?? 0.15)), limit - this.n)) : 0;
     for (let k = 0; k < grown; k++) spawnAt((this.n + k) * STRIDE, true);
     if (grown > 0) {

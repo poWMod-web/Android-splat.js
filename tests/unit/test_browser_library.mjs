@@ -13,7 +13,7 @@ for (const fn of ['saveRun', 'patchRun', 'listRuns', 'deleteRun',
 assert.match(appSource,
   /import \{ saveRun, patchRun, listRuns, deleteRun,[\s\S]*?saveLastCapture, loadLastCapture, deleteLastCapture \} from '\.\/app\/js\/store\.js';/,
   'the browser imports the run shelf from the vendored store');
-assert.match(appSource, /continuedBuf, buildReconJson, buildSessionZip \} from '\.\/app\/js\/session_io\.js';/,
+assert.match(appSource, /continuedBuf, buildReconJson, buildSessionZip,[\s\S]*?convertSHDegree \} from '\.\/app\/js\/session_io\.js';/,
   'finished runs keep a recon built by the shared builder');
 
 // ---- wiring pins: records open, persist, secure ---------------------------

@@ -235,7 +235,7 @@ class Emitter {
  *  dB/kiter. Needs minPoints finite samples spanning most of the window —
  *  anything less is "still warming up", never a plateau. Flat OR falling
  *  trips it: a stalled score wants fresh capacity, a falling one triage. */
-export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.08, minPoints = 4 } = {}) {
+export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, minPoints = 4 } = {}) {
   if (!Array.isArray(history) || !history.length) return false;
   const pts = [];
   for (const [i, p] of history) {
@@ -1474,7 +1474,7 @@ export class Session {
           sinceRefine >= (this.opts.plateauMinGap ?? 400)) {
         plateau = scorePlateaued(this.lossHistory, trainer.iter, {
           window: this.opts.plateauWindow ?? 1200,
-          slope: this.opts.plateauSlope ?? 0.08,
+          slope: this.opts.plateauSlope ?? 0.1,
         });
       }
       if (trainer.iter > 1500 && (sinceRefine >= refineEvery || plateau)) {

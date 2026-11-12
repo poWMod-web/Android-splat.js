@@ -7,7 +7,7 @@ const appSource = readFileSync(new URL('../../browser/app.js', import.meta.url),
 
 // ---- wiring pins: model intake, restore, continue ---------------------------
 assert.match(appSource,
-  /gravityUpForKnownRun, decodeModel, parseState, parsePlyGaussians,[\s\S]*?sogToGaussians, continuedInputDim, continuedBuf, buildReconJson, buildSessionZip \} from '\.\/app\/js\/session_io\.js';/,
+  /gravityUpForKnownRun, decodeModel, parseState, parsePlyGaussians,[\s\S]*?sogToGaussians, continuedInputDim, continuedBuf, buildReconJson, buildSessionZip,[\s\S]*?convertSHDegree \} from '\.\/app\/js\/session_io\.js';/,
   'restore/continue come from the vendored session_io module');
 assert.match(appSource, /buildLODPlan, undistortFrames,/,
   'continuations undistort against the original run');

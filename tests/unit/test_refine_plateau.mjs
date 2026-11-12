@@ -31,6 +31,10 @@ assert.equal(scorePlateaued([[9000, 20], [9200, NaN], [9400, 20], [9600, 20], [9
   'a NaN readout is skipped, not fatal');
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.0), NOW - 5000, { window: W }), false,
   'points past the horizon do not count');
+assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.09), NOW, { window: W }), true,
+  'the default trips under 0.1 dB/kiter');
+assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.11), NOW, { window: W }), false,
+  'the default holds at and above 0.1 dB/kiter');
 
 // ---- wiring pins: plateau pulls refines forward, cadence backstops ---------
 assert.match(sessionSource, /export function scorePlateaued\(history, nowIter/,
@@ -45,6 +49,10 @@ assert.match(sessionSource, /if \(trainer\.iter > 1500 && \(sinceRefine >= refin
   'the fixed cadence stays as the maximum gap');
 assert.match(sessionSource, /\[score plateaued\]/,
   'plateau-triggered refines say so in the log');
+assert.match(sessionSource, /slope: this\.opts\.plateauSlope \?\? 0\.1,/,
+  'the loop trips under 0.1 dB/kiter');
+assert.equal((trainerSource.match(/growUntil \?\? 0\.85 \* this\.horizon/g) || []).length, 4,
+  'growth runs to 85% of the horizon on every refine path');
 
 // ---- the mobile ceiling is 1M splats ----------------------------------------
 assert.match(appSource, /Math\.min\(phoneClass \? 1000000 : 2000000,/,
