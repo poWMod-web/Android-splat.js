@@ -529,6 +529,10 @@ function wireSession(session) {
         S.chartEvents.push({ iter: e.iter, kind: 'soft-prune', label: `−${fmt(e.culled)}` });
         log(`soft-prune @${fmt(e.iter)}: culled ${fmt(e.culled)} → ${fmt(e.n)} splats`);
       }
+      else if (e.kind === 'tandem-regrow' || e.kind === 'grow-now') {
+        S.chartEvents.push({ iter: e.iter, kind: 'grow', label: `+${fmt(e.grown || 0)}` });
+        log(`${e.kind === 'grow-now' ? 'grow-now' : 'tandem regrow'} @${fmt(e.iter)}: +${fmt(e.grown || 0)} → ${fmt(e.n)} splats`);
+      }
       else if (e.kind === 'cap-hit') showCapPrompt(e);
       else if (e.kind === 'prune-continue') {
         S.sogBlob = null;
@@ -2092,6 +2096,25 @@ async function runPruneContinue(ratio = 0.5) {
     ui.prune.disabled = S.phase !== 'train';
   }
 }
+/** Manual growth pass, any time: one immediate refine outside the schedule
+ *  (the Prune/Grow button's other half). */
+async function runGrowNow() {
+  const s = S.session;
+  if (!s || !s.trainer || S._pruning || S._growing) return;
+  S._growing = true;
+  ui.prune.disabled = true;
+  try {
+    setStatus('Growing into the error …');
+    const r = await s.growNow();
+    setStatus(`Grew +${fmt(r.grown || 0)} splats → ${fmt(r.n)} total.`);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Grow failed: ${e.message}`, 'error');
+  } finally {
+    S._growing = false;
+    ui.prune.disabled = S.phase !== 'train';
+  }
+}
 ui.prune.addEventListener('click', showPrunePicker);
 /** The ceiling's question, asked inline in the status line: the session
  *  paused itself at a full cap — prune to half and grow on, or keep
@@ -2118,7 +2141,8 @@ function showCapPrompt(e) {
       setStatus('Training on at the cap — growth stays off.');
     }));
 }
-/** Manual prune, any time: the status line becomes a ratio picker. */
+/** Manual prune/grow, any time: the status line becomes a ratio picker
+ *  with a growth pass on the side. */
 function showPrunePicker() {
   const s = S.session;
   if (!s || !s.trainer || S._pruning) return;
@@ -2138,6 +2162,7 @@ function showPrunePicker() {
     mk('Keep ¾', () => go(0.75)), ' ',
     mk('Keep ½', () => go(0.5)), ' ',
     mk('Keep ¼', () => go(0.25)), ' ',
+    mk('Grow now', runGrowNow), ' ',
     mk('Cancel', () => setStatus('')));
 }
 ui.simplify.addEventListener('click', async () => {

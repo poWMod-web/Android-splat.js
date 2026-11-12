@@ -2756,7 +2756,7 @@ function syncTrainButtons() {
   const f = $('t-finish');
   if (f) f.hidden = on;
   const p = $('t-prune');
-  if (p) p.disabled = !ses || !ses.trainer || !!S._pruning;
+  if (p) p.disabled = !ses || !ses.trainer || !!S._pruning || !!S._growing;
 }
 
 /** The ceiling's question: the session paused itself at a full cap — prune
@@ -2791,36 +2791,57 @@ function showCapCard(e) {
   });
 }
 
-/** Manual prune, any time: pick how much to keep, then the flow reseeds
- *  the trainer and grows on (same promise-picker as the export card). */
+/** Manual prune/grow, any time: pick how much to keep (the flow reseeds
+ *  the trainer and grows on), or trigger one growth pass right now. */
 function showPrunePicker() {
   const ses = S.session;
-  if (!ses || !ses.trainer || S._pruning) return;
+  if (!ses || !ses.trainer || S._pruning || S._growing) return;
   document.getElementById('prunepick')?.remove();
   const card = document.createElement('div');
   card.className = 'upcard';
   card.id = 'prunepick';
   card.innerHTML = `
-    <b>Prune &amp; continue</b>
-    <span class="sog-status">Fewer splats, room to regrow — pick how much to keep.</span>
+    <b>Prune / grow</b>
+    <span class="sog-status">Fewer splats with room to regrow — or grow into the error right now.</span>
     <div class="row" id="prunepick-pick">
       <button class="btn" data-ratio="0.75">Keep ¾</button>
       <button class="btn" data-ratio="0.5">Keep ½</button>
       <button class="btn" data-ratio="0.25">Keep ¼</button>
+      <button class="btn" data-grow="1">Grow now</button>
       <button class="btn linkish" data-ratio="">Cancel</button>
     </div>`;
   $('stage').appendChild(card);
   card.querySelector('#prunepick-pick').addEventListener('click', (e) => {
-    const r = e.target && e.target.dataset ? e.target.dataset.ratio : null;
-    if (r == null) return;
+    const d = e.target && e.target.dataset ? e.target.dataset : null;
+    if (!d) return;
     card.remove();
-    if (r !== '') runPruneAndContinue(parseFloat(r));
+    if (d.grow) { runGrowNow(); return; }
+    if (d.ratio != null && d.ratio !== '') runPruneAndContinue(parseFloat(d.ratio));
   });
+}
+
+/** Manual growth pass, any time: one immediate refine outside the schedule
+ *  (the Prune/Grow button's other half). Quick — no progress card. */
+async function runGrowNow() {
+  const ses = S.session;
+  if (!ses || !ses.trainer || S._pruning || S._growing) return;
+  S._growing = true;
+  syncTrainButtons();
+  try {
+    const r = await ses.growNow();
+    flash(`Grew +${(r.grown || 0).toLocaleString()} splats → ${(r.n || 0).toLocaleString()} total`, 4000);
+  } catch (e) {
+    console.error(e);
+    flash(`Could not grow: ${e.message}`, 8000);
+  } finally {
+    S._growing = false;
+    syncTrainButtons();
+  }
 }
 
 async function runPruneAndContinue(ratio = 0.5) {
   const ses = S.session;
-  if (!ses || !ses.trainer || S._pruning) return;
+  if (!ses || !ses.trainer || S._pruning || S._growing) return;
   S._pruning = true;
   syncTrainButtons();
   document.getElementById('prunecard')?.remove();
@@ -3215,6 +3236,10 @@ function onTrainEvent(e) {
   if (e.kind === 'soft-prune') {
     S.chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned −${fmt(e.culled)}` });
     S.growNote = { text: `−${fmt(e.culled)} splats`, until: performance.now() + 2200 };
+  }
+  if (e.kind === 'tandem-regrow' || e.kind === 'grow-now') {
+    S.chartEvents.push({ iter: e.iter, kind: 'grow', label: `Grew +${fmt(e.grown || 0)}` });
+    S.growNote = { text: `+${fmt(e.grown || 0)} splats`, until: performance.now() + 2200 };
   }
   if (e.kind === 'cap-hit') {
     if (S.state !== 'train') return;
@@ -5606,7 +5631,7 @@ function dock(kind) {
   if (kind === 'train') {
     d.innerHTML = `
       <div class="tcontrols">
-        <span class="playwrap"><button class="play" id="t-play" data-state="pause"><svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z"/></svg></button><button class="tbtn-sm" id="t-finish" hidden title="End the run here — the model is kept as it is and ready to export">Stop &amp; keep</button><button class="tbtn-sm" id="t-prune" title="Prune the model to half its splats and keep training with room to grow">Prune ½</button></span>
+        <span class="playwrap"><button class="play" id="t-play" data-state="pause"><svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z"/></svg></button><button class="tbtn-sm" id="t-finish" hidden title="End the run here — the model is kept as it is and ready to export">Stop &amp; keep</button><button class="tbtn-sm" id="t-prune" title="Prune the model down or trigger a growth pass, then keep training">Prune/Grow</button></span>
         <div class="tmeta">
           <span class="tmeta-1"><span id="t-iter">${pctOf(S.iter)}</span></span>
           <span class="tmeta-2">ETA <span id="t-eta">${etaText()}</span></span>

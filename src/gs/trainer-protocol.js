@@ -17,7 +17,7 @@ export const TRAIN_METHODS = [
   'init',         // build device+trainer, upload seed+targets -> state mirror
   'runBatch',     // run N training steps with fence gating -> { iter, n, lastCam }
   'refine',       // densification barrier -> refine stats
-  'softPrune',    // importance-cull barrier -> { culled, n }
+  'softPrune',    // importance-cull barrier (params.ratio overrides) -> { culled, n }
   'readLoss',     // accumulated error -> { mse, entryOverflowTiles }
   'eval',         // { kind: 'psnr'|'metrics'|'refined', ci, steps? } -> metric(s)
   'testPsnr',     // mean PSNR over cameras -> { psnr, frames }

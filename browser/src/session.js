@@ -704,7 +704,34 @@ export class Session {
    *  boot: { gaussians, cams, frames, maxW, maxH, radius, hull?, hullOpts?,
    *  hullKillFn? (local), protect?, freezePos?, sh?/shN? (resume), holdout?,
    *  excluded?, iter? }. */
+  /** Prune/grow tandem: pre-boost growRate so periodic culls don't bend
+   *  the growth curve — with k refines per prune window, g' solves
+   *  (1+g')^k * (1-p) = (1+g)^k exactly. Runs here, the single funnel
+   *  into local/remote/worker boots, so every path trains the same
+   *  trajectory; ses.opts.trainer stays unboosted, so continuations
+   *  recompute from the base rate instead of compounding. Engine v2
+   *  grows candidates, not n — the same relative uplift there is
+   *  approximate. */
+  _withTandemBoost(trainerOpts) {
+    const sp = trainerOpts.softPrune;
+    if (!sp || !(sp.ratio > 0 && sp.ratio < 1)) return trainerOpts;
+    const R = this.opts.refineEvery ?? 2500, E = sp.every ?? 3000;
+    const g0 = trainerOpts.growRate ?? 0.15;
+    const g1 = (1 + g0) / Math.pow(1 - sp.ratio, R / E) - 1;
+    if (!(g1 > g0)) return trainerOpts;
+    let note = '';
+    let g = g1;
+    if (g > 0.6) { g = 0.6; note = ' [clamped at 0.6]'; }
+    const out = { ...trainerOpts, growRate: +g.toFixed(4) };
+    if (trainerOpts.engine === 'v2') {
+      out.growFrac = +((trainerOpts.growFrac ?? 0.1) * (g / g0)).toFixed(4);
+    }
+    this._log(`prune/grow tandem: growRate ${g0} -> ${out.growRate} holds the no-prune curve against -${Math.round(sp.ratio * 100)}%/${E} (refine every ${R})${note}`);
+    return out;
+  }
+
   async _bootTrainer(trainerOpts, boot) {
+    trainerOpts = this._withTandemBoost(trainerOpts);
     if (this._shouldOffload()) {
       try {
         await this._bootRemoteTrainer(trainerOpts, boot);
@@ -1111,6 +1138,28 @@ export class Session {
         this._capAsked = false;
         throw e;
       }
+    });
+  }
+
+  /** Manual growth pass, any time: one immediate refine (relocate the dead
+   *  + grow into the highest-error donors) outside the schedule — the
+   *  Prune/Grow button's other half. A bonus pass like the tandem regrow:
+   *  lastRefine untouched. At a full cap it asks the ceiling question
+   *  instead of growing into nothing. */
+  async growNow() {
+    const trainer = this.trainer;
+    if (!trainer) throw new Error('seed() first');
+    return this._locked(async () => {
+      const r = await trainer.refine();
+      this._log(`grow-now @${trainer.iter}: relocated ${r.moved || 0}, grew +${r.grown || 0} -> ${r.n} splats`);
+      this._em.emit('event', { kind: 'grow-now', iter: trainer.iter, ...r });
+      if (r.capped && !this._capAsked) {
+        this._capAsked = true;
+        this.training = false;
+        this._log(`splat cap reached at ${trainer.n} — paused: keep training at the cap, or prune and continue`);
+        this._em.emit('event', { kind: 'cap-hit', iter: trainer.iter, splats: trainer.n });
+      }
+      return r;
     });
   }
 
@@ -1551,18 +1600,46 @@ export class Session {
         }
       }
 
-      // periodic soft-prune (opt-in): cull the lowest-rendered-mass
-      // fraction on its own cadence. Reads trainer.opts so the worker
-      // and remote paths (whose opts mirror boot) behave identically.
+      // soft-prune in tandem with growth (opt-in): cull the
+      // lowest-rendered-mass fraction, then immediately regrow into the
+      // highest-error donors with a bonus refine — removal and
+      // multiplication in one step, the count rising on average (the
+      // growRate boost in _withTandemBoost holds the no-prune trajectory).
+      // Reads trainer.opts so the worker and remote paths (whose opts
+      // mirror boot) behave identically. Early milestones restructure
+      // aggressively (keep 1/4 @500, 1/2 @1000, 3/4 @2000); past `until`
+      // of the run pruning stops and growth polishes on alone.
       const sp = trainer.opts ? trainer.opts.softPrune : null;
-      if (sp && trainer.iter >= (sp.from ?? 6000) &&
-          trainer.iter - (this._lastSoftPrune || 0) >= (sp.every ?? 3000)) {
-        this._lastSoftPrune = trainer.iter;
-        const s = await trainer.softPrune();
-        if (s.culled) {
-          this._log(`soft-prune @${trainer.iter}: culled ${s.culled} -> ${s.n} splats` +
-            (s.floorBound === 'ratchet' ? ' (growth ratchet held the floor)' : ''));
-          this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...s });
+      let pruned = null;
+      if (sp && trainer.iter <= (sp.until ?? 0.85) * this._maxIters()) {
+        this._pruneFired ??= [];
+        const marks = sp.milestones ?? [[500, 0.25], [1000, 0.5], [2000, 0.75]];
+        // a continued run starts past every mark — only fire within one
+        // window of it, so old milestones never replay back-to-back
+        const due = marks.find(([at]) => trainer.iter >= at &&
+          trainer.iter - at < (sp.every ?? 3000) && !this._pruneFired.includes(at));
+        if (due) {
+          this._pruneFired.push(due[0]);
+          pruned = await trainer.softPrune(1 - due[1]);
+          if (!pruned.culled) this._log(`early prune @${trainer.iter}: kept all ${pruned.n} (too few rows or no signal yet)`);
+        } else if (trainer.iter >= (sp.from ?? 6000) &&
+            trainer.iter - (this._lastSoftPrune || 0) >= (sp.every ?? 3000)) {
+          this._lastSoftPrune = trainer.iter;
+          pruned = await trainer.softPrune();
+        }
+      }
+      if (pruned && pruned.culled) {
+        this._log(`soft-prune @${trainer.iter}: culled ${pruned.culled} -> ${pruned.n} splats` +
+          (pruned.floorBound === 'ratchet' ? ' (growth ratchet held the floor)' : ''));
+        this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
+        // the tandem growth pass: recycle the freed capacity where the
+        // image needs it NOW, not at the next scheduled refine (a bonus
+        // pass — lastRefine untouched, the cadence keeps its rhythm)
+        const b = await trainer.refine();
+        if (!refineResult || b.capped) refineResult = b;
+        if (b.grown) {
+          this._log(`tandem regrow @${trainer.iter}: +${b.grown} -> ${b.n} splats`);
+          this._em.emit('event', { kind: 'tandem-regrow', iter: trainer.iter, ...b });
         }
       }
       // the ceiling's own prompt: a refine reporting growth-still-scheduled

@@ -13,8 +13,10 @@ const browser = readFileSync(new URL('../../browser/app.js', import.meta.url), '
 const browserHtml = readFileSync(new URL('../../browser/index.html', import.meta.url), 'utf8');
 
 // ---- the trainer culls by rendered mass, on demand -------------------------
-assert.match(trainer, /async softPrune\(\) \{/,
-  'the trainer serves a soft-prune call');
+assert.match(trainer, /async softPrune\(ratioOverride = null\) \{/,
+  'the trainer serves a soft-prune call, with a milestone override');
+assert.match(trainer, /const ratio = ratioOverride \?\? cfg\.ratio \?\? 0\.1;/,
+  'a milestone override culls its own fraction instead of the configured trim');
 assert.match(trainer, /planSoftPrune\(masses, this\.n, ratio, \{/,
   'scoring plans through the pure planner');
 assert.match(trainer, /this\.pipeCompact = d\.createComputePipeline\(\{/,
@@ -43,12 +45,16 @@ assert.match(protocol, /'softPrune',    \/\/ importance-cull barrier/,
   'the RPC contract lists the call');
 assert.match(worker, /case 'softPrune': \{/,
   'the worker serves it');
-assert.match(remote, /async softPrune\(\) \{/,
+assert.match(remote, /async softPrune\(ratio = null\) \{/,
   'the remote proxy mirrors n/iter like refine does');
+assert.match(worker, /const r = await tr\.softPrune\(params\.ratio \?\? null\);/,
+  'the worker forwards a milestone override to its trainer');
 
 // ---- the session drives cadence, prompt, and prune-and-continue ------------
-assert.match(session, /const s = await trainer\.softPrune\(\);/,
+assert.match(session, /pruned = await trainer\.softPrune\(\);/,
   'the loop fires soft-prunes on cadence');
+assert.match(session, /pruned = await trainer\.softPrune\(1 - due\[1\]\);/,
+  'early milestones cull their own keep-fraction');
 assert.match(session, /kind: 'soft-prune', iter: trainer\.iter/,
   'culls surface as events');
 assert.match(session, /if \(refineResult && refineResult\.capped && !this\._capAsked\) \{/,
@@ -95,8 +101,8 @@ assert.match(browserHtml, /<option value="0\.3">Trim 30%<\/option>/,
   'the trims run 5% to 30%');
 assert.match(browser, /softprune: ui\.softprune\.value,/,
   'the browser reads the setting');
-assert.match(browserHtml, /<button id="btn-prune" class="btn" disabled>Prune ½<\/button>/,
-  'the run row carries a prune button');
+assert.match(browserHtml, /<button id="btn-prune" class="btn" disabled>Prune\/Grow<\/button>/,
+  'the run row carries a prune/grow button');
 assert.match(browser, /ui\.prune\.addEventListener\('click', showPrunePicker\);/,
   'the button opens the ratio picker');
 assert.match(browser, /async function runPruneContinue\(ratio = 0\.5\) \{/,
@@ -109,5 +115,29 @@ assert.match(browser, /mk\('Prune to ¼', 'btn', \(\) => go\(0\.25\)\)/,
   'the ceiling prompt offers pruning to a quarter');
 assert.match(browser, /mk\('Keep training at cap', 'btn', \(\) => \{/,
   'the ceiling prompt offers staying put');
+
+// ---- prune/grow tandem: milestones, horizon stop, boosted regrowth --------
+assert.match(session, /\[\[500, 0\.25\], \[1000, 0\.5\], \[2000, 0\.75\]\]/,
+  'early milestones keep a quarter at 500, half at 1000, three quarters at 2000');
+assert.match(session, /trainer\.iter - at < \(sp\.every \?\? 3000\)/,
+  'a continued run never replays old milestones back-to-back');
+assert.match(session, /trainer\.iter <= \(sp\.until \?\? 0\.85\) \* this\._maxIters\(\)/,
+  'pruning stops at 85% of the run');
+assert.match(session, /trainerOpts = this\._withTandemBoost\(trainerOpts\);/,
+  'every boot (local, remote, worker) recomputes the tandem boost');
+assert.match(session, /const g1 = \(1 \+ g0\) \/ Math\.pow\(1 - sp\.ratio, R \/ E\) - 1;/,
+  'the boost holds the no-prune trajectory against the cull');
+assert.match(session, /kind: 'tandem-regrow', iter: trainer\.iter/,
+  'the bonus growth pass surfaces as an event');
+assert.match(session, /async growNow\(\) \{/,
+  'the session serves a manual growth pass');
+assert.match(app, />Prune\/Grow<\/button>/,
+  'the training dock button offers prune and grow');
+assert.match(app, /data-grow="1">Grow now<\/button>/,
+  'the manual picker offers a growth pass');
+assert.match(app, /async function runGrowNow\(\) \{/,
+  'the flow triggers one immediate refine');
+assert.match(browser, /mk\('Grow now', runGrowNow\)/,
+  'the browser picker offers a growth pass');
 
 console.log('prune-and-continue + soft-prune wiring: passed');

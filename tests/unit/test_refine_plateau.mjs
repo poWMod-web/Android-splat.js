@@ -51,8 +51,8 @@ assert.match(sessionSource, /\[score plateaued\]/,
   'plateau-triggered refines say so in the log');
 assert.match(sessionSource, /slope: this\.opts\.plateauSlope \?\? 0\.1,/,
   'the loop trips under 0.1 dB/kiter');
-assert.equal((trainerSource.match(/growUntil \?\? 0\.85 \* this\.horizon/g) || []).length, 4,
-  'growth runs to 85% of the horizon on every refine path');
+assert.equal((trainerSource.match(/growUntil \?\? 0\.90 \* this\.horizon/g) || []).length, 4,
+  'growth runs to 90% of the horizon on every refine path');
 
 // ---- the mobile ceiling is 1M splats ----------------------------------------
 assert.match(appSource, /Math\.min\(phoneClass \? 1000000 : 2000000,/,

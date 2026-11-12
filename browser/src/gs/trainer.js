@@ -1826,7 +1826,7 @@ export class GSTrainer {
     const d = this.device;
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const growPhase = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon);
+    const growPhase = this.iter < (this.opts.growUntil ?? 0.90 * this.horizon);
     const canGrow = growPhase && this.n < limit;
     // capped: growth still scheduled but the TRUE cap is full. A growLimit
     // hold (LOD levels) is not the ceiling — the session only prompts here.
@@ -2016,7 +2016,7 @@ export class GSTrainer {
     if (this.opts.refineV2 !== true) return this._refineLegacy(rng);
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const growPhase = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon);
+    const growPhase = this.iter < (this.opts.growUntil ?? 0.90 * this.horizon);
     const canGrow = growPhase && this.n < limit;
     // capped: growth still scheduled but the TRUE cap is full. A growLimit
     // hold (LOD levels) is not the ceiling — the session only prompts here.
@@ -2295,7 +2295,7 @@ export class GSTrainer {
 
   async _refineLegacy(rng = this.rand) {
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
-    const growPhase = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon);
+    const growPhase = this.iter < (this.opts.growUntil ?? 0.90 * this.horizon);
     const canGrow = growPhase && this.n < Math.min(this.cap, this.growLimit || this.cap);
     // capped: growth still scheduled but the TRUE cap is full (a growLimit
     // hold — LOD levels — is not the ceiling; the session only prompts here)
@@ -2505,7 +2505,7 @@ export class GSTrainer {
     // growLimit: a soft, raisable ceiling below cap — LOD training holds the
     // model at each detail level, snapshots it, then lets it grow on
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const grown = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon)
+    const grown = this.iter < (this.opts.growUntil ?? 0.90 * this.horizon)
       ? Math.max(0, Math.min(Math.ceil(this.n * (this.opts.growRate ?? 0.15)), limit - this.n)) : 0;
     for (let k = 0; k < grown; k++) spawnAt((this.n + k) * STRIDE, true);
     if (grown > 0) {
@@ -2537,18 +2537,20 @@ export class GSTrainer {
   }
 
   /** Periodic importance culling (Speedy-Splat method, opt-in via
-   *  opts.softPrune { ratio, every, from }): drop the lowest-rendered-mass
+   *  opts.softPrune { ratio, every, from, until, milestones }): drop the
+   *  lowest-rendered-mass
    *  fraction of splats and compact every per-splat buffer GPU-side.
    *  Survivors keep their Adam moments — unlike relocation and reseed, a
    *  soft-prune never resets optimizer state. Scoring reads the mass
    *  windows WITHOUT draining them (gather mode 2), so refine planning
    *  never notices. Skips while a protected seed range is active (rows
    *  permute) and whenever the plan refuses (too few rows, no signal).
-   *  Returns { culled, n }. */
-  async softPrune() {
+   *  ratioOverride (the session's early milestones) culls that fraction
+   *  instead of cfg.ratio. Returns { culled, n, floorBound }. */
+  async softPrune(ratioOverride = null) {
     const cfg = this.opts.softPrune;
     if (!cfg) return { culled: 0, n: this.n };
-    const ratio = cfg.ratio ?? 0.1;
+    const ratio = ratioOverride ?? cfg.ratio ?? 0.1;
     if (!(ratio > 0 && ratio < 1)) return { culled: 0, n: this.n };
     if (this.protect && this.iter < this.protect.until) return { culled: 0, n: this.n };
     // an LOD level hold is a polish window at a fixed count — culling

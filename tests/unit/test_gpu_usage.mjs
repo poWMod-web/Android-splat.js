@@ -6,7 +6,8 @@ const sessionSrc = readFileSync(new URL('../../src/session.js', import.meta.url)
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 const indexHtml = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 
-// the throttle math: duty-cycle idle between full batches, never smaller batches
+// the throttle math: duty-cycle idle between batches, bursts shrinking with
+// the slider (the throughput cap scales the chunk bound by duty)
 {
   assert.equal(gpuDuty(undefined), 1);
   assert.equal(gpuDuty(null), 1);

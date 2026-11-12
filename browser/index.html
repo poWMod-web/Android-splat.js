@@ -123,7 +123,7 @@
           <option value="60000">60,000 · full</option>
         </select>
       </label>
-      <label title="Share of wall time training runs the GPU. Below 100% the loop idles between full batches — the run just takes proportionally longer.">GPU usage
+      <label title="Share of wall time training runs the GPU. Below 100% the loop idles between batches and shrinks each burst with the slider, so the system stays responsive — the run just takes proportionally longer.">GPU usage
         <span class="rangewrap"><input id="opt-gpu" type="range" min="10" max="100" step="5" value="100"><b id="opt-gpu-v">100%</b></span>
       </label>
       <label title="Average spacing between frames picked from a video. Stable, unblurry frames still win inside each window.">Video frame spacing
@@ -164,7 +164,7 @@
     <div class="row">
       <button id="btn-pause" class="btn" disabled>Pause</button>
       <button id="btn-finish" class="btn" disabled>Finish early</button>
-      <button id="btn-prune" class="btn" disabled>Prune ½</button>
+      <button id="btn-prune" class="btn" disabled>Prune/Grow</button>
       <button id="btn-ply" class="btn accent" disabled>Download .ply ↓</button>
       <button id="btn-simplify" class="btn" disabled>Simplify ½ ↓</button>
       <button id="btn-session" class="btn" disabled>Session ↓</button>
