@@ -137,8 +137,8 @@ assert.match(browser, /mk\('Keep training at cap', 'btn', \(\) => \{/,
   'the ceiling prompt offers staying put');
 
 // ---- prune/grow tandem: milestones, horizon stop, boosted regrowth --------
-assert.match(session, /\[\[500, 0\.25\], \[1000, 0\.5\], \[2000, 0\.75\]\]/,
-  'early milestones keep a quarter at 500, half at 1000, three quarters at 2000');
+assert.match(session, /\[\[1000, 0\.9\], \[2000, 0\.9\], \[3000, 0\.9\], \[4000, 0\.9\], \[5000, 0\.9\], \[6000, 0\.9\]\]/,
+  'early milestones trim 10% every 1000 iterations through 6000');
 assert.match(session, /trainer\.iter - at < \(spm\.every \?\? 3000\)/,
   'a continued run never replays old milestones back-to-back');
 assert.match(session, /trainer\.iter <= \(sp\.until \?\? 0\.85\) \* this\._maxIters\(\)/,

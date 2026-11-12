@@ -1616,15 +1616,17 @@ export class Session {
         }
       }
 
-      // early milestones (opt-in, ahead of the tandem above): aggressive
-      // restructuring before the scheduled refines begin — keep 1/4 @500,
-      // 1/2 @1000, 3/4 @2000 — each followed by its own bonus regrow,
-      // since no scheduled refine follows this early. Past `until` of
+      // early milestones (opt-in, ahead of the tandem above): a gentle
+      // 10% trim every 1000 iterations through 6000 — keep 0.9 each —
+      // each followed by its own bonus regrow, since no scheduled
+      // refine follows this early. The old aggressive ladder (keep 1/4
+      // @500, 1/2 @1000, 3/4 @2000) culled before the model carried
+      // any signal and wedged training irrecoverably. Past `until` of
       // the run (short test runs) the marks stay unfired.
       const spm = trainer.opts ? trainer.opts.softPrune : null;
       if (spm && trainer.iter <= (spm.until ?? 0.85) * this._maxIters()) {
         this._pruneFired ??= [];
-        const marks = spm.milestones ?? [[500, 0.25], [1000, 0.5], [2000, 0.75]];
+        const marks = spm.milestones ?? [[1000, 0.9], [2000, 0.9], [3000, 0.9], [4000, 0.9], [5000, 0.9], [6000, 0.9]];
         // a continued run starts past every mark — only fire within one
         // window of it, so old milestones never replay back-to-back
         const due = marks.find(([at]) => trainer.iter >= at &&
