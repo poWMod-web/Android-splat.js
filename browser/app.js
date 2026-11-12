@@ -649,7 +649,7 @@ async function run() {
       });
     }
     // Soft prune (opt-in): periodic importance culls during growth
-    if (st.softprune) trainerOpts.softPrune = { ratio: parseFloat(st.softprune), every: 3000, from: 6000 };
+    if (st.softprune) trainerOpts.softPrune = { ratio: parseFloat(st.softprune), every: 3000, until: 0.85 };
     // Auto splat budget: the measured capacity law (~15 splats/cycle
     // classic, ~35 under MCMC), clamped to the device class
     const phone = phoneClass();
@@ -1501,7 +1501,7 @@ async function continueRun(files, urls = null) {
     // run; unset, the recipe replays the run's own setting (the spread above
     // already carries it — deleting here silently unpruned continuations of
     // pruned runs)
-    if (st.softprune) recipeTrainer.softPrune = { ratio: parseFloat(st.softprune), every: 3000, from: 6000 };
+    if (st.softprune) recipeTrainer.softPrune = { ratio: parseFloat(st.softprune), every: 3000, until: 0.85 };
     const ses = createSession({
       maxIters: S.maxIters, holdout: -1,
       gpuUsage: st.gpu / 100,

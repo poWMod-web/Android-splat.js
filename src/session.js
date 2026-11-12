@@ -704,9 +704,9 @@ export class Session {
    *  boot: { gaussians, cams, frames, maxW, maxH, radius, hull?, hullOpts?,
    *  hullKillFn? (local), protect?, freezePos?, sh?/shN? (resume), holdout?,
    *  excluded?, iter? }. */
-  /** Prune/grow tandem: pre-boost growRate so periodic culls don't bend
-   *  the growth curve — with k refines per prune window, g' solves
-   *  (1+g')^k * (1-p) = (1+g)^k exactly. Runs here, the single funnel
+  /** Prune/grow tandem: pre-boost growRate so the per-refine cull doesn't
+   *  bend the growth curve — every refine culls p and grows g', with g'
+   *  solving (1+g') * (1-p) = (1+g) exactly. Runs here, the single funnel
    *  into local/remote/worker boots, so every path trains the same
    *  trajectory; ses.opts.trainer stays unboosted, so continuations
    *  recompute from the base rate instead of compounding. Engine v2
@@ -715,9 +715,8 @@ export class Session {
   _withTandemBoost(trainerOpts) {
     const sp = trainerOpts.softPrune;
     if (!sp || !(sp.ratio > 0 && sp.ratio < 1)) return trainerOpts;
-    const R = this.opts.refineEvery ?? 2500, E = sp.every ?? 3000;
     const g0 = trainerOpts.growRate ?? 0.15;
-    const g1 = (1 + g0) / Math.pow(1 - sp.ratio, R / E) - 1;
+    const g1 = (1 + g0) / (1 - sp.ratio) - 1;
     if (!(g1 > g0)) return trainerOpts;
     let note = '';
     let g = g1;
@@ -726,7 +725,7 @@ export class Session {
     if (trainerOpts.engine === 'v2') {
       out.growFrac = +((trainerOpts.growFrac ?? 0.1) * (g / g0)).toFixed(4);
     }
-    this._log(`prune/grow tandem: growRate ${g0} -> ${out.growRate} holds the no-prune curve against -${Math.round(sp.ratio * 100)}%/${E} (refine every ${R})${note}`);
+    this._log(`prune/grow tandem: growRate ${g0} -> ${out.growRate} holds the no-prune curve against -${Math.round(sp.ratio * 100)}% every refine${note}`);
     return out;
   }
 
@@ -1112,7 +1111,6 @@ export class Session {
         await this.seedFrom(
           { data: simp.data, n: simp.n, sh: simp.sh, shK: simp.shK, dc: simp.dc },
           { iter });
-        this._lastSoftPrune = iter;
         let after = null, delta = null;
         if (this.holdout >= 0 && before != null) {
           after = await this.trainer.evalCamPsnr(this.holdout);
@@ -1582,6 +1580,23 @@ export class Session {
       let refineResult = null;
       if (trainer.iter > 1500 && (sinceRefine >= refineEvery || plateau)) {
         trainer.lastRefine = trainer.iter;
+        // tandem prune: cull the lowest-mass fraction FIRST (until 85% of
+        // the run), so this same refine regrows the freed capacity into
+        // the highest-error donors — one prune/multiply cycle, not two
+        // cadences. Survivors keep their accumulated error stats (the
+        // compaction moves grad buffers with their rows), so the growth
+        // donors below are scored on the same window.
+        const sp = trainer.opts ? trainer.opts.softPrune : null;
+        let tandemCulled = 0;
+        if (sp && trainer.iter <= (sp.until ?? 0.85) * this._maxIters()) {
+          const pruned = await trainer.softPrune();
+          if (pruned.culled) {
+            tandemCulled = pruned.culled;
+            this._log(`tandem prune @${trainer.iter}: culled ${pruned.culled} -> ${pruned.n} splats` +
+              (pruned.floorBound === 'ratchet' ? ' (growth ratchet held the floor)' : ''));
+            this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
+          }
+        }
         const r0 = performance.now();
         // awaited: refine reads six buffers and writes them all back — steps
         // submitted meanwhile would be silently rewound by that write-back,
@@ -1595,51 +1610,40 @@ export class Session {
         if (r.moved || r.grown) {
           this._log(`refine @${trainer.iter}: relocated ${r.moved}, grew +${r.grown} -> ${r.n} splats`
             + (r.dead != null ? ` (dead ${r.dead}, last round ${r.survived}/${r.lastReloc} survived)` : '')
-            + (plateau ? ' [score plateaued]' : ''));
+            + (plateau ? ' [score plateaued]' : '')
+            + (tandemCulled ? ` [tandem: culled ${tandemCulled} first]` : ''));
           this._em.emit('event', { kind: 'refine', iter: trainer.iter, ...r });
         }
       }
 
-      // soft-prune in tandem with growth (opt-in): cull the
-      // lowest-rendered-mass fraction, then immediately regrow into the
-      // highest-error donors with a bonus refine — removal and
-      // multiplication in one step, the count rising on average (the
-      // growRate boost in _withTandemBoost holds the no-prune trajectory).
-      // Reads trainer.opts so the worker and remote paths (whose opts
-      // mirror boot) behave identically. Early milestones restructure
-      // aggressively (keep 1/4 @500, 1/2 @1000, 3/4 @2000); past `until`
-      // of the run pruning stops and growth polishes on alone.
-      const sp = trainer.opts ? trainer.opts.softPrune : null;
-      let pruned = null;
-      if (sp && trainer.iter <= (sp.until ?? 0.85) * this._maxIters()) {
+      // early milestones (opt-in, ahead of the tandem above): aggressive
+      // restructuring before the scheduled refines begin — keep 1/4 @500,
+      // 1/2 @1000, 3/4 @2000 — each followed by its own bonus regrow,
+      // since no scheduled refine follows this early. Past `until` of
+      // the run (short test runs) the marks stay unfired.
+      const spm = trainer.opts ? trainer.opts.softPrune : null;
+      if (spm && trainer.iter <= (spm.until ?? 0.85) * this._maxIters()) {
         this._pruneFired ??= [];
-        const marks = sp.milestones ?? [[500, 0.25], [1000, 0.5], [2000, 0.75]];
+        const marks = spm.milestones ?? [[500, 0.25], [1000, 0.5], [2000, 0.75]];
         // a continued run starts past every mark — only fire within one
         // window of it, so old milestones never replay back-to-back
         const due = marks.find(([at]) => trainer.iter >= at &&
-          trainer.iter - at < (sp.every ?? 3000) && !this._pruneFired.includes(at));
+          trainer.iter - at < (spm.every ?? 3000) && !this._pruneFired.includes(at));
         if (due) {
           this._pruneFired.push(due[0]);
-          pruned = await trainer.softPrune(1 - due[1]);
-          if (!pruned.culled) this._log(`early prune @${trainer.iter}: kept all ${pruned.n} (too few rows or no signal yet)`);
-        } else if (trainer.iter >= (sp.from ?? 6000) &&
-            trainer.iter - (this._lastSoftPrune || 0) >= (sp.every ?? 3000)) {
-          this._lastSoftPrune = trainer.iter;
-          pruned = await trainer.softPrune();
-        }
-      }
-      if (pruned && pruned.culled) {
-        this._log(`soft-prune @${trainer.iter}: culled ${pruned.culled} -> ${pruned.n} splats` +
-          (pruned.floorBound === 'ratchet' ? ' (growth ratchet held the floor)' : ''));
-        this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
-        // the tandem growth pass: recycle the freed capacity where the
-        // image needs it NOW, not at the next scheduled refine (a bonus
-        // pass — lastRefine untouched, the cadence keeps its rhythm)
-        const b = await trainer.refine();
-        if (!refineResult || b.capped) refineResult = b;
-        if (b.grown) {
-          this._log(`tandem regrow @${trainer.iter}: +${b.grown} -> ${b.n} splats`);
-          this._em.emit('event', { kind: 'tandem-regrow', iter: trainer.iter, ...b });
+          const pruned = await trainer.softPrune(1 - due[1]);
+          if (!pruned.culled) {
+            this._log(`early prune @${trainer.iter}: kept all ${pruned.n} (too few rows or no signal yet)`);
+          } else {
+            this._log(`early prune @${trainer.iter}: culled ${pruned.culled} -> ${pruned.n} splats`);
+            this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
+            const b = await trainer.refine();
+            if (!refineResult || b.capped) refineResult = b;
+            if (b.grown) {
+              this._log(`tandem regrow @${trainer.iter}: +${b.grown} -> ${b.n} splats`);
+              this._em.emit('event', { kind: 'tandem-regrow', iter: trainer.iter, ...b });
+            }
+          }
         }
       }
       // the ceiling's own prompt: a refine reporting growth-still-scheduled

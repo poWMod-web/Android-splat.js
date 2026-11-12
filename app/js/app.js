@@ -2118,7 +2118,7 @@ async function startPrep() {
     }
     // Soft prune (opt-in): periodic importance culls during growth — the
     // model holds more detail under the same splat budget
-    if (st.softprune) trainerOpts.softPrune = { ratio: parseFloat(st.softprune), every: 3000, from: 6000 };
+    if (st.softprune) trainerOpts.softPrune = { ratio: parseFloat(st.softprune), every: 3000, until: 0.85 };
     // Auto splat budget: sized from the CYCLE budget, not just the solve —
     // the measured capacity law (~15 splats/cycle classic, ~35 under MCMC),
     // clamped to the device class. Explicit user choices always win.
@@ -4541,7 +4541,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     // a run pruned at 10% keeps pruning at 10%. The start panel stays out:
     // its value may have drifted since the run and must not leak in.
     if (opts.softprune !== undefined) {
-      if (opts.softprune > 0) recipeTrainer.softPrune = { ratio: opts.softprune, every: 3000, from: 6000 };
+      if (opts.softprune > 0) recipeTrainer.softPrune = { ratio: opts.softprune, every: 3000, until: 0.85 };
       else delete recipeTrainer.softPrune;
     }
     const contRefine = opts.mcmc === true ? 500 : opts.mcmc === false ? undefined : recipeRefine;

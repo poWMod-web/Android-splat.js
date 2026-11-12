@@ -2537,7 +2537,7 @@ export class GSTrainer {
   }
 
   /** Periodic importance culling (Speedy-Splat method, opt-in via
-   *  opts.softPrune { ratio, every, from, until, milestones }): drop the
+   *  opts.softPrune { ratio, every, until, milestones }): drop the
    *  lowest-rendered-mass
    *  fraction of splats and compact every per-splat buffer GPU-side.
    *  Survivors keep their Adam moments — unlike relocation and reseed, a
@@ -2546,7 +2546,8 @@ export class GSTrainer {
    *  never notices. Skips while a protected seed range is active (rows
    *  permute) and whenever the plan refuses (too few rows, no signal).
    *  ratioOverride (the session's early milestones) culls that fraction
-   *  instead of cfg.ratio. Returns { culled, n, floorBound }. */
+   *  instead of cfg.ratio. Every refine culls until `until` of the run;
+   *  milestones fire ahead of the schedule. Returns { culled, n, floorBound }. */
   async softPrune(ratioOverride = null) {
     const cfg = this.opts.softPrune;
     if (!cfg) return { culled: 0, n: this.n };

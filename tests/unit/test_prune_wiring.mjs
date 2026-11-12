@@ -51,8 +51,12 @@ assert.match(worker, /const r = await tr\.softPrune\(params\.ratio \?\? null\);/
   'the worker forwards a milestone override to its trainer');
 
 // ---- the session drives cadence, prompt, and prune-and-continue ------------
-assert.match(session, /pruned = await trainer\.softPrune\(\);/,
-  'the loop fires soft-prunes on cadence');
+assert.match(session, /const pruned = await trainer\.softPrune\(\);/,
+  'every tandem refine culls first');
+assert.match(session, /tandem prune @/,
+  'the cull rides inside the scheduled refine');
+assert.match(session, /\[tandem: culled /,
+  'the refine log names the cull it regrew');
 assert.match(session, /pruned = await trainer\.softPrune\(1 - due\[1\]\);/,
   'early milestones cull their own keep-fraction');
 assert.match(session, /kind: 'soft-prune', iter: trainer\.iter/,
@@ -75,7 +79,7 @@ assert.match(appHtml, /<option value="0\.3">Trim 30%<\/option>/,
   'the trims run 5% to 30%');
 assert.match(app, /st\.softprune = \$\('set-softprune'\)\.value;/,
   'the selection persists into settings');
-assert.match(app, /trainerOpts\.softPrune = \{ ratio: parseFloat\(st\.softprune\), every: 3000, from: 6000 \};/,
+assert.match(app, /trainerOpts\.softPrune = \{ ratio: parseFloat\(st\.softprune\), every: 3000, until: 0\.85 \};/,
   'fresh runs map it to trainer options');
 assert.match(app, /<button class="tbtn-sm" id="t-prune"/,
   'the training dock carries a manual prune button');
@@ -119,14 +123,16 @@ assert.match(browser, /mk\('Keep training at cap', 'btn', \(\) => \{/,
 // ---- prune/grow tandem: milestones, horizon stop, boosted regrowth --------
 assert.match(session, /\[\[500, 0\.25\], \[1000, 0\.5\], \[2000, 0\.75\]\]/,
   'early milestones keep a quarter at 500, half at 1000, three quarters at 2000');
-assert.match(session, /trainer\.iter - at < \(sp\.every \?\? 3000\)/,
+assert.match(session, /trainer\.iter - at < \(spm\.every \?\? 3000\)/,
   'a continued run never replays old milestones back-to-back');
 assert.match(session, /trainer\.iter <= \(sp\.until \?\? 0\.85\) \* this\._maxIters\(\)/,
-  'pruning stops at 85% of the run');
+  'tandem pruning stops at 85% of the run');
+assert.match(session, /trainer\.iter <= \(spm\.until \?\? 0\.85\) \* this\._maxIters\(\)/,
+  'milestone pruning stops at 85% of the run');
 assert.match(session, /trainerOpts = this\._withTandemBoost\(trainerOpts\);/,
   'every boot (local, remote, worker) recomputes the tandem boost');
-assert.match(session, /const g1 = \(1 \+ g0\) \/ Math\.pow\(1 - sp\.ratio, R \/ E\) - 1;/,
-  'the boost holds the no-prune trajectory against the cull');
+assert.match(session, /const g1 = \(1 \+ g0\) \/ \(1 - sp\.ratio\) - 1;/,
+  'the per-refine boost holds the no-prune trajectory against the cull');
 assert.match(session, /kind: 'tandem-regrow', iter: trainer\.iter/,
   'the bonus growth pass surfaces as an event');
 assert.match(session, /async growNow\(\) \{/,

@@ -62,7 +62,7 @@ assert.match(cont, /const prevInputDim = continuedInputDim\(prevDim, prevBuf\);/
   'the default should divide the buffer back out before the multiplier runs again');
 assert.match(cont, /if \(opts\.softprune !== undefined\) \{/,
   'an untouched soft-prune knob should replay the recipe’s own setting');
-assert.match(cont, /recipeTrainer\.softPrune = \{ ratio: opts\.softprune, every: 3000, from: 6000 \}/,
+assert.match(cont, /recipeTrainer\.softPrune = \{ ratio: opts\.softprune, every: 3000, until: 0\.85 \}/,
   'a reselected soft-prune trim should rebuild the periodic cull schedule');
 assert.match(cont, /Math\.max\(fr0\.nw \|\| fr0\.fw \|\| 0, fr0\.nh \|\| fr0\.fh \|\| 0\)/,
   'Full size should use the file’s own pixel size, not the feature-capped dims');
