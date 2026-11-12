@@ -2750,7 +2750,7 @@ function startTraining() {
     await saveRun({
       id: runId, name: runName,
       status: 'training', createdAt: Date.now(), updatedAt: Date.now(),
-      iter: S.iter || 0, maxIters: S.maxIters, splats: S.splats || 0, psnr: S.psnrTrain ?? null,
+      iter: S.iter || 0, maxIters: S.maxIters, splats: S.splats || 0, psnr: shownScore('train') ?? null,
       frames: (S.photos || []).length,
       // own-photo runs can train again from the device's capture store
       ownSrc: pid === '__own' || pid === '__last',
@@ -3046,8 +3046,8 @@ function captureRunProgressDetails() {
     minutes: S.state === 'train'
       ? Math.max(S.minutes || 0, Math.round((performance.now() - (S.trainT0 || performance.now())) / 60000))
       : (S.minutes || 0),
-    psnrTrain: S.psnrTrain ?? null,
-    psnrHold: S.psnrHold ?? null,
+    psnrTrain: shownScore('train') ?? null,
+    psnrHold: shownScore('hold') ?? null,
   };
 }
 
@@ -3158,15 +3158,28 @@ function formatTrainingScore(psnr) {
   return (S.scoreScale === 'similarity' ? psnrToApproxSsimPercent(psnr) : psnr).toFixed(2);
 }
 
+/** The score as shown: the ZLEMA curve's end once a chart has drawn one,
+ *  else the latest raw sample. Raw stays stored everywhere — dots, hover
+ *  and history all read it — only the headline number is filtered. */
+function shownScore(which) {
+  const raw = which === 'hold' ? S.psnrHold : S.psnrTrain;
+  for (const c of [chart, dchart]) {
+    if (!c) continue;
+    const f = which === 'hold' ? c.lastHoldF : c.lastTrainF;
+    if (f != null) return f;
+  }
+  return raw;
+}
+
 function renderTrainingScore() {
   const similarity = S.scoreScale === 'similarity';
   const unit = similarity ? '%' : 'dB';
   const trainEl = $('t-ptrain');
-  if (trainEl) trainEl.textContent = formatTrainingScore(S.psnrTrain);
+  if (trainEl) trainEl.textContent = formatTrainingScore(shownScore('train'));
   const trainUnit = $('t-punit');
   if (trainUnit) trainUnit.textContent = unit;
   const holdEl = $('t-phold');
-  if (holdEl) holdEl.textContent = formatTrainingScore(S.psnrHold);
+  if (holdEl) holdEl.textContent = formatTrainingScore(shownScore('hold'));
   const holdUnit = $('t-hunit');
   if (holdUnit) holdUnit.textContent = unit;
 }
@@ -3262,7 +3275,7 @@ function onMetrics(m) {
     const runId = S.runId;
     const detailProgress = captureRunProgressDetails();
     import('./store.js').then(({ patchRun }) => patchRun(runId, {
-      iter: m.iter, splats: m.splats, psnr: m.psnrTrain ?? null,
+      iter: m.iter, splats: m.splats, psnr: shownScore('train') ?? null,
       minutes: detailProgress.minutes, detailProgress,
     })).catch(() => {});
   }
@@ -5739,12 +5752,12 @@ function dock(kind) {
       <div class="chartwrap"><canvas id="chart"></canvas><div class="chart-tip" id="chart-tip" hidden></div></div>
       <div class="tscores">
         <div class="score" data-tone="accent">
-          <div class="score-1"><span class="score-v"><span id="t-ptrain">${formatTrainingScore(S.psnrTrain)}</span><small class="unit" id="t-punit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div>
+          <div class="score-1"><span class="score-v"><span id="t-ptrain">${formatTrainingScore(shownScore('train'))}</span><small class="unit" id="t-punit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div>
           <div class="score-sub"><span id="t-splats">${S.splats ? fmt(S.splats) : '—'}</span> splats</div>
           <button class="chart-scale score-scale" id="chart-scale" type="button">Use %</button>
           <span class="tmeta-grow" id="t-grow">&nbsp;</span>
         </div>
-        ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${formatTrainingScore(S.psnrHold)}</span><small class="unit" id="t-hunit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div><div class="score-sub">held out</div></div>` : ''}
+        ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${formatTrainingScore(shownScore('hold'))}</span><small class="unit" id="t-hunit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div><div class="score-sub">held out</div></div>` : ''}
       </div>`;
     $('t-play').addEventListener('click', toggleTrain);
     $('t-finish').addEventListener('click', async () => {
@@ -6747,7 +6760,7 @@ function renderDetails() {
   const survived = S.solveStats.pairsChecked
     ? Math.round(100 * S.solveStats.pairsUsable / S.solveStats.pairsChecked) : 0;
 
-  const gap = (S.psnrTrain != null && S.psnrHold != null) ? S.psnrTrain - S.psnrHold : null;
+  const gap = (shownScore('train') != null && shownScore('hold') != null) ? shownScore('train') - shownScore('hold') : null;
   const pf = (ses.perf && ses.perf.frames) || [];
   const colv = (i) => pf.map((r) => r[i]);
   const ipsAll = pf.length > 1
@@ -6772,8 +6785,8 @@ function renderDetails() {
       ],
       rows: [
         stat('Cycles', fmt(S.iter)),
-        S.psnrTrain != null ? stat('Trained photos', `${S.psnrTrain.toFixed(1)} <small>dB</small>`, 'accent') : '',
-        S.psnrHold != null ? stat('Hidden photo', `${S.psnrHold.toFixed(1)} <small>dB</small>`, 'alt') : '',
+        shownScore('train') != null ? stat('Trained photos', `${shownScore('train').toFixed(1)} <small>dB</small>`, 'accent') : '',
+        shownScore('hold') != null ? stat('Hidden photo', `${shownScore('hold').toFixed(1)} <small>dB</small>`, 'alt') : '',
         S.psnrTest != null ? stat(`Test photos (${S.psnrTest.frames.length})`, `${S.psnrTest.psnr.toFixed(2)} <small>dB</small>`, 'alt') : '',
         gap != null ? stat('Gap', `${gap.toFixed(1)} <small>dB</small>`, Math.abs(gap) < 1.5 ? 'accent' : undefined) : '',
         stat('Splats', fmt(S.splats)),

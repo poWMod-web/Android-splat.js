@@ -493,8 +493,9 @@ function wireSession(session) {
     }
     setStage(`Training · iteration ${fmt(m.iter)} / ${fmt(S.maxIters)}`, m.iter / S.maxIters);
       const bits = [`${fmt(m.splats)} splats`, `${fmt(m.itersPerSec)} it/s`];
-      if (m.psnrTrain > 0) bits.push(`train PSNR ${m.psnrTrain.toFixed(2)}`);
-      if (m.psnrHold > 0) bits.push(`holdout ${m.psnrHold.toFixed(2)}`);
+      const ft = shownScore('train'), fh = shownScore('hold');
+      if (ft != null && ft > 0) bits.push(`train PSNR ${ft.toFixed(2)}`);
+      if (fh != null && fh > 0) bits.push(`holdout ${fh.toFixed(2)}`);
       ui.metrics.textContent = bits.join(' · ');
       // the details sheet's raw material + the live curve (the first few
       // hundred cycles rocket from near-nothing to the real curve, so the
@@ -770,6 +771,14 @@ function pctl(arr, p) {
   return s[Math.min(s.length - 1, Math.floor(p * s.length))];
 }
 
+/** The score as shown: the ZLEMA curve's end once the chart has drawn one,
+ *  else the latest raw sample. */
+function shownScore(which) {
+  const raw = which === 'hold' ? S.psnrHold : S.psnrTrain;
+  const f = which === 'hold' ? chart?.lastHoldF : chart?.lastTrainF;
+  return f ?? raw;
+}
+
 /** A score in the visitor's chosen unit (dB, or the calibrated % estimate). */
 function fmtScore(psnr) {
   if (psnr == null || Number.isNaN(psnr)) return '—';
@@ -798,8 +807,8 @@ function renderDetails() {
     ['Splats', fmt(ses.trainer ? ses.trainer.n : 0)],
     ['Pace', `${fmt(S.itersPerSec)} it/s`],
     ['Remaining', S.phase === 'train' ? etaText() : '—'],
-    ['Train score', fmtScore(S.psnrTrain)],
-    ['Holdout score', fmtScore(S.psnrHold)],
+    ['Train score', fmtScore(shownScore('train'))],
+    ['Holdout score', fmtScore(shownScore('hold'))],
     ['Wall time', `${minutesLive()} min`],
   ];
   ui.detailBody.replaceChildren();
@@ -828,7 +837,7 @@ function buildPerfReport() {
   L.push(`screen: ${screen.width}x${screen.height} @dpr ${devicePixelRatio}`);
   L.push(`photos: ${(ses.frames && ses.frames.length) || 0} · placed ${ses.recon ? ses.recon.cams.length : '?'} · training res ${fr0.tw || '?'}x${fr0.th || '?'}`);
   L.push(`settings: ${JSON.stringify(S.runSettings || {})} · run ${S.runName || '?'}`);
-  L.push(`splats: ${fmt(ses.trainer ? ses.trainer.n : 0)} · holdout psnr ${S.psnrHold != null ? S.psnrHold.toFixed(2) : '—'} dB`);
+  L.push(`splats: ${fmt(ses.trainer ? ses.trainer.n : 0)} · holdout psnr ${shownScore('hold') != null ? shownScore('hold').toFixed(2) : '—'} dB`);
   if (ses.trainer) L.push(`tileGrad: ${ses.trainer.tileGrad} · maxIters ${S.maxIters}`);
   if (rows.length > 1) {
     const t0 = rows[0][0], t1 = rows[rows.length - 1][0];
@@ -1006,8 +1015,8 @@ function captureRunProgressDetails() {
     maxIters: S.maxIters || 0,
     iter: (ses && ses.trainer && ses.trainer.iter) || 0,
     minutes: minutesLive(),
-    psnrTrain: S.psnrTrain ?? null,
-    psnrHold: S.psnrHold ?? null,
+    psnrTrain: shownScore('train') ?? null,
+    psnrHold: shownScore('hold') ?? null,
   };
 }
 
@@ -1049,7 +1058,7 @@ async function persistRunDetails() {
     await patchRun(S.runId, {
       iter: (S.session.trainer && S.session.trainer.iter) || 0,
       splats: (S.session.trainer && S.session.trainer.n) || 0,
-      psnr: S.psnrHold ?? S.psnrTrain ?? null,
+      psnr: shownScore('hold') ?? shownScore('train') ?? null,
       minutes: minutesLive(),
       detailProgress: captureRunProgressDetails(),
       detailGpu: S.gpuFacts || await ensureGpuFacts().catch(() => null),
@@ -1095,7 +1104,7 @@ async function saveRunStart(firstFile) {
     status: 'training', createdAt: Date.now(), updatedAt: Date.now(),
     iter: (ses && ses.trainer && ses.trainer.iter) || 0, maxIters: S.maxIters,
     splats: (ses && ses.trainer && ses.trainer.n) || 0,
-    psnr: S.psnrHold ?? S.psnrTrain ?? null,
+    psnr: shownScore('hold') ?? shownScore('train') ?? null,
     frames: (ses && ses.frames && ses.frames.length) || 0,
     detailProgress: captureRunProgressDetails(),
     detailGpu: await ensureGpuFacts().catch(() => null),
@@ -1138,7 +1147,7 @@ async function secureFinishedRun() {
       status: 'finished',
       iter: (ses.trainer && ses.trainer.iter) || 0,
       splats: (ses.trainer && ses.trainer.n) || 0,
-      psnr: S.psnrHold ?? S.psnrTrain ?? null,
+      psnr: shownScore('hold') ?? shownScore('train') ?? null,
       minutes: minutesLive(),
       ...(ply ? { ply } : {}), recon,
       detailProgress: captureRunProgressDetails(),

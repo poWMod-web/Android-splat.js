@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { Chart, psnrToApproxSsimPercent, LivePlateauFilter } from '../../app/js/chart.js';
+import { Chart, psnrToApproxSsimPercent, FastRobustZLEMA } from '../../app/js/chart.js';
 
 const chartSource = readFileSync(new URL('../../app/js/chart.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
+const browserSource = readFileSync(new URL('../../browser/app.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 const appCss = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
 const baseCss = readFileSync(new URL('../../app/css/base.css', import.meta.url), 'utf8');
@@ -32,9 +33,13 @@ scoreChart.hold = [[0, 15], [100, 25]];
 scoreChart.scale = 'similarity';
 assert.deepEqual(scoreChart._activeSeries(), { train: scoreChart.train, hold: scoreChart.hold },
   'the approximate scale should reuse the PSNR samples, without a separate model-derived history');
-assert.deepEqual(scoreChart._displaySeries(scoreChart.train), [
-  [300, formula(25)], [400, formula(25)], [500, formula(25)],
-], 'the graph should apply the requested PSNR-to-SSIM approximation to each plotted sample');
+const simPlotted = scoreChart._displaySeries(scoreChart.train);
+assert.deepEqual(simPlotted.map((p) => p[0]), [300, 400, 500],
+  'the similarity graph should plot past the held samples');
+for (const p of simPlotted) {
+  assert.ok(Math.abs(p[1] - formula(25)) < 1e-9,
+    'the graph should apply the requested PSNR-to-SSIM approximation to each plotted sample');
+}
 
 assert.match(chartSource, /const ratio = 18 \/ psnr/,
   'the graph should implement the requested approximation formula');
@@ -100,17 +105,44 @@ assert.equal(drawn[0][1], 16,
   'the filter should latch the first plotted sample');
 assert.match(chartSource, /SKIP_FIRST = 3/,
   'the cold-start hold should cover the first three samples');
-// the live plateau filter: latch highs fast, hold noise, decay dips slowly
-const rise = new LivePlateauFilter(0.15, 0.02, 0.05, 2.2);
-assert.equal(rise.update(20), 20, 'the first sample latches the level');
-assert.equal(rise.update(20.02), 20, 'changes inside the deadband hold the level');
-assert.equal(rise.update(21), 21, 'a genuine rise snaps the level up');
-const fall = new LivePlateauFilter(0.15, 0.02, 0.05, 2.2);
-fall.update(20); fall.update(21);
-const dipped = fall.update(15);
-assert.ok(dipped > 20.5 && dipped < 21,
-  'a dip decays slowly instead of plunging the curve');
-assert.match(chartSource, /class LivePlateauFilter/,
-  'the curve should run through the plateau filter');
+// zero-lag EMA with a Z-score spike clamp: latch, track flats, tame spikes
+const zlatch = new FastRobustZLEMA();
+assert.equal(zlatch.update(20), 20, 'the first sample latches the level');
+const zflat = new FastRobustZLEMA();
+zflat.update(25);
+assert.ok(Math.abs(zflat.update(25) - 25) < 1e-9 && Math.abs(zflat.update(25) - 25) < 1e-9,
+  'flat samples pass through the filter');
+const zspike = new FastRobustZLEMA();
+for (let i = 0; i < 30; i++) zspike.update(20);
+const zclamped = zspike.update(40);
+assert.ok(zclamped < 21,
+  `a +20 dB spike should clamp near the level instead of yanking the curve (got ${zclamped})`);
+const zseries = new FastRobustZLEMA().series([[0, 10], [100, 12], [200, 14]]);
+assert.deepEqual(zseries.map((p) => p[0]), [0, 100, 200],
+  'a series pass should keep every sample iteration');
+assert.equal(zseries[0][1], 10, 'a series pass should latch its first sample');
+assert.match(chartSource, /class FastRobustZLEMA/,
+  'the curve should run through the zero-lag filter');
+assert.match(chartSource, /new FastRobustZLEMA\(\)\.series\(held\)/,
+  'each draw should run a fresh filter pass over the held samples');
+// raw dots: tiny — the curve carries the reading, the scatter just shows it
+assert.match(chartSource, /ctx\.arc\(X\(p\[0\]\), Y\(p\[1\]\), 0\.75 \* dpr, 0, 7\)/,
+  'raw-sample dots should be much smaller than the old 1.5px');
+// dynamic x: the axis grows with the plotted data, like the y-axis
+const xChart = new Chart(chartCanvas);
+assert.equal(xChart._xMaxFor([100]), 106, 'early data should use the full width plus headroom');
+assert.equal(xChart._xMaxFor([0]), 1, 'an empty plot should still have a span');
+xChart.maxIter = 40000;
+assert.equal(xChart._xMaxFor([40000]), 40000, 'the axis should never run past the horizon');
+assert.equal(xChart._xMaxFor([100, 5000]), 5300, 'the furthest series should set the axis');
+// the score readouts show the filtered curve end, not the raw sample
+assert.match(appSource, /function shownScore\(which\)/,
+  'the app should resolve the displayed score through the filter');
+assert.match(appSource, /formatTrainingScore\(shownScore\('train'\)\)/,
+  'the dock score should show the filtered train value');
+assert.match(appSource, /const gap = \(shownScore\('train'\) != null && shownScore\('hold'\) != null\)/,
+  'the details gap should compare filtered scores');
+assert.match(browserSource, /const ft = shownScore\('train'\), fh = shownScore\('hold'\);/,
+  'the browser metrics line should show filtered scores');
 
 console.log('PSNR and approximate SSIM graph scales: passed');

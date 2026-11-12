@@ -18,29 +18,79 @@ export function psnrToApproxSsimPercent(psnr) {
  *  appear and then vanish. Raw samples stay stored regardless. */
 const SKIP_FIRST = 3;
 
-/** Live plateau filter: snaps up to genuine rises, drifts down slowly,
- *  and holds inside a noise deadband — the trend without the jitter.
- *  attack: base rise gain per sample; snap: extra gain per unit of rise
- *  (large steps latch almost fully); release: fall gain per sample;
- *  deadband: smaller changes hold the level. Stateless across draws —
- *  series() runs a fresh pass, so redraws, scale toggles and scrubs
- *  can't desync the curve. Operates in raw dB; the caller converts. */
-export class LivePlateauFilter {
-  constructor(attack = 0.15, release = 0.02, deadband = 0.05, snap = 2.2) {
-    this.attack = attack; this.release = release;
-    this.deadband = deadband; this.snap = snap;
-    this.level = null;
+/** Zero-lag exponential moving average with a Z-score spike clamp: each
+ *  sample is clamped against the running level (beyond zThresh standard
+ *  deviations of the tracked variance it counts as a spike, not signal),
+ *  then smoothed with the lag taken back out (2*clean - lagged). Fast and
+ *  allocation-free past construction: the lag window is a power-of-2 ring
+ *  buffer with bitwise wrap. First sample latches the level.
+ *  series() runs a fresh pass, so redraws and scale toggles can't desync
+ *  the curve. Operates in raw dB; the caller converts. */
+export class FastRobustZLEMA {
+  /**
+   * @param {number} period   - Equivalent smoothing window (e.g., 16 to 32)
+   * @param {number} zThresh  - Gaussian tail cutoff in std devs (e.g., 2.2 to 2.5)
+   * @param {number} minStd   - Minimum noise floor (~50% of expected Gaussian sigma)
+   */
+  constructor(period = 20, zThresh = 2.3, minStd = 0.0) {
+    const p = Math.max(2, period | 0);
+    this.lag = (p - 1) >> 1;
+    // Standard EMA alpha for period N: 2 / (N + 1)
+    this.alpha = 2.0 / (p + 1);
+    this.oneMinusAlpha = 1.0 - this.alpha;
+    // Next power of 2 for fast bitwise wrap-around (& mask instead of %)
+    let cap = 1;
+    while (cap <= this.lag) cap <<= 1;
+    this.mask = cap - 1;
+    this.buf = new Float64Array(cap);
+    this.zThreshSq = zThresh * zThresh;
+    this.minVariance = minStd * minStd;
+    this.gamma = 0.05;
+    this.oneMinusGamma = 0.95;
+    this.writeIdx = 0;
+    this.initialized = false;
+    this.zlema = 0.0;
+    this.variance = 0.0;
   }
   update(x) {
-    if (this.level == null) { this.level = x; return x; }
-    const d = x - this.level;
-    if (Math.abs(d) < this.deadband) return this.level;   // noise: hold
-    if (d > 0) this.level += d * Math.min(1, this.attack + this.snap * d);
-    else this.level += d * this.release;                  // dips decay slowly
-    return this.level;
+    if (!this.initialized) {
+      this.buf.fill(x);
+      this.writeIdx = 0;
+      this.zlema = x;
+      this.variance = this.minVariance > 1e-3 ? this.minVariance : 1e-3;
+      this.initialized = true;
+      return x;
+    }
+    // 1. Clamp extreme Gaussian tail spikes against the current ZLEMA center
+    let cleanX = x;
+    const err = x - this.zlema;
+    let errSq = err * err;
+    const maxErrSq = this.zThreshSq * this.variance;
+    if (errSq > maxErrSq) {
+      const limit = Math.sqrt(maxErrSq);
+      cleanX = this.zlema + (err > 0 ? limit : -limit);
+      errSq = maxErrSq;
+    }
+    const nextVar = this.oneMinusGamma * this.variance + this.gamma * errSq;
+    this.variance = nextVar > this.minVariance ? nextVar : this.minVariance;
+    // 2. Read lagged clean sample from power-of-2 ring buffer
+    const laggedIdx = (this.writeIdx - this.lag) & this.mask;
+    const laggedX = this.buf[laggedIdx];
+    // Store current clean sample in ring buffer
+    this.buf[this.writeIdx] = cleanX;
+    this.writeIdx = (this.writeIdx + 1) & this.mask;
+    // 3. De-lagged input: cleanX + (cleanX - laggedX) = 2 * cleanX - laggedX
+    const deLagged = 2.0 * cleanX - laggedX;
+    // 4. Single EMA update (zero division, zero float drift)
+    this.zlema = this.alpha * deLagged + this.oneMinusAlpha * this.zlema;
+    return this.zlema;
+  }
+  reset() {
+    this.initialized = false;
+    this.writeIdx = 0;
   }
   series(pts) {
-    this.level = null;
+    this.reset();
     return pts.map(([iter, v]) => [iter, this.update(v)]);
   }
 }
@@ -96,11 +146,24 @@ export class Chart {
     return series.length > SKIP_FIRST ? series.slice(SKIP_FIRST) : [];
   }
 
-  _displaySeries(series) {
+  /** Raw-dB ZLEMA pass over the post-hold samples: the curve's material.
+   *  Fresh pass per call — redraws and scale toggles can't desync it. */
+  _filteredRaw(series) {
     const held = this._heldRaw(series);
     if (!held.length) return [];
-    return new LivePlateauFilter().series(held)
+    return new FastRobustZLEMA().series(held);
+  }
+
+  _displaySeries(series) {
+    return this._filteredRaw(series)
       .map(([iter, value]) => [iter, this._displayValue(value)]);
+  }
+
+  /** Dynamic x extent for the given last-sample iters: the data's reach
+   *  plus a breath of headroom, never past the run's horizon. */
+  _xMaxFor(lastIters) {
+    const m = Math.max(0, ...lastIters);
+    return Math.min(this.maxIter, Math.max(1, m * 1.06, m + 1));
   }
 
   // top just fits the event dots; there are no x labels, so the bottom is
@@ -142,12 +205,18 @@ export class Chart {
     const active = this._activeSeries();
     const trainHeld = this._heldRaw(active.train);
     const holdHeld = this._heldRaw(active.hold);
-    const train = this._displaySeries(active.train);
-    const hold = this._displaySeries(active.hold);
+    const trainF = this._filteredRaw(active.train);
+    const holdF = this._filteredRaw(active.hold);
+    // the score readouts show the ZLEMA curve's end, not the latest raw
+    // sample — one source of truth for the number and the line
+    this.lastTrainF = trainF.length ? trainF[trainF.length - 1][1] : null;
+    this.lastHoldF = holdF.length ? holdF[holdF.length - 1][1] : null;
+    const train = trainF.map(([iter, value]) => [iter, this._displayValue(value)]);
+    const hold = holdF.map(([iter, value]) => [iter, this._displayValue(value)]);
     const ghostTrain = this._displaySeries(this.ghost?.train || []);
     const ghostHold = this._displaySeries(this.ghost?.hold || []);
-    // the raw dots behind the filtered lines: very small, very light —
-    // the honest scatter the curve summarizes (ghost stays line-only)
+    // the raw dots behind the filtered lines: tiny and light — the honest
+    // scatter the curve summarizes (ghost stays line-only)
     const trainDots = trainHeld.map(([iter, value]) => [iter, this._displayValue(value)]);
     const holdDots = holdHeld.map(([iter, value]) => [iter, this._displayValue(value)]);
     const ys = [...train, ...hold, ...ghostTrain, ...ghostHold, ...trainDots, ...holdDots].map((p) => p[1]);
@@ -161,15 +230,23 @@ export class Chart {
     lo -= pad; hi += pad;
     if (this.scale === 'similarity') { lo = Math.max(0, lo); hi = Math.min(100, hi); }
 
-    const X = (i) => l + (i / this.maxIter) * pw;
+    // dynamic x: the axis grows with the plotted data instead of reserving
+    // the whole horizon up front — early curves use the full width, the
+    // way the y-axis already hugs the data
+    const lastIt = (arr) => (arr.length ? arr[arr.length - 1][0] : 0);
+    const xMax = this._xMaxFor([lastIt(active.train), lastIt(active.hold),
+      lastIt(this.ghost?.train || []), lastIt(this.ghost?.hold || [])]);
+    const X = (i) => l + (i / xMax) * pw;
     const Y = (v) => t + ph - ((v - lo) / (hi - lo)) * ph;
 
     // faint progress wash left of the latest sample — the chart quietly
     // doubles as a progress bar without competing with the curve
     if (active.train.length) {
-      const px = X(active.train[active.train.length - 1][0]);
+      // the wash keeps progress meaning (fraction of the horizon) while
+      // the curve above it enjoys the dynamic axis
+      const frac = Math.min(1, active.train[active.train.length - 1][0] / this.maxIter);
       ctx.fillStyle = 'rgba(94, 231, 214, .055)';
-      ctx.fillRect(l, t, Math.max(0, Math.min(px, l + pw) - l), ph);
+      ctx.fillRect(l, t, Math.max(0, frac * pw), ph);
     }
 
     // grid
@@ -219,7 +296,7 @@ export class Chart {
       if (!pts.length) return;
       ctx.fillStyle = color;
       for (const p of pts) {
-        ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 1.5 * dpr, 0, 7); ctx.fill();
+        ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 0.75 * dpr, 0, 7); ctx.fill();
       }
     };
     dots(holdDots, 'rgba(242,160,63,.35)');
@@ -244,10 +321,10 @@ export class Chart {
 
     // hover readout
     if (this.hover && trainHeld.length) {
-      const it = this._frac(this.hover.x) * this.maxIter;
+      const it = this._frac(this.hover.x) * xMax;
       const near = (arr) => arr.length ? arr.reduce((a, p) => Math.abs(p[0] - it) < Math.abs(a[0] - it) ? p : a) : null;
       const a = near(trainHeld), h = near(holdHeld);
-      const ev = this.events.find((e) => Math.abs(e.at * this.maxIter - it) < this.maxIter * .012);
+      const ev = this.events.find((e) => Math.abs(e.at * this.maxIter - it) < xMax * .012);
       if (a) {
         const x = X(a[0]);
         ctx.strokeStyle = 'rgba(230,236,235,.4)'; ctx.lineWidth = 1;
