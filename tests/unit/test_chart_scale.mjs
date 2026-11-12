@@ -4,7 +4,6 @@ import { Chart, psnrToApproxSsimPercent, FastRobustZLEMA } from '../../app/js/ch
 
 const chartSource = readFileSync(new URL('../../app/js/chart.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
-const browserSource = readFileSync(new URL('../../browser/app.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 const appCss = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
 const baseCss = readFileSync(new URL('../../app/css/base.css', import.meta.url), 'utf8');
@@ -142,7 +141,5 @@ assert.match(appSource, /formatTrainingScore\(shownScore\('train'\)\)/,
   'the dock score should show the filtered train value');
 assert.match(appSource, /const gap = \(shownScore\('train'\) != null && shownScore\('hold'\) != null\)/,
   'the details gap should compare filtered scores');
-assert.match(browserSource, /const ft = shownScore\('train'\), fh = shownScore\('hold'\);/,
-  'the browser metrics line should show filtered scores');
 
 console.log('PSNR and approximate SSIM graph scales: passed');

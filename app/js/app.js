@@ -34,7 +34,12 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
 
 // Two front doors, one codebase: classic and wall-first layouts use local
 // photo intake and device-saved work (splat-js2, or ?v2 anywhere).
-const WALL_FIRST = /splat-js2/.test(location.pathname)
+// One UI, two shells: the browser/ folder boots this same app with a marker
+// (its generated index.html sets __SPLAT_SHELL) or ?shell=browser — local
+// only, no AR capture, no avatar route, no share backend. Everything else
+// is the same code; the gates below are the whole difference.
+const SHELL = new URLSearchParams(location.search).get('shell') || globalThis.__SPLAT_SHELL || 'app';
+const WALL_FIRST = SHELL === 'browser' || /splat-js2/.test(location.pathname)
   || new URLSearchParams(location.search).has('v2');
 
 // short first run (phones especially) — the done screen offers "+10k cycles"
@@ -919,7 +924,7 @@ function boot() {
   window.__vp = () => vp;      // console access (camera state)
   // installable PWA: the worker is a no-op (no caching), the manifest does
   // the rest. Relative URL -> correct scope on every deploy base path.
-  if ('serviceWorker' in navigator) {
+  if (SHELL !== 'browser' && 'serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
   showIntro();
@@ -954,11 +959,21 @@ function boot() {
     // truck default sat invisibly behind the start card and leaked into
     // Back navigation ("why is the truck loaded?")
   }
+  if (SHELL === 'browser') {
+    // the browser profile boots this same UI local-only: no AR capture
+    // actions, no avatar route, no backend — files in, training, model
+    // out. Reviews of picked photo+pose sets stay (they are local).
+    for (const id of ['btn-ar', 'btn-xr-help', 'xr-open-tab', 'xr-ar-state', 'xr-device-guide', 'av-choice']) {
+      const el = $(id);
+      if (el) el.hidden = true;
+    }
+    document.querySelector('.xr-flow')?.remove();
+  }
   syncTrainingVisualsControl();
   requestAnimationFrame(loop);
 
   // a shared result: load it straight into the done-state viewer
-  if (mp.get('space')) restoreShared(mp.get('space'));
+  if (mp.get('space') && SHELL !== 'browser') restoreShared(mp.get('space'));
   else if (mp.get('model')) restoreSession({ url: mp.get('model'), reconUrl: mp.get('recon') });
   else mountWall();
 }
@@ -2061,6 +2076,7 @@ async function startPrep() {
   // Unticked, this is a plain scene run whatever the set once was: a restored
   // capture's stored mattes leave the frames the session sees.
   S.avatarOpts = null;
+  if (SHELL === 'browser') S.avatarWanted = false;   // the browser profile trains scenes only — no avatar models ship there
   if (!S.avatarWanted) { S.avatar = null; for (const f of S.preset.files || []) delete f.mask; }
   avatarFrames(S.avatarWanted);
   const wantMatte = S.avatarWanted && !S.avatar && !!(S.preset.files && S.preset.files.length);
@@ -3771,7 +3787,7 @@ async function restoreSession(src) {
     S._savedGpuFacts = null; S._savedDetailSettings = null;
     // a run that was already shared knows its space: the viewer offers its
     // link and its listing, where a reload used to leave only a Download
-    if (S._localRun && S._localRun.spaceId) S.share = { id: S._localRun.spaceId, title: S._localRun.name || '' };
+    if (SHELL !== 'browser' && S._localRun && S._localRun.spaceId) S.share = { id: S._localRun.spaceId, title: S._localRun.name || '' };
     S._viewerOpen = true;
     // the viewer is a navigable state: Back returns to the wall, never to
     // whatever page happened to precede the app
@@ -3792,8 +3808,8 @@ async function restoreSession(src) {
         const buf = new Uint8Array(await r.arrayBuffer());
         let reconJson;
         if (buf[0] === 0x50 && buf[1] === 0x4b) {
-          const { unzipStore } = await import('./session_io.js');
-          reconJson = JSON.parse(new TextDecoder().decode(unzipStore(buf).get('recon.json')));
+          const { unzipStoreAsync } = await import('./session_io.js');
+          reconJson = JSON.parse(new TextDecoder().decode((await unzipStoreAsync(buf)).get('recon.json')));
         } else {
           reconJson = JSON.parse(new TextDecoder().decode(buf));
         }
@@ -5246,7 +5262,7 @@ function showDetail(setOrPreset) {
   $('set-solve').disabled = !!setOrPreset?.capture?.transforms;
   $('set-feat').disabled = !!setOrPreset?.capture?.transforms;
   setStartStyle(!(setOrPreset && setOrPreset.spaceId));
-  if (setOrPreset && setOrPreset.spaceId) {
+  if (setOrPreset && setOrPreset.spaceId && SHELL !== 'browser') {
     // a trained model of this benchmark is shared — View opens it, and the
     // published model's train PSNR joins the input facts once resolved
     const view = document.createElement('a');
@@ -5345,12 +5361,12 @@ function closeViewerToHome() {
 /** The creation's recon json (plain or store-zipped) — the photographs and
  *  cameras a "train this yourself" run needs. */
 async function fetchShareRecon(it) {
-  const { unzipStore } = await import('./session_io.js');
+  const { unzipStoreAsync } = await import('./session_io.js');
   const r = await fetch(it.splatjs.reconUrl);
   if (!r.ok) throw new Error('recon unavailable');
   const rb = new Uint8Array(await r.arrayBuffer());
   if (rb[0] === 0x50 && rb[1] === 0x4b) {
-    return JSON.parse(new TextDecoder().decode(unzipStore(rb).get('recon.json')));
+    return JSON.parse(new TextDecoder().decode((await unzipStoreAsync(rb)).get('recon.json')));
   }
   return JSON.parse(new TextDecoder().decode(rb));
 }
@@ -5708,8 +5724,8 @@ async function thumbBmp(i) {
     S._thumbPack ??= (async () => {
       const r = await fetch(S._thumbsUrl);
       if (!r.ok) throw new Error(`thumbs fetch failed (${r.status})`);
-      const { unzipStore } = await import('./session_io.js');
-      return unzipStore(new Uint8Array(await r.arrayBuffer()));
+      const { unzipStoreAsync } = await import('./session_io.js');
+      return unzipStoreAsync(new Uint8Array(await r.arrayBuffer()));
     })();
     const data = (await S._thumbPack).get(`${i}.jpg`);
     return data ? await createImageBitmap(new Blob([data], { type: 'image/jpeg' })) : null;

@@ -14,7 +14,7 @@
 // model files. Bare exports carry baked opacities — fine for viewing, and
 // re-exports pass them through unchanged.
 
-import { zipStore } from './zip.js';
+import { zipStore, readZip } from './zip.js';
 import { loadST } from './sog.js';
 
 const STRIDE = 16;
@@ -269,6 +269,17 @@ export function unzipStore(bytes) {
   return out;
 }
 
+/** unzipStore that also inflates deflated entries (OS-compressor zips) —
+ *  async, via the platform DecompressionStream. Same Map shape; our own
+ *  stored exports still take the fast sync path first. */
+export async function unzipStoreAsync(bytes) {
+  try {
+    return unzipStore(bytes);
+  } catch {
+    return readZip(bytes);   // stored parse failed — maybe deflated (or corrupt: readZip says so)
+  }
+}
+
 export function parseState(bytes) {
   if (bytes.length < 4) throw new Error('truncated state header');
   const headLen = new DataView(bytes.buffer, bytes.byteOffset).getUint32(0, true);
@@ -425,7 +436,7 @@ export async function decodeModel(bytes, reconUrl) {
   if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
     // PK: either our session zip — or a bare SOG bundle, which is a zip too
     let entries = null;
-    try { entries = unzipStore(bytes); } catch { /* compressed: not ours */ }
+    try { entries = await unzipStoreAsync(bytes); } catch { /* not a readable zip */ }
     if (entries && entries.has('recon.json')) {
       reconJson = JSON.parse(new TextDecoder().decode(entries.get('recon.json')));
     }
@@ -453,7 +464,7 @@ export async function decodeModel(bytes, reconUrl) {
       // one-entry STORED zip, so accept both forms here
       const rb = new Uint8Array(await r.arrayBuffer());
       if (rb[0] === 0x50 && rb[1] === 0x4b) {
-        const entries = unzipStore(rb);
+        const entries = await unzipStoreAsync(rb);
         const entry = entries.get('recon.json') || [...entries.values()][0];
         if (entry) reconJson = JSON.parse(new TextDecoder().decode(entry));
       } else {

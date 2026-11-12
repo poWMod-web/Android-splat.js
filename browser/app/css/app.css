@@ -1,0 +1,1139 @@
+/* Splat.js v2 — the tech-demo cut. Same palette and type as v1
+   (imported), a much smaller frame around one stage. */
+
+@import url('base.css');
+
+body {
+  display: grid;
+  /* minmax(0,1fr), not 1fr: the filmstrip's row of thumbnails would otherwise
+     size the whole column to its own max-content width */
+  grid-template-columns: minmax(0, 1fr);
+  /* header · status+curve · stage · the photographs, which stay at the bottom */
+  grid-template-rows: 52px auto minmax(0, 1fr) auto;
+  height: 100dvh;
+  overflow: hidden;
+}
+/* iOS: fill the LARGE viewport so the page renders beneath the floating
+   Safari bar (viewport-fit=cover is set); interactive bottom content keeps
+   itself reachable via safe-area padding instead of stopping short */
+.strip { padding-bottom: env(safe-area-inset-bottom, 0px); }
+/* Phones, home view: the DOCUMENT scrolls. A fixed overlay with inner
+   scrolling never scrolls the page, so iOS keeps the URL pill expanded and
+   clamps the layer above it — the only way content renders beneath the bar
+   is real document flow: stage/strip hide behind the card anyway, the bar
+   goes sticky, and Safari collapses the pill as the visitor scrolls. */
+@media (max-width: 640px) {
+  body:has(#start:not([hidden])) {
+    display: block; height: auto; min-height: 100dvh; overflow-y: auto;
+  }
+  /* the card lives INSIDE the stage: the stage becomes plain flow, its
+     canvases and overlays sleep, the card is the page content */
+  body:has(#start:not([hidden])) .stage {
+    position: static; overflow: visible; height: auto; min-height: 0;
+  }
+  body:has(#start:not([hidden])) .stage > canvas,
+  body:has(#start:not([hidden])) .hud,
+  body:has(#start:not([hidden])) .strip,
+  body:has(#start:not([hidden])) .dock { display: none; }
+  body:has(#start:not([hidden])) .bar {
+    position: sticky; top: 0; z-index: 50; height: 52px;
+  }
+  body:has(#start:not([hidden])) #start {
+    position: static; height: auto; min-height: calc(100dvh - 52px);
+    width: auto; box-sizing: border-box; /* 100% + side padding overflowed */
+  }
+}
+
+/* ── bar ─────────────────────────────────────────────────────────────────── */
+
+.bar {
+  display: flex; align-items: center; gap: 14px; padding: 0 16px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(var(--ink-2), var(--ink));
+}
+.bar .grow { flex: 1; }
+.bar .brand { margin-right: 4px; }
+#btn-new {
+  display: inline-flex; align-items: center; gap: 7px;
+  color: var(--paper); border-color: var(--line-2);
+}
+/* New and Source: no pills — a quiet divider, then icon + word */
+#btn-new, #gh, #discord {
+  border: 0; background: none; border-radius: 8px;
+  padding: 6px 8px; margin-left: 14px;
+  position: relative; color: var(--muted);
+}
+#btn-new::before {
+  content: ''; position: absolute; left: -14px; top: 50%;
+  transform: translateY(-50%);
+  width: 1px; height: 18px; background: var(--line-2);
+}
+#btn-new:hover, #gh:hover, #discord:hover { color: var(--accent); }
+/* ── touch ownership ─────────────────────────────────────────────────────────
+   The page must never react on its own: no pinch-zoom, no rubber-banding, no
+   stray scrolling. Touches on the stage belong entirely to the app (pinch /
+   two-finger move become camera controls); the filmstrip and the details
+   sheet keep their own panning. */
+html, body { touch-action: pan-x pan-y; overscroll-behavior: none; }
+body { overflow: hidden; }
+.stage, .camrec { touch-action: none; }
+
+/* ── stage ───────────────────────────────────────────────────────────────── */
+
+/* v1 places .stage / .strip inside a named-area grid; v2 owns its own layout.
+   Rows are pinned explicitly: the status bar is display:none when a run is not
+   in progress, and without this the stage and the filmstrip would each shift up
+   a row and swap their auto/1fr sizing. */
+.bar   { grid-area: 1 / 1; }
+.dock  { grid-area: 2 / 1; }
+.stage { grid-area: 3 / 1; }
+.strip { grid-area: 4 / 1; }
+
+.stage {
+  position: relative; display: block; overflow: hidden;
+  background: var(--stage); min-height: 0;
+}
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.stage[data-cursor="loupe"] { cursor: none; }
+.stage[data-cursor="grab"] { cursor: grab; }
+.stage[data-cursor="grab"]:active { cursor: grabbing; }
+.stage[data-cursor="swipe"] { cursor: ew-resize; }
+
+.controls {
+  position: absolute; z-index: 3; right: 14px; top: 12px;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end;
+}
+/* one row, one height — chip, Train button and export share the same pill;
+   borders kept quiet, the frosted fill does the separating */
+.controls .statchip, .controls .cbtn { height: 32px; }
+.controls .iconbtn { width: 32px; height: 32px; }
+.controls .statchip, .controls .cbtn, .controls .iconbtn { border-color: var(--line); }
+.controls .iconbtn { color: var(--paper); }   /* icons speak like the Train text */
+.controls .statchip i { color: var(--paper); }   /* Details too */
+/* hover: the fill breathes, the border stays put */
+.controls .statchip:hover, .controls .cbtn:hover, .controls .iconbtn:hover {
+  border-color: var(--line);
+  background: rgba(36, 44, 45, .85);
+}
+.controls .seg { background: rgba(7, 9, 9, .82); backdrop-filter: blur(4px); }
+/* the arrival mark inside Enter space — sized to the label, keeps its color */
+.cbtn .enter-mark { width: 15px; height: 15px; display: inline-block; vertical-align: -3px; margin-right: 6px; }
+
+/* start card: a full-screen overlay under the top bar — every device.
+   The copy stays a centred readable column; the Scenes wall gets more of
+   the width. Content centres while it fits, scrolls from the top once not. */
+.card-start {
+  cursor: auto;   /* the stage behind wears the grab hand — the card doesn't */
+  position: fixed; z-index: 40; inset: 0; top: 52px; margin: 0;
+  width: 100%; height: calc(100% - 52px); max-height: none; overflow-y: auto;
+  touch-action: pan-y;   /* its own scroll works despite the stage's none */
+  /* bottom padding clears the iOS floating bar: the card renders under it,
+     the last tile still scrolls fully into view */
+  padding: 58px 30px calc(26px + env(safe-area-inset-bottom, 0px)); text-align: center;   /* the top gap is the × its own row */
+  background: rgba(14, 17, 18, .9); backdrop-filter: blur(12px);
+  /* minmax(0,1fr): the column is the CONTAINER's width — a wide child (the
+     wall's tile row) must scroll inside it, not inflate the track and shove
+     everything off-centre on narrow screens */
+  display: grid; grid-template-columns: minmax(0, 1fr);
+  align-content: safe center; justify-items: center;
+}
+.card-start > * { width: min(600px, 100%); }
+.card-start > #gallery { width: min(1100px, 100%); }
+.card-start > .card-x { width: 36px; }
+.card-start > .card-back { width: 46px; height: 46px; }
+@media (max-width: 640px) {
+  .card-start { padding-top: 26px; }   /* phones have no × row — title moves up */
+  .card-start .eyebrow { margin-bottom: 4px; }
+  .card-start h1 { margin-bottom: 8px; }
+}
+
+/* short screens: tighten the card — the copy stays (the card scrolls) */
+@media (max-height: 700px) {
+  .card-start { padding-top: 36px; }
+  .card-start h1 { font-size: 25px; }
+  .upload { padding: 10px 0 8px; margin-bottom: 10px; }
+}
+
+.card-x {
+  position: absolute; top: 12px; right: 14px;
+  width: 36px; height: 36px; border-radius: 50%;
+  color: var(--dim); font: 300 27px/1 var(--ui);
+}
+.card-x:hover { color: var(--paper); background: var(--panel-2); }
+
+.upload {
+  display: flex; align-items: center; gap: 18px; text-align: left;
+  padding: 18px 0 14px; margin-bottom: 16px;
+  border: none; border-radius: 12px;
+}
+.upload-txt { flex: 1; }
+.upload b { display: block; font: 600 15px var(--ui); }
+.upload span { display: block; margin-top: 2px; font-size: 12.5px; color: var(--muted); }
+.card-start.drop .upload { background: var(--accent-14); }
+
+.orline {
+  display: flex; align-items: center; gap: 12px;
+  margin: 0 0 14px; color: var(--dim);
+  font: 400 11px var(--mono); letter-spacing: .1em; text-transform: uppercase;
+}
+.orline::before, .orline::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+
+.btn-outline {
+  background: none; border: 1px solid var(--accent); color: var(--accent);
+}
+.btn-outline:hover { background: var(--accent-14); border-color: #5ee7d6; color: #5ee7d6; }
+
+.card-start .eyebrow { margin: 0 0 6px; }
+.card-start h1 { font: 700 32px/1.05 var(--display); letter-spacing: -.02em; margin-bottom: 10px; }
+.card-start p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
+.card-start .origin { max-width: 46ch; margin: 0 auto; }
+.card-start .runs { margin: 16px auto 20px; max-width: 44ch; color: var(--dim); font-size: 13px; }
+.card-start .fine { margin: 14px 0 0; font-size: 12.5px; color: var(--dim); }
+.btn.big { padding: 12px 24px; font-size: 15px; }
+.linkish { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; padding: 0; font: inherit; }
+
+.srclinks { margin-top: 9px !important; display: flex; gap: 14px; justify-content: center; }
+.srclinks:empty { display: none; }
+.srclinks a {
+  font: 400 12px var(--mono); color: var(--accent);
+  text-decoration: underline; text-underline-offset: 3px;
+}
+.srclinks a:hover { color: #5ee7d6; }
+.srclinks a::after { content: ' ↗'; text-decoration: none; opacity: .6; }
+
+/* the last-capture tile on the wall's Local tab carries a badge — its
+   thumbnail can look exactly like a share's when the capture WAS of that
+   scene (the badge needs the tile as its positioning box) */
+.galtile { position: relative; }
+/* the tile's options button — a round, always-visible "⋯" */
+.galtile .run-menu {
+  position: absolute; top: 16px; right: 16px; z-index: 2;
+  width: 36px; height: 36px; border-radius: 50%; border: 0; cursor: pointer;
+  background: rgba(10, 14, 14, .72); color: #fff;
+  font: 700 18px/1 var(--ui); letter-spacing: .02em;
+  display: flex; align-items: center; justify-content: center;
+  backdrop-filter: blur(4px);
+}
+.galtile .run-menu:hover { background: rgba(10, 14, 14, .92); }
+.tilemenu {
+  position: absolute; top: 58px; right: 16px; z-index: 6;
+  display: grid; gap: 2px; padding: 6px; min-width: 150px;
+  background: rgba(18, 22, 23, .97); border: 1px solid var(--line-2);
+  border-radius: 12px; box-shadow: 0 10px 30px rgba(0, 0, 0, .45);
+}
+.tilemenu button {
+  text-align: left; padding: 9px 12px; border-radius: 8px;
+  background: none; border: 0; cursor: pointer;
+  color: var(--paper); font: 500 13.5px var(--ui);
+}
+.tilemenu button:hover { background: rgba(255, 255, 255, .07); }
+.tilemenu button.danger { color: #ff8585; }
+.tilemenu button.danger.armed { background: rgba(178, 58, 58, .92); color: #fff; }
+.galtile .yours {
+  position: absolute; top: 6px; right: 6px; z-index: 1;
+  padding: 1px 6px 2px; border-radius: 5px;
+  background: rgba(47, 212, 193, .92); color: #04231f;
+  font: 600 9px var(--mono); font-style: normal;
+  letter-spacing: .06em; text-transform: uppercase;
+}
+
+/* ── filmstrip ───────────────────────────────────────────────────────────── */
+
+.strip { display: block; border-top: 1px solid var(--line); background: var(--ink-2); }
+.strip:empty { display: none; }
+.strip-scroll { display: flex; gap: 4px; padding: 7px 12px; overflow-x: auto; scrollbar-width: none; }
+.strip-scroll::-webkit-scrollbar { display: none; }
+.strip-scroll img { -webkit-user-drag: none; user-select: none; }
+.strip .frame { width: 62px; }
+
+/* ── dock ────────────────────────────────────────────────────────────────── */
+
+.dock {
+  border-bottom: 1px solid var(--line); background: var(--panel);
+  padding: 10px 16px 12px; min-height: 0;
+}
+.dock:empty { display: none; }
+
+.dock-train {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 18px; align-items: center;
+  position: relative; z-index: 5;
+}
+.dock-train.chart-expanded { grid-template-columns: auto minmax(0, 1fr); }
+.dock-train.chart-expanded .tscores { grid-column: 2; justify-self: end; }
+.stage > .chartwrap-expanded {
+  position: absolute; inset: 0; z-index: 1; height: auto; min-height: 0;
+  pointer-events: none;
+}
+.stage > .chartwrap-expanded canvas { pointer-events: auto; }
+.dock-prep, .dock-av { display: grid; grid-template-columns: minmax(0, 1fr); align-items: center; }
+
+/* the stage sequence doubles as the header: the active beat wears the title
+   style, the rest queue beside it in the small mono of the old side list */
+.prep-stages {
+  display: flex; gap: 14px; align-items: baseline;
+  font: 400 12px var(--mono); color: var(--dim);
+  margin-bottom: 3px;
+}
+.prep-stages span { transition: color .2s; }
+.prep-stages [data-on="1"] { font: 500 15px var(--ui); color: var(--accent); }
+.prep-stages [data-on="done"] { color: var(--accent-30); }
+.prep-stages [data-on="failed"] { color: var(--red); }
+/* the avatar's nine stages, not the solve's five: they wrap instead of
+   overflowing, and the active one keeps the title style */
+.av-beats { flex-wrap: wrap; row-gap: 2px; gap: 12px; }
+.prep-sub { font: 400 12px var(--mono); color: var(--dim); }
+.prep-meter { height: 5px; background: var(--panel-2); border-radius: var(--pill); overflow: hidden; margin-top: 9px; position: relative; }
+.prep-meter i { display: block; height: 100%; background: var(--accent); transition: width .12s linear; }
+.prep-cut { display: block; margin: 12px auto 2px; height: 320px; max-width: 100%; border-radius: 8px; background: var(--panel-2); opacity: 0; transition: opacity .3s; }
+.prep-cut.on { opacity: 1; }
+/* compositor-driven liveness sweep: transform/opacity animations keep
+   running through main-thread JS bursts (BA, RANSAC), so the meter visibly
+   works even when progress numbers pause */
+.prep-live {
+  position: absolute; inset: 0 auto 0 0; width: 70px; pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(94, 231, 214, .45), transparent);
+  animation: prep-sweep 1.5s linear infinite; will-change: transform;
+}
+@keyframes prep-sweep {
+  from { transform: translateX(-70px); }
+  to   { transform: translateX(100vw); }
+}
+
+/* phones: both docks stack — side-by-side columns squeezed the chart to a
+   sliver, the play button to an egg, and the stage label to one word a line.
+   The stage gets squarer; that is the right trade on a portrait screen. */
+@media (max-width: 720px) {
+  /* row 1 fits the play button plus the stop-and-keep chip below it; the
+     chart starts 6px under and runs to the dock's lowest pixels; the right
+     column's third line (grow note) may overhang the chart's empty
+     top-right corner */
+  .dock-train { grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto auto; row-gap: 6px; }
+  .dock-train .tcontrols { grid-row: 1; grid-column: 1; align-self: start; }
+  .dock-train .tscores { grid-row: 1; grid-column: 2; gap: 16px; align-self: start; }
+  .dock-train .chartwrap { grid-row: 2; grid-column: 1 / -1; height: 90px; }
+  .dock-train.chart-expanded { grid-template-rows: auto; row-gap: 6px; }
+  .dock-train { padding-top: 6px; padding-bottom: 0; }
+
+  .dock-prep { gap: 10px; }
+  .prep-stages { flex-wrap: wrap; gap: 5px 13px; }
+}
+
+/* ── details sheet ───────────────────────────────────────────────────────── */
+
+.sheet {
+  position: fixed; inset: 0; z-index: 30; overflow-y: auto;
+  background: var(--ink); animation: rise .18s ease-out;
+}
+@keyframes rise { from { transform: translateY(14px); opacity: 0; } }
+.sheet[hidden] { display: none; }
+.sheet-head {
+  position: sticky; top: 0; z-index: 2;
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 20px;
+  padding: 22px 28px 16px; border-bottom: 1px solid var(--line);
+  background: linear-gradient(var(--ink) 70%, transparent);
+}
+.sheet-x {
+  flex: none; width: 38px; height: 38px; border-radius: 50%;
+  color: var(--dim); font: 300 28px/1 var(--ui);
+}
+.sheet-x:hover { color: var(--paper); background: var(--panel-2); }
+
+.sheet-head h2 { font: 700 26px var(--display); letter-spacing: -.02em; }
+.sheet-head p { margin: 5px 0 0; color: var(--dim); font: 400 13px var(--mono); }
+.sheet-body { padding: 8px 28px 48px; max-width: 1180px; margin: 0 auto; }
+
+.sheet-row {
+  display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 30px; padding: 26px 0; border-bottom: 1px solid var(--line);
+}
+.sheet-row:last-child { border-bottom: 0; }
+.sheet-vis { min-width: 0; position: relative; }
+
+/* flip through the photos on the Landmarks tab — the filmstrip is covered */
+.d-nav {
+  position: absolute; top: 50%; transform: translateY(-50%); z-index: 2;
+  width: 40px; height: 40px; border-radius: 50%;
+  border: 1px solid var(--line-2); color: var(--paper);
+  background: rgba(7, 9, 9, .7); backdrop-filter: blur(4px);
+  font: 300 24px/1 var(--ui); padding-bottom: 3px;
+}
+.d-nav:hover { border-color: var(--muted); background: rgba(7, 9, 9, .9); }
+#d-prev { left: 10px; }
+#d-next { right: 10px; }
+.sheet-vis canvas {
+  display: block; width: 100%; aspect-ratio: 16 / 9;
+  background: var(--stage); border: 1px solid var(--line); border-radius: var(--r);
+}
+.sheet-vis canvas[hidden] { display: none; }
+#d-cv.camera-orbit { touch-action: none; cursor: grab; }
+#d-cv.camera-orbit:active { cursor: grabbing; }
+.seg-title, .sheet-vis .seg { margin-bottom: 10px; }
+.seg-title { font: 500 10.5px var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--dim); }
+.sheet-vis .seg { display: inline-flex; }
+.cap { margin: 9px 0 0; font-size: 12.5px; color: var(--dim); line-height: 1.5; }
+
+.sheet-txt h3 { font: 600 18px var(--display); margin-bottom: 8px; }
+.sheet-txt p { margin: 0 0 12px; color: var(--muted); font-size: 13.5px; line-height: 1.6; }
+.sheet-txt .grp { padding: 6px 0 0; }
+
+@media (max-width: 900px) {
+  .sheet-row { grid-template-columns: minmax(0, 1fr); }
+  .tag { display: none; }
+}
+
+/* ── stage controls: reveal · details · export ───────────────────────────── */
+
+.cbtn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 13px; border-radius: var(--pill);
+  border: 1px solid var(--line-2); color: var(--paper); font-size: 12.5px;
+  background: rgba(7, 9, 9, .82); backdrop-filter: blur(4px);
+}
+.cbtn:hover { border-color: var(--muted); }
+.cbtn.accent {
+  background: var(--accent); border-color: var(--accent);
+  color: #04231f; font-weight: 600;
+}
+.cbtn.accent:hover { background: #5ee7d6; border-color: #5ee7d6; }
+/* same height as the pills beside it; the icon is the only coloured part */
+.iconbtn {
+  display: inline-grid; place-content: center;
+  width: 31px; height: 31px; border-radius: 50%;
+  border: 1px solid var(--line-2); color: var(--accent);
+  background: rgba(7, 9, 9, .82); backdrop-filter: blur(4px);
+}
+.iconbtn:hover { border-color: var(--muted); color: #5ee7d6; }
+.iconbtn .pl { width: 18px; height: 18px; fill: currentColor; }
+.iconbtn .dl {
+  width: 15px; height: 15px;
+  fill: none; stroke: currentColor; stroke-width: 2.5;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+
+.sheet-tools { display: flex; align-items: center; gap: 12px; }
+.sheet-tools .iconbtn { color: var(--paper); }
+
+.statchip {
+  display: inline-flex; align-items: center; gap: 13px;
+  padding: 6px 13px; border-radius: var(--pill);
+  border: 1px solid var(--line-2); color: var(--dim);
+  background: rgba(7, 9, 9, .82); backdrop-filter: blur(4px);
+  font: 400 12px var(--mono);
+}
+.statchip b { color: var(--paper); font-weight: 500; }
+.statchip i { font-style: normal; color: var(--accent); }
+.statchip:hover { border-color: var(--accent); }
+
+.exportwrap { position: relative; }
+
+.menu {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 20;
+  min-width: 268px; padding: 6px;
+  background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 12px;
+  box-shadow: var(--shadow);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.menu button { text-align: left; padding: 9px 12px; border-radius: 8px; }
+.menu button:hover { background: rgba(255, 255, 255, .055); }
+.menu b { display: block; font: 600 13.5px var(--ui); color: var(--paper); }
+.menu span { display: block; margin-top: 2px; font: 400 11.5px var(--mono); color: var(--dim); }
+
+
+
+/* ── what this is ────────────────────────────────────────────────────────── */
+
+.brand { padding: 0; cursor: pointer; }
+.brand:hover .brand-name { color: #fff; }
+
+.about {
+  position: fixed; inset: 0; z-index: 50;
+  display: grid; place-items: center; padding: 24px;
+  background: rgba(8, 10, 11, .72); backdrop-filter: blur(4px);
+  animation: rise .16s ease-out;
+}
+.about[hidden] { display: none; }
+
+.about-card {
+  position: relative; width: min(560px, 100%);
+  padding: 34px 34px 26px;
+  background: var(--panel); border: 1px solid var(--line-2); border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+.about-card h2 { font: 700 26px/1.15 var(--display); letter-spacing: -.02em; margin: 6px 0 14px; }
+.about-card p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.6; }
+.about-card code {
+  font: 400 12.5px var(--mono); color: var(--paper);
+  background: var(--panel-2); padding: 1px 5px; border-radius: 4px;
+}
+
+.about-note {
+  margin: 18px 0 20px; padding: 13px 15px;
+  border: 1px solid var(--accent-30); border-radius: 12px; background: var(--accent-14);
+}
+.about-note b { display: block; font: 600 13.5px var(--ui); color: var(--accent); }
+.about-note span { display: block; margin-top: 3px; font-size: 13px; color: var(--muted); line-height: 1.55; }
+
+.about-foot {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: 8px 12px;
+  padding-top: 16px; border-top: 1px solid var(--line);
+  font: 400 12px var(--mono); color: var(--dim);
+}
+/* an item never breaks inside itself ("Source on GitHub" / "↗" on two lines):
+   when the row is too narrow the whole item wraps to the next line */
+.about-foot > * { white-space: nowrap; }
+.about-foot a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.about-ver { color: var(--dim); font: 11px "Spline Sans Mono", monospace; margin-left: auto; }
+@media (max-width: 640px) {
+  .about-ver { flex-basis: 100%; margin-left: 0; }
+}
+
+/* the GPU line: the same facts as the Details sheet's GPU tab, where a
+   visitor reporting a slow or failing device finds them first */
+.about-gpu {
+  margin: 0 0 18px; padding: 10px 15px 12px;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2);
+  font: 400 12.5px var(--mono); color: var(--muted); line-height: 1.5;
+}
+.about-gpu[hidden] { display: none; }
+.about-gpu-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 2px; }
+.about-gpu b { font: 600 12px var(--ui); color: var(--paper); letter-spacing: .02em; }
+.about-gpu span { display: block; overflow-wrap: anywhere; }
+.about-gpu .iconbtn { width: 32px; height: 32px; color: var(--muted); background: none; border: 0; backdrop-filter: none; }
+.about-gpu .iconbtn:hover { color: var(--accent); }
+.about-gpu .iconbtn[data-done="1"] { color: var(--accent); }
+.about-foot a:hover { color: #5ee7d6; }
+
+/* run-length hint on the start card */
+.srclinks .approx { color: var(--dim, #6b7877); margin-left: 10px; font-size: 12px; }
+
+/* training settings: a bare name-value table, folded away below Start */
+.settings { margin: 16px auto 2px; max-width: 320px; text-align: left; }
+.setrow {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 4px 0;
+}
+.setrow label { font: 400 12.5px var(--ui); color: var(--muted); }
+.setgroup { margin: 12px 0 2px; padding-top: 8px; border-top: 1px solid var(--line, rgba(255,255,255,.08)); font: 600 11px var(--ui); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.setrow select, .setrow input[type="number"] {
+  width: 104px; padding: 4px 8px; text-align: right; text-align-last: right;
+  font: 500 12px var(--mono); color: var(--paper);
+  background: var(--panel-2); border: 1px solid transparent; border-radius: 8px;
+}
+#set-softprune-custom { width: 64px; }
+.setrow select:hover, .setrow input[type="number"]:hover { border-color: var(--line-2); }
+.setrow select:focus, .setrow input[type="number"]:focus { border-color: var(--accent-30); outline: none; }
+
+/* the image-count row: a slider, and the value doubles as "use all" */
+.setrow-range input[type="range"] {
+  flex: 1; min-width: 0; margin: 0 2px; accent-color: var(--accent);
+}
+.countv {
+  flex: none; min-width: 66px; padding: 2px 4px; text-align: right;
+  font: 500 12px var(--mono); color: var(--paper); border-radius: 6px;
+}
+button.countv:hover { color: var(--accent); }
+/* one centred group: Start, the quality dropdown to its right at the same
+   height, then the gear */
+.startrow { display: flex; justify-content: center; align-items: center; }
+.startrow .q-quick { margin-left: 10px; }
+.startrow .setgear { margin-left: 4px; }
+.q-quick {
+  appearance: none; -webkit-appearance: none;   /* no native chevron */
+  height: 47px; padding: 0 14px; text-align: center; text-align-last: center;
+  font: 500 13px var(--ui); color: var(--muted);
+  background: var(--panel-2); border: 1px solid transparent; border-radius: var(--pill);
+  cursor: pointer;
+}
+.q-quick:hover { color: var(--paper); border-color: var(--line-2); }
+.q-quick:focus { border-color: var(--accent-30); outline: none; }
+/* same height as .btn.big beside it; the chevron flips down when open */
+.setgear {
+  display: inline-flex; align-items: center; gap: 5px;
+  width: auto; height: 47px; padding: 0 12px 0 14px;
+  border: 0; border-radius: var(--pill); color: var(--muted);
+  background: none; backdrop-filter: none;
+}
+.setgear:hover { background: var(--panel-2); }
+.setgear:hover { color: var(--accent); }
+/* disabled: same voice as the disabled Start beside it */
+.setgear[disabled] {
+  background: transparent; color: var(--dim);
+  backdrop-filter: none; pointer-events: none;
+}
+.setgear .gear {
+  width: 18px; height: 18px; fill: none; stroke: currentColor;
+  stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round;
+}
+.setgear .chev {
+  font: 400 17px/1 var(--ui); transition: transform .16s ease;
+}
+.setgear[aria-expanded="true"] .chev { transform: rotate(90deg); }
+
+
+/* Keep the pause and stop controls anchored without shifting score content. */
+.tmeta { position: relative; }
+.playwrap { position: relative; display: inline-flex; flex-direction: column; align-items: flex-start; }
+#t-finish {
+  position: static;
+  margin-top: 6px; padding: 3px 10px;
+  white-space: nowrap;
+}
+/* the stop-and-keep chip sits below the pause circle, in normal flow so the
+   dock contains it — the circle keeps its left breathing room for the chip */
+.dock-train .play { margin: 0 0 0 16px; }
+@media (max-width: 720px) {
+  .dock-train .play { margin: 0; }
+}
+
+/* the upload dialog + the result link chip */
+.upcard {
+  /* FIXED, not absolute: dialogs centre in the VIEWPORT — on the document-
+     scrolled home an absolute card anchors to the page top, out of view.
+     z above the start overlay (40): tile menus launch dialogs from the wall. */
+  position: fixed; left: 50%; top: 40%; transform: translate(-50%, -50%);
+  display: flex; flex-direction: column; gap: 12px;
+  width: min(340px, 86%); padding: 18px 18px 14px;
+  background: rgba(10, 13, 13, .96); border: 1px solid var(--line-2);
+  border-radius: 16px; backdrop-filter: blur(8px); z-index: 60;
+}
+.upcard b { font: 600 14px var(--sans, system-ui); color: var(--paper); }
+.upcard input {
+  padding: 9px 12px; font: 500 13px var(--mono); color: var(--paper);
+  background: rgba(7, 9, 9, .8); border: 1px solid var(--line-2);
+  border-radius: 10px; outline: none;
+}
+.upcard input:focus { border-color: var(--accent-30); }
+.upcard-row { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* the ?perf benchmark summary */
+#perfcard { width: min(560px, 92%); }
+/* the Timing tab: the log takes the canvas's slot in the details sheet */
+#d-perf { aspect-ratio: 16 / 9; max-height: none; }
+#d-perf[hidden] { display: none; }
+.tabbtns { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+.perfpre {
+  margin: 0; padding: 10px 12px; max-height: min(320px, 42vh); overflow: auto;
+  font: 400 10.5px/1.55 var(--mono); color: var(--muted); text-align: left;
+  white-space: pre; background: rgba(7, 9, 9, .8);
+  border: 1px solid var(--line); border-radius: 10px;
+}
+.chip a { color: inherit; text-decoration: underline; }
+
+/* the in-app camera recorder */
+.camrec {
+  position: fixed; inset: 0; z-index: 60; background: #000;
+  display: flex; flex-direction: column;
+}
+.camrec video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.camrec-top { position: absolute; top: 14px; left: 14px; }
+.camrec-hint {
+  position: absolute; left: 50%; bottom: 108px; transform: translateX(-50%);
+  padding: 6px 14px; border-radius: var(--pill);
+  background: rgba(7, 9, 9, .7); backdrop-filter: blur(4px);
+  font: 400 12px var(--mono); color: var(--muted); white-space: nowrap;
+}
+.camrec-hint b { color: var(--accent); }
+.camrec-row {
+  position: absolute; left: 0; right: 0; bottom: 26px;
+  display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+  padding: 0 22px;
+}
+
+.camrec-time { justify-self: end; font: 500 13px var(--mono); color: var(--paper); }
+.camrec-btn {
+  position: relative; width: 64px; height: 64px; border-radius: 50%;
+  cursor: pointer; padding: 0;
+  border: 4px solid rgba(230, 236, 235, .9); background: transparent;
+  justify-self: center;
+}
+.camrec-btn::after {
+  content: ''; position: absolute; left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  width: 46px; height: 46px; border-radius: 50%;
+  background: #e5484d; transition: border-radius .15s, width .15s, height .15s;
+}
+.camrec-btn[data-on="1"]::after { width: 26px; height: 26px; border-radius: 6px; }
+
+.upload-btns { display: flex; gap: 8px; align-items: center; }
+
+/* capture-mode toggle + photo-mode shutter */
+.camrec-mode {
+  position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+  display: flex; padding: 3px; gap: 2px;
+  background: rgba(7, 9, 9, .65); backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, .12); border-radius: var(--pill);
+}
+.camrec-mode button {
+  min-width: 78px; padding: 7px 16px; border-radius: var(--pill);
+  font: 500 13px var(--sans, system-ui); color: rgba(230, 236, 235, .65);
+}
+.camrec-mode button[aria-pressed="true"] { background: rgba(230, 236, 235, .92); color: #0b0e0e; }
+.camrec-btn[data-mode="photos"] { border-color: var(--accent); }
+.camrec-btn[data-mode="photos"]::after { background: var(--paper); }
+.camrec-done {
+  position: absolute; right: 22px; bottom: 108px;
+}
+.camrec-flash video { filter: brightness(1.7); }
+
+.runs a { color: var(--accent); text-decoration: none; }
+.runs a:hover { text-decoration: underline; }
+
+/* the restored capture: a small tile like the test sets, no pill */
+.lastcap {
+  padding: 4px 4px 5px; border: 1px solid transparent; border-radius: 12px;
+  overflow: hidden; text-align: center; cursor: pointer;
+  transition: border-color .14s, background .14s;
+}
+.lastcap img {
+  display: block; width: 74px; aspect-ratio: 16 / 10; object-fit: cover;
+  background: var(--panel-2); opacity: .75; transition: opacity .14s;
+  border-radius: 8px;
+}
+.lastcap span {
+  display: block; margin-top: 5px;
+  font: 500 11px var(--mono); color: var(--dim); letter-spacing: .02em;
+  white-space: nowrap;
+}
+.lastcap:hover { background: var(--panel-2); }
+.lastcap:hover img { opacity: 1; }
+
+/* breathing room above Start training (the removed paragraph used to provide it) */
+.startrow { margin-top: 18px; }   /* the gap the Start button used to carry */
+
+/* capture close, top right */
+.camrec-x {
+  position: absolute; top: 14px; right: 14px; z-index: 2;
+  width: 34px; height: 34px; border-radius: 50%; cursor: pointer;
+  display: grid; place-items: center;
+  background: rgba(7, 9, 9, .65); backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, .12);
+  color: var(--paper); font-size: 19px; line-height: 1;
+}
+.camrec-x:hover { background: rgba(7, 9, 9, .85); }
+
+/* the upload box is controls-only now */
+.upload { justify-content: center; }
+.upload-btns { align-items: center; }
+
+/* the record dot (kept for when video capture returns) */
+.recdot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: #e5484d; margin-right: 7px; vertical-align: 0;
+}
+.capicon { width: 15px; height: 15px; margin-right: 7px; vertical-align: -3px; }
+
+/* the primary CTA: gradient accent, inner sheen, soft glow, gentle lift —
+   modern without theatrics. A CLASS, not an id: the treatment belongs to
+   whichever action is primary on the card (View on trained scenes, Start
+   everywhere else). */
+.btn-cta:not([disabled]) {
+  background: linear-gradient(180deg, #4be0cd, #23c2af);
+  color: #032420;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .28),
+    0 0 18px 2px var(--accent-30),
+    0 1px 2px rgba(0, 0, 0, .35);
+  transition: transform .12s ease, box-shadow .16s ease, filter .16s ease;
+}
+.btn-cta:not([disabled]):hover {
+  filter: brightness(1.06);
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .3),
+    0 0 26px 4px rgba(47, 212, 193, .42),
+    0 2px 4px rgba(0, 0, 0, .3);
+}
+.btn-cta:not([disabled]):active {
+  transform: translateY(0);
+  filter: brightness(.98);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .18),
+    0 0 10px 1px rgba(47, 212, 193, .3);
+}
+
+/* bright only when actually available — disabled reads as a quiet outline */
+.btn-cta[disabled] {
+  background: transparent; color: var(--dim);
+  border: 1px solid var(--line); cursor: default;
+}
+
+label.btn { cursor: pointer; }
+
+/* the SOG compression card: stage name + determinate bar */
+/* the train chooser: wrapped description, x in the corner */
+.lt-desc {
+  display: block; font: 400 13px var(--ui); color: var(--muted);
+  line-height: 1.5; padding-right: 20px;
+}
+.upcard .lt-x { top: 10px; right: 10px; }
+.sog-status {
+  display: block; font: 400 12px var(--mono); color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* the no-WebGPU notice: quiet, specific, sits above the upload buttons */
+.gpuwarn {
+  margin: 16px auto 4px; max-width: 54ch; text-align: left;
+  padding: 12px 16px; border: 1px solid rgba(242, 160, 63, .35);
+  border-radius: 12px; background: rgba(242, 160, 63, .06);
+  font-size: 12.5px; line-height: 1.55; color: var(--muted);
+}
+.gpuwarn > b { display: block; margin-bottom: 4px; color: var(--paper); font-weight: 600; }
+.gpuwarn b { color: var(--paper); font-weight: 500; }
+
+/* the selected set describes itself under the preset row */
+.setdesc {
+  margin: 2px 0 0; text-align: center;
+  font-size: 12.5px; line-height: 1.55; color: var(--muted);
+}
+.setdesc b { color: var(--paper); font-weight: 600; }
+.setdesc a { color: var(--accent); text-decoration: none; margin-left: 2px; }
+.setdesc a:hover { text-decoration: underline; }
+.setdesc .approx { color: var(--dim); margin-left: 8px; }
+
+/* solve-failure card: plain words + the capture rules that matter */
+.failcard {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(420px, 88%);
+  z-index: 60;
+}
+.fail-why { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.fail-tips { margin: 2px 0 4px; padding-left: 18px; display: grid; gap: 7px; }
+.fail-tips li { font-size: 12.5px; color: var(--muted); line-height: 1.45; }
+.fail-tips b { color: var(--paper); }
+
+/* ── shared creations: the gallery wall + share dialog extras ─────────── */
+a.cbtn { text-decoration: none; }
+.upcard-opt {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--muted); line-height: 1.4;
+}
+.upcard-opt select {
+  flex: 1; padding: 7px 10px; border-radius: 9px;
+  border: 1px solid var(--line-2); background: rgba(7, 9, 9, .8);
+  color: var(--paper); font-size: 13px;
+}
+.upcard-opt input[type="checkbox"] { accent-color: var(--accent); }
+/* the one line under the publish toggle that says what it means */
+.sh-hint { display: block; font-size: 11.5px; color: var(--muted); margin: -4px 0 2px 25px; }
+#gallery { margin-top: 2px; }
+/* the wall is a FEED: post-style cards, one under the other, the whole
+   card is the View action */
+.galrow {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 26px; padding: 12px 0 6px;
+}
+.galtile {
+  display: flex; flex-direction: column; gap: 5px;
+  width: min(640px, 100%);
+  text-decoration: none; border-radius: 0;
+  padding: 10px; margin: -10px 0;   /* the hover halo, without shifting layout */
+  background: transparent;
+  transition: background .15s;
+  text-align: left;
+}
+.galtile:hover { background: rgba(48, 58, 60, .7); }
+.galtile img { transition: filter .15s; }
+.galtile:hover img { filter: brightness(1.06); }
+.galtile img {
+  width: 100%; height: auto; aspect-ratio: 16 / 9; object-fit: cover;
+  border-radius: 12px; background: #0b0e0f; display: block;
+}
+.galname {
+  margin-top: 3px;
+  font: 600 17px var(--sans, system-ui); color: var(--paper);
+}
+.galdesc {
+  font-size: 14px; line-height: 1.55; color: var(--muted);
+}
+.galmeta { font: 400 12px var(--mono); color: var(--dim); letter-spacing: .02em; }
+
+/* wall tabs + the Mine management strip */
+/* the divider where the visitor's own tiles end and the presets begin —
+   shown only when both sides exist (the wall is ONE list, own-first) */
+.galsep {
+  width: min(640px, 100%);
+  display: flex; align-items: center; gap: 12px;
+  color: var(--dim); font: 400 11px var(--mono);
+  letter-spacing: .1em; text-transform: uppercase;
+}
+.galsep::before, .galsep::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.galtabs { width: min(640px, 100%); margin-left: auto; margin-right: auto; }
+.galtabs span { display: inline-flex; gap: 14px; }
+/* the wall header speaks exactly like the Benchmarks label; with two tabs
+   the inactive one just fades */
+.galtabs b {
+  font: inherit; letter-spacing: inherit; text-transform: inherit;
+  color: inherit; font-weight: 400; cursor: pointer; opacity: .5;
+}
+.galtabs b.on { opacity: 1; }
+.galmanage {
+  display: flex; align-items: center; gap: 6px; margin-top: 2px;
+}
+.galmanage select {
+  flex: 1; min-width: 0; font-size: 10.5px; padding: 3px 4px;
+  border-radius: 6px; border: 1px solid var(--line-2);
+  background: rgba(7, 9, 9, .8); color: var(--paper);
+}
+.galmanage a, .galmanage button {
+  font-size: 10.5px; color: var(--muted); background: none;
+  border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px;
+  cursor: pointer; text-decoration: none;
+}
+.galmanage a:hover, .galmanage button:hover { color: var(--paper); border-color: var(--muted); }
+.galmanage [data-a="del"][data-arm="1"] { color: #f2743f; border-color: #f2743f; }
+
+/* the stand-in while a shared creation's SOG streams: the tile's own image,
+   full-bleed and slightly dimmed, fading out when the model takes over */
+#share-hero {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; opacity: .45; filter: saturate(.9);
+  transition: opacity .6s ease;
+}
+#share-hero.gone { opacity: 0; }
+
+/* the focused detail card: back arrow + hero image above the set's story */
+.card-back {
+  position: absolute; top: 10px; left: 12px;
+  width: 46px; height: 46px; border-radius: 50%;
+  color: var(--muted); font: 300 30px/1 var(--ui);
+  display: flex; align-items: center; justify-content: center;
+  padding-bottom: 4px;
+}
+.card-back:hover { color: var(--paper); background: var(--panel-2); }
+/* training facts under the hero: what this model is, in numbers */
+.detail-stats {
+  display: flex; flex-wrap: wrap; justify-content: center;
+  gap: 4px 26px; margin-bottom: 14px;
+}
+.detail-stats b {
+  display: block; font: 600 17px/1.2 var(--display); color: var(--paper);
+  letter-spacing: -.01em;
+}
+.detail-stats span {
+  display: block; font: 500 9.5px var(--mono); color: var(--dim);
+  letter-spacing: .07em; text-transform: uppercase;
+}
+.detail-hero {
+  /* the hero holds the text column's width — not the fullscreen card's */
+  width: min(600px, 100%); max-height: 220px; object-fit: cover;
+  border-radius: 12px; margin-bottom: 14px; display: block;
+  background: #0b0e0f;
+}
+#detail-body .startrow { margin-top: 16px; }
+#detail-view { margin-right: 10px; }
+@media (max-width: 640px) {
+  .detail-hero { max-height: 160px; }
+}
+
+/* video review: the scan's scores as a timeline, a range to trim, the picks as a filmstrip */
+/* fullscreen sheet on every device; content column capped at 1200 px */
+#vidcard { position: fixed; inset: 0; transform: none; width: auto; border-radius: 0; border: 0; overflow-y: auto; gap: 14px; padding: clamp(16px, 4vh, 40px) clamp(16px, 6vw, 80px); justify-content: center; background: rgba(10, 13, 13, .985); }
+#vidcard > * { width: min(1200px, 100%); margin: 0 auto; }
+#vidcard > .card-x { position: absolute; top: 14px; right: 16px; width: 36px; margin: 0; z-index: 1; }
+#vidcard .vid-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+#vidcard .vid-head b { font: 600 22px var(--ui); }
+#vidcard .vid-head .prep-sub { font-size: 13px; }
+.stage #vidcard canvas { position: static; inset: auto; height: auto; }   /* the card lives in the stage, whose canvases are absolute */
+.stage #vidcard .vid-tl { display: block; width: 100%; height: clamp(160px, 38vh, 440px); border-radius: 10px; background: rgba(7, 9, 9, .8); border: 1px solid var(--line); touch-action: none; cursor: crosshair; }
+.stage #vidcard .vid-strip { display: block; width: 100%; height: clamp(64px, 15vh, 170px); border-radius: 8px; background: rgba(7, 9, 9, .8); border: 1px solid var(--line); }
+.vid-read { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font: 400 14px var(--mono); color: var(--muted); }
+.vid-gap { display: flex; align-items: center; gap: 10px; font: 400 12px var(--mono); color: var(--muted); }
+.vid-gap select { flex: none; background: var(--panel-2); color: var(--paper); border: 1px solid var(--line-2); border-radius: 8px; padding: 5px 8px; font: 500 12px var(--mono); outline: none; }
+.vid-read b { font: 600 17px var(--ui); color: var(--paper); }
+.vid-read .linkish { cursor: pointer; background: none; border: 0; }
+.vid-legend { display: flex; gap: 16px; flex-wrap: wrap; font: 400 12.5px var(--mono); color: var(--dim); }
+.vid-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; margin-right: 5px; }
+.vid-legend i.focus { background: var(--accent-30); border-top: 2px solid var(--accent); box-sizing: border-box; }
+.vid-legend i.pick { background: var(--paper); width: 2px; height: 10px; border-radius: 0; }
+.vid-legend i.blur { background: var(--red); }
+.vid-legend i.cut { background: none; border-left: 1px dashed var(--muted); width: 1px; }
+.vid-legend i.range { background: var(--accent-14); border: 1px solid var(--accent); box-sizing: border-box; }
+#vidcard .upcard-row { align-items: center; justify-content: space-between; }
+#vidcard .upcard-row .fine { margin: 0; color: var(--dim); font-size: 13.5px; max-width: 60ch; }
+#vidcard .upcard-row .btn { white-space: nowrap; }
+@media (max-width: 560px) {
+  /* phones: the review is a fullscreen sheet, the timeline gets the height */
+  #vidcard { padding: calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom)); justify-content: flex-start; gap: 10px; }
+  #vidcard .vid-head b { font-size: 18px; }
+  .stage #vidcard .vid-tl { height: 170px; }
+  .stage #vidcard .vid-strip { height: 84px; }
+  #vidcard .upcard-row > span .btn { flex: 1; }
+  #vidcard .vid-head { flex-direction: column; gap: 2px; }
+  #vidcard .upcard-row { flex-wrap: wrap; gap: 10px; }
+  #vidcard .upcard-row .fine { flex: 1 1 100%; }
+  #vidcard .upcard-row > span { flex: 1 1 100%; justify-content: flex-end; }
+  #vidcard .vid-read { flex-wrap: wrap; }
+}
+
+/* saved run titles and details */
+.galname { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+
+/* ?admin — the community moderation sheet */
+#admincard { position: fixed; inset: 0; transform: none; width: auto; border-radius: 0; border: 0; overflow-y: auto; gap: 14px; padding: clamp(16px, 4vh, 36px) clamp(16px, 6vw, 80px); justify-content: flex-start; background: rgba(10, 13, 13, .985); }
+#admincard > * { width: min(1100px, 100%); margin: 0 auto; }
+#admincard > .card-x { position: absolute; top: 14px; right: 16px; width: 36px; margin: 0; z-index: 1; }
+.adm-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.adm-head b { font: 600 22px var(--ui); color: var(--paper); }
+.adm-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font: 400 13px var(--ui); color: var(--muted); }
+.adm-manual input { width: 15ch; margin-left: 8px; padding: 7px 10px; font: 500 13px var(--mono); color: var(--paper); background: rgba(7, 9, 9, .8); border: 1px solid var(--line-2); border-radius: 8px; outline: none; }
+.adm-manual input:focus { border-color: var(--accent-30); }
+.adm-check { display: flex; align-items: center; gap: 6px; }
+.adm-check input { accent-color: var(--accent); }
+.adm-spacer { flex: 1; }
+.adm-list { display: flex; flex-direction: column; gap: 8px; }
+.adm-section { margin: 10px 0 2px; font: 400 11px var(--mono); color: var(--dim); letter-spacing: .1em; text-transform: uppercase; }
+.adm-row { display: grid; grid-template-columns: 112px 1fr auto auto; align-items: center; gap: 14px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.adm-row[data-kind="unlisted"] { opacity: .8; }
+.adm-thumb { display: block; width: 112px; aspect-ratio: 16 / 9; border-radius: 8px; overflow: hidden; background: #0b0e0f; }
+.adm-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.adm-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.adm-main b { font: 600 15px var(--ui); color: var(--paper); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.adm-meta { font: 400 12px var(--mono); color: var(--dim); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.adm-meta code { font: inherit; color: var(--muted); }
+.adm-by { display: inline-flex; align-items: center; gap: 6px; color: var(--paper); font: 500 12.5px var(--ui); }
+.adm-by em { font-style: normal; }
+.adm-state { font: 500 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line-2); color: var(--muted); }
+.adm-state[data-state="listed"] { color: var(--accent); border-color: var(--accent-30); }
+.adm-state[data-state="unlisted"] { color: var(--red); border-color: rgba(226, 102, 79, .4); }
+.adm-acts { display: flex; gap: 8px; align-items: center; }
+.adm-acts .btn { padding: 7px 14px; font-size: 13px; text-decoration: none; }
+.adm-empty { color: var(--dim); }
+@media (max-width: 700px) {
+  .adm-row { grid-template-columns: 88px 1fr; }
+  .adm-state { grid-column: 2; justify-self: start; }
+  .adm-acts { grid-column: 1 / -1; }
+}
+
+/* Local captures and runs saved on this device. */
+.galgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 26px 18px; width: min(1100px, 100%); margin: 6px auto 0; padding: 10px 0 14px; }
+.galgrid .galtile { width: 100%; margin: 0; }
+.galgrid .galsep, .galgrid .orline { grid-column: 1 / -1; }
+@media (max-width: 1000px) { .galgrid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 640px) { .galgrid { grid-template-columns: 1fr; } }
+
+/* the finished run's call to action: Share (accent) — downloads live inside the share sheet */
+/* same pill as Compress / Train beside it; only the icon is added */
+.btn-share svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+#upcard { position: relative; max-height: 92vh; overflow-y: auto; }
+#upcard > .card-x { position: absolute; top: 8px; right: 8px; width: 32px; height: 32px; font-size: 24px; }
+.sh-form { display: flex; flex-direction: column; gap: 12px; }
+.sh-dl { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; padding-top: 10px; border-top: 1px solid var(--line); }
+.sh-dl-head { font: 400 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); margin: 0 0 4px 10px; }
+.sh-dl button { text-align: left; padding: 8px 10px; border-radius: 8px; background: none; border: 0; color: inherit; cursor: pointer; }
+.sh-dl button:hover { background: rgba(255, 255, 255, .055); }
+.sh-dl b { display: block; font: 600 13px var(--ui); color: var(--paper); }
+.sh-dl span { font: 400 11.5px var(--mono); color: var(--dim); }
+/* share sheet, link mode: the scene's link with copy / native share / enter */
+.sh-link { display: flex; flex-direction: column; gap: 10px; }
+.sh-link input { width: 100%; box-sizing: border-box; font-size: 12px; color: var(--muted); }
+/* ...except the publish toggle: the rule above is for the URL field */
+.sh-link input[type="checkbox"] { width: auto; flex: none; }
+.sh-manage { cursor: pointer; color: var(--paper); }
+.sh-linkrow { justify-content: flex-end; align-items: center; flex-wrap: wrap; }
+.sh-enter { margin-right: auto; font-size: 13px; }
+.sh-linkrow .btn { text-decoration: none; padding: 8px 14px; font-size: 13px; }
+
+/* ── avatar mode (app/avatar) ─────────────────────────────────────────────── */
+/* the avatar route, on the start-training card (above the Start row) */
+.av-choice {
+  display: flex; align-items: flex-start; gap: 10px; cursor: pointer;
+  margin: 16px 0 2px; padding: 11px 13px;
+  border: 1px solid var(--line-2); border-radius: 12px; background: var(--panel-2);
+  font: 500 14px var(--sans, system-ui); color: var(--paper); text-align: left;
+}
+.av-choice input { width: 16px; height: 16px; margin: 1px 0 0; flex: none; accent-color: var(--accent); }
+.av-choice span { display: block; min-width: 0; }
+.av-choice small { display: block; margin-top: 3px; font-weight: 400; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+.av-choice:hover { border-color: var(--accent-30); }
+.av-strip { display: flex; gap: 6px; overflow-x: auto; padding: 8px 0 8px; scroll-snap-type: x proximity; cursor: grab; scrollbar-width: thin; touch-action: pan-x; user-select: none; }
+.av-strip:active { cursor: grabbing; }
+.av-strip canvas { flex: 0 0 auto; scroll-snap-align: start; border-radius: 4px; }
+.av-fine { margin: 6px 0 0; color: var(--dim); font-size: 13.5px; }
+.av-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+@media (max-width: 640px) { .av-actions .btn { flex: 1; } }
+.av-strip canvas { height: 160px !important; width: auto !important; border-radius: 6px; background: #fff; flex: none; }
+/* The avatar's decision card. ABSOLUTE in the stage and anchored under the
+   dock, not centred in the viewport: centred, it sat exactly in front of the
+   face it was asking about — and at 340 px the three photos and two buttons
+   were unreadable (the user, 2026-09-18). The progress itself is in the dock
+   (.av-bar), so this card exists only while a stage asks something. */
+.av-card {
+  /* below the done-state controls (.controls: top 14px, 32px tall), so the
+     Train/Share row stays reachable while a stage asks its question */
+  position: absolute; left: 50%; top: 58px; transform: translateX(-50%);
+  width: fit-content;
+  min-width: min(520px, calc(100% - 24px)); max-width: min(880px, calc(100% - 24px));
+  max-height: calc(100% - 70px); overflow-y: auto; gap: 10px; z-index: 6;
+}
+.av-card .vid-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding-right: 30px; }
+.av-card .vid-head b { font: 600 17px var(--ui); }
+.av-card > .card-x { position: absolute; top: 10px; right: 12px; width: 32px; margin: 0; }
+.av-card .av-overlay { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0; }
+.av-card .av-overlay canvas { border-radius: 6px; flex: none; }
+.av-card .av-overlay canvas, .av-strip canvas { position: static; display: block; }
+/* what the picture shows, and the stage's own numbers under it */
+.av-shotcap { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+
+/* The finished avatar's action: top right, UNDER the view controls, never in
+   front of the model. It has to be walked around and inspected — "there should
+   be no ui in front of it" (the user, 2026-09-18). */
+.av-act {
+  position: absolute; top: 56px; right: 14px; z-index: 6;
+  width: min(320px, calc(100% - 28px));
+  display: flex; flex-direction: column; gap: 9px;
+  padding: 12px 14px 13px; border-radius: 14px;
+  background: rgba(10, 13, 13, .92); border: 1px solid var(--line-2);
+  backdrop-filter: blur(8px);
+}
+.av-act-head { font: 600 14px var(--ui); color: var(--paper); }
+.av-act .upcard-row { display: flex; flex-direction: column; align-items: stretch; gap: 9px; margin: 0; }
+.av-act .upcard-row p.fine { margin: 0; font-size: 12.5px; line-height: 1.45; color: var(--muted); }
+.av-act .upcard-row > span { display: flex; gap: 8px; }
+.av-act .upcard-row .btn { flex: 1; white-space: nowrap; padding: 9px 12px; font-size: 13px; }
+.av-act #av-status { margin: 0; font-size: 12.5px; color: var(--dim); }
+/* the walk preview's own row, above the actions */
+.av-walk { display: flex; align-items: center; gap: 8px; }
+.av-walk .btn { flex: none; padding: 7px 12px; font-size: 12.5px; }
+.av-walk span { font: 400 12px var(--mono); color: var(--dim); }
+@media (max-width: 720px) {
+  .av-act { top: auto; bottom: 14px; right: 8px; left: 8px; width: auto; }
+}
+/* the text and the buttons share one line at this width */
+.av-card .upcard-row { align-items: center; margin-top: 10px; flex-wrap: nowrap; gap: 14px; }
+.av-card .upcard-row .btn { white-space: nowrap; flex: none; }
+.av-card .upcard-row p.fine { flex: 1 1 auto; min-width: 0; margin: 0; color: var(--muted); font-size: 13.5px; line-height: 1.5; }
+.av-card #av-status { margin: 8px 0 0; color: var(--dim); font-size: 13px; }
+@media (max-width: 720px) {
+  .av-card { top: 54px; width: calc(100% - 16px); min-width: 0; max-width: none; max-height: calc(100% - 62px); padding: 14px 14px 12px; }
+  .av-card .upcard-row { flex-wrap: wrap; gap: 10px; }
+  .av-card .upcard-row p.fine { flex: 1 1 100%; margin: 0 0 4px; }
+  .av-card .upcard-row > span { flex: 1 1 100%; justify-content: flex-end; display: flex; }
+  .av-card .upcard-row > span .btn { flex: 1; }
+}
+/* the matte + "is this the person?" checkpoint: a sheet over the STAGE, so
+   the dock's beats stay visible above it. Nothing is rendered yet at that
+   point in a run, and the cut-outs have to be seen big to be judged. */
+.av-sheet {
+  position: absolute; inset: 0; left: 0; top: 0; transform: none;
+  width: auto; max-width: none; border: 0; border-radius: 0;
+  overflow-y: auto; gap: 12px; justify-content: flex-start;
+  padding: clamp(14px, 3vh, 30px) clamp(16px, 5vw, 64px);
+  background: rgba(10, 13, 13, .985); z-index: 6;
+}
+.av-sheet > * { width: min(1200px, 100%); margin: 0 auto; }
+.av-sheet .vid-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.av-sheet .vid-head b { font: 600 20px var(--ui); }
+.stage .av-sheet canvas { position: static; inset: auto; height: auto; }   /* the stage's own canvases are absolute */
+.av-sheet .prep-cut { height: min(320px, 42vh); }
+
+/* Keep utility controls light beside the main capture and training actions. */
+#btn-xr-help, #btn-training-visuals, #xr-device-guide {
+  padding: 4px 9px;
+  font-size: 11px;
+  line-height: 1.2;
+}

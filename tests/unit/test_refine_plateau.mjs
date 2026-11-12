@@ -5,7 +5,6 @@ import { scorePlateaued } from '../../src/session.js';
 const sessionSource = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
 const trainerSource = readFileSync(new URL('../../src/gs/trainer.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
-const browserSource = readFileSync(new URL('../../browser/app.js', import.meta.url), 'utf8');
 
 // ---- the detector on synthetic score curves --------------------------------
 const line = (n, i0, step, p0, slopePerKiter) =>
@@ -57,8 +56,6 @@ assert.equal((trainerSource.match(/growUntil \?\? 0\.90 \* this\.horizon/g) || [
 // ---- the mobile ceiling is 1M splats ----------------------------------------
 assert.match(appSource, /Math\.min\(phoneClass \? 1000000 : 2000000,/,
   'the app budgets mobiles to 1M splats');
-assert.match(browserSource, /Math\.min\(phone \? 1000000 : 2000000,/,
-  'the browser matches it');
 
 // ---- growth already plants splats where the error is ------------------------
 assert.match(trainerSource, /error-weighted donor draw \(only when the window carries any mass\)/,
@@ -73,7 +70,5 @@ assert.match(sessionSource, /this\._em\.emit\('event', \{ kind: 'overflow', iter
   'each increase emits once');
 assert.match(appSource, /if \(e\.kind === 'overflow' && S\._ovWarned !== \(S\.runId \?\? 'live'\)\) \{/,
   'the app flashes once per run');
-assert.match(browserSource, /else if \(e\.kind === 'overflow' && S\._ovWarned !== \(S\.runId \?\? 'live'\)\) \{/,
-  'the browser logs once per run');
 
 console.log('plateau-driven refine + 1M mobile ceiling + overflow warnings: passed');

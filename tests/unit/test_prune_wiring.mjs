@@ -9,8 +9,6 @@ const remote = readFileSync(new URL('../../src/gs/remote-trainer.js', import.met
 const session = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 const appHtml = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
-const browser = readFileSync(new URL('../../browser/app.js', import.meta.url), 'utf8');
-const browserHtml = readFileSync(new URL('../../browser/index.html', import.meta.url), 'utf8');
 
 // ---- the trainer culls by rendered mass, on demand -------------------------
 assert.match(trainer, /async softPrune\(ratioOverride = null\) \{/,
@@ -112,30 +110,6 @@ assert.match(app, /data-ratio="0\.25">Prune to ¼<\/button>/,
 assert.match(app, /id="cap-keep">Keep training at cap<\/button>/,
   'the ceiling card offers staying put');
 
-// ---- the browser mirrors it ------------------------------------------------
-assert.match(browserHtml, /<select id="opt-softprune">/,
-  'the browser settings offer soft prune');
-assert.match(browserHtml, /<option value="0\.3">Trim 30%<\/option>/,
-  'the trims run 5% to 30%');
-assert.match(browser, /softprune: readSoftprune\(\),/,
-  'the browser reads the setting');
-assert.match(browserHtml, /<input id="opt-softprune-custom" type="number" min="1" max="50"/,
-  'the browser offers a custom 1–50% trim');
-assert.match(browserHtml, /<button id="btn-prune" class="btn" disabled>Prune\/Grow<\/button>/,
-  'the run row carries a prune/grow button');
-assert.match(browser, /ui\.prune\.addEventListener\('click', showPrunePicker\);/,
-  'the button opens the ratio picker');
-assert.match(browser, /async function runPruneContinue\(ratio = 0\.5\) \{/,
-  'the flow prunes to the picked ratio, default half');
-assert.match(browser, /mk\('Prune to ¾', 'btn', \(\) => go\(0\.75\)\)/,
-  'the ceiling prompt offers pruning to three quarters');
-assert.match(browser, /mk\('Prune to ½', 'btn accent', \(\) => go\(0\.5\)\)/,
-  'the ceiling prompt offers pruning to half');
-assert.match(browser, /mk\('Prune to ¼', 'btn', \(\) => go\(0\.25\)\)/,
-  'the ceiling prompt offers pruning to a quarter');
-assert.match(browser, /mk\('Keep training at cap', 'btn', \(\) => \{/,
-  'the ceiling prompt offers staying put');
-
 // ---- prune/grow tandem: milestones, horizon stop, boosted regrowth --------
 assert.match(session, /\[\[1000, 0\.9\], \[2000, 0\.9\], \[3000, 0\.9\], \[4000, 0\.9\], \[5000, 0\.9\], \[6000, 0\.9\]\]/,
   'early milestones trim 10% every 1000 iterations through 6000');
@@ -159,11 +133,5 @@ assert.match(app, /data-grow="1">Grow now<\/button>/,
   'the manual picker offers a growth pass');
 assert.match(app, /async function runGrowNow\(\) \{/,
   'the flow triggers one immediate refine');
-assert.match(browser, /mk\('Grow now', runGrowNow\)/,
-  'the browser picker offers a growth pass');
-assert.match(browser, /mk\('Keep %', goCustom\)/,
-  'the browser picker offers a custom keep');
-assert.match(browser, /mk\('Prune to %', 'btn', goCustom\)/,
-  'the browser ceiling prompt offers a custom keep');
 
 console.log('prune-and-continue + soft-prune wiring: passed');

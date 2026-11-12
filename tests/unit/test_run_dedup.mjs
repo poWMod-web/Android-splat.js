@@ -5,7 +5,6 @@ import { captureSrcKey } from '../../app/js/store.js';
 
 const root = resolve(new URL('../..', import.meta.url).pathname);
 const app = readFileSync(resolve(root, 'app/js/app.js'), 'utf8');
-const browser = readFileSync(resolve(root, 'browser/app.js'), 'utf8');
 
 // the fingerprint: stable across entry shapes, sensitive to content
 const fresh = [{ name: 'a.jpg', size: 10 }, { name: 'b.jpg', size: 20 }];
@@ -43,12 +42,5 @@ assert.doesNotMatch(livePatch, /name:|thumb|recon|poses|createdAt/,
 assert.match(app, /id: runId, name: runName, \.\.\.\(srcKey \? \{ srcKey \} : \{\}\),/,
   'new records should carry the source key for the next run to adopt by');
 
-// the browser mirrors the same identity rules
-assert.match(browser, /captureSrcKey\(staged\.kind, stagedFiles\)/,
-  'the browser should fingerprint staged picks for adoption');
-assert.match(browser, /r\.srcKey === srcKey && r\.status !== 'finished'/,
-  'the browser should never adopt a finished record');
-assert.match(browser, /const \{ id: _id, name: _name, createdAt: _drop, \.\.\.patch \} = rec;/,
-  'browser adoption should keep the record’s name and identity');
 
 console.log('run identity: replace, never duplicate, never clobber: passed');
