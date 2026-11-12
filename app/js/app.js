@@ -1887,10 +1887,11 @@ async function open(preset, autostart = false) {
   $('btn-go').disabled = !!S.noGpu;
   $('btn-settings').disabled = false;
   $('card-x').hidden = true;
+  closeOverlays();
   $('start').hidden = true;
   $('detail').hidden = true;
   $('controls').hidden = true;
-  $('btn-new').hidden = true;
+  $('btn-new').hidden = false;   // the setup card is not home
   $('strip').innerHTML = '';
   dock('');
   vp.resize();
@@ -2427,12 +2428,34 @@ function backToSetup() {
   else showHome();
 }
 
+/** Dismiss every floating layer: modal cards (.upcard), capture dialogs
+ *  (.xr-dialog — closed, not just removed, so their promises resolve and
+ *  their object URLs are revoked), the Details sheet with its score graph,
+ *  and the About sheet. Every landing on the home wall or back on a
+ *  trained model funnels through here, so nothing opened on the previous
+ *  screen survives the trip. */
+function closeOverlays() {
+  document.querySelectorAll('.upcard').forEach((c) => c.remove());
+  document.querySelectorAll('.xr-dialog').forEach((d) => { if (d.open) d.close(); else d.remove(); });
+  if (!$('details').hidden) {
+    $('details').hidden = true;
+    syncDetailsUrl();
+    syncTrainingVisualsControl();
+  }
+  if (!$('about').hidden) $('about').hidden = true;
+  chart?.clearHover();
+  dchart?.clearHover();
+}
+
 /** The home wall, properly: the start card is NEVER revealed without its
  *  scenes mounted — a bare upload card with no presets is a bug, not a
  *  state. Every path that lands on home goes through here. */
 function showHome() {
+  closeOverlays();
   $('detail').hidden = true;
   $('start').hidden = false;
+  $('btn-new').hidden = true;   // home is where Back leads — it needs none
+  dock('');
   mountWall();
 }
 
@@ -3716,7 +3739,9 @@ async function restoreSession(src) {
     // the viewer is a navigable state: Back returns to the wall, never to
     // whatever page happened to precede the app
     if (!(history.state && history.state.sj)) history.pushState({ sj: 'viewer' }, '');
+    closeOverlays();
     $('start').hidden = true;
+    $('detail').hidden = true;
     flash('Loading the model …', 120000);
     // SOG + recon: the lite viewer — the engine renders the compressed splat
     // directly (sorted, WebGL2), nothing decodes to float arrays, and phones
@@ -5090,7 +5115,9 @@ async function renderShareThumb() {
  *  space's privacy) and present it like a finished run. */
 async function restoreShared(spaceId) {
   try {
+    closeOverlays();
     $('start').hidden = true;
+    $('detail').hidden = true;
     flash('Loading the shared creation …', 120000);
     const { resolveShare } = await import('./share.js');
     const sh = await resolveShare(spaceId);
@@ -5204,6 +5231,7 @@ function showDetail(setOrPreset) {
   $('btn-go').disabled = !!S.noGpu;
   $('start').hidden = true;
   $('detail').hidden = false;
+  $('btn-new').hidden = false;   // the setup card is not home
   // the card is a navigable UI state: Back must close IT, not leave the app
   if (!(history.state && history.state.sj === 'detail')) {
     history.pushState({ sj: 'detail' }, '');
@@ -5213,9 +5241,15 @@ function showDetail(setOrPreset) {
 // Back closes pushed UI layers (About sheet, the viewer, the detail card)
 // instead of navigating away — history walks the same steps the visitor sees
 addEventListener('popstate', () => {
-  if (!$('about').hidden) { $('about').hidden = true; return; }
-  if (S._viewerOpen) { closeViewerToHome(); return; }
-  if (!$('detail').hidden) { closeDetailCard(); return; }
+  // snapshot first: closing the overlays hides the sheets, and the pushed
+  // states below still have to walk in the same order as before
+  const aboutOpen = !$('about').hidden;
+  const viewerOpen = S._viewerOpen;
+  const detailOpen = !$('detail').hidden;
+  closeOverlays();   // modals and score graphs never survive a Back
+  if (aboutOpen) return;
+  if (viewerOpen) { closeViewerToHome(); return; }
+  if (detailOpen) { closeDetailCard(); return; }
   // back during a running solve/training: leave the same way the header
   // Back does — a page navigation home (the wall is never rendered OVER a
   // live scene; beforeunload asks before a training is thrown away)
@@ -5234,7 +5268,7 @@ function detailClose() {
 /** Close the setup card — back INTO the shared scene its Train came from,
  *  otherwise home to the wall. */
 function closeDetailCard() {
-  document.getElementById('failcard')?.remove();
+  closeOverlays();   // a subset (failcard) used to be removed here
   S.pendingShare = null;
   $('detail').hidden = true;
   if (S.state === 'ready' && S._fromSpace) {
@@ -5253,7 +5287,7 @@ function closeViewerToHome() {
   try { S.session && S.session.dispose(); } catch (e) { /* view-only facade */ }
   document.getElementById('cv-model')?.remove();
   document.getElementById('share-hero')?.remove();
-  document.getElementById('ltchoice')?.remove();
+  closeOverlays();   // modals and score graphs stay on the screen that opened them
   gpuCanvas = null;
   S.gen++;
   S.session = null; S.share = null; S.restored = null; S._localRun = null; S._securing = null;
@@ -5378,6 +5412,8 @@ function trainFromShare() {
   setStartStyle(true);
   $('btn-go').disabled = !!S.noGpu;
   $('btn-settings').disabled = false;   // open() normally arms the gear — this path skips it
+  closeOverlays();   // the viewer's sheets and cards stay behind
+  $('btn-new').hidden = false;   // the setup card is not home
   if (WALL_FIRST) {
     $('start').hidden = false;
   } else {
