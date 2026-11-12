@@ -71,6 +71,16 @@ export async function saveRun(rec) {
   pruneRuns().catch(() => {});
 }
 
+/** Stable identity for an own-capture pick: kind + sorted name:size pairs.
+ *  The same photos re-picked — or restored from the capture slot — produce
+ *  the same key, so a fresh run adopts (replaces) its stale same-source
+ *  record instead of duplicating the tile. Entries arrive as Files (fresh
+ *  picks) or { name, blob } (restored); both shapes read the same. */
+export function captureSrcKey(kind, files) {
+  const parts = (files || []).map((f) => `${f.name}:${f.size ?? f.blob?.size ?? 0}`).sort();
+  return `${kind}:${parts.length}:${parts.join(',')}`;
+}
+
 export async function patchRun(id, patch) {
   try {
     const d = await openDb2();

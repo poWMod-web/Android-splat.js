@@ -96,7 +96,7 @@ assert.match(app, /function androidNotifTick\(\)/,
   'training progress should tick the notification');
 assert.match(app, /function androidNotifStop\(finished\)/,
   'training end should settle the notification');
-assert.match(app, /S\.runId = resumeId \|\| `run_[\s\S]*?`;\s*androidNotifStart\(\);/,
+assert.match(app, /S\.runId = keepId \|\| `run_[\s\S]*?`;\s*androidNotifStart\(\);/,
   'every training run should be background-safe from the first cycle');
 assert.match(app, /S\.itersPerSec = m\.itersPerSec;\s*androidNotifTick\(\);/,
   'every metrics beat should offer the notification fresh stats');

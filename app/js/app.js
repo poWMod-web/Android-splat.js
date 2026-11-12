@@ -2717,38 +2717,62 @@ function startTraining() {
   }
   // local library: every run is listed from the moment it starts — a small
   // record now, the finished result later (see finish())
-  // a continuation keeps its run identity — same tile, same slot — whether
-  // it resumes a pause or refines a finished result; only fresh runs get a
-  // new record, so a continued result replaces the previous trained state
+  // run identity: a continuation keeps its record; a same-session re-entry
+  // (device-lost recovery, a double-pressed Start) keeps the live one —
+  // minting new here duplicated the tile on every fault recovery. Fresh
+  // runs resolve below: an own capture adopts its stale same-source
+  // record instead of duplicating it.
   const resumeId = S._resumeRunId;
   S._securing = null;   // the previous run's finish work, if any, is history now
   S._resumeRunId = null;
-  S.runId = resumeId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+  const keepId = resumeId || S.runId || null;
+  S.runId = keepId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
   androidNotifStart();   // background-safe from the first cycle
   S._ckptIter = 0;
   (async () => {
-    if (resumeId) {
+    const runGen = S.gen;
+    const pid = String((S.preset && S.preset.id) || '');
+    // own captures carry a stable source key — the adoption lookup below
+    const capKind = S._capRec && S._capRec.kind;
+    const capFiles = (S.preset && S.preset.files) || [];
+    const { saveRun, patchRun, listRuns, captureSrcKey } = await import('./store.js');
+    const srcKey = (pid === '__own' || pid === '__last') && capKind && capFiles.length
+      ? captureSrcKey(capKind + (S.preset.capture?.transforms ? '+poses' : ''), capFiles) : null;
+    // marking a record live moves only the training head (status, horizon,
+    // diagnostics) — name, thumb, poses and source photos stay untouched
+    const livePatch = () => ({
+      status: 'training', maxIters: S.maxIters, ...(srcKey ? { srcKey } : {}),
+      detailSolve: captureRunSolveDetails(),
+      detailProgress: captureRunProgressDetails(),
+      detailGpu: gpuFacts(false),
+    });
+    if (keepId) {
       // the record already exists (thumb, checkpoint, name, and for a
       // finished run its last result) — just mark it live; the run's own
       // checkpoints and its final result overwrite the trained state in
       // place while the record's original camera poses stay untouched
-      const { patchRun } = await import('./store.js');
-      await patchRun(resumeId, {
-        status: 'training', maxIters: S.maxIters,
-        detailSolve: captureRunSolveDetails(),
-        detailProgress: captureRunProgressDetails(),
-        detailGpu: gpuFacts(false),
-      });
-      return;
+      if (await patchRun(keepId, livePatch())) return;
+      // storage lost the record mid-run — recreate it under the same id
+    } else if (srcKey) {
+      // a fresh run of an already-run capture replaces the stale record
+      // instead of duplicating its tile — but only a stale INTERRUPTED
+      // one: finished results are never adopted (a re-run that fails must
+      // not eat a good result), and neither is a record written in the
+      // last minute (a live run in another tab)
+      const stale = (await listRuns().catch(() => []))
+        .find((r) => r.srcKey === srcKey && r.status !== 'finished' &&
+          Date.now() - (r.updatedAt || 0) > 60000);
+      if (stale && S.gen === runGen && await patchRun(stale.id, livePatch())) {
+        S.runId = stale.id;
+        return;
+      }
     }
-    const runId = S.runId, runGen = S.gen;
-    const pid = String((S.preset && S.preset.id) || '');
+    const runId = S.runId;
     // own scenes are SCENES, not photos — a continued run keeps the name it
     // already carries; the tile's description holds the capture details
     let runName = localRunName(S.preset);
-    const { saveRun, patchRun } = await import('./store.js');
     await saveRun({
-      id: runId, name: runName,
+      id: runId, name: runName, ...(srcKey ? { srcKey } : {}),
       status: 'training', createdAt: Date.now(), updatedAt: Date.now(),
       iter: S.iter || 0, maxIters: S.maxIters, splats: S.splats || 0, psnr: shownScore('train') ?? null,
       frames: (S.photos || []).length,

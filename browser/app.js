@@ -19,7 +19,7 @@ import { plyToSog } from './app/js/sog.js';
 import { zipStore } from './app/js/zip.js';
 import { saveBlob } from './app/js/download.js';
 import { Chart, psnrToApproxSsimPercent } from './app/js/chart.js';
-import { saveRun, patchRun, listRuns, deleteRun,
+import { saveRun, patchRun, listRuns, deleteRun, captureSrcKey,
   saveLastCapture, loadLastCapture, deleteLastCapture } from './app/js/store.js';
 
 const $ = (id) => document.getElementById(id);
@@ -1099,8 +1099,16 @@ function reconFacade() {
  *  library run keeps its record (status flips back to training). */
 async function saveRunStart(firstFile) {
   const ses = S.session;
+  const staged = S.staged || {};
+  // same pick, same key — restored captures fingerprint identically, so a
+  // re-run adopts its stale record instead of duplicating the tile
+  const stagedFiles = staged.kind === 'photos' ? [...(staged.images || []), ...(staged.jsons || [])]
+    : staged.file ? [staged.file] : [];
+  const srcKey = (staged.kind === 'photos' || staged.kind === 'video' || staged.kind === 'zip') && stagedFiles.length
+    ? captureSrcKey(staged.kind, stagedFiles) : null;
   const rec = {
     id: S.runId || `run-${Date.now()}`, name: S.runName || 'run',
+    ...(srcKey ? { srcKey } : {}),
     status: 'training', createdAt: Date.now(), updatedAt: Date.now(),
     iter: (ses && ses.trainer && ses.trainer.iter) || 0, maxIters: S.maxIters,
     splats: (ses && ses.trainer && ses.trainer.n) || 0,
@@ -1114,7 +1122,22 @@ async function saveRunStart(firstFile) {
       const { createdAt: _drop, ...patch } = rec;
       if (!await patchRun(rec.id, patch)) await saveRun(rec);
     } else {
-      await saveRun(rec);
+      // adopt a stale same-source record (interrupted, never finished,
+      // untouched for a minute) rather than duplicating its tile — the
+      // adoption keeps the record's name, thumb and source photos
+      let adopted = null;
+      if (srcKey) {
+        adopted = (await listRuns().catch(() => []))
+          .find((r) => r.srcKey === srcKey && r.status !== 'finished' &&
+            Date.now() - (r.updatedAt || 0) > 60000) || null;
+      }
+      if (adopted) {
+        S.runId = adopted.id;
+        const { id: _id, name: _name, createdAt: _drop, ...patch } = rec;
+        if (!await patchRun(adopted.id, patch)) await saveRun({ ...rec, id: adopted.id });
+      } else {
+        await saveRun(rec);
+      }
     }
   } catch { /* best-effort */ }
   S.runId = rec.id;
