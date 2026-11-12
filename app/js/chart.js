@@ -10,22 +10,39 @@ export function psnrToApproxSsimPercent(psnr) {
   return Math.max(0, Math.min(100, 100 / (1 + ratio ** 4)));
 }
 
-/** Samples dropped from the START of each drawn line: the first samples
- *  climb almost vertically off a cold start, pinning the floor far below
- *  the working range and flattening the rest of the curve. Raw samples
- *  stay stored — hover still reads exact values; only the line is cut. */
+/** Samples held from the START of each drawn line: nothing plots until
+ *  the series runs past these — the first samples climb almost vertically
+ *  off a cold start (large, disoriented splats) and would pin the floor
+ *  far below the working range. The hold is up front, not a trim after
+ *  the fact: short series draw nothing at all, so early points never
+ *  appear and then vanish. Raw samples stay stored regardless. */
 const SKIP_FIRST = 3;
 
-/** Centered 3-point moving average: damps sample-to-sample jitter so the
- *  trend reads instead of the noise. Edges reuse the nearest sample, so
- *  the line neither shortens nor shifts. */
-function smooth3(pts) {
-  if (pts.length < 3) return pts;
-  return pts.map(([iter, v], i) => {
-    const a = pts[Math.max(0, i - 1)][1];
-    const b = pts[Math.min(pts.length - 1, i + 1)][1];
-    return [iter, (a + v + b) / 3];
-  });
+/** Live plateau filter: snaps up to genuine rises, drifts down slowly,
+ *  and holds inside a noise deadband — the trend without the jitter.
+ *  attack: base rise gain per sample; snap: extra gain per unit of rise
+ *  (large steps latch almost fully); release: fall gain per sample;
+ *  deadband: smaller changes hold the level. Stateless across draws —
+ *  series() runs a fresh pass, so redraws, scale toggles and scrubs
+ *  can't desync the curve. Operates in raw dB; the caller converts. */
+export class LivePlateauFilter {
+  constructor(attack = 0.15, release = 0.02, deadband = 0.05, snap = 2.2) {
+    this.attack = attack; this.release = release;
+    this.deadband = deadband; this.snap = snap;
+    this.level = null;
+  }
+  update(x) {
+    if (this.level == null) { this.level = x; return x; }
+    const d = x - this.level;
+    if (Math.abs(d) < this.deadband) return this.level;   // noise: hold
+    if (d > 0) this.level += d * Math.min(1, this.attack + this.snap * d);
+    else this.level += d * this.release;                  // dips decay slowly
+    return this.level;
+  }
+  series(pts) {
+    this.level = null;
+    return pts.map(([iter, v]) => [iter, this.update(v)]);
+  }
 }
 
 export class Chart {
@@ -73,11 +90,17 @@ export class Chart {
     return { train: this.train, hold: this.hold };
   }
 
+  /** Raw post-hold samples (still in dB): the dots' material and the
+   *  hover's lookup — never the held-back cold start. */
+  _heldRaw(series) {
+    return series.length > SKIP_FIRST ? series.slice(SKIP_FIRST) : [];
+  }
+
   _displaySeries(series) {
-    const conv = series.map(([iter, value]) => [iter, this._displayValue(value)]);
-    // too short to trim: plot everything (early runs land here)
-    const trimmed = conv.length > SKIP_FIRST + 1 ? conv.slice(SKIP_FIRST) : conv;
-    return smooth3(trimmed);
+    const held = this._heldRaw(series);
+    if (!held.length) return [];
+    return new LivePlateauFilter().series(held)
+      .map(([iter, value]) => [iter, this._displayValue(value)]);
   }
 
   // top just fits the event dots; there are no x labels, so the bottom is
@@ -117,11 +140,17 @@ export class Chart {
     if (pw <= 0 || ph <= 0) return;
 
     const active = this._activeSeries();
+    const trainHeld = this._heldRaw(active.train);
+    const holdHeld = this._heldRaw(active.hold);
     const train = this._displaySeries(active.train);
     const hold = this._displaySeries(active.hold);
     const ghostTrain = this._displaySeries(this.ghost?.train || []);
     const ghostHold = this._displaySeries(this.ghost?.hold || []);
-    const ys = [...train, ...hold, ...ghostTrain, ...ghostHold].map((p) => p[1]);
+    // the raw dots behind the filtered lines: very small, very light —
+    // the honest scatter the curve summarizes (ghost stays line-only)
+    const trainDots = trainHeld.map(([iter, value]) => [iter, this._displayValue(value)]);
+    const holdDots = holdHeld.map(([iter, value]) => [iter, this._displayValue(value)]);
+    const ys = [...train, ...hold, ...ghostTrain, ...ghostHold, ...trainDots, ...holdDots].map((p) => p[1]);
     let lo = ys.length ? Math.min(...ys) : (this.scale === 'similarity' ? 0 : 10);
     let hi = ys.length ? Math.max(...ys) : (this.scale === 'similarity' ? 100 : 30);
     const minSpan = this.scale === 'similarity' ? 1 : 6;
@@ -186,6 +215,15 @@ export class Chart {
       line(ghostTrain, 'rgba(147,161,160,.35)', [4, 3], 1.2);
       line(ghostHold, 'rgba(147,161,160,.22)', [2, 3], 1.2);
     }
+    const dots = (pts, color) => {
+      if (!pts.length) return;
+      ctx.fillStyle = color;
+      for (const p of pts) {
+        ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 1.5 * dpr, 0, 7); ctx.fill();
+      }
+    };
+    dots(holdDots, 'rgba(242,160,63,.35)');
+    dots(trainDots, 'rgba(47,212,193,.30)');
     line(hold, '#f2a03f', [5, 3], 1.5);
     line(train, '#2fd4c1', null, 1.8);
 
@@ -205,10 +243,10 @@ export class Chart {
     }
 
     // hover readout
-    if (this.hover && active.train.length) {
+    if (this.hover && trainHeld.length) {
       const it = this._frac(this.hover.x) * this.maxIter;
       const near = (arr) => arr.length ? arr.reduce((a, p) => Math.abs(p[0] - it) < Math.abs(a[0] - it) ? p : a) : null;
-      const a = near(active.train), h = near(active.hold);
+      const a = near(trainHeld), h = near(holdHeld);
       const ev = this.events.find((e) => Math.abs(e.at * this.maxIter - it) < this.maxIter * .012);
       if (a) {
         const x = X(a[0]);

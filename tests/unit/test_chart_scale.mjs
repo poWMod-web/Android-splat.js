@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { Chart, psnrToApproxSsimPercent } from '../../app/js/chart.js';
+import { Chart, psnrToApproxSsimPercent, LivePlateauFilter } from '../../app/js/chart.js';
 
 const chartSource = readFileSync(new URL('../../app/js/chart.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
@@ -25,14 +25,16 @@ assert.equal(psnrToApproxSsimPercent(Infinity), 100);
 
 const chartCanvas = { getContext: () => ({}), addEventListener: () => {} };
 const scoreChart = new Chart(chartCanvas);
-scoreChart.train = [[0, 20], [100, 30]];
+// flat past the hold: the filter latches flats exactly, so the conversion
+// reads through sample by sample
+scoreChart.train = [[0, 25], [100, 25], [200, 25], [300, 25], [400, 25], [500, 25]];
 scoreChart.hold = [[0, 15], [100, 25]];
 scoreChart.scale = 'similarity';
 assert.deepEqual(scoreChart._activeSeries(), { train: scoreChart.train, hold: scoreChart.hold },
   'the approximate scale should reuse the PSNR samples, without a separate model-derived history');
 assert.deepEqual(scoreChart._displaySeries(scoreChart.train), [
-  [0, formula(20)], [100, formula(30)],
-], 'the graph should apply the requested PSNR-to-SSIM approximation to each sample');
+  [300, formula(25)], [400, formula(25)], [500, formula(25)],
+], 'the graph should apply the requested PSNR-to-SSIM approximation to each plotted sample');
 
 assert.match(chartSource, /const ratio = 18 \/ psnr/,
   'the graph should implement the requested approximation formula');
@@ -83,20 +85,32 @@ assert.match(appSource, /\$\('d-chart-wrap'\)\.hidden = vis !== 'chart'/,
 assert.match(appCss, /\.sheet-vis canvas\[hidden\]\s*\{\s*display:\s*none\s*;/,
   'inactive Details canvases should stay hidden despite the general canvas display rule');
 
-// the cold-start transient is trimmed from the drawn line so the working
-// range fills the plot; the line is damped with a 3-point window average
+// the cold start is HELD, not trimmed after the fact: short series draw
+// nothing at all, so early points never appear and then vanish
+const holdChart = new Chart(chartCanvas);
+holdChart.train = [[0, 10], [100, 12], [200, 14]];
+assert.deepEqual(holdChart._displaySeries(holdChart.train), [],
+  'the plot should hold back the first few samples entirely');
 const trimChart = new Chart(chartCanvas);
 trimChart.train = [[0, 10], [100, 12], [200, 14], [300, 16], [400, 18], [500, 20]];
-assert.deepEqual(trimChart._displaySeries(trimChart.train).map((p) => p[0]), [300, 400, 500],
-  'the plot should drop the first few samples from the drawn line');
-const smoothChart = new Chart(chartCanvas);
-smoothChart.train = [[0, 10], [100, 20], [200, 30]];
-const smoothed = smoothChart._displaySeries(smoothChart.train).map((p) => p[1]);
-assert.ok(Math.abs(smoothed[0] - (10 + 10 + 20) / 3) < 1e-9 &&
-  Math.abs(smoothed[1] - 20) < 1e-9 &&
-  Math.abs(smoothed[2] - (20 + 30 + 30) / 3) < 1e-9,
-  'the plot should dampen samples with a centered 3-point window average');
+const drawn = trimChart._displaySeries(trimChart.train);
+assert.deepEqual(drawn.map((p) => p[0]), [300, 400, 500],
+  'the plot should start the line past the held samples');
+assert.equal(drawn[0][1], 16,
+  'the filter should latch the first plotted sample');
 assert.match(chartSource, /SKIP_FIRST = 3/,
-  'the cold-start trim should drop the first three samples');
+  'the cold-start hold should cover the first three samples');
+// the live plateau filter: latch highs fast, hold noise, decay dips slowly
+const rise = new LivePlateauFilter(0.15, 0.02, 0.05, 2.2);
+assert.equal(rise.update(20), 20, 'the first sample latches the level');
+assert.equal(rise.update(20.02), 20, 'changes inside the deadband hold the level');
+assert.equal(rise.update(21), 21, 'a genuine rise snaps the level up');
+const fall = new LivePlateauFilter(0.15, 0.02, 0.05, 2.2);
+fall.update(20); fall.update(21);
+const dipped = fall.update(15);
+assert.ok(dipped > 20.5 && dipped < 21,
+  'a dip decays slowly instead of plunging the curve');
+assert.match(chartSource, /class LivePlateauFilter/,
+  'the curve should run through the plateau filter');
 
 console.log('PSNR and approximate SSIM graph scales: passed');
