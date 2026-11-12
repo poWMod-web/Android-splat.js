@@ -1560,7 +1560,8 @@ export class Session {
         this._lastSoftPrune = trainer.iter;
         const s = await trainer.softPrune();
         if (s.culled) {
-          this._log(`soft-prune @${trainer.iter}: culled ${s.culled} -> ${s.n} splats`);
+          this._log(`soft-prune @${trainer.iter}: culled ${s.culled} -> ${s.n} splats` +
+            (s.floorBound === 'ratchet' ? ' (growth ratchet held the floor)' : ''));
           this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...s });
         }
       }

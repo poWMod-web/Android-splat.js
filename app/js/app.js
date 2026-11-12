@@ -744,7 +744,7 @@ function boot() {
     st.lod = lodEnabled;
     st.lodLevels = lodCount;
     st.mcmc = $('set-mcmc').value;  // '' Auto | '1' on | '0' off
-    st.softprune = $('set-softprune').value;  // '' off | '0.1' trim 10% | '0.2' trim 20%
+    st.softprune = $('set-softprune').value;  // '' off | '0.05'–'0.3' trim fraction
     st.gpu = Math.min(100, Math.max(10, parseInt($('set-gpu').value, 10) || 100));
     showSettings();
     saveSettings();
@@ -2769,25 +2769,56 @@ function showCapCard(e) {
   card.id = 'capcard';
   card.innerHTML = `
     <b>Splat cap reached (${fmt(e.splats)})</b>
-    <span class="sog-status">Growth is full. Prune to half and grow on, or keep training at this size.</span>
-    <div class="row">
-      <button class="btn btn-accent" id="cap-prune">Prune to ½ &amp; continue</button>
-      <button class="btn" id="cap-keep">Keep training at cap</button>
+    <span class="sog-status">Growth is full. Prune and grow on, or keep training at this size.</span>
+    <div class="row" id="cap-pick">
+      <button class="btn" data-ratio="0.75">Prune to ¾</button>
+      <button class="btn btn-accent" data-ratio="0.5">Prune to ½</button>
+      <button class="btn" data-ratio="0.25">Prune to ¼</button>
+      <button class="btn linkish" id="cap-keep">Keep training at cap</button>
     </div>`;
   $('stage').appendChild(card);
+  card.querySelector('#cap-pick').addEventListener('click', (ev) => {
+    const r = ev.target && ev.target.dataset ? ev.target.dataset.ratio : null;
+    if (r == null || r === '') return;   // the keep button answers for itself
+    card.remove();
+    runPruneAndContinue(parseFloat(r));
+  });
   card.querySelector('#cap-keep').addEventListener('click', () => {
     card.remove();
     if (S.session) S.session.start();
     syncTrainButtons();
     flash('Training on at the cap — growth stays off.', 4000);
   });
-  card.querySelector('#cap-prune').addEventListener('click', () => {
+}
+
+/** Manual prune, any time: pick how much to keep, then the flow reseeds
+ *  the trainer and grows on (same promise-picker as the export card). */
+function showPrunePicker() {
+  const ses = S.session;
+  if (!ses || !ses.trainer || S._pruning) return;
+  document.getElementById('prunepick')?.remove();
+  const card = document.createElement('div');
+  card.className = 'upcard';
+  card.id = 'prunepick';
+  card.innerHTML = `
+    <b>Prune &amp; continue</b>
+    <span class="sog-status">Fewer splats, room to regrow — pick how much to keep.</span>
+    <div class="row" id="prunepick-pick">
+      <button class="btn" data-ratio="0.75">Keep ¾</button>
+      <button class="btn" data-ratio="0.5">Keep ½</button>
+      <button class="btn" data-ratio="0.25">Keep ¼</button>
+      <button class="btn linkish" data-ratio="">Cancel</button>
+    </div>`;
+  $('stage').appendChild(card);
+  card.querySelector('#prunepick-pick').addEventListener('click', (e) => {
+    const r = e.target && e.target.dataset ? e.target.dataset.ratio : null;
+    if (r == null) return;
     card.remove();
-    runPruneAndContinue();
+    if (r !== '') runPruneAndContinue(parseFloat(r));
   });
 }
 
-async function runPruneAndContinue() {
+async function runPruneAndContinue(ratio = 0.5) {
   const ses = S.session;
   if (!ses || !ses.trainer || S._pruning) return;
   S._pruning = true;
@@ -2805,7 +2836,7 @@ async function runPruneAndContinue() {
     const st = card.querySelector('#prune-status');
     const bar = card.querySelector('#prune-bar');
     let from = 0;
-    const out = await ses.pruneAndContinue(0.5, {
+    const out = await ses.pruneAndContinue(ratio, {
       onStatus: (m) => { if (st) st.textContent = String(m); },
       onProgress: (p) => {
         if (!from) from = p.currentCount;
@@ -5583,7 +5614,7 @@ function dock(kind) {
       $('t-finish').disabled = true;
       await S.session.finish();   // emits train-complete -> finish()
     });
-    $('t-prune').addEventListener('click', runPruneAndContinue);
+    $('t-prune').addEventListener('click', showPrunePicker);
     // the GPU usage slider, mid-training edition: the same persisted knob
     // as the settings panel, mirrored both ways, live on every input
     const tGpu = $('t-gpu');

@@ -2551,6 +2551,11 @@ export class GSTrainer {
     const ratio = cfg.ratio ?? 0.1;
     if (!(ratio > 0 && ratio < 1)) return { culled: 0, n: this.n };
     if (this.protect && this.iter < this.protect.until) return { culled: 0, n: this.n };
+    // an LOD level hold is a polish window at a fixed count — culling
+    // would eat the level out from under its snapshot
+    if (this.growLimit && this.growLimit < this.cap && this.n >= this.growLimit) {
+      return { culled: 0, n: this.n };
+    }
     const d = this.device;
     d.queue.writeBuffer(this.uniGather, 0, new Uint32Array([this.n, 2, 0, 0]));
     {
@@ -2569,9 +2574,12 @@ export class GSTrainer {
     const g = new Float32Array(this.bufGatherRead.getMappedRange(0, this.n * 16)).slice();
     this.bufGatherRead.unmap();
     const masses = new Float32Array(this.n);
-    for (let i = 0; i < this.n; i++) masses[i] = g[i * 4 + 2];
+    const logitOp = new Float32Array(this.n);
+    const meanLogS = new Float32Array(this.n);
+    for (let i = 0; i < this.n; i++) { masses[i] = g[i * 4 + 2]; logitOp[i] = g[i * 4]; meanLogS[i] = g[i * 4 + 3]; }
     const plan = planSoftPrune(masses, this.n, ratio, {
       minCull: cfg.minCull ?? 1024, floor: cfg.floor ?? 8192,
+      last: this._softPruneFloor || 0, cap: this.cap, logitOp, meanLogS,
     });
     if (!plan) return { culled: 0, n: this.n };
     this._ensureCompact();
@@ -2611,7 +2619,9 @@ export class GSTrainer {
     this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
     // row-indexed CPU state dies with the permutation: the census baseline
     this._lastReloc = null;
-    return { culled: plan.culled, n: this.n };
+    // the growth ratchet: the next prune (below the cap) holds this floor
+    this._softPruneFloor = plan.kept;
+    return { culled: plan.culled, n: this.n, floorBound: plan.floorBound };
   }
 
   /** Lazily built compaction kit: no buffers, no pipelines until the first

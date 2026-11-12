@@ -11,7 +11,9 @@ import { planSoftPrune, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES, CULLED } fro
   assert.equal(p.culled, 4000);
   assert.equal(p.threshold, 4000);
   for (let i = 0; i < 4000; i++) assert.equal(p.rank[i], CULLED, `row ${i} culled`);
-  for (let i = 4000; i < n; i++) assert.equal(p.rank[i], i - 4000, `row ${i} ranks ${i - 4000}`);
+  for (let i = 4001; i < n; i++) assert.equal(p.rank[i], i - 4001, `row ${i} ranks ${i - 4001}`);
+  assert.equal(p.rank[4000], 15999, 'the threshold tie ranks after the strict survivors');
+  assert.equal(p.floorBound, null, 'no floor binds on a clean cull');
 }
 
 // ---- ties fill in ascending row order (deterministic) ----------------------
@@ -36,6 +38,43 @@ import { planSoftPrune, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES, CULLED } fro
   assert.throws(() => planSoftPrune(ones, n, 0), /ratio must be in/);
   assert.throws(() => planSoftPrune(ones, n, 1), /ratio must be in/);
   assert.throws(() => planSoftPrune(new Float32Array(10), n, 0.2), /holds 10 rows/);
+}
+
+// ---- the growth ratchet: below the cap a prune never shrinks the curve ----
+{
+  const n = 20000;
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i;
+  // 20k now, 19k after the last prune: a 20% cull (→16k) is held at 19k
+  const p = planSoftPrune(masses, n, 0.2, { last: 19000, cap: 1000000, minCull: 1 });
+  assert.equal(p.kept, 19000, 'the ratchet holds the last post-prune count');
+  assert.equal(p.culled, 1000);
+  assert.equal(p.floorBound, 'ratchet');
+  // at the cap the ratchet releases: recycling is the point up there
+  const q = planSoftPrune(masses, n, 0.2, { last: 19000, cap: 20000 });
+  assert.equal(q.kept, 16000, 'at the cap the full cull goes through');
+  assert.equal(q.floorBound, null);
+  // regrowth past the floor prunes normally (the cull eats the regrowth)
+  const overshoot = new Float32Array(22000);
+  for (let i = 0; i < 22000; i++) overshoot[i] = i;
+  const r = planSoftPrune(overshoot, 22000, 0.2, { last: 16000, cap: 1000000 });
+  assert.equal(r.kept, 17600, 'a 20% cull of 22k lands on 17600, above the 16k floor');
+  assert.equal(r.floorBound, null);
+}
+
+// ---- structural tie-break: big-and-opaque outranks tiny-and-faint ---------
+{
+  const n = 20000;
+  const masses = new Float32Array(n).fill(7);   // every row ties
+  const logitOp = new Float32Array(n).fill(-4); // faint …
+  const meanLogS = new Float32Array(n).fill(-5); // … and tiny …
+  logitOp[15000] = 4; meanLogS[15000] = 2;       // … except one load-bearing giant
+  const p = planSoftPrune(masses, n, 0.5, { minCull: 1, floor: 1, logitOp, meanLogS });
+  assert.equal(p.kept, 10000);
+  assert.equal(p.rank[15000], 0, 'the giant survives first among equals');
+  // without the structure arrays the old ascending fill still rules
+  const q = planSoftPrune(masses, n, 0.5, { minCull: 1, floor: 1 });
+  for (let i = 0; i < 10000; i++) assert.equal(q.rank[i], i);
 }
 
 // ---- chunk plans cover every survivor exactly once -------------------------

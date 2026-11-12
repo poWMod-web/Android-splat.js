@@ -21,6 +21,12 @@ assert.match(trainer, /this\.pipeCompact = d\.createComputePipeline\(\{/,
   'compaction runs GPU-side');
 assert.match(trainer, /\|\| !!this\.opts\.softPrune\)\);/,
   'enabling soft-prune forces the stats accumulation its score needs');
+assert.match(trainer, /if \(this\.growLimit && this\.growLimit < this\.cap && this\.n >= this\.growLimit\) \{/,
+  'an LOD level hold pauses culling (polish, not churn)');
+assert.match(trainer, /this\._softPruneFloor = plan\.kept;/,
+  'each prune sets the growth-ratchet floor for the next one');
+assert.match(session, /growth ratchet held the floor/,
+  'the log names the ratchet when it binds');
 assert.match(trainer, /const capped = growPhase && this\.n >= limit && limit >= this\.cap;/,
   'the ceiling reports itself (true cap only — LOD holds stay quiet)');
 
@@ -59,31 +65,49 @@ assert.match(session, /kind: 'prune-continue', iter, \.\.\.out/,
 // ---- the full app: setting, button, card -----------------------------------
 assert.match(appHtml, /<select id="set-softprune">/,
   'the gear panel offers soft prune');
+assert.match(appHtml, /<option value="0\.3">Trim 30%<\/option>/,
+  'the trims run 5% to 30%');
 assert.match(app, /st\.softprune = \$\('set-softprune'\)\.value;/,
   'the selection persists into settings');
 assert.match(app, /trainerOpts\.softPrune = \{ ratio: parseFloat\(st\.softprune\), every: 3000, from: 6000 \};/,
   'fresh runs map it to trainer options');
 assert.match(app, /<button class="tbtn-sm" id="t-prune"/,
   'the training dock carries a manual prune button');
-assert.match(app, /\$\('t-prune'\)\.addEventListener\('click', runPruneAndContinue\);/,
-  'the button runs the flow');
-assert.match(app, /id="cap-prune">Prune to ½ &amp; continue<\/button>/,
-  'the ceiling card offers prune-and-continue');
+assert.match(app, /\$\('t-prune'\)\.addEventListener\('click', showPrunePicker\);/,
+  'the button opens the ratio picker');
+assert.match(app, /async function runPruneAndContinue\(ratio = 0\.5\) \{/,
+  'the flow prunes to the picked ratio, default half');
+assert.match(app, /id="prunepick-pick"/,
+  'the manual picker card offers the ratios');
+assert.match(app, /data-ratio="0\.75">Prune to ¾<\/button>/,
+  'the ceiling card offers pruning to three quarters');
+assert.match(app, /data-ratio="0\.5">Prune to ½<\/button>/,
+  'the ceiling card offers pruning to half');
+assert.match(app, /data-ratio="0\.25">Prune to ¼<\/button>/,
+  'the ceiling card offers pruning to a quarter');
 assert.match(app, /id="cap-keep">Keep training at cap<\/button>/,
   'the ceiling card offers staying put');
 
 // ---- the browser mirrors it ------------------------------------------------
 assert.match(browserHtml, /<select id="opt-softprune">/,
   'the browser settings offer soft prune');
+assert.match(browserHtml, /<option value="0\.3">Trim 30%<\/option>/,
+  'the trims run 5% to 30%');
 assert.match(browser, /softprune: ui\.softprune\.value,/,
   'the browser reads the setting');
 assert.match(browserHtml, /<button id="btn-prune" class="btn" disabled>Prune ½<\/button>/,
   'the run row carries a prune button');
-assert.match(browser, /ui\.prune\.addEventListener\('click', runPruneContinue\);/,
-  'the button runs the flow');
-assert.match(browser, /prune\.textContent = 'Prune to ½ & continue';/,
-  'the ceiling prompt offers prune-and-continue');
-assert.match(browser, /keep\.textContent = 'Keep training at cap';/,
+assert.match(browser, /ui\.prune\.addEventListener\('click', showPrunePicker\);/,
+  'the button opens the ratio picker');
+assert.match(browser, /async function runPruneContinue\(ratio = 0\.5\) \{/,
+  'the flow prunes to the picked ratio, default half');
+assert.match(browser, /mk\('Prune to ¾', 'btn', \(\) => go\(0\.75\)\)/,
+  'the ceiling prompt offers pruning to three quarters');
+assert.match(browser, /mk\('Prune to ½', 'btn accent', \(\) => go\(0\.5\)\)/,
+  'the ceiling prompt offers pruning to half');
+assert.match(browser, /mk\('Prune to ¼', 'btn', \(\) => go\(0\.25\)\)/,
+  'the ceiling prompt offers pruning to a quarter');
+assert.match(browser, /mk\('Keep training at cap', 'btn', \(\) => \{/,
   'the ceiling prompt offers staying put');
 
 console.log('prune-and-continue + soft-prune wiring: passed');

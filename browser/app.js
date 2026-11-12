@@ -2070,14 +2070,14 @@ ui.ply.addEventListener('click', async () => {
     ui.ply.disabled = false;
   }
 });
-async function runPruneContinue() {
+async function runPruneContinue(ratio = 0.5) {
   const s = S.session;
   if (!s || !s.trainer || S._pruning) return;
   S._pruning = true;
   ui.prune.disabled = true;
   try {
     setStatus('Pruning the model …');
-    const out = await s.pruneAndContinue(0.5, {
+    const out = await s.pruneAndContinue(ratio, {
       onStatus: (m) => setStatus(String(m).replace(/^prune: /, '')),
     });
     const d = out.delta == null ? 'no holdout to score against'
@@ -2091,7 +2091,7 @@ async function runPruneContinue() {
     ui.prune.disabled = S.phase !== 'train';
   }
 }
-ui.prune.addEventListener('click', runPruneContinue);
+ui.prune.addEventListener('click', showPrunePicker);
 /** The ceiling's question, asked inline in the status line: the session
  *  paused itself at a full cap — prune to half and grow on, or keep
  *  training at this size. */
@@ -2099,22 +2099,45 @@ function showCapPrompt(e) {
   const st = ui.status;
   st.replaceChildren();
   const span = document.createElement('span');
-  span.textContent = `Splat cap reached (${fmt(e.splats)}). `;
-  const prune = document.createElement('button');
-  prune.className = 'btn accent';
-  prune.textContent = 'Prune to ½ & continue';
-  const keep = document.createElement('button');
-  keep.className = 'btn';
-  keep.textContent = 'Keep training at cap';
-  st.append(span, prune, ' ', keep);
-  prune.addEventListener('click', () => {
-    setStatus('Pruning the model …');
-    runPruneContinue();
-  });
-  keep.addEventListener('click', () => {
-    if (S.session) S.session.start();
-    setStatus('Training on at the cap — growth stays off.');
-  });
+  span.textContent = `Splat cap reached (${fmt(e.splats)}): `;
+  const mk = (label, cls, fn) => {
+    const b = document.createElement('button');
+    b.className = cls;
+    b.textContent = label;
+    b.addEventListener('click', fn);
+    return b;
+  };
+  const go = (ratio) => { setStatus('Pruning the model …'); runPruneContinue(ratio); };
+  st.append(span,
+    mk('Prune to ¾', 'btn', () => go(0.75)), ' ',
+    mk('Prune to ½', 'btn accent', () => go(0.5)), ' ',
+    mk('Prune to ¼', 'btn', () => go(0.25)), ' ',
+    mk('Keep training at cap', 'btn', () => {
+      if (S.session) S.session.start();
+      setStatus('Training on at the cap — growth stays off.');
+    }));
+}
+/** Manual prune, any time: the status line becomes a ratio picker. */
+function showPrunePicker() {
+  const s = S.session;
+  if (!s || !s.trainer || S._pruning) return;
+  const st = ui.status;
+  st.replaceChildren();
+  const span = document.createElement('span');
+  span.textContent = 'Prune to: ';
+  const mk = (label, fn) => {
+    const b = document.createElement('button');
+    b.className = 'btn';
+    b.textContent = label;
+    b.addEventListener('click', fn);
+    return b;
+  };
+  const go = (ratio) => { setStatus('Pruning the model …'); runPruneContinue(ratio); };
+  st.append(span,
+    mk('Keep ¾', () => go(0.75)), ' ',
+    mk('Keep ½', () => go(0.5)), ' ',
+    mk('Keep ¼', () => go(0.25)), ' ',
+    mk('Cancel', () => setStatus('')));
 }
 ui.simplify.addEventListener('click', async () => {
   const s = S.session;

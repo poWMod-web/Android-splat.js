@@ -59,18 +59,34 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
  *
  * masses: Float32Array(n) of rendered mass per splat (gather slot 2).
  * ratio: fraction to cull, in (0, 1).
- * Returns null when there is nothing worth doing (with `reason`), else
- * { rank, kept, culled, threshold }: rank[i] is the survivor's compacted
- * row or CULLED. Ties at the threshold fill in ascending row order, so
- * the same masses always plan the same prune.
+ * last: post-prune count at the previous prune (the growth ratchet —
+ *   below the cap a prune never shrinks the model under it, so periodic
+ *   culls can only eat regrowth, never reverse the growth curve; at the
+ *   cap the ratchet releases and culling recycles freely).
+ * cap: the true splat cap (atCap releases the ratchet).
+ * logitOp/meanLogS: optional structural tie-break — among equal masses
+ *   the bigger, more opaque splat survives (a large rarely-seen splat
+ *   outranks a tiny frequent one at equal contribution).
+ * Returns null when there is nothing worth doing, else { rank, kept,
+ * culled, threshold, floorBound }: rank[i] is the survivor's compacted
+ * row or CULLED; floorBound names the binding floor ('ratchet',
+ * 'absolute', null). Deterministic: same inputs, same plan.
  */
-export function planSoftPrune(masses, n, ratio, { minCull = 1024, floor = 8192 } = {}) {
+export function planSoftPrune(masses, n, ratio,
+    { minCull = 1024, floor = 8192, last = 0, cap = Infinity, logitOp = null, meanLogS = null } = {}) {
   if (!(ratio > 0 && ratio < 1)) throw new Error(`planSoftPrune: ratio must be in (0, 1), got ${ratio}`);
   if (!masses || masses.length < n) throw new Error(`planSoftPrune: masses holds ${masses ? masses.length : 0} rows for n=${n}`);
   let target = n - Math.floor(n * ratio);
+  let floorBound = null;
+  if (n < cap && last > 0 && target < Math.min(last, n)) {
+    target = Math.min(last, n);   // the cull eats regrowth, not the curve
+    floorBound = 'ratchet';
+  }
+  if (target < Math.min(n, floor)) {
+    target = Math.min(n, floor);
+    floorBound = 'absolute';
+  }
   if (target >= n || n - target < minCull) return null;   // culls too little to matter
-  target = Math.max(target, Math.min(n, floor));          // never below the floor
-  if (target >= n) return null;
   let max = 0;
   for (let i = 0; i < n; i++) {
     const m = masses[i];
@@ -85,10 +101,28 @@ export function planSoftPrune(masses, n, ratio, { minCull = 1024, floor = 8192 }
   const threshold = sorted[n - target];
   const rank = new Uint32Array(n).fill(CULLED);
   let kept = 0;
+  const ties = [];
   for (let i = 0; i < n; i++) {
-    if (masses[i] > threshold || (masses[i] === threshold && kept < target)) rank[i] = kept++;
+    if (masses[i] > threshold) rank[i] = kept++;
+    else if (masses[i] === threshold) ties.push(i);
   }
-  return { rank, kept, culled: n - kept, threshold };
+  let order = ties;
+  if (logitOp && meanLogS && kept < target) {
+    // structural tie-break: opacity × volume, descending (stable — full
+    // ties keep ascending rows). Non-finite structure sorts last: a
+    // splat with broken params is culled before a sound one.
+    const key = (i) => {
+      const o = 1 / (1 + Math.exp(-logitOp[i]));
+      const k = o * Math.exp(meanLogS[i] * 3);
+      return Number.isFinite(k) ? k : -Infinity;
+    };
+    order = ties.slice().sort((a, b) => key(b) - key(a));
+  }
+  for (const i of order) {
+    if (kept >= target) break;
+    rank[i] = kept++;
+  }
+  return { rank, kept, culled: n - kept, threshold, floorBound };
 }
 
 /**
