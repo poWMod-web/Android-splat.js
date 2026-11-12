@@ -12,13 +12,27 @@
  * @property {() => void} dispose
  */
 
+/** GPUAdapterInfo cannot cross postMessage (structured clone rejects
+ *  platform objects — spreading doesn't help either: the spec strings live
+ *  on the prototype, so a spread yields {}). Snapshot the four spec fields
+ *  into a plain object wherever adapter info is stored or sent. */
+export function plainAdapterInfo(info) {
+  const g = info || {};
+  return {
+    vendor: g.vendor || '',
+    architecture: g.architecture || '',
+    device: g.device || '',
+    description: g.description || '',
+  };
+}
+
 /**
  * @param {{ device?: GPUDevice, powerPreference?: GPUPowerPreference }} [opts]
  * @returns {Promise<GpuContext>}
  */
 export async function createGpu(opts = {}) {
   if (opts.device) {
-    return watchLost({ device: opts.device, adapter: null, info: opts.info || {}, owned: false, dispose() {} });
+    return watchLost({ device: opts.device, adapter: null, info: plainAdapterInfo(opts.info), owned: false, dispose() {} });
   }
   if (typeof navigator === 'undefined' || !navigator.gpu) {
     throw new Error('WebGPU not available in this environment');
@@ -61,7 +75,7 @@ export async function createGpu(opts = {}) {
     got = await attempt();
   }
   const { adapter, device } = got;
-  const info = adapter.info || {};
+  const info = plainAdapterInfo(adapter.info);
   return watchLost({ device, adapter, info, owned: true, dispose() { device.destroy(); } });
 }
 

@@ -22,10 +22,19 @@ assert.match(card, /id="ltc-sh"/, 'the card should offer a spherical-harmonics s
 assert.match(card, /id="ltc-buf"/, 'the card should offer a working-buffer select');
 assert.match(card, /id="ltc-lod"/, 'the card should offer an LOD select');
 assert.match(card, /id="ltc-mcmc"/, 'the card should offer an MCMC-optimizer select');
+assert.match(card, /id="ltc-softprune"/, 'the card should offer a soft-prune select');
+assert.match(card, /<input id="ltc-softprune-custom" type="number" min="1" max="50"/,
+  'the card should offer a custom 1–50% trim');
+assert.match(card, /softRaw === 'custom'/,
+  'confirming the card should read the custom trim input');
 assert.match(card, /\.\.\.\[480, 640, 960, 1280, 1600, 1920\]\.map\(\(v\) =>/,
   'the card should list every start-panel resolution step, unfiltered');
 assert.match(card, /Same as current/,
-  'the splat budget should default to Same as current');
+  'the splat budget should fall back to Same as current without a recorded budget');
+assert.match(card, /const prevCap = r\.cap \|\| recon\.maxSplats \|\| 0;/,
+  'the card should resolve the run’s original budget first');
+assert.match(card, /Original budget \(\$\{fmt\(prevCap\)\}\)/,
+  'the splat budget should default to the original budget, stated plainly');
 assert.match(card, /const prevBuf = continuedBuf\(recon\.trainScale, r\.detailProgress && r\.detailProgress\.settings, prevDim \|\| undefined\);/,
   'the card should resolve the run’s buffer from the recon or its saved settings');
 assert.match(card, /<option value="same" selected>\$\{prevInputDim \? `\$\{prevInputDim\} px` : 'Run size'\}<\/option>/,
@@ -36,6 +45,14 @@ assert.match(card, /<option value="" selected>\$\{prevBuf\}×<\/option>/,
   'the working buffer should default to the run’s own scale, stated plainly');
 assert.match(card, /<option value="" selected>\$\{prevMcmc \? 'On' : 'Off'\}<\/option>/,
   'the MCMC optimizer should default to the run’s own set, stated plainly');
+assert.match(card, /const prevSoftRatio = recipe0 && recipe0\.softPrune && Number\.isFinite\(recipe0\.softPrune\.ratio\)/,
+  'the card should read the run’s own trim from its saved recipe');
+assert.match(card, /<option value="" selected>\$\{prevSoft\}<\/option>/,
+  'soft prune should default to the run’s own trim, stated plainly');
+assert.match(card, /const softVal = softRaw === '' \? undefined : softRaw === 'custom'/,
+  'confirming the card should resolve the trim, honoring a custom percent');
+assert.match(card, /softprune: softVal,/,
+  'confirming the card should pass the reselected soft-prune trim through');
 assert.ok(!/Same as (before|run)/.test(card),
   'only the splat budget should keep a Same-as label');
 assert.match(card, /continueLocalRun\(false, \{\s*res:[\s\S]*splats:[\s\S]*extraIters,[\s\S]*sh:[\s\S]*buf:[\s\S]*lod:[\s\S]*mcmc:/,
@@ -53,10 +70,18 @@ assert.match(cont, /const prevBuf = continuedBuf\(recon\.trainScale, lr\.detailP
   'the continuation should resolve the run’s buffer from the recon or its saved settings');
 assert.match(cont, /const prevInputDim = continuedInputDim\(prevDim, prevBuf\);/,
   'the default should divide the buffer back out before the multiplier runs again');
+assert.match(cont, /if \(opts\.softprune !== undefined\) \{/,
+  'an untouched soft-prune knob should replay the recipe’s own setting');
+assert.match(cont, /recipeTrainer\.softPrune = \{ ratio: opts\.softprune, every: 3000, until: 0\.85 \}/,
+  'a reselected soft-prune trim should rebuild the periodic cull schedule');
 assert.match(cont, /Math\.max\(fr0\.nw \|\| fr0\.fw \|\| 0, fr0\.nh \|\| fr0\.fh \|\| 0\)/,
   'Full size should use the file’s own pixel size, not the feature-capped dims');
 assert.match(sessionIo, /\.\.\.\(Number\.isFinite\(f\.srcW\) \? \{ nw: f\.srcW, nh: f\.srcH \} : \{\}\)/,
   'the recon JSON should persist each frame’s native pixel size');
+assert.match(sessionIo, /maxSplats: ses\.trainer\.cap \|\| 0,/,
+  'the recon JSON should record the budget continuations replay');
+assert.match(cont, /const cap = Math\.max\(g\.n, lr\.splats \|\| 0, lr\.cap \|\| 0,/,
+  'the continuation should carry the run’s own budget, finished runs included');
 assert.match(cont, /Math\.max\(g\.n, lr\.splats \|\| 0,[\s\S]*opts\.splats \|\| 0\)/,
   'the continuation budget should honor a reselected splat count, never below the trained size');
 assert.match(cont, /frames: \{ trainMaxDim, \.\.\.\(bufScale != null \? \{ trainScale: bufScale \} : \{\}\) \}/,
@@ -149,5 +174,29 @@ assert.match(cont, /ses\.trainer\.growLimit = S\.lodPlan\.levels\[S\.lodPlan\.id
   assert.equal(continuedBuf(undefined, { res: 960, buf: 0.5 }, 0), 0.5);
   assert.equal(continuedBuf(NaN, { res: 960, buf: 0.5 }, 480), 0.5);
 }
+
+// A fresh run's done screen must reach the same finished-run path: finish()
+// adopts the secured record in memory (Train then offers the config card +
+// history like Yours), and an immediate tap waits for the securing pass
+// instead of taking the blind live resume.
+assert.match(app, /S\._securing = \(async \(\) => \{/,
+  'finish should expose its securing work for the Train gate');
+assert.match(app, /status: 'finished', createdAt: Date\.now\(\), updatedAt: Date\.now\(\),/,
+  'finish should adopt the finished record in memory');
+assert.match(app, /if \(S\.state === 'done'\) renderControls\(\);   \/\/ swap the quick Train for the run's own/,
+  'adopting the record should re-render the done controls');
+assert.match(app, /more\.addEventListener\('click', trainAfterDone\);/,
+  'the pre-secure Train button should go through the securing gate');
+assert.match(app, /if \(S\._localRun\) \{ trainLocalChoice\(\); return; \}/,
+  'an adopted record should take the finished-run choice dialog');
+assert.match(app, /try \{ await S\._securing; \} catch/,
+  'an immediate tap should wait for the securing pass first');
+// The blind live resume stays for record-less sessions only — and it must
+// await the horizon: assigning continueFor's promise used to NaN the
+// chart's x-scale and blank the restored history (2026-11).
+assert.match(app, /async function continueTraining\(\) \{/,
+  'the live resume should be async');
+assert.match(app, /S\.maxIters = await S\.session\.continueFor\(MORE_ITERS\);/,
+  'the live resume should await the horizon (a number, never a promise)');
 
 console.log('continue-training configuration reselection: passed');

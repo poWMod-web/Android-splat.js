@@ -1,5 +1,6 @@
-# large binaries / downloads
-tools/
+# large binaries / downloads (the browser sync script stays tracked)
+tools/*
+!tools/sync-browser.sh
 *.zip
 
 # datasets: images stay out of git, metadata/GT stays in

@@ -3,7 +3,11 @@
 //   const s = createSession();
 //   s.on('stage',   e => ...)   // { stage, done, total, detail }
 //   s.on('metrics', e => ...)   // { iter, splats, itersPerSec, psnrTrain, psnrHold }
-//   s.on('event',   e => ...)   // { kind: 'refine' | 'train-complete', ... }
+//   s.on('event',   e => ...)   // { kind: 'refine' | 'train-complete' | 'device-lost' |
+//                                 'worker-error' | 'train-error' | 'view-error' |
+//                                 'train-stall', ... }
+//   (a no-present view-error also carries diagnosis: 'presentation' |
+//   'raster' | 'capture-failed' | 'unknown' — which link the probe blames)
 //   s.on('log',     m => ...)   // prose, for consoles
 //
 //   await s.load(files);        // File[] / Blob[] -> Frames
@@ -28,8 +32,14 @@ import { runSfM } from './sfm/sfm.js';
 import { initGaussians } from './gs/init.js';
 import { buildVisualHull, makeHullTest, makeSplatTest } from './gs/hull.js';
 import { GSTrainer } from './gs/trainer.js';
+import { RemoteTrainer } from './gs/remote-trainer.js';
 import { createGpu } from './gpu/context.js';
 import { gaussiansToPly, bakeOpacityCompensation, unbakeOpacityCompensation } from './io/ply.js';
+import { simplifyGaussians } from './gs/simplify.js';
+
+/** One macrotask breath — lets a pending frame present go out before a GPU
+ *  readback drains the queue behind it. */
+const tick = () => new Promise((r) => setTimeout(r, 0));
 
 /** world-space position of a camera pose {R, t} */
 export function camPosition({ R, t }) {
@@ -104,6 +114,14 @@ export function undistortFrames(frames, recon) {
  * @property {number} [gpuUsage=1]  GPU-usage fraction (the slider): full
  *   batches with duty-cycle idle between them — 0.5 trains half the wall
  *   time; 1 (or unset) is full speed
+ * @property {boolean} [autoDuty=true]  duty governor: derate the effective
+ *   duty below the slider when rAF / event-loop health slips or the GPU's
+ *   own step cost sags, recover when healthy. The slider stays the thermal
+ *   ceiling ("how hot"); false pins the loop to the slider exactly. Frozen
+ *   while the tab is hidden.
+ * @property {object} [governor]  governor thresholds
+ *   ({ lagJank, lagOk, rafJank, rafOk, gpuJank, gpuOk, down, up, floor };
+ *   see GOV_DEFAULTS)
  * @property {number} [initTarget=60000] initial Gaussian count (grows during training)
  * @property {number|'auto'|null} [holdout='auto']  frame excluded from training
  *   and scored as the novel-view metric; 'auto' picks a sharp mid-sequence frame
@@ -116,6 +134,17 @@ export function undistortFrames(frames, recon) {
  * @property {object} [sfm]              SfmOptions passed to solve()
  * @property {object} [trainer]          extra GSTrainer options (shDeg, ...)
  * @property {object} [frames]           FrameOptions passed to load()
+ * @property {'auto'|boolean} [trainWorker='auto']  run the GPU training core
+ *   in a dedicated worker (encoding, submits and readbacks leave the main
+ *   thread responsive); 'auto' falls back to main-thread training when
+ *   workers or WebGPU-in-workers are unavailable, false forces local, true
+ *   demands the worker. A host-owned `device` always forces local: devices
+ *   cannot cross threads.
+ * @property {() => Worker} [createTrainWorker]  inject the training worker
+ *   (tests; default spawns src/gs/trainworker.js as a module worker)
+ * @property {number} [gpuChunkMs=400]  the phone budget (ms of GPU work):
+ *   bounds one batch's queued work AND the total outstanding across the
+ *   fence ring — over it, the loop cuts submits until the queue drains
  */
 
 /** Duty cycle of the GPU-usage throttle: the fraction of wall time the
@@ -146,6 +175,49 @@ export function gpuBurstMs(chunkMs, usage) {
   return chunkMs * gpuDuty(usage);
 }
 
+/** Whether the page is hidden (no document, e.g. Node/tests, counts as
+ *  visible). Plan item (7) gates everything the user can't see on this. */
+function isHidden() {
+  return typeof document !== 'undefined' && !!document.hidden;
+}
+
+/** Lit-pixel sample of an RGBA readback: { lit, n, frac }. Up to ~2k
+ *  pixels sampled; lit = any channel above the near-black floor. Shared
+ *  by the no-present probe (canvas-free capture) and the app's
+ *  present-health watchdog (placeholder-canvas readback) so "renders
+ *  content" means the same thing in both. */
+export function litSample(rgba, { threshold = 12, maxSamples = 2048 } = {}) {
+  if (!rgba || rgba.length < 4) return { lit: 0, n: 0, frac: 0 };
+  const step = Math.max(4, Math.floor(rgba.length / 4 / maxSamples) * 4);
+  let lit = 0, n = 0;
+  for (let o = 0; o < rgba.length; o += step) {
+    n++;
+    if (rgba[o] > threshold || rgba[o + 1] > threshold || rgba[o + 2] > threshold) lit++;
+  }
+  return { lit, n, frac: n ? lit / n : 0 };
+}
+
+/** Duty-governor thresholds: jank above which to derate, health below which
+ *  to recover, the multiplicative down-step, additive up-step, and floor. */
+export const GOV_DEFAULTS = {
+  lagJank: 50, lagOk: 20, rafJank: 34, rafOk: 20,
+  gpuJank: 1.25, gpuOk: 1.1, down: 0.7, up: 0.1, floor: 0.1,
+};
+
+/** One governor step (pure, for tests): derate fast on jank, recover slow
+ *  on health, hysteresis between the thresholds. Returns { auto, moved }
+ *  with moved -1/0/+1 for derated/held/recovered. */
+export function governDuty(auto, { lagMs = 0, rafMs = 16.7, gpuRatio = 1 } = {}, opts = {}) {
+  const g = { ...GOV_DEFAULTS, ...opts };
+  if (lagMs > g.lagJank || rafMs > g.rafJank || gpuRatio > g.gpuJank) {
+    return { auto: Math.max(g.floor, auto * g.down), moved: -1 };
+  }
+  if (lagMs < g.lagOk && rafMs < g.rafOk && gpuRatio < g.gpuOk && auto < 1) {
+    return { auto: Math.min(1, auto + g.up), moved: 1 };
+  }
+  return { auto, moved: 0 };
+}
+
 class Emitter {
   constructor() { this.map = new Map(); }
   on(type, fn) {
@@ -159,6 +231,27 @@ class Emitter {
   }
 }
 
+/** Plateau test for score-driven refine cadence: least-squares slope of
+ *  train PSNR over the trailing `window` iters stays under `slope`
+ *  dB/kiter. Needs minPoints finite samples spanning most of the window —
+ *  anything less is "still warming up", never a plateau. Flat OR falling
+ *  trips it: a stalled score wants fresh capacity, a falling one triage. */
+export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, minPoints = 4 } = {}) {
+  if (!Array.isArray(history) || !history.length) return false;
+  const pts = [];
+  for (const [i, p] of history) {
+    if (Number.isFinite(i) && Number.isFinite(p) && i >= nowIter - window && i <= nowIter) pts.push([i, p]);
+  }
+  if (pts.length < minPoints) return false;
+  if (pts[pts.length - 1][0] - pts[0][0] < window * 0.75) return false;
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (const [i, p] of pts) { sx += i; sy += p; sxx += i * i; sxy += i * p; }
+  const n = pts.length;
+  const denom = n * sxx - sx * sx;
+  if (!(denom > 0)) return false;
+  return (n * sxy - sx * sy) / denom * 1000 < slope;
+}
+
 export class Session {
   /** @param {SessionOptions} [opts] */
   constructor(opts = {}) {
@@ -168,11 +261,29 @@ export class Session {
     this.model = null;      // seed() result: { data, n, center, radius }
     this.trainer = null;
     this.gpu = null;
+    this._worker = null;    // the training worker (remote mode; null = local)
+    this._remote = false;   // whether this.trainer is a RemoteTrainer proxy
+    this._workerGen = 0;    // bumped per remote boot; canvas transfers die with the worker
     this.holdout = -1;
     this.testCams = [];
     this.training = false;
     this.lossHistory = [];  // [iter, psnrTrain]
     this._fences = [];      // in-flight batch fences (see _frameLoop)
+    this._govAuto = 1;      // duty governor: auto duty, min()'d with the slider
+    this._govLag = 0;       // event-loop lag EWMA (ms)
+    this._govRaf = 16.7;    // rAF inter-arrival EWMA (ms)
+    this._govMsStep = 0;    // GPU ms/step EWMA (item 3: the ceiling's own signal)
+    this._govMsBase = 0;    // best smoothed ms/step at this splat count (0 = unanchored)
+    this._govN = -1;        // splat count the baseline is anchored to
+    this._gpuMsMisses = 0;  // consecutive batches without a timer reading
+    this._cutMs = 0;        // (4) estimated outstanding GPU work (ms)
+    this._cutT = null;      // wall time the estimate is current as of
+    this._cutPred = 0;      // last submit's predicted ms (corrected by measure)
+    this._cutPending = false; // last submit uncorrected by its gpuMs yet
+    this._lastGpuMs = null; // most recent batch's measured GPU-busy ms
+    this._govRafLast = 0;
+    this._govRafRunning = false;
+    this._govBucket = 1;    // last logged derate bucket (log on change only)
     // Per-frame loop timings, recorded by default — the cost is a handful of
     // performance.now() calls and one small array row per submitted batch.
     // opts.perf: false disables.
@@ -309,8 +420,10 @@ export class Session {
       }
     }
     // the GPU matcher shares the session device (created here rather than at
-    // seed) — it carries the raised buffer limits big feature sets need
-    if (!this.gpu) {
+    // seed) — it carries the raised buffer limits big feature sets need.
+    // Remote training skips it: the matcher then uses a transient own device
+    // (destroyed after matching) and the worker owns the only live device.
+    if (!this.gpu && !this._shouldOffload()) {
       this.gpu = await createGpu({ device: this.opts.device });
       this.gpu.onLost = (info) => this._deviceLost(info);
     }
@@ -496,9 +609,6 @@ export class Session {
     }
     this._log(`initialized ${this.model.n} Gaussians (scene radius ${this.model.radius.toFixed(2)})`);
 
-    if (!this.gpu) this.gpu = await createGpu({ device: this.opts.device });
-    this.gpu.onLost = (info) => this._deviceLost(info);
-    const gi = this.gpu.info || {};
     // opts.shHorizontal: SH evaluated on the view direction's horizontal part only —
     // the up axis is the cameras' dominant up (minus each R's second row)
     const shUp = this.opts.shHorizontal ? this._camerasUp() : null;
@@ -511,12 +621,7 @@ export class Session {
       // the cleared area at full photometric strength
       ...(masked && this.frames && this.frames.some((f) => f.emptyFrac > 0) ? { randomBg: true } : {}),
       ...this.opts.trainer, ...extra.trainer,
-      gpu: this.gpu,
     };
-    this.trainer = await GSTrainer.create(trainerOpts);
-    this._log(`GPU: ${gi.vendor || 'unknown'} ${gi.architecture || ''} — ` +
-      `${this.trainer.tileGrad ? 'tile-shared' : 'direct'} gradient accumulation`);
-
     // training-resolution intrinsics (recon poses live at feature scale)
     const cams = this.recon.cams.map((c) => {
       const im = this.frames[c.imgIdx];
@@ -531,18 +636,30 @@ export class Session {
     // interactive canvases are usually LARGER than the training resolution
     const maxW = Math.max(this.opts.maxViewW ?? 2560, ...cams.map((c) => c.w));
     const maxH = Math.max(this.opts.maxViewH ?? 1440, ...cams.map((c) => c.h));
-    this._setupTrainer(cams, this.frames, maxW, maxH, this.model.radius);
+    // lowMem released the frame pixels after the first boot (and the worker
+    // owns the seed) — a second seed (recover) has nothing to boot from.
+    // Say so plainly instead of crashing inside setup on null rgb.
+    if (this.frames && this.frames.some((f) => !f.rgb)) {
+      throw new Error('seed data was released after the first boot (lowMem) — reload to train again');
+    }
+    await this._bootTrainer(trainerOpts, {
+      gaussians: this.model, cams, frames: this.frames, maxW, maxH, radius: this.model.radius,
+      hull: (masked && this.splatTest) ? this.hull : null, hullOpts: extra.hullOpts,
+      hullKillFn: (masked && this.splatTest) || null,
+      protect: (this._appendedSeed && this._appendedSeed.protectIters > 0)
+        ? { from: this._appendedSeed.from, to: this._appendedSeed.to, until: this._appendedSeed.protectIters } : null,
+      freezePos: (this._appendedSeed && this._appendedSeed.freezePos)
+        ? { from: this._appendedSeed.from, to: this._appendedSeed.to } : null,
+    });
     if (this.opts.lowMem) {
       // targets now live on the GPU (packed RGBA8); the float32 CPU copies
       // are 3x that size and nothing reads them after setup
       for (const f of this.frames) { f.rgb = null; f.sampleColor = () => [0.5, 0.5, 0.5]; }
     }
 
-    this._applyTrainingSplit(extra);
+    await this._applyTrainingSplit(extra);
 
-    if (masked && this.splatTest) this.trainer.hullKill = this.splatTest;
-    if (this._appendedSeed && this._appendedSeed.protectIters > 0) this.trainer.protect = { from: this._appendedSeed.from, to: this._appendedSeed.to, until: this._appendedSeed.protectIters };
-    if (this._appendedSeed && this._appendedSeed.freezePos) { this.trainer.setFreezePos(this._appendedSeed.from, this._appendedSeed.to); this._log(`seed rows ${this._appendedSeed.from}-${this._appendedSeed.to} keep their positions`); }
+    if (this._appendedSeed && this._appendedSeed.freezePos) this._log(`seed rows ${this._appendedSeed.from}-${this._appendedSeed.to} keep their positions`);
     this._stage({ stage: 'seed', done: 1, total: 1, detail: { splats: this.model.n } });
     return this.model;
   }
@@ -564,17 +681,209 @@ export class Session {
     finally { if (hide) frames.forEach((f, i) => { f.alpha = saved[i]; }); }
   }
 
+  /** Whether the GPU training core should live in a dedicated worker.
+   *  'auto' (default) attempts it and falls back to local training on any
+   *  failure; false forces local; true demands the worker. A host-owned
+   *  device (opts.device) can never cross threads, so it always forces local
+   *  — loudly under true, silently under auto. */
+  _shouldOffload() {
+    const mode = this.opts.trainWorker ?? 'auto';
+    if (mode === false || mode === 'never') return false;
+    if (this.opts.device) {
+      if (mode === true) throw new Error('trainWorker: true with opts.device — a host-owned device cannot move to a worker');
+      return false;
+    }
+    if (typeof Worker === 'undefined') {
+      if (mode === true) throw new Error('trainWorker: true but Web Workers are unavailable');
+      return false;
+    }
+    return true;
+  }
+
+  /** Create the trainer and run setup, local or remote per _shouldOffload.
+   *  boot: { gaussians, cams, frames, maxW, maxH, radius, hull?, hullOpts?,
+   *  hullKillFn? (local), protect?, freezePos?, sh?/shN? (resume), holdout?,
+   *  excluded?, iter? }. */
+  /** Prune/grow tandem: pre-boost growRate so the per-refine cull doesn't
+   *  bend the growth curve — every refine culls p and grows g', with g'
+   *  solving (1+g') * (1-p) = (1+g) exactly. Runs here, the single funnel
+   *  into local/remote/worker boots, so every path trains the same
+   *  trajectory; ses.opts.trainer stays unboosted, so continuations
+   *  recompute from the base rate instead of compounding. Engine v2
+   *  grows candidates, not n — the same relative uplift there is
+   *  approximate. */
+  _withTandemBoost(trainerOpts) {
+    const sp = trainerOpts.softPrune;
+    if (!sp || !(sp.ratio > 0 && sp.ratio < 1)) return trainerOpts;
+    const g0 = trainerOpts.growRate ?? 0.15;
+    const g1 = (1 + g0) / (1 - sp.ratio) - 1;
+    if (!(g1 > g0)) return trainerOpts;
+    let note = '';
+    let g = g1;
+    if (g > 0.6) { g = 0.6; note = ' [clamped at 0.6]'; }
+    const out = { ...trainerOpts, growRate: +g.toFixed(4) };
+    if (trainerOpts.engine === 'v2') {
+      out.growFrac = +((trainerOpts.growFrac ?? 0.1) * (g / g0)).toFixed(4);
+    }
+    this._log(`prune/grow tandem: growRate ${g0} -> ${out.growRate} holds the no-prune curve against -${Math.round(sp.ratio * 100)}% every refine${note}`);
+    return out;
+  }
+
+  async _bootTrainer(trainerOpts, boot) {
+    trainerOpts = this._withTandemBoost(trainerOpts);
+    if (this._shouldOffload()) {
+      try {
+        await this._bootRemoteTrainer(trainerOpts, boot);
+        return;
+      } catch (e) {
+        if ((this.opts.trainWorker ?? 'auto') === true) throw e;
+        if (e && e.workerOwned) throw e;   // the seed moved — fallback would boot from detached buffers
+        this._log(`worker training unavailable (${(e && e.message) || e}) — training on the main thread`);
+        this._terminateWorker();
+        this.trainer = null;
+      }
+    }
+    const twMode = this.opts.trainWorker ?? 'auto';
+    if (twMode === false || twMode === 'never') this._log('training on the main thread (trainWorker disabled)');
+    if (!this.gpu) this.gpu = await createGpu({ device: this.opts.device });
+    this.gpu.onLost = (info) => this._deviceLost(info);
+    this.trainer = await GSTrainer.create({ ...trainerOpts, gpu: this.gpu });
+    const gi = this.gpu.info || {};
+    this._log(`GPU: ${gi.vendor || 'unknown'} ${gi.architecture || ''} — ` +
+      `${this.trainer.tileGrad ? 'tile-shared' : 'direct'} gradient accumulation`);
+    this._setupTrainer(boot.cams, boot.frames, boot.maxW, boot.maxH, boot.radius);
+    if (boot.hullKillFn) this.trainer.hullKill = boot.hullKillFn;
+    if (boot.protect) this.trainer.protect = { ...boot.protect };
+    if (boot.freezePos) this.trainer.setFreezePos(boot.freezePos.from, boot.freezePos.to);
+    if (boot.sh && this.trainer.bufSH) {
+      // a checkpoint with more splats than the cap truncated the params
+      // but pasted all shN rows into a cap-sized SH buffer — an upload
+      // larger than its buffer. Clamp to the same rows the params kept.
+      const shRows = Math.min(boot.shN ?? this.trainer.cap, this.trainer.cap);
+      if (shRows < boot.shN) {
+        this._log(`SH restore truncated to ${shRows} of ${boot.shN} rows (splat cap)`);
+      }
+      this.trainer.device.queue.writeBuffer(this.trainer.bufSH, 0,
+        boot.sh.buffer, boot.sh.byteOffset, shRows * this.trainer.shK * 3 * 4);
+    }
+    this.trainer.excluded = new Set(boot.excluded || []);
+    this.trainer.holdout = boot.holdout ?? -1;
+    if (boot.iter != null) { this.trainer.iter = boot.iter; this.trainer.adamT0 = boot.iter; }
+  }
+
+  /** Spawn the training worker and upload the seed + targets through the
+   *  trainer protocol. Images are projected to cloneable payloads (frames
+   *  carry functions); lowMem transfers ownership instead of copying. */
+  async _bootRemoteTrainer(trainerOpts, boot) {
+    const factory = this.opts.createTrainWorker ||
+      (() => new Worker(new URL('./gs/trainworker.js', import.meta.url), { type: 'module' }));
+    let worker;
+    try {
+      worker = await factory();
+    } catch (e) {
+      throw new Error(`training worker did not start (${(e && e.message) || e})`);
+    }
+    this._worker = worker;
+    const remote = new RemoteTrainer(worker, trainerOpts);
+    remote.onEvent('device-lost', (info) => this._deviceLost(info));
+    remote.onEvent('worker-error', (err) => this._workerFailed(err));
+    remote.onEvent('log', (m) => this._log(m));
+    // lowMem moves (transfers) the seed and targets instead of copying: from
+    // the setup postMessage on, the main-side buffers are detached. A worker
+    // failure past that point is fatal — a local fallback would boot from
+    // dead memory (its first upload throws "Number of bytes to write is too
+    // large", 2026-11) — and the ORIGINAL error is the diagnosable one.
+    const moved = !!this.opts.lowMem;
+    try {
+      const images = boot.frames.map((f) => ({ tw: f.tw, th: f.th, rgb: f.rgb, alpha: f.alpha ?? null }));
+      if (this.opts.maskTraining === false && images.some((im) => im.alpha)) {
+        for (const im of images) im.alpha = null;   // mirror _setupTrainer
+      }
+      const mirror = await remote.setupRemote({
+        gaussians: boot.gaussians, cams: boot.cams, images,
+        maxViewW: boot.maxW, maxViewH: boot.maxH, radius: boot.radius,
+        trainerOpts, hull: boot.hull ?? null, hullOpts: boot.hullOpts,
+        protect: boot.protect ?? null, freezePos: boot.freezePos ?? null,
+        holdout: boot.holdout ?? -1, excluded: [...(boot.excluded || [])],
+        iter: boot.iter ?? null,
+        transferOwnership: !!this.opts.lowMem,
+      });
+      // matching is over: release a main-side device left from solve() rather
+      // than carry two live devices (solve already skips creating one when
+      // offloading; this covers option-timing edges)
+      if (this.gpu && this.gpu.owned) {
+        try { this.gpu.dispose(); } catch { /* already gone */ }
+        this.gpu = null;
+      }
+      this.trainer = remote;
+      this._remote = true;
+      this._workerGen++;
+      this.gpu = { info: mirror.gpuInfo || {}, owned: false, dispose() {} };
+      const gi = mirror.gpuInfo || {};
+      this._log(`GPU: ${gi.vendor || 'unknown'} ${gi.architecture || ''} — ` +
+        `${mirror.tileGrad ? 'tile-shared' : 'direct'} gradient accumulation (worker)`);
+    } catch (e) {
+      this._terminateWorker();
+      if (moved) {
+        const fatal = new Error(`training worker failed (${(e && e.message) || e}) — ` +
+          `the seed already moved to the worker, so training cannot fall back to the main thread; reload to retry`);
+        fatal.cause = e;
+        fatal.workerOwned = true;
+        throw fatal;
+      }
+      throw e;
+    }
+  }
+
+  _terminateWorker() {
+    // the dead worker answers nothing: fail the in-flight RPCs (else they
+    // hang) and drop the view chain's tail (else every post-recovery view
+    // command queues behind a promise that never settles — a black view
+    // after every recover, 2026-11)
+    if (this.trainer && this._remote && typeof this.trainer.abort === 'function') {
+      try { this.trainer.abort(new Error('training worker terminated')); } catch { /* gone */ }
+    }
+    if (this._worker) {
+      try { if (typeof this._worker.terminate === 'function') this._worker.terminate(); } catch { /* gone */ }
+      this._worker = null;
+    }
+    this._remote = false;
+    if (this.view) {
+      this.view._chain = null;
+      this.view._remoteInFlight = false;   // aborted sends never settle: drop the gate with the chain
+      // the abort above rejects in-flight view commands by design — not a
+      // view failure. (Cleared by the next success or resync, so a genuinely
+      // broken re-attach still surfaces.)
+      this.view._viewFailed = true;
+      this.view._falseSince = null;
+    }
+  }
+
+  /** Commit the training split computed by _applyTrainingSplit. */
+  async _commitSplit(excluded) {
+    if (this._remote) await this.trainer.setConfig({ excluded: [...excluded], holdout: this.holdout });
+    else { this.trainer.excluded = excluded; this.trainer.holdout = this.holdout; }
+  }
+
   /** After a run with photometric pose optimisation (trainer opts.camOpt): log how far
    *  the cameras moved and write the moved poses back into recon.cams, so everything
    *  after training (hull, cut, landmarks, body fit) sees the frame the model was
    *  trained in. camMeta and recon.cams share their order. */
-  _camDriftDone() {
+  async _camDriftDone() {
     try {
       const tr = this.trainer; if (!tr || !tr.opts.camOpt || !this.recon || !this.recon.cams) return;
-      const dr = tr.camDrift(); if (!dr) return;
+      let dr, poses;
+      if (this._remote) {
+        ({ report: dr, poses } = await tr.camDrift());
+      } else {
+        dr = tr.camDrift();
+        if (!dr) return;
+        poses = tr.camMeta;
+      }
+      if (!dr) return;
       let moved = 0;
-      for (let i = 0; i < tr.camMeta.length && i < this.recon.cams.length; i++) {
-        const m = tr.camMeta[i], c = this.recon.cams[i]; if (!m || !c) continue;
+      for (let i = 0; i < poses.length && i < this.recon.cams.length; i++) {
+        const m = poses[i], c = this.recon.cams[i]; if (!m || !c) continue;
         c.R = Array.from(m.R); c.t = Array.from(m.t); moved++;
       }
       this._log(`pose optimisation: ${dr.n} cameras moved — rotation median ${dr.rotDegMedian.toFixed(3)}° max ${dr.rotDegMax.toFixed(2)}°, centre median ${dr.trnMedian.toFixed(4)} max ${dr.trnMax.toFixed(3)} scene units; ${moved} poses written back to the reconstruction`);
@@ -584,7 +893,7 @@ export class Session {
   /** Which cameras train and which are scored: blur exclusions, the chart
    *  holdout and the evaluation split. Shared by seed() and a continuation
    *  (seedFrom with frames), so a resumed run keeps the same test set. */
-  _applyTrainingSplit(extra = {}) {
+  async _applyTrainingSplit(extra = {}) {
     // blur-aware training: the blurriest frames stay registered (their poses
     // hold the chain together) but are excluded from the loss so the model
     // doesn't learn their motion blur
@@ -602,14 +911,14 @@ export class Session {
     const group = this.trainer.camMeta.map((m, i) => (this.recon && this.recon.cams && this.recon.cams[i] && this.recon.cams[i].crop) ? 1 : 0);
     const medOf = (g) => { const v = sh.filter((x, i) => group[i] === g && (!inLoss || inLoss[i])).sort((a, b) => a - b); return v.length ? v[v.length >> 1] : 0; };
     const med = [medOf(0), medOf(1)];
-    this.trainer.excluded = new Set();
+    const excluded = new Set();
     const blurry = [0, 0];
     // known cameras (useKnownCameras) are mostly renders: their low "sharpness" is a thin
     // object seen edge-on, not motion blur — 16 of 180 sharp renders went out (2026-10-21)
     const blurGate = this.opts.excludeBlurry ?? !(this.recon && this.recon.known);
     this.trainer.camMeta.forEach((m, i) => {
-      if (inLoss && !inLoss[i]) { this.trainer.excluded.add(i); return; }
-      if (blurGate && sh[i] < med[group[i]] * 0.45) { this.trainer.excluded.add(i); blurry[group[i]]++; }
+      if (inLoss && !inLoss[i]) { excluded.add(i); return; }
+      if (blurGate && sh[i] < med[group[i]] * 0.45) { excluded.add(i); blurry[group[i]]++; }
     });
     if (inLoss) this._log(`training loss on ${inLoss.filter(Boolean).length} of ${inLoss.length} cameras (opts.lossCams; the rest keep their poses)`);
     if (blurry[0] + blurry[1]) {
@@ -623,14 +932,13 @@ export class Session {
     const want = extra.holdout ?? this.opts.holdout ?? 'auto';
     if (want === 'auto') {
       let hi = this.trainer.camMeta.length >> 1;
-      for (let k = 0; k < this.trainer.camMeta.length && this.trainer.excluded.has(hi); k++) {
+      for (let k = 0; k < this.trainer.camMeta.length && excluded.has(hi); k++) {
         hi = (hi + 1) % this.trainer.camMeta.length;
       }
       this.holdout = hi;
     } else {
       this.holdout = (want == null || want < 0) ? -1 : want;
     }
-    this.trainer.holdout = this.holdout;
 
     // benchmark protocol: every Nth frame joins the test set — excluded from
     // the loss (poses kept, same as the blur exclusions) and scored together
@@ -643,25 +951,23 @@ export class Session {
       const want = new Set(evalNames);
       this.trainer.camMeta.forEach((m, i) => {
         const f = this.frames[m.imgIdx];
-        if (f && want.has(f.name)) { this.trainer.excluded.add(i); this.testCams.push(i); }
+        if (f && want.has(f.name)) { excluded.add(i); this.testCams.push(i); }
       });
       if (this.testCams.length && this.holdout < 0) {
         this.holdout = this.testCams[this.testCams.length >> 1];
-        this.trainer.holdout = this.holdout;
       }
       this._log(`evaluation set: ${this.testCams.length} of ${this.trainer.camMeta.length} cameras (named) held out of training`);
     } else if (split >= 2) {
       this.trainer.camMeta.forEach((m, i) => {
-        if (m.imgIdx % split === 0) { this.trainer.excluded.add(i); this.testCams.push(i); }
+        if (m.imgIdx % split === 0) { excluded.add(i); this.testCams.push(i); }
       });
       if (this.testCams.length && this.holdout < 0) {
         this.holdout = this.testCams[this.testCams.length >> 1];
-        this.trainer.holdout = this.holdout;
       }
       this._log(`evaluation split: ${this.testCams.length} of ${this.trainer.camMeta.length} ` +
         `cameras (every ${split}th) held out of training`);
     }
-
+    await this._commitSplit(excluded);
   }
 
   /**
@@ -683,8 +989,6 @@ export class Session {
     const radius = opts.sceneRadius ?? this.recon?.sceneRadius ?? 10;
     this.model = { data: gaussians.data, n: gaussians.n, radius, dc: gaussians.dc };
 
-    if (!this.gpu) this.gpu = await createGpu({ device: this.opts.device });
-    this.gpu.onLost = (info) => this._deviceLost(info);
     const shUp2 = this.opts.shHorizontal && this.recon?.cams?.length ? this._camerasUp() : null;
     const trainerOpts = {
       maxIters: this.opts.maxIters ?? 60000,
@@ -694,10 +998,8 @@ export class Session {
       // converged person grew opaque dark needles out of the subject)
       ...(this.opts.maskTraining !== false && this.frames && this.frames.some((f) => f.emptyFrac > 0) ? { randomBg: true } : {}),
       ...this.opts.trainer, ...opts.trainer,
-      gpu: this.gpu,
     };
     if (gaussians.shK != null) trainerOpts.shDeg = { 0: 0, 3: 1, 8: 2, 15: 3 }[gaussians.shK] ?? trainerOpts.shDeg;
-    this.trainer = await GSTrainer.create(trainerOpts);
 
     let cams = [];
     if (!opts.viewOnly) {
@@ -713,7 +1015,7 @@ export class Session {
     }
     const maxW = Math.max(this.opts.maxViewW ?? 2560, ...cams.map((c) => c.w));
     const maxH = Math.max(this.opts.maxViewH ?? 1440, ...cams.map((c) => c.h));
-    if (opts.unbake && this.trainer.mipComp !== false && this.recon?.cams?.length) {
+    if (opts.unbake && trainerOpts.mipComp !== false && this.recon?.cams?.length) {
       // a bare .ply/.sog export carries opacities with the Mip compensation
       // BAKED (exportPlyBlob); this trainer compensates at render time, so
       // undo the bake with the exporter's own f (training scale of the first
@@ -722,25 +1024,27 @@ export class Session {
       const fr0 = (this.frames || this.recon.frames || [])[c0.imgIdx];
       const f0 = cams.length ? cams[0].f : c0.f * (fr0 && fr0.tw && fr0.fw ? fr0.tw / fr0.fw : 1);
       const pos = Float32Array.from(this.recon.cams.flatMap(camPosition));
-      this.model.data = unbakeOpacityCompensation(this.model.data, this.model.n, f0, pos, this.trainer.dilate);
-      this._log(`unbaked the export's opacity compensation (f ${f0.toFixed(1)}, ${this.recon.cams.length} cams, dilate ${this.trainer.dilate})`);
+      // dilate derives from trainer opts alone (GSTrainer: opts.dilate ?? 0.1),
+      // so the unbake needs no trainer instance — local or remote
+      const dilate = trainerOpts.dilate ?? 0.1;
+      this.model.data = unbakeOpacityCompensation(this.model.data, this.model.n, f0, pos, dilate);
+      this._log(`unbaked the export's opacity compensation (f ${f0.toFixed(1)}, ${this.recon.cams.length} cams, dilate ${dilate})`);
     }
-    this._setupTrainer(cams, this.frames || [], maxW, maxH, radius);
-    // setup zero-fills SH (view dependence is normally learned) — a restored
-    // model brings its own
-    if (gaussians.sh && this.trainer.bufSH) {
-      this.trainer.device.queue.writeBuffer(this.trainer.bufSH, 0,
-        gaussians.sh.buffer, gaussians.sh.byteOffset, gaussians.n * this.trainer.shK * 3 * 4);
-    }
-    if (opts.iter) { this.trainer.iter = opts.iter; this.trainer.adamT0 = opts.iter; }
-    this.trainer.excluded = new Set();
+    await this._bootTrainer(trainerOpts, {
+      gaussians: {
+        data: this.model.data, n: gaussians.n, dc: gaussians.dc,
+        ...(gaussians.sh ? { sh: gaussians.sh, shK: gaussians.shK } : {}),
+      },
+      cams, frames: this.frames || [], maxW, maxH, radius,
+      sh: gaussians.sh || null, shN: gaussians.n,
+      holdout: -1, excluded: [], iter: opts.iter || null,
+    });
     this.holdout = -1;
-    this.trainer.holdout = -1;
     this.testCams = [];
     // a continuation trains like the run it continues: the same blur
     // exclusions and evaluation split (a resume that trained on the held-out
     // views scored them as train views)
-    if (!opts.viewOnly && this.frames && cams.length) this._applyTrainingSplit(opts);
+    if (!opts.viewOnly && this.frames && cams.length) await this._applyTrainingSplit(opts);
     // a resumed run must not refine on its first frame: the refine timer is
     // not part of the saved state, and lastRefine 0 fired a growth refine
     // (+5 % splats) right after every resume (e2e resume spec, 2026-09-09)
@@ -763,6 +1067,10 @@ export class Session {
     this._thrT = null;
     this._stage({ stage: 'train', done: this.trainer.iter, total: this._maxIters() });
     this._ensureScheduler();
+    if (!this._govRafRunning) {
+      this._govRafRunning = true;
+      this._sched.raf(() => this._govRafLoop());
+    }
     this._scheduleFrame();
   }
 
@@ -771,13 +1079,86 @@ export class Session {
   /** Raise the training horizon by `moreIters` and resume. The trainer's
    *  schedules (pos-lr decay, growth stop) are horizon-relative and stretch
    *  with it — this is a real continued run, not idling at floor lr. */
-  continueFor(moreIters) {
+  async continueFor(moreIters) {
     if (!this.trainer) throw new Error('seed() first');
     this.opts.maxIters = (this.opts.maxIters ?? 60000) + moreIters;
-    this.trainer.opts.maxIters = this.opts.maxIters;
-    this.trainer.horizon = this.opts.maxIters;
+    if (this._remote) await this.trainer.setConfig({ maxIters: this.opts.maxIters });
+    else { this.trainer.opts.maxIters = this.opts.maxIters; this.trainer.horizon = this.opts.maxIters; }
     this.start();
     return this.opts.maxIters;
+  }
+
+  /** Prune-and-continue: compact the model to `ratio` of its splats with
+   *  the training-free merge-down, reseed the trainer on the compacted
+   *  model where the schedules stopped, stretch the horizon, and resume.
+   *  The holdout is probed before and after (skipped without one); a drop
+   *  past 0.5 dB warns but never blocks — training recovers it. Resets
+   *  the cap prompt, so the next ceiling hit asks again. */
+  async pruneAndContinue(ratio = 0.5, { extendIters = null, onStatus = null, onProgress = null } = {}) {
+    const trainer = this.trainer;
+    if (!trainer) throw new Error('seed() first');
+    return this._locked(async () => {
+      this.training = false;
+      const say = (m) => { this._log(m); if (onStatus) onStatus(m); };
+      try {
+        const before = this.holdout >= 0 ? await trainer.evalCamPsnr(this.holdout) : null;
+        const raw = await trainer.readGaussians();
+        say(`pruning ${raw.n.toLocaleString()} splats to ${Math.round(ratio * 100)}% …`);
+        const simp = await simplifyGaussians(
+          { data: raw.data, n: raw.n, sh: raw.sh, shK: raw.shK, dc: raw.dc ?? trainer.dcMode },
+          { ratio, onStatus: (m) => say(String(m).replace(/^simplify: /, 'prune: ')), onProgress });
+        const iter = trainer.iter;
+        await this.seedFrom(
+          { data: simp.data, n: simp.n, sh: simp.sh, shK: simp.shK, dc: simp.dc },
+          { iter });
+        let after = null, delta = null;
+        if (this.holdout >= 0 && before != null) {
+          after = await this.trainer.evalCamPsnr(this.holdout);
+          delta = after - before;
+        }
+        const ext = extendIters ?? Math.round((this.opts.maxIters ?? 60000) * 0.25);
+        await this.continueFor(ext);
+        this._capAsked = false;
+        if (delta != null && delta < -0.5) {
+          this._log(`WARNING: prune cost ${(-delta).toFixed(2)} dB ` +
+            `(holdout ${before.toFixed(2)} → ${after.toFixed(2)}) — continuing anyway; training should recover it`);
+        } else if (delta != null) {
+          say(`prune holdout ${before.toFixed(2)} → ${after.toFixed(2)} dB`);
+        } else {
+          say(`pruned ${raw.n.toLocaleString()} → ${simp.n.toLocaleString()} splats (no holdout — flying blind)`);
+        }
+        const out = { from: raw.n, to: simp.n, before, after, delta, maxIters: this.opts.maxIters };
+        this._em.emit('event', { kind: 'prune-continue', iter, ...out });
+        return out;
+      } catch (e) {
+        // a failed prune must not swallow the prompt — the ceiling is
+        // still full and the user can retry (or keep training at the cap)
+        this._capAsked = false;
+        throw e;
+      }
+    });
+  }
+
+  /** Manual growth pass, any time: one immediate refine (relocate the dead
+   *  + grow into the highest-error donors) outside the schedule — the
+   *  Prune/Grow button's other half. A bonus pass like the tandem regrow:
+   *  lastRefine untouched. At a full cap it asks the ceiling question
+   *  instead of growing into nothing. */
+  async growNow() {
+    const trainer = this.trainer;
+    if (!trainer) throw new Error('seed() first');
+    return this._locked(async () => {
+      const r = await trainer.refine();
+      this._log(`grow-now @${trainer.iter}: relocated ${r.moved || 0}, grew +${r.grown || 0} -> ${r.n} splats`);
+      this._em.emit('event', { kind: 'grow-now', iter: trainer.iter, ...r });
+      if (r.capped && !this._capAsked) {
+        this._capAsked = true;
+        this.training = false;
+        this._log(`splat cap reached at ${trainer.n} — paused: keep training at the cap, or prune and continue`);
+        this._em.emit('event', { kind: 'cap-hit', iter: trainer.iter, splats: trainer.n });
+      }
+      return r;
+    });
   }
 
   /** End the run early with the model as it stands: final metrics, then the
@@ -787,7 +1168,7 @@ export class Session {
     this.training = false;
     this._log(`training finished early at ${this.trainer.iter} iterations`);
     await this._emitMetrics(true);
-    this._camDriftDone();
+    await this._camDriftDone();
     this._em.emit('event', { kind: 'train-complete', iter: this.trainer.iter, splats: this.trainer.n });
   }
 
@@ -809,6 +1190,36 @@ export class Session {
 
   get deviceLost() { return !!this._lost; }
 
+  /** The training worker faulted (uncaught exception in the worker realm).
+   *  Like device loss the loop cannot continue — but unlike device loss the
+   *  main-side device (if any) is fine, so this is its own event and the app
+   *  reboots the worker through recover(). Pre-boot failures (this._remote
+   *  still false) already propagate through seed()'s throw and stay quiet
+   *  here, or a successful local fallback would flash a phantom error. */
+  _workerFailed(err) {
+    if (!this._remote || !this.trainer) return;
+    if (this._lost) return;   // device-lost owns the narrative then
+    this.training = false;
+    const msg = (err && err.message) || String(err || 'worker error');
+    this._log(`training worker failed (${msg})`);
+    this._em.emit('event', { kind: 'worker-error', message: msg,
+      iter: this.trainer ? this.trainer.iter : 0 });
+  }
+
+  /** A scheduled frame threw: the loop is dead (the throw skipped the
+   *  reschedule at the end of _frameLoop) and training must NOT stay true —
+   *  start() no-ops while it is, which wedged runs as "never starts, no
+   *  error" (2026-11). Device loss and worker faults already emitted their
+   *  own events and stopped the loop; anything else stops it HERE, loudly. */
+  _frameFailed(e) {
+    const msg = (e && e.message) || String(e);
+    this._log(`frame loop: ${msg}`);
+    if (this._lost || !this.training) return;
+    this.training = false;
+    this._em.emit('event', { kind: 'train-error', message: msg,
+      iter: this.trainer ? this.trainer.iter : 0 });
+  }
+
   /** Rebuild after device loss: a fresh device and trainer from the CPU-side
    *  reconstruction. Training restarts at iteration 0. */
   async recover() {
@@ -821,11 +1232,17 @@ export class Session {
     this._statsGap = 2000;
     this._lastStats = performance.now();
     this._metricsLock = null;    // readbacks on the dead device never resolve
+    this._instantChecked = false;   // the fresh device re-proves its fences
+    this._instantFences = false;
+    this._instantSuspect = false;
+    this._instantHits = 0;
+    this._readOverrun = false;
     this._framePending = false;
     this.lossHistory = [];
     this._lastHold = null;
     this._lastHoldEval = 0;
     this._itersAtStats = 0;
+    this._terminateWorker();
     this.trainer = null;
     if (this.gpu && this.gpu.owned) { try { this.gpu.dispose(); } catch { /* already gone */ } }
     this.gpu = null;
@@ -847,9 +1264,29 @@ export class Session {
     const runFrame = () => {
       if (!this._framePending) return;
       this._framePending = false;
+      // stall watchdog: a frame that never completes (wedged worker,
+      // hung readback, runaway backlog) must surface instead of sitting
+      // at "Starting" forever — loud, repeating, and non-fatal (the
+      // frame still owns the loop if it ever lands)
+      const stallMs = this.opts.stallMs ?? 60000;
+      const id = (this._frameSeq = (this._frameSeq || 0) + 1);
+      const arm = () => {
+        clearTimeout(this._stallT);
+        this._stallT = setTimeout(() => {
+          if (!this.training || this._frameSeq !== id) return;
+          const tr = this.trainer;
+          this._log(`training stall: a frame has run ${(stallMs / 1000) | 0}s+ without completing ` +
+            `(iteration ${tr ? tr.iter : '?'})`);
+          this._em.emit('event', { kind: 'train-stall', frameMs: stallMs, iter: tr ? tr.iter : 0 });
+          arm();   // re-arm while the same frame stays stuck
+        }, stallMs);
+      };
+      arm();
       // a readback rejecting mid-flight (device loss) must not become an
-      // unhandled rejection — the loop stops, the device-lost event explains
-      this._frameLoop().catch((e) => this._log(`frame loop: ${(e && e.message) || e}`));
+      // unhandled rejection — _frameFailed stops the loop and explains it
+      this._frameLoop().then(
+        () => { if (this._frameSeq === id) clearTimeout(this._stallT); },
+        (e) => { if (this._frameSeq === id) clearTimeout(this._stallT); this._frameFailed(e); });
     };
     if (tickWorker) {
       tickWorker.onmessage = () => {
@@ -874,6 +1311,172 @@ export class Session {
     this._sched.raf(this._sched.runFrame);
   }
 
+  /** Effective GPU usage: the governor's auto duty capped by the slider.
+   *  The slider is the thermal ceiling ("how hot"); auto only ever derates
+   *  below it. Disabled (opts.autoDuty false) or hidden: the slider as-is. */
+  _effUsage() {
+    const slider = gpuDuty(this.opts.gpuUsage);
+    if (this.opts.autoDuty === false || isHidden()) return slider;
+    return Math.min(slider, this._govAuto);
+  }
+
+  /** One event-loop lag sample per frame: a setTimeout(0) measures how long
+   *  the main thread takes to turn (encode bursts, GC, refine planning). */
+  _govProbe() {
+    const p0 = performance.now();
+    setTimeout(() => this._govNoteLag(performance.now() - p0), 0);
+  }
+
+  _govNoteLag(ms) {
+    this._govLag = this._govLag * 0.7 + Math.min(ms, 500) * 0.3;
+  }
+
+  /** rAF sampler tick (own loop, not the training cadence): inter-arrival
+   *  time is what the user feels as animation smoothness. */
+  _govNoteRaf(now) {
+    const dt = now - (this._govRafLast || now);
+    this._govRafLast = now;
+    if (dt > 0 && dt < 1000) this._govRaf = this._govRaf * 0.8 + Math.min(dt, 250) * 0.2;
+  }
+
+  /** Plan item (3): feed the batch GPU timer into the governor. ms/step
+   *  at a fixed splat count is unambiguous — growth only lands at refine
+   *  boundaries (the baseline re-anchors there), so a sustained rise
+   *  between refines is the GPU slowing under its own heat or contention:
+   *  the ceiling shrinks; a return toward the best lets it grow back. A
+   *  null gpuMs (timerless trainers) leaves the state untouched — ratio 1,
+   *  the batch-A law. Called with the pre-refine count the steps ran with. */
+  _govNoteGpu(gpuMs, batch, n) {
+    if (!Number.isFinite(gpuMs) || gpuMs <= 0 || !(batch > 0)) return;
+    const sample = gpuMs / batch;
+    if (n !== this._govN) {
+      this._govMsStep = sample;
+      this._govMsBase = sample;
+      this._govN = n;
+      return;
+    }
+    this._govMsStep = this._govMsStep * 0.7 + sample * 0.3;
+    if (this._govMsStep < this._govMsBase) this._govMsBase = this._govMsStep;
+  }
+
+  /** Current GPU slowdown vs its best this refine-window (1 = healthy). */
+  _govGpuRatio() {
+    return this._govMsBase > 0 ? this._govMsStep / this._govMsBase : 1;
+  }
+
+  /** Instant-fence detector (timerless loops only — a batch timer makes
+   *  fences irrelevant). Some phone drivers resolve onSubmittedWorkDone
+   *  before the work completes: dt then measures CPU encode, the batch
+   *  ramps to 64 on fake speed, and the queue grows unboundedly while the
+   *  notification sits at "Starting" (2026-11, ~10-image hangs). A gated
+   *  fence settling in <5ms with real work submitted is meaningless; three
+   *  in a row engages drain pacing (every frame readback-drains, so wall
+   *  dt turns honest and the adapter self-regulates). Any healthy fence
+   *  (>=5ms) or any timed batch concludes the check the other way.
+   *  fenceMs null = nothing gated this frame (no signal either way). */
+  _noteFence(fenceMs, batch, gpuMs) {
+    if (this._instantChecked) return;
+    if (gpuMs != null) { this._instantChecked = true; return; }
+    if (fenceMs == null) return;
+    if (fenceMs >= 5) {
+      this._instantChecked = true;
+      this._instantHits = 0;
+      return;
+    }
+    if (!(batch >= 4)) return;   // trivial work settles fast legitimately
+    this._instantHits = (this._instantHits || 0) + 1;
+    this._instantSuspect = true;
+    if (this._instantHits >= 3) {
+      this._instantChecked = true;
+      this._instantFences = true;
+      this._log('fences resolve before the GPU drains (instant fences) — ' +
+        'pacing each frame on a readback drain instead of queue depth');
+    }
+  }
+
+  /** Ideal next batch for the measured cadence. Growth needs the honest
+   *  timer: the first null batches (the timer delivers one batch lagged)
+   *  hold-or-shrink on wall dt, because stale fences fake speed and would
+   *  spike the batch into its clamp; permanently timerless trainers keep
+   *  the legacy wall-dt law after the grace batches. */
+  _batchIdeal(batch, paceMs, gpuMs) {
+    if (gpuMs == null) this._gpuMsMisses = (this._gpuMsMisses || 0) + 1;
+    else this._gpuMsMisses = 0;
+    const ideal = batch * (120 / paceMs);
+    return gpuMs == null && this._gpuMsMisses <= 2 ? Math.min(batch, ideal) : ideal;
+  }
+
+  /** Plan item (4): submit cut when the queued GPU work exceeds the phone
+   *  budget (opts.gpuChunkMs). The fence ring caps outstanding SUBMITS, but
+   *  on a phone each batch can hold hundreds of ms of GPU work — this caps
+   *  the outstanding WORK instead: predict the batch from the governor's
+   *  ms/step, correct the last submit with its measured gpuMs, and drain
+   *  with the wall clock (stale fences can't serialize the loop — the cut
+   *  only bites when the GPU is genuinely behind). Returns the ms to idle
+   *  instead of submitting, 0 to submit. Without the batch timer there is
+   *  no estimate and the loop runs uncut; the wall drain guarantees
+   *  progress (worst case one batch per budget window), so no fail-open. */
+  _submitCutMs(batch) {
+    const now = performance.now();
+    if (this._cutT == null) this._cutT = now;
+    this._cutMs = Math.max(0, this._cutMs - (now - this._cutT));
+    this._cutT = now;
+    if (this._cutPending) {
+      if (Number.isFinite(this._lastGpuMs)) {
+        this._cutMs = Math.max(0, this._cutMs + (this._lastGpuMs - this._cutPred));
+      }
+      this._cutPending = false;
+    }
+    const pred = this._govMsStep * batch;
+    const excess = this._cutMs + pred - (this.opts.gpuChunkMs ?? 400);
+    // no timer signal yet (or timerless): run uncut but keep accounting, so
+    // the first measurement corrects the estimate retroactively. And the
+    // floor batch always submits: a minimum batch over budget must still
+    // run (slowly, honestly) — cutting it idles forever, since the cut
+    // branch never re-estimates (2026-11: large-res runs hung exactly this
+    // way — completing frames, responsive UI, frozen metrics, and a stall
+    // watchdog with nothing to catch).
+    if (this._govN < 0 || batch <= 4 || excess <= 0) {
+      this._cutMs += pred;
+      this._cutPred = pred;
+      this._cutPending = true;
+      return 0;
+    }
+    return Math.min(100, excess);
+  }
+
+  _govRafLoop() {
+    if (!this.training) { this._govRafRunning = false; return; }
+    this._govNoteRaf(performance.now());
+    this._sched.raf(() => this._govRafLoop());
+  }
+
+  /** Run the controller over the EWMAs (stats-window cadence); frozen while
+   *  hidden, where there is no responsiveness to protect. Logs only when the
+   *  derate crosses a bucket boundary. */
+  _govUpdate() {
+    if (this.opts.autoDuty === false || isHidden()) return;
+    const g = { ...GOV_DEFAULTS, ...this.opts.governor };
+    const ratio = this._govGpuRatio();
+    const { auto, moved } = governDuty(this._govAuto,
+      { lagMs: this._govLag, rafMs: this._govRaf, gpuRatio: ratio }, this.opts.governor);
+    this._govAuto = auto;
+    if (moved !== 0) {
+      const bucket = auto >= 1 ? 1 : auto > 0.5 ? 0.5 : auto > 0.25 ? 0.25 : 0.1;
+      if (bucket !== this._govBucket) {
+        this._govBucket = bucket;
+        const gpuTrip = ratio > g.gpuJank;
+        const sysTrip = this._govLag > g.lagJank || this._govRaf > g.rafJank;
+        this._log(auto >= 1
+          ? 'system healthy — GPU duty back to the slider'
+          : `${gpuTrip && !sysTrip ? 'GPU throttling' : 'display struggling'} (event-loop lag ` +
+            `${this._govLag.toFixed(0)}ms, frame ${this._govRaf.toFixed(0)}ms` +
+            (gpuTrip ? `, GPU step cost ${ratio.toFixed(2)}x its best` : '') +
+            `) — GPU duty auto-derated to ${Math.round(auto * 100)}% of the slider`);
+      }
+    }
+  }
+
   async _frameLoop() {
     const trainer = this.trainer;
     if (!trainer || !trainer.camMeta || this._lost) return;
@@ -885,7 +1488,7 @@ export class Session {
       await this._emitMetrics(true);
       // emitted AFTER the final readback: listeners typically call metrics()
       // right away, which must not interleave with ours on the staging buffer
-      this._camDriftDone();
+      await this._camDriftDone();
       this._em.emit('event', { kind: 'train-complete', iter: trainer.iter, splats: trainer.n });
     }
 
@@ -894,9 +1497,43 @@ export class Session {
       // adapts to the device: ~120ms of GPU work per frame keeps a desktop
       // GPU saturated with few submits AND keeps metrics/UI alive on a phone
       // where the same 15 iterations could take seconds.
-      const batch = this.opts.itersPerFrame ??
+      let batch = this.opts.itersPerFrame ??
         Math.max(4, Math.min(64, Math.round(this._batch ?? 15)));
+      // timerless + pacing suspect: hold small batches until the fence
+      // check concludes (a healthy fence or a timed batch lifts this
+      // within a few frames; instant fences keep it, plus drain pacing)
+      if (this._lastGpuMs == null && !this._instantChecked &&
+          (this._instantSuspect || this._readOverrun)) {
+        batch = Math.min(batch, 8);
+      }
+      // (4) over budget: skip the submit, keep the view alive, idle a beat
+      // for the queue to drain — then re-evaluate next frame
+      const cutMs = this._submitCutMs(batch);
+      if (cutMs > 0) {
+        if (this.perf) {
+          this.perf.marks.push({ t: Math.round(performance.now()), kind: 'cut',
+            iter: trainer.iter, ms: Math.round(cutMs) });
+        }
+        // the cut must ESCAPE, not just idle: the adapter only re-estimates
+        // in the work branch, so a frozen batch over budget would cut
+        // forever — the adapter never shrinks what never runs (same hang as
+        // above, at any batch). Decay toward the floor, whose submit (see
+        // _submitCutMs) guarantees progress, and say so while it bites.
+        this._cutStreak = (this._cutStreak || 0) + 1;
+        const cutFrom = Math.round(this._batch ?? batch);
+        this._batch = Math.max(4, (this._batch ?? batch) * 0.7);
+        if (this._cutStreak === 1 || this._cutStreak % 50 === 0) {
+          this._log(`submit cut: holding ${Math.round(cutMs)}ms idle ` +
+            `(batch ${cutFrom}→${Math.round(this._batch)}, streak ${this._cutStreak}) — GPU work over budget`);
+        }
+        this.view._tick(this._frameCount, this.training);
+        await new Promise((r) => setTimeout(r, cutMs));
+        if (this.training || (this.view.enabled && this.view._dirty)) this._scheduleFrame();
+        return;
+      }
+      this._cutStreak = 0;
       const t0 = performance.now();
+      this._govProbe(); // duty governor: one event-loop lag sample per frame
       // true throughput, stall time included: Safari's stale fences hide the
       // GPU's real pace from per-frame dt, and a slow GPU otherwise ends up
       // with many seconds of work queued (chunky metrics, laggy pause)
@@ -907,28 +1544,120 @@ export class Session {
         this._ips = this._ips == null ? ips : this._ips * 0.5 + ips * 0.5;
         this._thrT = t0; this._thrIter = trainer.iter;
       }
-      for (let k = 0; k < batch; k++) trainer.stepOnce();
+      // (2) the batch GPU timer brackets the steps; the adapter below paces
+      // on measured GPU-busy ms, falling back to wall dt without timestamps
+      let gpuMs = null, fenceMs = null;
+      if (this._remote) {
+        const s = await trainer.runSteps(batch);
+        gpuMs = s.gpuMs ?? null;
+        fenceMs = s.fenceMs ?? null;
+      } else {
+        if (typeof trainer.beginGpuBatch === 'function') trainer.beginGpuBatch();
+        for (let k = 0; k < batch; k++) trainer.stepOnce();
+        if (typeof trainer.endGpuBatch === 'function') gpuMs = await trainer.endGpuBatch();
+      }
+      // (3) the ceiling's own signal: reads before refine() below can move n
+      this._govNoteGpu(gpuMs, batch, trainer.n);
+      this._lastGpuMs = gpuMs; // (4) corrects the submit prediction next frame
 
       const tEnc = performance.now() - t0;
 
-      // periodic refinement: relocate dead splats + grow capacity (MCMC-lite)
-      if (trainer.iter > 1500 &&
-          trainer.iter - (trainer.lastRefine || 0) >= (this.opts.refineEvery ?? 2500)) {
+      // periodic refinement: relocate dead splats + grow capacity (MCMC-lite).
+      // Cadence is score-driven: a plateaued PSNR pulls the next refine
+      // forward (past a minimum gap, so a flat score can't storm); the
+      // refineEvery cadence stays as the maximum gap, so fast-rising early
+      // training — and any metric outage — still refines on schedule.
+      const refineEvery = this.opts.refineEvery ?? 2500;
+      const sinceRefine = trainer.iter - (trainer.lastRefine || 0);
+      let plateau = false;
+      if (this.opts.refinePlateau !== false && trainer.iter > 1500 &&
+          sinceRefine >= (this.opts.plateauMinGap ?? 400)) {
+        plateau = scorePlateaued(this.lossHistory, trainer.iter, {
+          window: this.opts.plateauWindow ?? 1200,
+          slope: this.opts.plateauSlope ?? 0.1,
+        });
+      }
+      let refineResult = null;
+      if (trainer.iter > 1500 && (sinceRefine >= refineEvery || plateau)) {
         trainer.lastRefine = trainer.iter;
+        // tandem prune: cull the lowest-mass fraction FIRST (until 85% of
+        // the run), so this same refine regrows the freed capacity into
+        // the highest-error donors — one prune/multiply cycle, not two
+        // cadences. Survivors keep their accumulated error stats (the
+        // compaction moves grad buffers with their rows), so the growth
+        // donors below are scored on the same window.
+        const sp = trainer.opts ? trainer.opts.softPrune : null;
+        let tandemCulled = 0;
+        if (sp && trainer.iter <= (sp.until ?? 0.85) * this._maxIters()) {
+          const pruned = await trainer.softPrune();
+          if (pruned.culled) {
+            tandemCulled = pruned.culled;
+            this._log(`tandem prune @${trainer.iter}: culled ${pruned.culled} -> ${pruned.n} splats` +
+              (pruned.floorBound === 'ratchet' ? ' (growth ratchet held the floor)' : ''));
+            this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
+          }
+        }
         const r0 = performance.now();
         // awaited: refine reads six buffers and writes them all back — steps
         // submitted meanwhile would be silently rewound by that write-back,
         // and the six snapshots would come from six different iterations
         const r = await trainer.refine();
+        refineResult = r;
         if (this.perf) {
           this.perf.marks.push({ t: Math.round(r0), kind: 'refine', iter: trainer.iter,
             ms: Math.round(performance.now() - r0), moved: r.moved, grown: r.grown });
         }
         if (r.moved || r.grown) {
           this._log(`refine @${trainer.iter}: relocated ${r.moved}, grew +${r.grown} -> ${r.n} splats`
-            + (r.dead != null ? ` (dead ${r.dead}, last round ${r.survived}/${r.lastReloc} survived)` : ''));
+            + (r.dead != null ? ` (dead ${r.dead}, last round ${r.survived}/${r.lastReloc} survived)` : '')
+            + (plateau ? ' [score plateaued]' : '')
+            + (tandemCulled ? ` [tandem: culled ${tandemCulled} first]` : ''));
           this._em.emit('event', { kind: 'refine', iter: trainer.iter, ...r });
         }
+      }
+
+      // early milestones (opt-in, ahead of the tandem above): a gentle
+      // 10% trim every 1000 iterations through 6000 — keep 0.9 each —
+      // each followed by its own bonus regrow, since no scheduled
+      // refine follows this early. The old aggressive ladder (keep 1/4
+      // @500, 1/2 @1000, 3/4 @2000) culled before the model carried
+      // any signal and wedged training irrecoverably. Past `until` of
+      // the run (short test runs) the marks stay unfired.
+      const spm = trainer.opts ? trainer.opts.softPrune : null;
+      if (spm && trainer.iter <= (spm.until ?? 0.85) * this._maxIters()) {
+        this._pruneFired ??= [];
+        const marks = spm.milestones ?? [[1000, 0.9], [2000, 0.9], [3000, 0.9], [4000, 0.9], [5000, 0.9], [6000, 0.9]];
+        // a continued run starts past every mark — only fire within one
+        // window of it, so old milestones never replay back-to-back
+        const due = marks.find(([at]) => trainer.iter >= at &&
+          trainer.iter - at < (spm.every ?? 3000) && !this._pruneFired.includes(at));
+        if (due) {
+          this._pruneFired.push(due[0]);
+          const pruned = await trainer.softPrune(1 - due[1]);
+          if (!pruned.culled) {
+            this._log(`early prune @${trainer.iter}: kept all ${pruned.n} (too few rows or no signal yet)`);
+          } else {
+            this._log(`early prune @${trainer.iter}: culled ${pruned.culled} -> ${pruned.n} splats`);
+            this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
+            const b = await trainer.refine();
+            if (!refineResult || b.capped) refineResult = b;
+            if (b.grown) {
+              this._log(`tandem regrow @${trainer.iter}: +${b.grown} -> ${b.n} splats`);
+              this._em.emit('event', { kind: 'tandem-regrow', iter: trainer.iter, ...b });
+            }
+          }
+        }
+      }
+      // the ceiling's own prompt: a refine reporting growth-still-scheduled
+      // against a full TRUE cap pauses and asks — keep training at the cap,
+      // or prune to half and grow on. The UI answers via start() (growth
+      // stays blocked by the limit) or pruneAndContinue() (which resets
+      // _capAsked, so the next ceiling hit asks again).
+      if (refineResult && refineResult.capped && !this._capAsked) {
+        this._capAsked = true;
+        this.training = false;
+        this._log(`splat cap reached at ${trainer.n} — paused: keep training at the cap, or prune and continue`);
+        this._em.emit('event', { kind: 'cap-hit', iter: trainer.iter, splats: trainer.n });
       }
 
       const now = performance.now();
@@ -937,6 +1666,7 @@ export class Session {
         const m0 = performance.now();
         await this._emitMetrics();
         tMet = performance.now() - m0;
+        this._govUpdate(); // duty governor runs on the stats cadence
       }
 
       const v0 = performance.now();
@@ -952,13 +1682,33 @@ export class Session {
       // overlap; the frame period becomes ~latency/4 and the same adapter now
       // GROWS the batch until real GPU work dominates. Prompt-fence devices
       // (desktop) behave as before.
-      this._fences.push(trainer.device.queue.onSubmittedWorkDone());
-      const s0 = performance.now();
-      // fence ring depth trades UI latency for fence-latency overlap
-      // (4 x 0.4s of queued dispatches is the "whole system stalls" feel —
-      // hosts sharing the GPU with a compositor can pass a lower fenceRing)
-      if (this._fences.length > (this.opts.fenceRing ?? 4)) await this._fences.shift();
-      const tStall = performance.now() - s0;
+      // remote training gates its own fence ring worker-side and the round
+      // trip above already carries the backpressure — the local ring is local-only
+      let tStall = 0;
+      if (!this._remote) {
+        this._fences.push(trainer.device.queue.onSubmittedWorkDone());
+        // fence ring depth trades UI latency for fence-latency overlap
+        // (4 x 0.4s of queued dispatches is the "whole system stalls" feel —
+        // hosts sharing the GPU with a compositor can pass a lower fenceRing)
+        if (this._fences.length > (this.opts.fenceRing ?? 4)) {
+          const s0 = performance.now();
+          await this._fences.shift();
+          tStall = performance.now() - s0;
+          fenceMs = tStall;
+        }
+      }
+
+      // instant-fence check (timerless loops): three meaningless fences
+      // engage drain pacing below; the batch cap above holds the ramp
+      // until the check concludes either way
+      this._noteFence(fenceMs, batch, gpuMs);
+      if (this._lastGpuMs == null && (this._instantFences || this._readOverrun)) {
+        // drain pacing: without timestamps the readback is the ONLY honest
+        // completion signal (mapAsync waits for preceding work) — the wall
+        // dt below then measures real GPU time and the adapter self-regulates
+        // instead of queueing backlog behind instant fences
+        await this._locked(() => trainer.readLoss());
+      }
 
       // Duty honesty: the ring above keeps several batches in flight, so
       // the throttle sleep below would merely run the backlog while the
@@ -969,9 +1719,9 @@ export class Session {
       // pipelined behavior instead of stalling every frame. Skipped
       // entirely at full duty (duty 1 never sleeps: provable no-op).
       let dt = Math.max(5, performance.now() - t0);
-      const duty = gpuDuty(this.opts.gpuUsage);
+      const duty = gpuDuty(this._effUsage());
       if (duty < 1 && this._fences.length) {
-        const budget = Math.max(0, gpuIdleMs(dt, this.opts.gpuUsage) * 0.25);
+        const budget = Math.max(0, gpuIdleMs(dt, this._effUsage()) * 0.25);
         const w0 = performance.now();
         const drained = await Promise.race([
           this._fences[this._fences.length - 1].then(() => true, () => true),
@@ -981,9 +1731,12 @@ export class Session {
         if (drained) this._fences.length = 0;
       }
 
-      // adapt the batch to the measured cadence (steady-state ~= GPU time of
-      // one batch, the honesty drain included); damped so it settles
-      const ideal = batch * (120 / dt);
+      // adapt the batch to the measured cadence: honest GPU-busy ms when the
+      // batch timer measured it (fence latency, throttle sleeps and encode
+      // gaps excluded — thermal sag shows as rising ms and shrinks the batch
+      // instead of queueing backlog), wall dt otherwise; damped so it settles
+      const paceMs = Number.isFinite(gpuMs) && gpuMs > 0 ? gpuMs : dt;
+      const ideal = this._batchIdeal(batch, paceMs, gpuMs);
       this._batch = Math.max(4, Math.min(64, (this._batch ?? 15) * 0.7 + ideal * 0.3));
       // throughput cap: ~0.4s of measured GPU work per batch. The dt adapter
       // reads 5ms frames when fences resolve stale and pushes the batch to
@@ -992,11 +1745,11 @@ export class Session {
         // gpuChunkMs bounds how much GPU work one batch queues at full
         // duty; below, the bound scales with the slider (gpuBurstMs) so a
         // burst never outruns its idle window as backlog
-        const chunk = gpuBurstMs(this.opts.gpuChunkMs ?? 400, this.opts.gpuUsage) / 1000;
+        const chunk = gpuBurstMs(this.opts.gpuChunkMs ?? 400, this._effUsage()) / 1000;
         // _ips is wall-time (throttle idle included): divide the requested
         // duty back out against the duty-scaled bound, so batches stay
         // saturating at full duty and shrink with the slider below
-        this._batch = Math.min(this._batch, Math.max(8, Math.round(this._ips * chunk / gpuDuty(this.opts.gpuUsage))));
+        this._batch = Math.min(this._batch, Math.max(8, Math.round(this._ips * chunk / gpuDuty(this._effUsage()))));
       }
       if (this.perf) {
         this.perf.frames.push([Math.round(now), trainer.iter, batch, trainer.n,
@@ -1007,11 +1760,12 @@ export class Session {
       // size, and the pause between batches is what yields the GPU to the
       // system. Read live so the slider bites on the next batch; before the
       // reschedule check so a pause during the sleep still stops the loop.
-      const idleMs = gpuIdleMs(dt, this.opts.gpuUsage);
+      const idleMs = gpuIdleMs(dt, this._effUsage());
       if (idleMs > 0) await new Promise((r) => setTimeout(r, idleMs));
     } else {
       this.view._tick(this._frameCount, this.training);
-      await trainer.device.queue.onSubmittedWorkDone();
+      if (this._remote) await trainer.sync();
+      else await trainer.device.queue.onSubmittedWorkDone();
       this._fences.length = 0;
     }
     if (this.training || (this.view.enabled && this.view._dirty)) this._scheduleFrame();
@@ -1038,17 +1792,41 @@ export class Session {
     const trainer = this.trainer;
     const now = performance.now();
     const itersPerSec = (trainer.iter - this._itersAtStats) / Math.max(1, now - this._lastStats) * 1000;
-    const m = { iter: trainer.iter, splats: trainer.n, itersPerSec: Math.round(itersPerSec) };
+    const m = { iter: trainer.iter, splats: trainer.n, itersPerSec: Math.round(itersPerSec),
+      duty: +this._effUsage().toFixed(3), autoDuty: +this._govAuto.toFixed(3),
+      gpuRatio: +this._govGpuRatio().toFixed(3) };
     this._lastIps = m.itersPerSec;
     const tRead = performance.now();
+    // breathe first: the readback drains every queued batch, so a pending
+    // frame present goes out now instead of queueing behind the stall
+    await tick();
     const mse = await trainer.readLoss();
     if (mse != null && mse > 0) {
       m.psnrTrain = -10 * Math.log10(mse);
       this.lossHistory.push([trainer.iter, m.psnrTrain]);
     }
+    // tile-sort overflow used to be silent (dropped tiles render as
+    // background): the count is cumulative on the trainer in both the
+    // local and worker paths, so any increase is news, once per increase
+    const ov = trainer.entryOverflowTiles || 0;
+    if (ov > (this._lastOverflow || 0)) {
+      this._lastOverflow = ov;
+      this._log(`WARNING: tile-sort overflow — ${ov} tiles dropped so far; the splat budget is too large for this adapter's entry binding`);
+      this._em.emit('event', { kind: 'overflow', iter: trainer.iter, tiles: ov });
+    }
     const holdEvery = this.opts.evalHoldEvery ?? 4000;
+    // (7) hidden tabs skip the holdout eval (training continues); the stale
+    // _lastHoldEval fires it immediately when the tab returns. Final always
+    // evaluates — the done screen needs its number.
+    // A deep queue drain already stalled this readout — stacking the
+    // holdout's extra full-frame render + readbacks onto it turns one hitch
+    // into two, so the holdout defers to the next readout instead. The
+    // cadence is iter-based and _lastHoldEval only advances on an actual
+    // eval, so the deferred eval fires there; meanwhile the stale-score
+    // branch below keeps the last known value on screen.
+    const drainDefer = !final && (performance.now() - tRead) > 1500;
     if (this.holdout >= 0 &&
-        (final || trainer.iter - this._lastHoldEval >= holdEvery)) {
+        (final || (!isHidden() && !drainDefer && trainer.iter - this._lastHoldEval >= holdEvery))) {
       this._lastHoldEval = trainer.iter;
       m.psnrHold = await trainer.evalCamPsnr(this.holdout);
       this._lastHold = m.psnrHold;
@@ -1062,6 +1840,17 @@ export class Session {
     this._lastStats = end;
     this._itersAtStats = trainer.iter;
     this._statsGap = Math.min(8000, Math.max(2000, (end - tRead) * 2.5));
+    // a multi-second drain means the loop submitted faster than the GPU
+    // drains — the backlog instant fences hide everywhere else. Without a
+    // batch timer there is nothing else to pace off, so stay conservative
+    // (small batches + drain pacing). Sticky: one overrun proves the
+    // pacing signal dishonest for this run.
+    this._lastReadMs = end - tRead;
+    if (this._lastReadMs > 3000 && this._lastGpuMs == null && !this._readOverrun) {
+      this._readOverrun = true;
+      this._log(`metrics readback drained ${(this._lastReadMs / 1000).toFixed(1)}s of queued GPU work — ` +
+        'holding small batches + drain pacing (no batch timer to pace off)');
+    }
     this._em.emit('metrics', m);
     return m;
   }
@@ -1103,6 +1892,7 @@ export class Session {
    *  report. Resolves null when no eval split was requested. */
   evalTestPsnr() {
     if (!this.testCams || !this.testCams.length) return Promise.resolve(null);
+    if (this._remote) return this._locked(() => this.trainer.evalTestPsnr(this.testCams));
     return this._locked(async () => {
       const frames = [];
       let sum = 0;
@@ -1124,38 +1914,57 @@ export class Session {
     // shares the trainer's staging buffers with the metric readbacks
     return this._locked(async () => {
       const { data, n, sh, shK } = await this.trainer.readGaussians();
-      const meta = this.trainer.camMeta[0];
-      // a view-only restore has no training cameras — its model came from an
-      // export that already baked the compensation, so pass it through.
-      // A trainer without Mip compensation (opts.mipComp false) rendered
-      // exactly what external rasterizers render: nothing to bake.
-      const baked = (meta && this.trainer.mipComp !== false)
-        ? bakeOpacityCompensation(data, n, meta.f,
-            Float32Array.from(this.trainer.camMeta.flatMap(camPosition)), this.trainer.dilate)
-        : data;
-      // dead splats — invisible at the smallest 8-bit alpha — are pure
-      // file-size and render tax for every viewer. Long classic-era runs
-      // accumulated 50%+ of them (opacity-reg ratchet, lab log 2026-09-01):
-      // drop them at the door.
-      const A_DEAD = Math.log(1 / 254);   // logit of alpha 1/255
-      let live = 0;
-      for (let i = 0; i < n; i++) if (baked[i * 16 + 13] > A_DEAD) live++;
-      let oData = baked, oSh = sh, oN = n;
-      if (live < n) {
-        oData = new Float32Array(live * 16);
-        const shPer = sh ? sh.length / n : 0;
-        oSh = sh ? new Float32Array(live * shPer) : sh;
-        let w = 0;
-        for (let i = 0; i < n; i++) {
-          if (baked[i * 16 + 13] <= A_DEAD) continue;
-          oData.set(baked.subarray(i * 16, i * 16 + 16), w * 16);
-          if (sh) oSh.set(sh.subarray(i * shPer, (i + 1) * shPer), w * shPer);
-          w++;
-        }
-        oN = live;
-      }
-      return gaussiansToPly(oData, oN, oSh, shK, this.trainer.dcMode);
+      return this._bakedPly(data, n, sh, shK);
     });
+  }
+
+  /** Simplified .ply: training-free NanoGS-method merge-down to `ratio` of
+   *  the splats, then the same bake + dead-splat filter as a full export.
+   *  The live model is untouched — the simplification runs on a readback. */
+  exportSimplifiedPlyBlob(ratio, { onStatus = () => {}, onProgress = null } = {}) {
+    return this._locked(async () => {
+      const { data, n, sh, shK } = await this.trainer.readGaussians();
+      const simp = await simplifyGaussians(
+        { data, n, sh, shK, dc: this.trainer.dcMode },
+        { ratio, onStatus, onProgress });
+      return this._bakedPly(simp.data, simp.n, simp.sh, simp.shK);
+    });
+  }
+
+  /** Mip-compensation bake + dead-splat filter + PLY pack, shared by the
+   *  full and simplified export paths. */
+  _bakedPly(data, n, sh, shK) {
+    const meta = this.trainer.camMeta[0];
+    // a view-only restore has no training cameras — its model came from an
+    // export that already baked the compensation, so pass it through.
+    // A trainer without Mip compensation (opts.mipComp false) rendered
+    // exactly what external rasterizers render: nothing to bake.
+    const baked = (meta && this.trainer.mipComp !== false)
+      ? bakeOpacityCompensation(data, n, meta.f,
+          Float32Array.from(this.trainer.camMeta.flatMap(camPosition)), this.trainer.dilate)
+      : data;
+    // dead splats — invisible at the smallest 8-bit alpha — are pure
+    // file-size and render tax for every viewer. Long classic-era runs
+    // accumulated 50%+ of them (opacity-reg ratchet, lab log 2026-09-01):
+    // drop them at the door.
+    const A_DEAD = Math.log(1 / 254);   // logit of alpha 1/255
+    let live = 0;
+    for (let i = 0; i < n; i++) if (baked[i * 16 + 13] > A_DEAD) live++;
+    let oData = baked, oSh = sh, oN = n;
+    if (live < n) {
+      oData = new Float32Array(live * 16);
+      const shPer = sh ? sh.length / n : 0;
+      oSh = sh ? new Float32Array(live * shPer) : sh;
+      let w = 0;
+      for (let i = 0; i < n; i++) {
+        if (baked[i * 16 + 13] <= A_DEAD) continue;
+        oData.set(baked.subarray(i * 16, i * 16 + 16), w * 16);
+        if (sh) oSh.set(sh.subarray(i * shPer, (i + 1) * shPer), w * shPer);
+        w++;
+      }
+      oN = live;
+    }
+    return gaussiansToPly(oData, oN, oSh, shK, this.trainer.dcMode);
   }
 
   /** The trainer's RAW parameter state ({ data, n, sh, shK }) — the exact
@@ -1167,8 +1976,10 @@ export class Session {
 
   dispose() {
     this.training = false;
+    clearTimeout(this._stallT);
     if (this._sched && this._sched.tickWorker) this._sched.tickWorker.terminate();
     if (this.gpu && this.gpu.owned) this.gpu.dispose();
+    this._terminateWorker();
     this.trainer = null;
   }
 }
@@ -1184,18 +1995,86 @@ class SessionView {
     this._dirty = false;
     this._renderInFlight = null;   // latest-wins gate (see renderNow)
     this._offset = 0;     // training-target offset when looking through a frame
+    this._lookIdx = null; // frame index when looking through a frame (else the free camera holds)
+    this._offs = new Map();  // canvas element -> { off, key, gen, sent } (remote only)
+    this._remoteInFlight = false; // latest-wins gate for remote sends (see renderNow)
+    this._chain = null;      // serializes remote view commands (attach before render)
+    this._viewFailed = false; // a view-error event is already out for this failure streak
+    this._falseSince = null;  // first consecutive renderNow=false (no-present streak clock)
+  }
+
+  /** Remote view commands run strictly ordered — overlapping ticks must not
+   *  reorder attach/setCamera/renderNow across the round trips. A rejected
+   *  command surfaces once per streak as a view-error event (the app
+   *  re-mounts a fresh canvas on it); renderNow resolving false (disabled,
+   *  in-flight, no camera yet) is normal flow, not an error. */
+  _send(cmd, params, transfer) {
+    const run = () => this.s.trainer.viewCmd(cmd, params, transfer);
+    const p = (this._chain || Promise.resolve()).then(run, run);
+    this._chain = p.catch(() => {});
+    p.then(
+      () => { this._viewFailed = false; },
+      (e) => {
+        if (this._viewFailed) return;
+        this._viewFailed = true;
+        const msg = (e && e.message) || String(e);
+        this.s._log(`view ${cmd} failed: ${msg}`);
+        this.s._em.emit('event', { kind: 'view-error', cmd, message: msg });
+      });
+    return p;
   }
 
   attach(canvas) {
+    if (!this.s._remote) {
+      this.canvas = canvas;
+      this.ctx = canvas.getContext('webgpu');
+      this.ctx.configure({
+        device: this.s.trainer.device,
+        format: this.s.trainer.canvasFormat,
+        alphaMode: 'opaque',
+      });
+      this._dirty = true;
+      if (!this.s.training && this.enabled) this.s._ensureScheduler(), this.s._scheduleFrame();
+      return;
+    }
+    let rec = this._offs.get(canvas);
+    if (!rec) {
+      rec = { off: canvas.transferControlToOffscreen(), key: this._offs.size,
+              gen: this.s._workerGen, sent: false };
+      this._offs.set(canvas, rec);
+    }
+    if (rec.gen !== this.s._workerGen) {
+      // the element's offscreen died with a previous worker (recover); a
+      // transferred element can never move again — attach a fresh canvas
+      throw new Error('view: this canvas was transferred to a previous worker — attach a fresh canvas');
+    }
     this.canvas = canvas;
-    this.ctx = canvas.getContext('webgpu');
-    this.ctx.configure({
-      device: this.s.trainer.device,
-      format: this.s.trainer.canvasFormat,
-      alphaMode: 'opaque',
-    });
+    const first = !rec.sent;
+    rec.sent = true;
     this._dirty = true;
+    const p = this._send('attach',
+      { key: rec.key, canvas: first ? rec.off : undefined, w: canvas.width, h: canvas.height },
+      first ? [rec.off] : undefined);
+    // a failed attach must not poison the element: sent=true would make
+    // every later attach omit the canvas and the worker answer 'unknown
+    // canvas key' forever — a permanent black view from one transient
+    // rejection (2026-11). The next attach retries with the canvas.
+    p.catch(() => { if (this._offs.get(canvas) === rec) rec.sent = false; });
     if (!this.s.training && this.enabled) this.s._ensureScheduler(), this.s._scheduleFrame();
+    return p;
+  }
+
+  /** Re-push the live view state (enabled + camera) behind the queued
+   *  commands. After a re-attach the worker may have missed any of it —
+   *  rejections don't retry — while the main side looks unchanged, so plain
+   *  setters would early-return and the desync would stick. */
+  resync() {
+    if (!this.s._remote || !this.canvas) return Promise.resolve(false);
+    this._viewFailed = false;   // the re-attach starts a fresh failure streak
+    this._send('setEnabled', { enabled: this.enabled });
+    if (this._lookIdx != null) this._send('lookThrough', { i: this._lookIdx });
+    else if (this.camera) this._send('setCamera', { cam: this.camera });
+    return Promise.resolve(true);
   }
 
   /** Enable/disable the app's standalone viewport without touching trainer
@@ -1206,23 +2085,34 @@ class SessionView {
     this.enabled = enabled;
     this._dirty = true; // repaint the latest model/camera when re-enabled
     if (enabled && !this.s.training) this.s._ensureScheduler(), this.s._scheduleFrame();
+    if (this.s._remote) return this._send('setEnabled', { enabled });
   }
 
   /** Point the camera at training frame i (exact pose + intrinsics). Returns
    *  the camera meta so the UI can overlay the photograph. */
   lookThrough(i) {
     const meta = this.s.trainer.camMeta[i];
-    this.setCamera({ ...meta });
+    if (!this.s._remote) {
+      this.setCamera({ ...meta });
+      this._lookIdx = i;   // setCamera clears it (it is the free-camera path)
+      this._offset = meta.offset;
+      return meta;
+    }
+    this._lookIdx = i;
+    this.camera = { ...meta };
     this._offset = meta.offset;
-    return meta;
+    this._dirty = true;
+    return this._send('lookThrough', { i }).then(() => meta);
   }
 
   /** Free camera: { R, t, f, cx, cy, w, h }. */
   setCamera(cam) {
     this.camera = cam;
+    this._lookIdx = null;
     this._offset = 0;
     this._dirty = true;
     if (!this.s.training && this.s._sched) this.s._scheduleFrame();
+    if (this.s._remote) return this._send('setCamera', { cam });
   }
 
   /** Render the current camera now — latest-wins: while a render is still
@@ -1232,6 +2122,46 @@ class SessionView {
    *  camera. `force` submits unconditionally for synchronous snapshots
    *  that read the canvas back immediately. */
   renderNow(force = false) {
+    if (this.s._remote) {
+      if (!this.enabled || !this.camera) return Promise.resolve(false);
+      // latest-wins like the local branch: a render already draining its
+      // round trip coalesces — mark dirty (the next tick retries with the
+      // newest camera) instead of queueing stale renders behind the chain
+      // (continuous orbiting used to backlog them all: orbit lag vs main,
+      // 2026-11). A coalesced render is accepted work, not a refusal: it
+      // resolves true without touching the no-present streak, which only
+      // counts worker refusals.
+      if (this._remoteInFlight && !force) { this._dirty = true; return Promise.resolve(true); }
+      this._remoteInFlight = true;
+      // a submitted render clears dirty (latest-wins: an in-flight one keeps it)
+      return this._send('renderNow', { force }).then((ok) => {
+        this._remoteInFlight = false;
+        // accepted renders push back the auto-refresh like the local branch:
+        // without this the tick re-fires every frame during training and the
+        // worker never parks its present loop (same-phone lag vs main, 2026-11)
+        if (ok) { this._dirty = false; this._falseSince = null; this._lastAuto = performance.now(); return ok; }
+        // sustained refusal WITHOUT a rejection is silent black (worker
+        // disabled/desynced, stuck in-flight, or never attached) — after a
+        // grace window it surfaces as view-error like a rejection does,
+        // with a probe diagnosis of WHICH link is broken (see below)
+        const now = performance.now();
+        if (this._falseSince == null) this._falseSince = now;
+        const stallMs = this.s.opts.viewStallMs ?? 5000;
+        if (!this._viewFailed && now - this._falseSince > stallMs) {
+          this._viewFailed = true;
+          const secs = ((now - this._falseSince) / 1000).toFixed(0);
+          return this._diagnoseNoPresent().then((d) => {
+            const msg = `worker presented no frames for ${secs}s ` +
+              `(renders refused: disabled, busy, or no canvas) — probe: ${d.summary}`;
+            this.s._log(`view renderNow stalled: ${msg}${d.worker ? ` [worker ${d.worker}]` : ''}`);
+            this.s._em.emit('event',
+              { kind: 'view-error', cmd: 'renderNow', message: msg, diagnosis: d.kind });
+            return ok;
+          });
+        }
+        return ok;
+      }, (e) => { this._remoteInFlight = false; throw e; });
+    }
     if (!this.enabled || !this.ctx || !this.camera) return;
     if (this._renderInFlight && !force) { this._dirty = true; return; }
     this._dirty = false;
@@ -1246,9 +2176,62 @@ class SessionView {
     this._lastAuto = performance.now();
   }
 
+  /** Which link of the remote view path is broken: a canvas-free probe
+   *  capture with content means the worker renders fine and only the
+   *  present fails; a black capture means the raster/camera itself
+   *  produces nothing. Plus the worker's own view state (desync shows
+   *  as no canvas / no camera / disabled / stuck in flight). Best
+   *  effort — a failed probe is itself a diagnosis. Remote only (the
+   *  no-present streak that calls it never fires locally). */
+  async _diagnoseNoPresent() {
+    let worker = null;
+    try {
+      const i = await this._send('inspect', {});
+      if (i) worker = `current=${i.current}/${i.canvases} canvases, enabled=${i.enabled}, ` +
+        `cam=${i.camera ? `${i.camera.w}x${i.camera.h}` : 'none'}, ` +
+        `offscreen=${i.canvasWH ? `${i.canvasWH.w}x${i.canvasWH.h}` : 'none'}, ` +
+        `inFlight=${i.inFlight}`;
+    } catch (e) { worker = `inspect failed: ${(e && e.message) || e}`; }
+    let kind = 'unknown', summary = 'probe skipped (no camera)';
+    if (this.camera) {
+      try {
+        const shot = await this.capture();
+        const s = litSample(shot && shot.rgba);
+        if (s.lit >= 3 && s.frac > 0.001) {
+          kind = 'presentation';
+          summary = `capture renders content (${(100 * s.frac).toFixed(1)}% lit) — the present fails, not the raster`;
+        } else {
+          kind = 'raster';
+          summary = 'capture comes back black — the worker rasterizes nothing for this camera';
+        }
+      } catch (e) {
+        kind = 'capture-failed';
+        summary = `probe capture failed: ${(e && e.message) || e}`;
+      }
+    }
+    return { kind, summary, worker };
+  }
+
+  /** Pixels for the current camera, no canvas involved (snapshots, error
+   *  renders): { w, h, rgba }. The capture renders itself — no preceding
+   *  renderNow needed — and works identically local or remote. */
+  async capture() {
+    if (!this.camera) throw new Error('view.capture: no camera');
+    if (this.s._remote) return this.s.trainer.capture(this.camera);
+    return this.s.trainer.renderCapture(this.camera);
+  }
+
   _tick(frameCount, training) {
-    if (!this.enabled || !this.ctx || !this.camera) return;
-    if (this._dirty) { this.renderNow(); return; }
+    if (!this.enabled || !this.camera) return;
+    if (!this.s._remote && !this.ctx) return;
+    if (isHidden()) return; // (7) hidden: skip renders, keep the cycles for training
+    // remote sends are fire-and-forget here (the chain orders them); a dead
+    // worker rejects and the loop must not die with an unhandled rejection
+    const fire = () => {
+      const r = this.renderNow();
+      if (r && typeof r.catch === 'function') r.catch(() => {});
+    };
+    if (this._dirty) { fire(); return; }
     // during training, refresh the (unchanged-camera) view sparingly — every
     // render is a full raster pass stolen from the optimiser (~2/s at most,
     // fewer on slow devices: ~25 iterations between refreshes)
@@ -1256,7 +2239,7 @@ class SessionView {
       ? Math.max(1, this.s._lastIps || 100) : 100;
     const interval = Math.max(500, 25000 / ips);
     if (training && performance.now() - (this._lastAuto || 0) > interval) {
-      this.renderNow();
+      fire();
     }
   }
 }

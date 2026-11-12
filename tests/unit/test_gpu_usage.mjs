@@ -6,7 +6,8 @@ const sessionSrc = readFileSync(new URL('../../src/session.js', import.meta.url)
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 const indexHtml = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 
-// the throttle math: duty-cycle idle between full batches, never smaller batches
+// the throttle math: duty-cycle idle between batches, bursts shrinking with
+// the slider (the throughput cap scales the chunk bound by duty)
 {
   assert.equal(gpuDuty(undefined), 1);
   assert.equal(gpuDuty(null), 1);
@@ -33,9 +34,9 @@ const indexHtml = readFileSync(new URL('../../app/index.html', import.meta.url),
 
 // the frame loop: a live read, a compensated cap, the sleep before the reschedule check
 {
-  assert.match(sessionSrc, /gpuIdleMs\(dt, this\.opts\.gpuUsage\)/,
-    'the loop should read the GPU usage live every batch');
-  assert.match(sessionSrc, /Math\.round\(this\._ips \* chunk \/ gpuDuty\(this\.opts\.gpuUsage\)\)/,
+  assert.match(sessionSrc, /gpuIdleMs\(dt, this\._effUsage\(\)\)/,
+    'the loop should read the effective (governor x slider) GPU usage live every batch');
+  assert.match(sessionSrc, /Math\.round\(this\._ips \* chunk \/ gpuDuty\(this\._effUsage\(\)\)\)/,
     'the throughput cap should divide the duty back out so batches stay full');
   const sleepAt = sessionSrc.indexOf('await new Promise((r) => setTimeout(r, idleMs))');
   assert.ok(sleepAt > 0, 'the loop should sleep the duty-cycle idle between batches');
@@ -90,8 +91,8 @@ const indexHtml = readFileSync(new URL('../../app/index.html', import.meta.url),
     'the hold should engage only while training with visuals shown');
   assert.match(app, /S\._dragPaused = true;\s*S\.session\.pause\(\);/,
     'the hold should pause a running training');
-  assert.match(app, /\}, 2000\);/,
-    'training should resume after 2s of no interaction');
+  assert.match(app, /\}, 500\);/,
+    'training should resume after 500ms of no interaction');
   assert.match(app, /clearTimeout\(resumeT\); resumeT = 0;/,
     'every new touch should refresh the quiet window');
   assert.match(app, /S\._dragPaused = false;\s*if \(S\.state === 'train'\) S\.session\.start\(\);/,
@@ -110,16 +111,16 @@ const indexHtml = readFileSync(new URL('../../app/index.html', import.meta.url),
   assert.equal(gpuBurstMs(400, 0.5), 200);
   assert.equal(gpuBurstMs(400, 0.1), 40);
   assert.equal(gpuBurstMs(120, 0.1), 12);
-  assert.match(sessionSrc, /const chunk = gpuBurstMs\(this\.opts\.gpuChunkMs \?\? 400, this\.opts\.gpuUsage\) \/ 1000;/,
+  assert.match(sessionSrc, /const chunk = gpuBurstMs\(this\.opts\.gpuChunkMs \?\? 400, this\._effUsage\(\)\) \/ 1000;/,
     'the batch cap should bound duty-scaled bursts, not full-size ones');
   assert.match(sessionSrc, /if \(duty < 1 && this\._fences\.length\) \{/,
     'the honesty drain should run below full duty and never at it');
-  assert.match(sessionSrc, /gpuIdleMs\(dt, this\.opts\.gpuUsage\) \* 0\.25/,
+  assert.match(sessionSrc, /gpuIdleMs\(dt, this\._effUsage\(\)\) \* 0\.25/,
     'the drain should be bounded by a fraction of the coming idle');
   assert.match(sessionSrc, /if \(drained\) this\._fences\.length = 0;/,
     'a successful drain should empty the ring so the sleep starts GPU-free');
   const drainAt = sessionSrc.indexOf('const drained = await Promise.race([');
-  assert.ok(drainAt > 0 && drainAt < sessionSrc.indexOf('const ideal = batch', drainAt),
+  assert.ok(drainAt > 0 && drainAt < sessionSrc.indexOf('this._batchIdeal(batch, paceMs, gpuMs)', drainAt),
     'the drain should land before the measurement the adapters and idle are computed from');
 }
 

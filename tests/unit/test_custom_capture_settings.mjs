@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DistanceCaptureTrigger } from '../../app/js/xr-distance.js';
-import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from '../../app/js/training-settings.js';
+import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from '../../src/training-settings.js';
 
 const trigger = new DistanceCaptureTrigger(.10);
 assert.equal(trigger.sample([0, 0, 0]), false, 'enabling auto establishes a baseline, not an immediate shot');
@@ -67,4 +67,26 @@ assert.match(controller, /camera-orbit/);
 assert.match(html, /id="set-lod-count" type="number"/);
 assert.match(html, /<option value="">Off<\/option>\s*<option value="1">On<\/option>/);
 assert.match(controller, /lod: false/);
+// 2× working buffer on a phone OOMs the run (seen 2026-11: full-res + buf 2
+// aborts) — the panel says so where the choice is made, and both training
+// entries flash it while Start is still the decision point
+assert.match(html, /title="Render grid relative[^"]*quadruples GPU working memory/);
+assert.match(html, /id="set-buf-hint" hidden>2× roughly quadruples GPU working memory/);
+assert.match(controller, /\$\('set-buf-hint'\)\.hidden = st\.buf !== 2;/);
+assert.match(controller, /if \(st\.buf === 2 && phoneClass\) \{/);
+assert.match(controller, /if \(\(bufScale \?\? 1\) === 2 && isPhoneClass\(\)\) \{/);
+assert.match(controller, /function isPhoneClass\(\) \{/);
+assert.match(controller, /const phone = isPhoneClass\(\);/);
+assert.match(controller, /const phoneClass = isPhoneClass\(\);/);
+// phones train locally like main: the worker's OffscreenCanvas view never
+// presented reliably on phone WebViews (black + laggy, 2026-11)
+assert.match(controller, /function trainWorkerOpt\(\) \{/);
+assert.match(controller, /get\('trainworker'\)/);
+assert.match(controller, /return isPhoneClass\(\) \? false : 'auto';/);
+assert.equal((controller.match(/trainWorker: trainWorkerOpt\(\),?/g) || []).length, 3,
+  'fresh, restore and continue sessions all take the worker/local decision');
+// remote training rasterizes on the worker with the same compute kernel as
+// local — only the SOG-lite stand-in earns the cheap-viewer moving budget
+// (2026-11: the worker view rendered up to 2x main's pixels on one phone)
+assert.match(controller, /const sogView = !\(S\.session\.trainer && \(S\.session\.trainer\.device \|\| S\.session\._remote\)\);/);
 console.log('manual default, distance-only travel, custom cycles and requested LOD plans: passed');

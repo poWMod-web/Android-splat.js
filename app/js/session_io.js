@@ -138,6 +138,7 @@ export function buildReconJson(S) {
     })) } : {}),
     iter: ses.trainer.iter,
     splats: ses.trainer.n,
+    maxSplats: ses.trainer.cap || 0,
     shK: ses.trainer.shK,
     sceneRadius: ses.model.radius,
     center: ses.model.center ? r6(ses.model.center) : null,

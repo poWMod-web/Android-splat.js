@@ -121,4 +121,24 @@ assert.match(app, /androidNotifStop\(true\);   \/\/ the shade keeps the final sc
 assert.match(app, /function solveFailed\(why\) \{\s*androidNotifStop\(false\);/,
   'a failed run should clear the notification');
 
+// A wedged frame surfaces train-stall as a flash AND a stuck notification:
+// the user never watches "Starting" forever again.
+assert.match(app, /if \(e\.kind === 'train-stall'\) \{/,
+  'the stall event should reach the user');
+assert.match(app, /Training stalled: a frame has run/,
+  'the stall should name the wedged frame');
+assert.match(app, /Stalled at \$\{fmt\(e\.iter\)\} — GPU overwhelmed/,
+  'the notification should say stalled, not hang at Starting');
+
+// The snapshot view: when the worker canvas path is dead, worker renders
+// still reach the screen as blitted pixels (no canvas needed).
+assert.match(app, /function engageCaptureView\(why\) \{/,
+  'exhausting remounts should engage the snapshot view');
+assert.match(app, /cv-model-cap/,
+  'the snapshot view should own its 2D canvas in the stage');
+assert.match(app, /S\.session\.view\.capture\(\)\.then\(\(shot\) => \{/,
+  'the snapshot view should blit worker renderCapture pixels');
+assert.match(app, /snapshot view instead/,
+  'the fallback should say so plainly');
+
 console.log('background training notification: passed');

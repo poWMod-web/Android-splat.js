@@ -5,10 +5,58 @@ import {
   SCAN_SRC, SCATTER_SRC, SORT_SRC, ADAM_SRC, SH_ADAM_SRC, BLIT_SRC, shRestCoefs,
   VIS_COUNT_SRC, VIS_SCAN_SRC, VIS_SCATTER_SRC, makeAdamSrc, makeSHAdamSrc, makeShapeClampSrc,
   GATHER_SRC, REFINE_APPLY_SRC, REFINE_PATCH_SRC, SSIM_SRC, SSIM_METRIC_SRC, makeSsaaLossSrc,
+  TILE_ZERO_SRC,
 } from './shaders.js';
 import { rodrigues, m3mul, makeRng } from '../sfm/geometry.js';
 import { createGpu } from '../gpu/context.js';
 import { ssimIndexRgb } from './ssim.js';
+import { planSoftPrune, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES } from './softprune.js';
+
+// plan item (6): one event-loop turn between the stages of multi-second
+// queue drains (refine readbacks, refined-eval passes) — input and the
+// compositor stay alive for ~ms of throughput. Also lets worker RPCs
+// (view, config) interleave when the trainer lives in trainworker.js.
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+// plan item (2): always-on batch GPU timer. Slots for 128 stamped submits
+// per batch (today's ceiling is 64; item (3) grows into the headroom).
+const TS_MAX_STEPS = 128;
+/** Plan item (1): merged-submit uniform ring depth — one uniform slot per
+ *  step, covering the whole adaptive batch range (4..64) in a single
+ *  submit; larger explicit batches flush the encoder mid-batch and reuse
+ *  the ring. Merging stays within a batch: the item-(4) budget still sizes
+ *  what gets queued, this only changes the submit granularity. */
+export const UNI_RING = 64;
+/** Plan item (1): a merged submit never holds more than ~this much predicted
+ *  GPU work — one multi-second job trips mobile driver timeouts (device
+ *  loss), while the same steps as several submits stay preemptible. The
+ *  item-(4) budget still caps what is outstanding; this caps each submit. */
+export const MERGE_BUDGET_MS = 250;
+/** Steps per merged submit before the first timer measurement lands. */
+export const UNMEASURED_MERGE = 8;
+
+/** Partition camera target images (whole cameras, in order) into chunks of
+ *  at most `limitBytes` each, so packed training targets fit adapters whose
+ *  single-binding ceiling the full set exceeds. sizesPx: pixels per camera.
+ *  Returns [{ start, count, px }]. Throws only when ONE image exceeds the
+ *  limit — no chunking can save that, it needs a smaller training image. */
+export function planTargetChunks(sizesPx, limitBytes) {
+  const chunks = [];
+  let start = 0, px = 0;
+  sizesPx.forEach((np, i) => {
+    if (np * 4 > limitBytes) {
+      throw new Error(`training image ${i} (${(np * 4 / 1e6).toFixed(0)}MB) exceeds the device ` +
+        `binding limit (${(limitBytes / 1e6).toFixed(0)}MB) — reduce training resolution`);
+    }
+    if (px > 0 && (px + np) * 4 > limitBytes) {
+      chunks.push({ start, count: i - start, px });
+      start = i; px = 0;
+    }
+    px += np;
+  });
+  if (px > 0 || !chunks.length) chunks.push({ start, count: sizesPx.length - start, px });
+  return chunks;
+}
 
 export class GSTrainer {
   /** opts.gpu: a GpuContext from createGpu() — share ONE device between the
@@ -36,6 +84,11 @@ export class GSTrainer {
     // 4.18 -> 3.65 ms (~85 % of an object-centric scene is in view); parity exact.
     this.compact = opts.compact ?? true;
     this.iter = 0;
+    this._mEnc = null;      // (1) open merged-batch encoder (null outside a batch)
+    this._ringUsed = 0;     // (1) ring slots consumed by the open encoder
+    this._tsSteps = 0;      // (1) steps encoded in the open batch (timer scaling)
+    this._msStepEst = null;   // (1) lagged measured ms/step (merge-submit cap)
+    this._tsPrevSteps = 0;  // (1) previous batch's steps, rides with _tsPrevSlots
     this.pixelsSeen = 0;
     this.stride = STRIDE;
     // view-dependent color: SH degree (0 disables; coeffs live in a separate
@@ -107,6 +160,11 @@ export class GSTrainer {
       label: 'tile-sort', layout: 'auto',
       compute: { module: mk(SORT_SRC, 'tile-sort'), entryPoint: 'main' },
     });
+    // (1) the per-step tile-counter reset is a dispatch, not a queue write
+    this.pipeTileZero = d.createComputePipeline({
+      label: 'tile-zero', layout: 'auto',
+      compute: { module: mk(TILE_ZERO_SRC, 'tile-zero'), entryPoint: 'main' },
+    });
     // subgroup-aggregated gradient atomics — DEFAULT OFF (2026-08-25):
     // Tint only allows subgroup builtins in fully-uniform flow, and the
     // unconditional 10-reduction flush that satisfies it TDR-crashed truck
@@ -121,7 +179,7 @@ export class GSTrainer {
     // bufCamGrad without enabling camOpt/aspectOpt/expComp).
     this.camGrads = !!(this.opts.camGrads ?? (this.opts.camOpt || this.opts.aspectOpt || this.opts.expComp));
     this.useStats = !!(this.opts.useStats ?? (this.opts.engine === 'v2' || this.opts.refineV2 === true ||
-      this.opts.errDonors || this.opts.statMax));
+      this.opts.errDonors || this.opts.statMax || !!this.opts.softPrune));
     // covW: mask-supervised coverage (see makeRenderSrc). Off unless a masked
     // set asks for it, and compiled out of the kernel entirely when 0.
     this.renderFeat = { camGrad: this.camGrads, stats: this.useStats, robust: !!this.opts.robustLoss,
@@ -210,10 +268,7 @@ export class GSTrainer {
       label: 'refine-apply', layout: 'auto',
       compute: { module: mk(REFINE_APPLY_SRC, 'refine-apply'), entryPoint: 'main' },
     });
-    this.pipeSsimMetric = d.createComputePipeline({
-      label: 'ssim-metric', layout: 'auto',
-      compute: { module: mk(SSIM_METRIC_SRC, 'ssim-metric'), entryPoint: 'main' },
-    });
+    // pipeSsimMetric is built lazily by _ensureSsimMetric (first SSIM read).
     const blitModule = mk(BLIT_SRC, 'blit');
     this.pipeBlit = d.createRenderPipeline({
       label: 'blit', layout: 'auto',
@@ -287,34 +342,45 @@ export class GSTrainer {
     // photographs are 8-bit, so this is lossless vs f32 — and 4x less GPU
     // memory and loss-read bandwidth, which is what lets full sets fit on
     // phones.
-    let total = 0; // in PIXELS
-    this.camMeta = cams.map((c) => {
-      const im = images[c.imgIdx];
-      const meta = { ...c, w: im.tw, h: im.th, offset: total };
-      total += im.tw * im.th;
-      return meta;
-    });
+    // One binding per chunk (whole cameras, each chunk under the adapter's
+    // binding ceiling): a 200-photo set trains on a 128 MB phone at the
+    // user's own resolution instead of failing a single-buffer check.
+    // camMeta.offset is the CHUNK-LOCAL pixel offset from here on; tgtChunk
+    // selects the binding at encode time. Every target read is
+    // single-camera-per-dispatch, so the shader math is unchanged.
     const limit = this.device.limits.maxStorageBufferBindingSize;
-    if (total * 4 > limit) {
-      throw new Error(`training targets (${(total * 4 / 1e6).toFixed(0)}MB) exceed the device ` +
-        `binding limit (${(limit / 1e6).toFixed(0)}MB) — reduce image count or resolution`);
-    }
-    const targetData = new Uint32Array(total);
-    let nEmpty = 0, nPartial = 0, nInvalid = 0;
+    const pxPerCam = cams.map((c) => {
+      const im = images[c.imgIdx];
+      return im.tw * im.th;
+    });
+    const chunkPlan = planTargetChunks(pxPerCam, limit);
+    this.camMeta = [];
+    chunkPlan.forEach((ch, k) => {
+      let local = 0;
+      for (let i = ch.start; i < ch.start + ch.count; i++) {
+        const im = images[cams[i].imgIdx];
+        this.camMeta[i] = { ...cams[i], w: im.tw, h: im.th, offset: local, tgtChunk: k };
+        local += im.tw * im.th;
+      }
+    });
+    const targetChunks = chunkPlan.map((ch) => new Uint32Array(Math.max(4, ch.px)));
+    let nEmpty = 0, nPartial = 0, nInvalid = 0, total = 0;
     for (const meta of this.camMeta) {
       const im = images[meta.imgIdx];
       const rgb = im.rgb, alpha = im.alpha;
       const np = meta.w * meta.h;
+      const td = targetChunks[meta.tgtChunk];
+      total += np;
       for (let p = 0; p < np; p++) {
         const r = rgb[p * 3];
-        if (r < 0) { targetData[meta.offset + p] = 0; nInvalid++; continue; } // invalid sentinel
+        if (r < 0) { td[meta.offset + p] = 0; nInvalid++; continue; } // invalid sentinel
         // subject alpha in the top byte; 1 is the floor so 0 stays "invalid"
         let a = 255;
         if (alpha) {
           a = Math.max(1, alpha[p]);
           if (a <= 64) nEmpty++; else if (a < 191) nPartial++;
         }
-        targetData[meta.offset + p] = (a << 24)
+        td[meta.offset + p] = (a << 24)
           | (Math.min(255, Math.round(rgb[p * 3 + 2] * 255)) << 16)
           | (Math.min(255, Math.round(rgb[p * 3 + 1] * 255)) << 8)
           | Math.min(255, Math.round(r * 255));
@@ -335,47 +401,86 @@ export class GSTrainer {
     // SSAA raster covers ssaa^2 x the pixels/tiles of the loss resolution
     const ssq = this.ssaa >= 2 ? this.ssaa * this.ssaa : 1;
     this.maxTiles = maxTiles * ssq;
-    this.tileZero = new Uint32Array(this.maxTiles);
+    this.tileZeroGroups = Math.ceil(this.maxTiles / 256); // (1) full-buffer zero dispatch
+    // plan item (10): the per-step temporaries live here, not in the GC —
+    // the SSAA uniform copy and the lr-warmup scalings run every iteration
+    this._u2 = new Float32Array(40);       // _writeTrainUniforms supersampled twin
+    this._warmAdam = new Float32Array(36); // _warmed(adamData) while ramping
+    this._warmSh = new Float32Array(12);   // _warmed(shAdamData) while ramping
 
     const B = GPUBufferUsage;
     const buf = (size, usage, label) => d.createBuffer({ size, usage, label });
+    // (1) one uniform slot per merged step (labels stay bare: slots are
+    // distinguished by buffer identity, and label-keyed logic is untouched)
+    const ring = (size, label) =>
+      Array.from({ length: UNI_RING }, () => buf(size, B.UNIFORM | B.COPY_DST, label));
     const nb = this.cap * STRIDE * 4;
     this.bufParams = buf(nb, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'params');
     d.queue.writeBuffer(this.bufParams, 0, gaussians.data.buffer, gaussians.data.byteOffset,
       this.n * STRIDE * 4);
     // proj carries a TAIL for the compaction list: [cap*16] = visible count,
     // [cap*16+1 ..] = visible splat ids (u32 bits) — the chain has no spare binding
-    this.bufProj = buf(nb + (this.cap + 16) * 4, B.STORAGE | B.COPY_SRC, 'proj');
+    this.bufProj = buf(nb + (this.cap + 16) * 4, B.STORAGE | B.COPY_SRC | B.COPY_DST, 'proj'); // COPY_DST: soft-prune compaction writes rows back
     if (this.compact) {
       this.bufVisBlocks = buf(Math.ceil(this.cap / 256) * 4 + 16, B.STORAGE, 'vis-blocks');
       this.bufVisDisp = buf(48, B.STORAGE | B.INDIRECT, 'vis-dispatch');
       this.uniVisScan = buf(16, B.UNIFORM | B.COPY_DST, 'uniVisScan');
       d.queue.writeBuffer(this.uniVisScan, 0, new Uint32Array([this.shK * 3, 0, 0, 0]));
     }
-    this.bufGradP = buf(nb, B.STORAGE | B.COPY_SRC, 'gradP'); // COPY_SRC: precision diagnostics
-    this.bufGradF = buf(nb, B.STORAGE | B.COPY_SRC, 'gradF');
+    this.bufGradP = buf(nb, B.STORAGE | B.COPY_SRC | B.COPY_DST, 'gradP'); // COPY_SRC: precision diagnostics; COPY_DST: soft-prune compaction
+    this.bufGradF = buf(nb, B.STORAGE | B.COPY_SRC | B.COPY_DST, 'gradF'); // COPY_DST: soft-prune compaction writes rows back
     this.bufM = buf(nb, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'adam-m');
     this.bufV = buf(nb, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'adam-v');
     d.queue.writeBuffer(this.bufM, 0, new Float32Array(this.cap * STRIDE));
     d.queue.writeBuffer(this.bufV, 0, new Float32Array(this.cap * STRIDE));
     this.bufTileCnt = buf(this.maxTiles * 4, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'tileCnt');
+    // (1) shared, static: the counters stay ONE buffer under merged submits
+    this.bgTileZero = d.createBindGroup({
+      layout: this.pipeTileZero.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: this.bufTileCnt } }],
+    });
     this.bufTileStart = buf((this.maxTiles + 1) * 4, B.STORAGE | B.COPY_SRC, 'tileStart');
     this.bufTileCursor = buf(this.maxTiles * 4, B.STORAGE | B.COPY_SRC, 'tileCursor');
     this.bufEntries = buf(this.entriesCap * 2 * 4, B.STORAGE | B.COPY_SRC, 'entries');
     this.bufOut = buf(maxPix * ssq * 4 * 4, B.STORAGE | B.COPY_SRC, 'outImg');
-    this.bufTarget = buf(Math.max(16, total * 4), B.STORAGE | B.COPY_DST, 'targets');
-    d.queue.writeBuffer(this.bufTarget, 0, targetData);
+    this.tgtChunks = targetChunks.map((td, k) =>
+      buf(Math.max(16, td.byteLength), B.STORAGE | B.COPY_DST, `targets-${k}`));
+    this.tgtChunks.forEach((b, k) => d.queue.writeBuffer(b, 0, targetChunks[k]));
+    if (this.tgtChunks.length > 1) {
+      console.log(`[trainer] targets: ${(total * 4 / 1e6).toFixed(0)}MB in ${this.tgtChunks.length} bindings ` +
+        `(device limit ${(this.bindLimit / 1e6).toFixed(0)}MB)`);
+    }
+    // chunk 0 backs every binding that must exist but never reads targets
+    // (view renders return before the loss section reads tgtImg)
+    this.bufTarget = this.tgtChunks[0];
     // SSIM is measured only on demand (when the graph uses its percentage
     // scale). Its compact 2x2-averaged image pair is read back for the exact
     // 11x11 Gaussian SSIM calculation on the CPU.
     const maxSsimPixels = Math.max(
       Math.ceil(maxViewW / 2) * Math.ceil(maxViewH / 2),
       ...this.camMeta.map((m) => Math.ceil(m.w / 2) * Math.ceil(m.h / 2)));
+    // sizing for the lazy SSIM-metric buffers (see _ensureSsimMetric)
     this.ssimMetricBytes = Math.max(32, maxSsimPixels * 32);
-    this.bufSsimMetric = buf(this.ssimMetricBytes, B.STORAGE | B.COPY_SRC, 'ssim-metric');
-    this.bufSsimMetricRead = buf(this.ssimMetricBytes, B.COPY_DST | B.MAP_READ, 'ssim-metric-read');
     this.bufStats = buf(16, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'stats');
     d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
+    // (2) the batch GPU timer: one timestamp pair brackets each step's
+    // whole pass (stepOnce is a single submit). Absent without the
+    // timestamp-query feature — the batch adapter falls back to wall dt.
+    this._tsSet = null;
+    // opts.timestamps === false kills the timer (bisection switch for suspect
+    // drivers): merging still works, everything timer-fed falls back
+    if (d.features && d.features.has('timestamp-query') && this.opts.timestamps !== false) {
+      this._tsPeriod = d.limits.timestampPeriod ?? 1; // ns per tick (profileSteps-compatible)
+      this._tsSet = d.createQuerySet({ type: 'timestamp', count: TS_MAX_STEPS * 2 });
+      this._tsResolve = buf(TS_MAX_STEPS * 16, B.QUERY_RESOLVE | B.COPY_SRC, 'ts-resolve');
+      this._tsRead = [0, 1].map((i) =>
+        buf(TS_MAX_STEPS * 16, B.COPY_DST | B.MAP_READ, `ts-read${i}`));
+      this._tsCur = 0;
+      this._tsSlot = 0;
+      this._tsOpen = false;
+      this._tsHavePrev = false;
+      this._tsPrevSlots = 0;
+    }
     this.bufStatsRead = buf(16, B.COPY_DST | B.MAP_READ, 'statsRead');
     this.bufParamsRead = buf(nb, B.COPY_DST | B.MAP_READ, 'paramsRead'); // cap-sized
     this.bufCamGrad = buf((cams.length + 1) * 8 * 4, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'camGrad');
@@ -385,18 +490,18 @@ export class GSTrainer {
       // pass) gradients + Adam moments; zero-initialized per the WebGPU spec
       const shb = this.cap * this.shK * 3 * 4;
       this.bufSH = buf(shb, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'sh');
-      this.bufSHGrad = buf(shb, B.STORAGE | B.COPY_SRC, 'shGrad');
+      this.bufSHGrad = buf(shb, B.STORAGE | B.COPY_SRC | B.COPY_DST, 'shGrad'); // COPY_DST: soft-prune compaction writes rows back
       // COPY_SRC is load-bearing: refine() reads these back to relocate donor
       // moments — without it the readback encoder errors and refine silently
       // wrote back ZEROED SH Adam moments every 2500 iters
       this.bufSHM = buf(shb, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'sh-adam-m');
       this.bufSHV = buf(shb, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'sh-adam-v');
-      this.uniSHAdam = buf(48, B.UNIFORM | B.COPY_DST, 'uniSHAdam');
+      this.uniSHAdamR = ring(48, 'uniSHAdam');
     }
 
-    this.uniTrain = buf(160, B.UNIFORM | B.COPY_DST, 'uniTrain');
+    this.uniTrainR = ring(160, 'uniTrain');
     this.uniView = buf(160, B.UNIFORM | B.COPY_DST, 'uniView');
-    this.uniAdam = buf(144, B.UNIFORM | B.COPY_DST, 'uniAdam');
+    this.uniAdamR = ring(144, 'uniAdam');
     this.uniShape = buf(16, B.UNIFORM | B.COPY_DST, 'uniShape');
     // the face-skin field (opts.skinField {origin, cell, dims, data, scale} + opts.skin {wPos, wNorm, thickMm}); a dummy when absent
     this.uniSkin = buf(48, B.UNIFORM | B.COPY_DST, 'uniSkin');
@@ -457,14 +562,14 @@ export class GSTrainer {
         { binding: 4, resource: { buffer: this.bufTileStart } },
       ],
     });
-    const bgRender = (uni) => d.createBindGroup({
+    const bgRender = (uni, tgt) => d.createBindGroup({
       layout: this.pipeRender.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: uni } },
         { binding: 1, resource: { buffer: this.bufProj } },
         { binding: 2, resource: { buffer: this.bufTileStart } },
         { binding: 3, resource: { buffer: this.bufEntries } },
-        { binding: 4, resource: { buffer: this.bufTarget } },
+        { binding: 4, resource: { buffer: tgt } },
         { binding: 5, resource: { buffer: this.bufOut } },
         { binding: 6, resource: { buffer: this.bufGradP } },
         { binding: 7, resource: { buffer: this.bufStats } },
@@ -478,23 +583,17 @@ export class GSTrainer {
         { binding: 1, resource: { buffer: this.bufOut } },
       ],
     });
-    this.bgProjectTrain = bgProject(this.uniTrain);
+    this.bgProjectTrainR = this.uniTrainR.map((u) => bgProject(u));
     this.bgProjectView = bgProject(this.uniView);
-    this.bgScanTrain = bgScan(this.uniTrain);
+    this.bgScanTrainR = this.uniTrainR.map((u) => bgScan(u));
     this.bgScanView = bgScan(this.uniView);
-    this.bgScatterTrain = bgScatter(this.uniTrain);
+    this.bgScatterTrainR = this.uniTrainR.map((u) => bgScatter(u));
     this.bgScatterView = bgScatter(this.uniView);
-    this.bgRenderTrain = bgRender(this.uniTrain);
-    this.bgRenderView = bgRender(this.uniView);
-    this.bgSsimMetric = d.createBindGroup({
-      layout: this.pipeSsimMetric.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.uniTrain } },
-        { binding: 1, resource: { buffer: this.bufOut } },
-        { binding: 2, resource: { buffer: this.bufTarget } },
-        { binding: 3, resource: { buffer: this.bufSsimMetric } },
-      ],
-    });
+    // per-chunk train variants (encode time picks the camera's chunk);
+    // the view variant binds chunk 0 — view renders never read targets
+    this.bgRenderTrainCR = this.uniTrainR.map((u) => this.tgtChunks.map((t) => bgRender(u, t)));
+    this.bgRenderView = bgRender(this.uniView, this.bufTarget);
+    // bgSsimMetricC is built lazily by _ensureSsimMetric (first SSIM read).
     if (this.ssimW > 0) {
       // SSIM working buffers: A/B pixel-major 16 f32/px, gssim 4 f32/px,
       // endBuf 1 u32/px (per-pixel walk end handed from fwd to bwd kernel)
@@ -502,50 +601,52 @@ export class GSTrainer {
       this.bufSsimA = buf(maxPix * 64, B.STORAGE, 'ssim-A');
       this.bufSsimB = buf(maxPix * 64, B.STORAGE, 'ssim-B');
       this.bufGssim = buf(maxPix * 16, B.STORAGE, 'ssim-grad');
-      this.bgRenderFwd = d.createBindGroup({
+      const bgRenderFwd = (t, u) => d.createBindGroup({
         layout: this.pipeRenderFwd.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: this.uniTrain } },
+          { binding: 0, resource: { buffer: u } },
           { binding: 1, resource: { buffer: this.bufProj } },
           { binding: 2, resource: { buffer: this.bufTileStart } },
           { binding: 3, resource: { buffer: this.bufEntries } },
-          { binding: 4, resource: { buffer: this.bufTarget } },
+          { binding: 4, resource: { buffer: t } },
           { binding: 5, resource: { buffer: this.bufOut } },
           { binding: 7, resource: { buffer: this.bufStats } },
           { binding: 8, resource: { buffer: this.bufCamGrad } },
           { binding: 9, resource: { buffer: this.bufEnd } },
         ],
       });
-      this.bgRenderBwd = d.createBindGroup({
+      this.bgRenderFwdCR = this.uniTrainR.map((u) => this.tgtChunks.map((t) => bgRenderFwd(t, u)));
+      const bgRenderBwd = (t, u) => d.createBindGroup({
         layout: this.pipeRenderBwd.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: this.uniTrain } },
+          { binding: 0, resource: { buffer: u } },
           { binding: 1, resource: { buffer: this.bufProj } },
           { binding: 2, resource: { buffer: this.bufTileStart } },
           { binding: 3, resource: { buffer: this.bufEntries } },
-          { binding: 4, resource: { buffer: this.bufTarget } },
+          { binding: 4, resource: { buffer: t } },
           { binding: 5, resource: { buffer: this.bufOut } },
           { binding: 6, resource: { buffer: this.bufGradP } },
           { binding: 9, resource: { buffer: this.bufEnd } },
           { binding: 10, resource: { buffer: this.bufGssim } },
         ],
       });
+      this.bgRenderBwdCR = this.uniTrainR.map((u) => this.tgtChunks.map((t) => bgRenderBwd(t, u)));
       const bgSsim = (pipe, entries) => d.createBindGroup({
         layout: pipe.getBindGroupLayout(0),
         entries: entries.map(([binding, buffer]) => ({ binding, resource: { buffer } })),
       });
-      this.bgSsimPrep = bgSsim(this.pipeSsimPrep, [
-        [0, this.uniTrain], [2, this.bufSsimA], [3, this.bufOut], [4, this.bufTarget]]);
-      this.bgSsimBH15 = bgSsim(this.pipeSsimBH15, [
-        [0, this.uniTrain], [1, this.bufSsimA], [2, this.bufSsimB]]);
-      this.bgSsimBV15 = bgSsim(this.pipeSsimBV15, [
-        [0, this.uniTrain], [1, this.bufSsimB], [2, this.bufSsimA]]);
-      this.bgSsimCoeff = bgSsim(this.pipeSsimCoeff, [
-        [0, this.uniTrain], [1, this.bufSsimA], [2, this.bufSsimB]]);
-      this.bgSsimBH9 = bgSsim(this.pipeSsimBH9, [
-        [0, this.uniTrain], [1, this.bufSsimB], [2, this.bufSsimA]]);
-      this.bgSsimFinal = bgSsim(this.pipeSsimFinal, [
-        [0, this.uniTrain], [1, this.bufSsimA], [3, this.bufOut], [4, this.bufTarget], [5, this.bufGssim]]);
+      this.bgSsimPrepCR = this.uniTrainR.map((u) => this.tgtChunks.map((t) => bgSsim(this.pipeSsimPrep, [
+        [0, u], [2, this.bufSsimA], [3, this.bufOut], [4, t]])));
+      this.bgSsimBH15R = this.uniTrainR.map((u) => bgSsim(this.pipeSsimBH15, [
+        [0, u], [1, this.bufSsimA], [2, this.bufSsimB]]));
+      this.bgSsimBV15R = this.uniTrainR.map((u) => bgSsim(this.pipeSsimBV15, [
+        [0, u], [1, this.bufSsimB], [2, this.bufSsimA]]));
+      this.bgSsimCoeffR = this.uniTrainR.map((u) => bgSsim(this.pipeSsimCoeff, [
+        [0, u], [1, this.bufSsimA], [2, this.bufSsimB]]));
+      this.bgSsimBH9R = this.uniTrainR.map((u) => bgSsim(this.pipeSsimBH9, [
+        [0, u], [1, this.bufSsimB], [2, this.bufSsimA]]));
+      this.bgSsimFinalCR = this.uniTrainR.map((u) => this.tgtChunks.map((t) => bgSsim(this.pipeSsimFinal, [
+        [0, u], [1, this.bufSsimA], [3, this.bufOut], [4, t], [5, this.bufGssim]])));
     }
     if (this.ssaa >= 2) {
       this.bufEnd = buf(maxPix * ssq * 4, B.STORAGE, 'ssaa-end');
@@ -553,29 +654,30 @@ export class GSTrainer {
       // raster passes at ssaa x need their own scaled cam uniforms; the fwd
       // one carries trainMode 0 (render + walk-end only, loss lives in the
       // downsample pass), the bwd one trainMode 1
-      this.uniTrain2f = buf(160, B.UNIFORM | B.COPY_DST, 'uniTrain2f');
-      this.uniTrain2b = buf(160, B.UNIFORM | B.COPY_DST, 'uniTrain2b');
-      this.bgProject2 = bgProject(this.uniTrain2f);
-      this.bgScan2 = bgScan(this.uniTrain2f);
-      this.bgScatter2 = bgScatter(this.uniTrain2f);
-      this.bgRenderFwdSsaa = d.createBindGroup({
+      this.uniTrain2fR = ring(160, 'uniTrain2f');
+      this.uniTrain2bR = ring(160, 'uniTrain2b');
+      this.bgProject2R = this.uniTrain2fR.map((u) => bgProject(u));
+      this.bgScan2R = this.uniTrain2fR.map((u) => bgScan(u));
+      this.bgScatter2R = this.uniTrain2fR.map((u) => bgScatter(u));
+      const bgRenderFwdSsaa = (t, u) => d.createBindGroup({
         layout: this.pipeRenderFwd.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: this.uniTrain2f } },
+          { binding: 0, resource: { buffer: u } },
           { binding: 1, resource: { buffer: this.bufProj } },
           { binding: 2, resource: { buffer: this.bufTileStart } },
           { binding: 3, resource: { buffer: this.bufEntries } },
-          { binding: 4, resource: { buffer: this.bufTarget } },
+          { binding: 4, resource: { buffer: t } },
           { binding: 5, resource: { buffer: this.bufOut } },
           { binding: 7, resource: { buffer: this.bufStats } },
           { binding: 8, resource: { buffer: this.bufCamGrad } },
           { binding: 9, resource: { buffer: this.bufEnd } },
         ],
       });
-      this.bgRenderBwd3 = d.createBindGroup({
+      this.bgRenderFwdSsaaCR = this.uniTrain2fR.map((u) => this.tgtChunks.map((t) => bgRenderFwdSsaa(t, u)));
+      this.bgRenderBwd3R = this.uniTrain2bR.map((u) => d.createBindGroup({
         layout: this.pipeRenderBwd3.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: this.uniTrain2b } },
+          { binding: 0, resource: { buffer: u } },
           { binding: 1, resource: { buffer: this.bufProj } },
           { binding: 2, resource: { buffer: this.bufTileStart } },
           { binding: 3, resource: { buffer: this.bufEntries } },
@@ -584,20 +686,21 @@ export class GSTrainer {
           { binding: 9, resource: { buffer: this.bufEnd } },
           { binding: 10, resource: { buffer: this.bufGssim } },
         ],
-      });
-      this.bgSsaaLoss = d.createBindGroup({
+      }));
+      const bgSsaaLoss = (t, u) => d.createBindGroup({
         layout: this.pipeSsaaLoss.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: this.uniTrain } },
+          { binding: 0, resource: { buffer: u } },
           { binding: 1, resource: { buffer: this.bufOut } },
-          { binding: 2, resource: { buffer: this.bufTarget } },
+          { binding: 2, resource: { buffer: t } },
           { binding: 3, resource: { buffer: this.bufGssim } },
           { binding: 4, resource: { buffer: this.bufStats } },
           { binding: 5, resource: { buffer: this.bufCamGrad } },
         ],
       });
+      this.bgSsaaLossCR = this.uniTrainR.map((u) => this.tgtChunks.map((t) => bgSsaaLoss(t, u)));
     }
-    this.bgBlitTrain = bgBlit(this.uniTrain);
+    this.bgBlitTrainR = this.uniTrainR.map((u) => bgBlit(u));
     this.bgBlitView = bgBlit(this.uniView);
     this.bgSort = d.createBindGroup({
       layout: this.pipeSort.getBindGroupLayout(0),
@@ -607,10 +710,10 @@ export class GSTrainer {
         { binding: 2, resource: { buffer: this.bufEntries } },
       ],
     });
-    this.bgChain = d.createBindGroup({
+    this.bgChainR = this.uniTrainR.map((u) => d.createBindGroup({
       layout: this.pipeChain.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: this.uniTrain } },
+        { binding: 0, resource: { buffer: u } },
         { binding: 1, resource: { buffer: this.bufParams } },
         { binding: 2, resource: { buffer: this.bufProj } },
         { binding: 3, resource: { buffer: this.bufGradP } },
@@ -623,19 +726,19 @@ export class GSTrainer {
         { binding: 8, resource: { buffer: this.uniSkin } },
         { binding: 9, resource: { buffer: this.bufSkin } },
       ],
-    });
-    this.bgAdam = d.createBindGroup({
+    }));
+    this.bgAdamR = this.uniAdamR.map((u) => d.createBindGroup({
       layout: this.pipeAdam.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: this.uniAdam } },
+        { binding: 0, resource: { buffer: u } },
         { binding: 1, resource: { buffer: this.bufParams } },
         { binding: 2, resource: { buffer: this.bufGradF } },
         { binding: 3, resource: { buffer: this.bufM } },
         { binding: 4, resource: { buffer: this.bufV } },
       ],
-    });
+    }));
     if (this.pipeShape) {
-      this.bgShape = d.createBindGroup({ layout: this.pipeShape.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.uniAdam } }, { binding: 1, resource: { buffer: this.bufParams } }, { binding: 2, resource: { buffer: this.uniShape } }] });
+      this.bgShapeR = this.uniAdamR.map((u) => d.createBindGroup({ layout: this.pipeShape.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: u } }, { binding: 1, resource: { buffer: this.bufParams } }, { binding: 2, resource: { buffer: this.uniShape } }] }));
       const reg = this.opts.blobRegion; const c = reg && reg.centre ? reg.centre : [0, 0, 0];
       d.queue.writeBuffer(this.uniShape, 0, new Float32Array([c[0], c[1], c[2], reg && reg.radius > 0 ? reg.radius : 0]));
     }
@@ -665,16 +768,16 @@ export class GSTrainer {
     this.bgRefineApply = bgApply(this.uniRefine);
     this.bgRefineApplyB = bgApply(this.uniRefineB);
     if (this.shK) {
-      this.bgSHAdam = d.createBindGroup({
+      this.bgSHAdamR = this.uniSHAdamR.map((u) => d.createBindGroup({
         layout: this.pipeSHAdam.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: this.uniSHAdam } },
+          { binding: 0, resource: { buffer: u } },
           { binding: 1, resource: { buffer: this.bufSH } },
           { binding: 2, resource: { buffer: this.bufSHGrad } },
           { binding: 3, resource: { buffer: this.bufSHM } },
           { binding: 4, resource: { buffer: this.bufSHV } },
         ],
-      });
+      }));
       // Adam hp + lr for the SH coeffs; INRIA convention: rest lr = DC/20,
       // directly applicable since our bands also add in color space
       this.shAdamData = new Float32Array([
@@ -686,13 +789,13 @@ export class GSTrainer {
     }
     if (this.compact) {
       const bg = (pipe, entries) => d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: entries.map((buffer, binding) => ({ binding, resource: { buffer } })) });
-      this.bgVisCount = bg(this.pipeVisCount, [this.uniTrain, this.bufProj, this.bufVisBlocks]);
-      this.bgVisScan = bg(this.pipeVisScan, [this.uniTrain, this.bufVisBlocks, this.bufProj, this.bufVisDisp, this.uniVisScan]);
-      this.bgVisScatter = bg(this.pipeVisScatter, [this.uniTrain, this.bufProj, this.bufVisBlocks]);
-      this.bgChainC = d.createBindGroup({
+      this.bgVisCountR = this.uniTrainR.map((u) => bg(this.pipeVisCount, [u, this.bufProj, this.bufVisBlocks]));
+      this.bgVisScanR = this.uniTrainR.map((u) => bg(this.pipeVisScan, [u, this.bufVisBlocks, this.bufProj, this.bufVisDisp, this.uniVisScan]));
+      this.bgVisScatterR = this.uniTrainR.map((u) => bg(this.pipeVisScatter, [u, this.bufProj, this.bufVisBlocks]));
+      this.bgChainCR = this.uniTrainR.map((u) => d.createBindGroup({
         layout: this.pipeChainC.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: this.uniTrain } },
+          { binding: 0, resource: { buffer: u } },
           { binding: 1, resource: { buffer: this.bufParams } },
           { binding: 2, resource: { buffer: this.bufProj } },
           { binding: 3, resource: { buffer: this.bufGradP } },
@@ -702,10 +805,10 @@ export class GSTrainer {
           { binding: 8, resource: { buffer: this.uniSkin } },
           { binding: 9, resource: { buffer: this.bufSkin } },
         ],
-      });
-      this.bgAdamC = bg(this.pipeAdamC, [this.uniAdam, this.bufParams, this.bufGradF, this.bufM, this.bufV, this.bufProj]);
-      this.bgAdamI = bg(this.pipeAdamI, [this.uniAdam, this.bufParams, this.bufGradF, this.bufM, this.bufV, this.bufProj]);
-      if (this.shK) this.bgSHAdamC = bg(this.pipeSHAdamC, [this.uniSHAdam, this.bufSH, this.bufSHGrad, this.bufSHM, this.bufSHV, this.bufProj]);
+      }));
+      this.bgAdamCR = this.uniAdamR.map((u) => bg(this.pipeAdamC, [u, this.bufParams, this.bufGradF, this.bufM, this.bufV, this.bufProj]));
+      this.bgAdamIR = this.uniAdamR.map((u) => bg(this.pipeAdamI, [u, this.bufParams, this.bufGradF, this.bufM, this.bufV, this.bufProj]));
+      if (this.shK) this.bgSHAdamCR = this.uniSHAdamR.map((u) => bg(this.pipeSHAdamC, [u, this.bufSH, this.bufSHGrad, this.bufSHM, this.bufSHV, this.bufProj]));
     }
 
     for (const m of this.camMeta) { m.f0 = m.f; m.fy0 = m.fy ?? m.f; } // original focals (shared scale + aspect are optimized)
@@ -822,12 +925,67 @@ export class GSTrainer {
 
   /** Write the training cam uniform, plus the ssaa-scaled variants when
    *  supersampling (f/cx/cy/w/h/tilesX scaled; fwd gets trainMode 0). */
+  /** Steps per merged submit: the ring depth, bounded by predicted GPU time
+   *  once the batch timer has measured ms/step (conservative until then). */
+  _mergeCap() {
+    if (!(this._msStepEst > 0)) return Math.min(UNI_RING, UNMEASURED_MERGE);
+    return Math.max(2, Math.min(UNI_RING, Math.floor(MERGE_BUDGET_MS / this._msStepEst)));
+  }
+
+  /** Plan item (1): the merged-submit uniform ring. Every per-step buffer
+   *  (train/adam uniforms) and every bind group referencing one exists
+   *  UNI_RING times; the scalar names read the CURRENT slot. Correctness is
+   *  one invariant: write-slot == bind-slot inside a synchronous block.
+   *  stepOnce writes slot _ringUsed and encodes with it; every legacy path
+   *  (profile/eval/view/refine) writes, encodes and submits synchronously,
+   *  so whatever stale slot it finds is self-consistent — safe under
+   *  arbitrary interleave. The tile counters stay ONE shared buffer: their
+   *  reset is a zero dispatch ordered with the passes (queue writes would
+   *  land before every pass of a merged submit). */
+  _ringGet(ring) { return ring && ring[this._ringUsed]; }
+  get uniTrain() { return this._ringGet(this.uniTrainR); }
+  get uniTrain2f() { return this._ringGet(this.uniTrain2fR); }
+  get uniTrain2b() { return this._ringGet(this.uniTrain2bR); }
+  get uniAdam() { return this._ringGet(this.uniAdamR); }
+  get uniSHAdam() { return this._ringGet(this.uniSHAdamR); }
+  get bgProjectTrain() { return this._ringGet(this.bgProjectTrainR); }
+  get bgScanTrain() { return this._ringGet(this.bgScanTrainR); }
+  get bgScatterTrain() { return this._ringGet(this.bgScatterTrainR); }
+  get bgRenderTrainC() { return this._ringGet(this.bgRenderTrainCR); }
+  get bgRenderFwdC() { return this._ringGet(this.bgRenderFwdCR); }
+  get bgRenderBwdC() { return this._ringGet(this.bgRenderBwdCR); }
+  get bgSsimPrepC() { return this._ringGet(this.bgSsimPrepCR); }
+  get bgSsimBH15() { return this._ringGet(this.bgSsimBH15R); }
+  get bgSsimBV15() { return this._ringGet(this.bgSsimBV15R); }
+  get bgSsimCoeff() { return this._ringGet(this.bgSsimCoeffR); }
+  get bgSsimBH9() { return this._ringGet(this.bgSsimBH9R); }
+  get bgSsimFinalC() { return this._ringGet(this.bgSsimFinalCR); }
+  get bgProject2() { return this._ringGet(this.bgProject2R); }
+  get bgScan2() { return this._ringGet(this.bgScan2R); }
+  get bgScatter2() { return this._ringGet(this.bgScatter2R); }
+  get bgRenderFwdSsaaC() { return this._ringGet(this.bgRenderFwdSsaaCR); }
+  get bgRenderBwd3() { return this._ringGet(this.bgRenderBwd3R); }
+  get bgSsaaLossC() { return this._ringGet(this.bgSsaaLossCR); }
+  get bgBlitTrain() { return this._ringGet(this.bgBlitTrainR); }
+  get bgChain() { return this._ringGet(this.bgChainR); }
+  get bgAdam() { return this._ringGet(this.bgAdamR); }
+  get bgShape() { return this._ringGet(this.bgShapeR); }
+  get bgSHAdam() { return this._ringGet(this.bgSHAdamR); }
+  get bgVisCount() { return this._ringGet(this.bgVisCountR); }
+  get bgVisScan() { return this._ringGet(this.bgVisScanR); }
+  get bgVisScatter() { return this._ringGet(this.bgVisScatterR); }
+  get bgChainC() { return this._ringGet(this.bgChainCR); }
+  get bgAdamC() { return this._ringGet(this.bgAdamCR); }
+  get bgAdamI() { return this._ringGet(this.bgAdamIR); }
+  get bgSHAdamC() { return this._ringGet(this.bgSHAdamCR); }
+  get bgSsimMetricC() { return this._ringGet(this.bgSsimMetricCR); }
+
   _writeTrainUniforms(u) {
     const d = this.device;
     d.queue.writeBuffer(this.uniTrain, 0, u);
     if (this.ssaa >= 2) {
       const s = this.ssaa;
-      const u2 = new Float32Array(u);
+      const u2 = this._u2; u2.set(u); // (10) pooled — no per-step alloc
       u2[16] *= s; u2[17] *= s; u2[18] *= s;              // f, cx, cy
       u2[34] *= s;                                         // fy
       u2[20] *= s; u2[21] *= s;                            // w, h
@@ -842,6 +1000,9 @@ export class GSTrainer {
   /** Encode the full raster sequence (project -> scan -> scatter -> sort ->
    *  render) into an open compute pass for the given camera dims. */
   encodeRaster(p, meta, train) {
+    // chunked targets: the camera's chunk selects the train binding
+    // (free view cameras carry no chunk — view renders never read targets)
+    const tc = meta.tgtChunk ?? 0;
     if (train && this.ssaa >= 2) {
       // supersampled training: raster at ssaa x, then box-downsample + loss
       // at the native target resolution, then the backward at ssaa x with
@@ -861,10 +1022,10 @@ export class GSTrainer {
       p.setBindGroup(0, this.bgSort);
       p.dispatchWorkgroups(gx2 * gy2);
       p.setPipeline(this.pipeRenderFwd);
-      p.setBindGroup(0, this.bgRenderFwdSsaa);
+      p.setBindGroup(0, this.bgRenderFwdSsaaC[tc]);
       p.dispatchWorkgroups(gx2, gy2);
       p.setPipeline(this.pipeSsaaLoss);
-      p.setBindGroup(0, this.bgSsaaLoss);
+      p.setBindGroup(0, this.bgSsaaLossC[tc]);
       p.dispatchWorkgroups(Math.ceil(meta.w / TILE), Math.ceil(meta.h / TILE));
       p.setPipeline(this.pipeRenderBwd3);
       p.setBindGroup(0, this.bgRenderBwd3);
@@ -889,18 +1050,18 @@ export class GSTrainer {
       // split renderer with the D-SSIM image passes in between; dispatch
       // ordering within one pass makes each stage's writes visible to the next
       const run = (pipe, bg) => { p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(gx, gy); };
-      run(this.pipeRenderFwd, this.bgRenderFwd);
-      run(this.pipeSsimPrep, this.bgSsimPrep);
+      run(this.pipeRenderFwd, this.bgRenderFwdC[tc]);
+      run(this.pipeSsimPrep, this.bgSsimPrepC[tc]);
       run(this.pipeSsimBH15, this.bgSsimBH15);
       run(this.pipeSsimBV15, this.bgSsimBV15);
       run(this.pipeSsimCoeff, this.bgSsimCoeff);
       run(this.pipeSsimBH9, this.bgSsimBH9);
-      run(this.pipeSsimFinal, this.bgSsimFinal);
-      run(this.pipeRenderBwd, this.bgRenderBwd);
+      run(this.pipeSsimFinal, this.bgSsimFinalC[tc]);
+      run(this.pipeRenderBwd, this.bgRenderBwdC[tc]);
       return;
     }
     p.setPipeline(this.pipeRender);
-    p.setBindGroup(0, train ? this.bgRenderTrain : this.bgRenderView);
+    p.setBindGroup(0, train ? this.bgRenderTrainC[tc] : this.bgRenderView);
     p.dispatchWorkgroups(gx, gy);
   }
 
@@ -922,12 +1083,13 @@ export class GSTrainer {
    *  accumulate the true gradient scale while the steps are still small.
    *  Returns the uniform array with lr slots [lo, hi) scaled (a copy while
    *  ramping, the array itself once warm). */
-  _warmed(arr, lo, hi) {
+  _warmed(arr, lo, hi, scratch = null) {
     const N = this.opts.lrWarmup;
     if (!(N > 0)) return arr;
     const w = Math.min(1, Math.max(1, this.iter - (this.adamT0 || 0)) / N);
     if (w >= 1) return arr;
-    const out = Float32Array.from(arr);
+    const out = scratch || new Float32Array(arr.length); // (10) pooled while ramping
+    out.set(arr);
     for (let i = lo; i < hi; i++) out[i] *= w;
     return out;
   }
@@ -958,11 +1120,10 @@ export class GSTrainer {
       for (let tries = 0; tries < 16 && (ci === this.holdout || (this.excluded && this.excluded.has(ci))); tries++) ci = (ci + 1) % this.camMeta.length;
       const meta = this.camMeta[ci];
       this._writeTrainUniforms(this.camUniforms[ci]);
-      d.queue.writeBuffer(this.bufTileCnt, 0, this.tileZero);
       this.adamData[19] = (this.iter + 1) - (this.adamT0 || 0);
       this._adamBias();
-      d.queue.writeBuffer(this.uniAdam, 0, this._warmed(this.adamData, 0, 14));
-      if (this.shK) { this.shAdamData[3] = this.iter + 1; this.shAdamData[5] = this.n * this.shK * 3; this._shAdamBias(); d.queue.writeBuffer(this.uniSHAdam, 0, this._warmed(this.shAdamData, 4, 5)); }
+      d.queue.writeBuffer(this.uniAdam, 0, this._warmed(this.adamData, 0, 14, this._warmAdam));
+      if (this.shK) { this.shAdamData[3] = this.iter + 1; this.shAdamData[5] = this.n * this.shK * 3; this._shAdamBias(); d.queue.writeBuffer(this.uniSHAdam, 0, this._warmed(this.shAdamData, 4, 5, this._warmSh)); }
       const gx = Math.ceil(meta.w / TILE), gy = Math.ceil(meta.h / TILE);
       const nGroups = Math.ceil(this.n / 256);
       const d1 = (pass, total) => { const g = Math.ceil(total / 256); if (g <= 65535) pass.dispatchWorkgroups(g); else pass.dispatchWorkgroups(65535, Math.ceil(g / 65535)); };
@@ -971,12 +1132,18 @@ export class GSTrainer {
       // render − renderFwd ≈ the backward's share
       const uFwd = new Float32Array(this.camUniforms[ci]); uFwd[28] = 0;
       const seq = [
-        ['project', this.pipeProject, this.bgProjectTrain, (p) => p.dispatchWorkgroups(nGroups)],
+        ['project', this.pipeProject, this.bgProjectTrain, (p) => {
+          // (1) the ordered counter reset lives in the first pass, not the queue
+          p.setPipeline(this.pipeTileZero); p.setBindGroup(0, this.bgTileZero);
+          p.dispatchWorkgroups(this.tileZeroGroups);
+          p.setPipeline(this.pipeProject); p.setBindGroup(0, this.bgProjectTrain);
+          p.dispatchWorkgroups(nGroups);
+        }],
         ['scan', this.pipeScan, this.bgScanTrain, (p) => p.dispatchWorkgroups(1)],
         ['scatter', this.pipeScatter, this.bgScatterTrain, (p) => p.dispatchWorkgroups(nGroups)],
         ['sort', this.pipeSort, this.bgSort, (p) => p.dispatchWorkgroups(gx * gy)],
-        ['renderFwd', this.pipeRender, this.bgRenderTrain, (p) => p.dispatchWorkgroups(gx, gy), uFwd],
-        ['render', this.pipeRender, this.bgRenderTrain, (p) => p.dispatchWorkgroups(gx, gy), this.camUniforms[ci]],
+        ['renderFwd', this.pipeRender, this.bgRenderTrainC[meta.tgtChunk ?? 0], (p) => p.dispatchWorkgroups(gx, gy), uFwd],
+        ['render', this.pipeRender, this.bgRenderTrainC[meta.tgtChunk ?? 0], (p) => p.dispatchWorkgroups(gx, gy), this.camUniforms[ci]],
         ...(this.compact ? [
           ['visCount', this.pipeVisCount, this.bgVisCount, (p) => d1(p, this.n)],
           ['visScan', this.pipeVisScan, this.bgVisScan, (p) => p.dispatchWorkgroups(1)],
@@ -1049,6 +1216,20 @@ export class GSTrainer {
    *  (evaluate it with evalCamPsnr for an honest novel-view metric). */
   stepOnce() {
     const d = this.device;
+    // (1) merged-submit bracketing: inside a batch every step encodes into
+    // the shared encoder (one submit per batch); unbracketed callers get the
+    // legacy immediate submit on slot 0. A full ring flushes mid-batch — the
+    // submit separates the generations, so slot reuse stays correct.
+    let own = false;
+    if (!this._mEnc) {
+      this._mEnc = d.createCommandEncoder();
+      this._ringUsed = 0;
+      own = true;
+    } else if (this._ringUsed >= this._mergeCap()) {
+      d.queue.submit([this._mEnc.finish()]);
+      this._mEnc = d.createCommandEncoder();
+      this._ringUsed = 0;
+    }
     let ci = (this.rand() * this.camMeta.length) | 0;
     // skip the holdout and any excluded (e.g. motion-blurred) cameras
     for (let tries = 0; tries < 16; tries++) {
@@ -1076,7 +1257,6 @@ export class GSTrainer {
       u[24] = this.rand(); u[25] = this.rand(); u[26] = this.rand();
     }
     this._writeTrainUniforms(this.camUniforms[ci]);
-    d.queue.writeBuffer(this.bufTileCnt, 0, this.tileZero);
     this.iter++;
     this.pixelsSeen += meta.w * meta.h;
     // Adam's bias-correction step count runs from the moments' birth, not the
@@ -1141,16 +1321,21 @@ export class GSTrainer {
     // while the photographs correct it. opts.lockGeom is the 0 case.
     const gls = this.opts.lockGeom ? 0 : this.opts.geomLrScale;
     if (gls != null && gls !== 1) for (let k = 0; k < 10; k++) this.adamData[k] *= gls;
-    d.queue.writeBuffer(this.uniAdam, 0, this._warmed(this.adamData, 0, 14));
+    d.queue.writeBuffer(this.uniAdam, 0, this._warmed(this.adamData, 0, 14, this._warmAdam));
     if (this.shK) {
       this.shAdamData[3] = this.iter;
       this.shAdamData[5] = this.n * this.shK * 3;
       this._shAdamBias();
-      d.queue.writeBuffer(this.uniSHAdam, 0, this._warmed(this.shAdamData, 4, 5));
+      d.queue.writeBuffer(this.uniSHAdam, 0, this._warmed(this.shAdamData, 4, 5, this._warmSh));
     }
 
-    const enc = d.createCommandEncoder();
-    const p = enc.beginComputePass();
+    const enc = this._mEnc;
+    const p = enc.beginComputePass(this._tsStamp()); // (2) brackets the step's GPU time
+    // (1) the counters are shared across merged steps: reset by dispatch
+    // (pass-ordered), so each step's project accumulates from zero
+    p.setPipeline(this.pipeTileZero);
+    p.setBindGroup(0, this.bgTileZero);
+    p.dispatchWorkgroups(this.tileZeroGroups);
     this.encodeRaster(p, meta, true);
     // 2D-safe dispatch: at high splat counts these linear passes exceed the
     // 65535 workgroups-per-dimension limit (SH-Adam broke first: n*24/256 >
@@ -1190,7 +1375,13 @@ export class GSTrainer {
       if (this.pipeShape && this.bgShape) { p.setPipeline(this.pipeShape); p.setBindGroup(0, this.bgShape); dispatch1D(p, this.n); }
     }
     p.end();
-    d.queue.submit([enc.finish()]);
+    this._ringUsed++;
+    if (own) {
+      d.queue.submit([enc.finish()]);
+      this._mEnc = null;
+    } else {
+      this._tsSteps++;
+    }
 
     // camera pose/focal optimization (default ON — validated +0.4..0.7dB
     // holdout on both test scenes): apply accumulated gradients every 25
@@ -1207,6 +1398,74 @@ export class GSTrainer {
     if (((this.opts.camOpt ?? false) || (this.opts.aspectOpt ?? false)) && this.iter > 1500 && this.iter % 25 === 0) {
       this._applyCamGrads();
     }
+  }
+
+  /** Plan item (2): pass descriptor stamping this step's whole-submit GPU
+   *  time into the batch timer (undefined outside an open batch — zero
+   *  overhead when the adapter isn't measuring). */
+  _tsStamp() {
+    if (!this._tsSet || !this._tsOpen || this._tsSlot + 1 >= TS_MAX_STEPS * 2) return undefined;
+    const s = this._tsSlot;
+    this._tsSlot += 2;
+    return { timestampWrites: { querySet: this._tsSet, beginningOfPassWriteIndex: s, endOfPassWriteIndex: s + 1 } };
+  }
+
+  /** Open a merged batch (the session loop / runBatch own the cadence):
+   *  every step encodes into one shared encoder, submitted once at the end
+   *  with the timer resolve riding along. Merging is independent of the
+   *  timestamp feature (timerless trainers merge too, reporting null). */
+  beginGpuBatch() {
+    this._mEnc = this.device.createCommandEncoder();
+    this._ringUsed = 0;
+    this._tsSteps = 0;
+    if (!this._tsSet) return;
+    this._tsSlot = 0;
+    this._tsOpen = true;
+  }
+
+  /** Close the batch: resolve this batch into one read buffer and return
+   *  the PREVIOUS batch's GPU-busy ms (one batch of lag, so the readback
+   *  never stalls the loop on in-flight work). Null without timestamps,
+   *  on the first batch, or on an empty one. */
+  async endGpuBatch() {
+    const d = this.device;
+    const enc = this._mEnc;
+    this._mEnc = null;
+    const stepped = this._ringUsed;
+    this._ringUsed = 0;
+    const timed = !!(this._tsSet && this._tsOpen);
+    this._tsOpen = false;
+    if (enc && stepped) {
+      // the resolve rides the merged submit, after every step's pass
+      if (timed && this._tsSlot) {
+        enc.resolveQuerySet(this._tsSet, 0, this._tsSlot, this._tsResolve, 0);
+        enc.copyBufferToBuffer(this._tsResolve, 0, this._tsRead[this._tsCur], 0, this._tsSlot * 8);
+      }
+      d.queue.submit([enc.finish()]);
+    }
+    if (!timed || !this._tsSlot) return null;
+    const cur = this._tsCur;
+    const prev = this._tsRead[cur ^ 1];
+    const slots = this._tsSlot;
+    // every batch resolves from slot 0; the previous batch's pair count
+    // rides along so the lagged read sums exactly its pairs
+    this._tsCur = cur ^ 1;
+    const prevSlots = this._tsPrevSlots;
+    this._tsPrevSlots = slots;
+    const prevSteps = this._tsPrevSteps;
+    this._tsPrevSteps = this._tsSteps;
+    if (!this._tsHavePrev) { this._tsHavePrev = true; return null; }
+    await prev.mapAsync(GPUMapMode.READ);
+    const t = new BigUint64Array(prev.getMappedRange()).slice();
+    prev.unmap();
+    let ticks = 0n;
+    for (let i = 0; i + 1 < prevSlots; i += 2) ticks += t[i + 1] - t[i];
+    const ms = Number(ticks) * this._tsPeriod / 1e6;
+    // batches past the query set's 128 pairs stamp only their head: scale to
+    // the whole batch (exact under uniform steps; a no-op otherwise)
+    const pairs = Math.max(1, prevSlots / 2);
+    if (ms > 0) this._msStepEst = ms / pairs;
+    return ms * (prevSteps > pairs ? prevSteps / pairs : 1);
   }
 
   /** How far the photometric pose optimisation moved the cameras from the solve:
@@ -1312,6 +1571,29 @@ export class GSTrainer {
     }
   }
 
+  /** SSIM-metric GPU objects, created on first use: a shader compile plus
+   *  two ~tens-of-MB buffers that non-graph runs never need. Idempotent. */
+  _ensureSsimMetric() {
+    if (this.bgSsimMetricC) return;
+    const d = this.device;
+    this.pipeSsimMetric = d.createComputePipeline({
+      label: 'ssim-metric', layout: 'auto',
+      compute: { module: d.createShaderModule({ code: SSIM_METRIC_SRC, label: 'ssim-metric' }), entryPoint: 'main' },
+    });
+    const B = GPUBufferUsage;
+    this.bufSsimMetric = d.createBuffer({ size: this.ssimMetricBytes, usage: B.STORAGE | B.COPY_SRC, label: 'ssim-metric' });
+    this.bufSsimMetricRead = d.createBuffer({ size: this.ssimMetricBytes, usage: B.COPY_DST | B.MAP_READ, label: 'ssim-metric-read' });
+    this.bgSsimMetricCR = this.uniTrainR.map((u) => this.tgtChunks.map((t) => d.createBindGroup({
+      layout: this.pipeSsimMetric.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: u } },
+        { binding: 1, resource: { buffer: this.bufOut } },
+        { binding: 2, resource: { buffer: t } },
+        { binding: 3, resource: { buffer: this.bufSsimMetric } },
+      ],
+    })));
+  }
+
   /** One training-path pass for camera ci (optionally with a pose override);
    *  returns { psnr, camGrad (Int32Array row ci + focal row) }. Drains all
    *  gradient pollution so training state stays clean. */
@@ -1325,13 +1607,16 @@ export class GSTrainer {
     const rows = this.camMeta.length + 1;
     d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
     this._writeTrainUniforms(uni);
-    d.queue.writeBuffer(this.bufTileCnt, 0, this.tileZero);
     const enc = d.createCommandEncoder();
     const p = enc.beginComputePass();
+    p.setPipeline(this.pipeTileZero); // (1) ordered reset, not a queue write
+    p.setBindGroup(0, this.bgTileZero);
+    p.dispatchWorkgroups(this.tileZeroGroups);
     this.encodeRaster(p, meta, true);
     if (includeSsim) {
+      this._ensureSsimMetric();
       p.setPipeline(this.pipeSsimMetric);
-      p.setBindGroup(0, this.bgSsimMetric);
+      p.setBindGroup(0, this.bgSsimMetricC[meta.tgtChunk ?? 0]);
       p.dispatchWorkgroups(Math.ceil(Math.ceil(meta.w / 2) / 8), Math.ceil(Math.ceil(meta.h / 2) / 8));
     }
     p.setPipeline(this.pipeChain); p.setBindGroup(0, this.bgChain); // zeroes gradP
@@ -1418,6 +1703,7 @@ export class GSTrainer {
         g = Math.max(-0.1, Math.min(0.1, g - upd[6]));
         b = Math.max(-0.05, Math.min(0.05, b - upd[7]));
       }
+      if (s % 25 === 0) await tick(); // (6) 200 eval passes: breathe every 25
     }
     return (await this._evalPass(ci, { R, t, g, b })).psnr;
   }
@@ -1456,9 +1742,11 @@ export class GSTrainer {
     const d = this.device;
     const u = this._camUniform(camParams, trainMode, offset);
     d.queue.writeBuffer(this.uniView, 0, u);
-    d.queue.writeBuffer(this.bufTileCnt, 0, this.tileZero);
     const enc = d.createCommandEncoder();
     const p = enc.beginComputePass();
+    p.setPipeline(this.pipeTileZero); // (1) ordered reset, not a queue write
+    p.setBindGroup(0, this.bgTileZero);
+    p.dispatchWorkgroups(this.tileZeroGroups);
     this.encodeRaster(p, camParams, false);
     p.end();
     const rp = enc.beginRenderPass({
@@ -1478,6 +1766,42 @@ export class GSTrainer {
   renderTrainCam(ci, ctx) {
     const meta = this.camMeta[ci];
     this.renderView(meta, ctx, 0, meta.offset);
+  }
+
+  /** Render a camera offscreen (no canvas) and read the pixels back:
+   *  clamp(outImg) quantized to RGBA8 — exactly what the blit presents
+   *  (BLIT_SRC is a bare clamp; the canvas applies no colorspace transform).
+   *  View snapshots use this instead of reading canvas pixels, which is also
+   *  what makes snapshots work in worker mode: a transferred OffscreenCanvas
+   *  has no main-side readable pixels. Sizes derive from known canvases and
+   *  metas and always fit bufOut by construction (maxViewW/H cover them). */
+  async renderCapture(camParams) {
+    const d = this.device;
+    const w = camParams.w | 0, h = camParams.h | 0;
+    const u = this._camUniform(camParams, 0, 0);
+    d.queue.writeBuffer(this.uniView, 0, u);
+    const enc = d.createCommandEncoder();
+    const p = enc.beginComputePass();
+    p.setPipeline(this.pipeTileZero); // (1) ordered reset, not a queue write
+    p.setBindGroup(0, this.bgTileZero);
+    p.dispatchWorkgroups(this.tileZeroGroups);
+    this.encodeRaster(p, camParams, false);
+    p.end();
+    const bytes = w * h * 16;
+    const rb = d.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyBufferToBuffer(this.bufOut, 0, rb, 0, bytes);
+    d.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const f = new Float32Array(rb.getMappedRange());
+    const rgba = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0, j = 0; i < f.length; i += 4, j += 4) {
+      rgba[j] = Math.min(1, Math.max(0, f[i])) * 255;
+      rgba[j + 1] = Math.min(1, Math.max(0, f[i + 1])) * 255;
+      rgba[j + 2] = Math.min(1, Math.max(0, f[i + 2])) * 255;
+      rgba[j + 3] = 255;
+    }
+    rb.unmap(); rb.destroy();
+    return { w, h, rgba };
   }
 
   /** Phase-2 MCMC refine (default): dead splats relocate as EXACT copies of
@@ -1502,8 +1826,12 @@ export class GSTrainer {
     const d = this.device;
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const canGrow = this.iter < (this.opts.growUntil ?? 0.5 * this.horizon) && this.n < limit;
-    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n };
+    const growPhase = this.iter < (this.opts.growUntil ?? 0.90 * this.horizon);
+    const canGrow = growPhase && this.n < limit;
+    // capped: growth still scheduled but the TRUE cap is full. A growLimit
+    // hold (LOD levels) is not the ceiling — the session only prompts here.
+    const capped = growPhase && this.n >= limit && limit >= this.cap;
+    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n, capped };
 
     d.queue.writeBuffer(this.uniGather, 0, new Uint32Array([this.n, 1, this.opts.statMax ? 1 : 0, 0]));
     {
@@ -1521,6 +1849,7 @@ export class GSTrainer {
     await this.bufGatherRead.mapAsync(GPUMapMode.READ, 0, this.n * 16);
     const g = new Float32Array(this.bufGatherRead.getMappedRange(0, this.n * 16)).slice();
     this.bufGatherRead.unmap();
+    await tick(); // (6) drain resolved — breathe before the planning burst
 
     const sig = (x) => 1 / (1 + Math.exp(-x));
     const minLog = Math.log(this.sceneRadius * (this.opts.minScale ?? 1e-5)) + 0.05;
@@ -1531,7 +1860,7 @@ export class GSTrainer {
       if (o < 2 / 255 || g[i * 4 + 3] < minLog) { if (canReloc) dead.push(i); }
       else if (o >= 0.05) pool.push(i);
     }
-    if (pool.length < 16) return { moved: 0, grown: 0, n: this.n };
+    if (pool.length < 16) return { moved: 0, grown: 0, n: this.n, capped };
 
     // relocation donors ~ opacity; growth donors ~ grad-stat above threshold
     const opCdf = new Float64Array(pool.length);
@@ -1577,7 +1906,7 @@ export class GSTrainer {
       while (lo < hi) { const mid = (lo + hi) >> 1; if (gsCdf[mid] < r) lo = mid + 1; else hi = mid; }
       return gCands[lo];
     };
-    if (dead.length + grown === 0) return { moved: 0, grown: 0, n: this.n };
+    if (dead.length + grown === 0) return { moved: 0, grown: 0, n: this.n, capped };
     const budget = Math.floor(this.planCap / 2) - 1;
     if (dead.length > budget) dead = dead.slice(0, budget);
     grown = Math.min(grown, budget - dead.length);
@@ -1641,7 +1970,7 @@ export class GSTrainer {
       this.adamData[23] = this.n * STRIDE;
       this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
     }
-    return { moved: dead.length, grown, n: this.n };
+    return { moved: dead.length, grown, n: this.n, capped };
   }
 
   /** opts.relocTaper = f (fraction of the horizon, e.g. 0.5): the per-round
@@ -1675,6 +2004,9 @@ export class GSTrainer {
   }
 
   async refine(rng = this.rand) {
+    // (1) the cost basis may move under the merge cap — re-measure (one
+    // conservative batch) rather than overshoot on a stale estimate
+    this._msStepEst = null;
     if (this.v2 && (this.opts.v2Refine ?? true)) return this._refineV3(rng);
     // OPT-IN while unproven: at truck 40k the v2 mechanics plateau 0.1-0.2 dB
     // BELOW the legacy path (best 25.38 vs 25.49) and one knob combination
@@ -1684,8 +2016,12 @@ export class GSTrainer {
     if (this.opts.refineV2 !== true) return this._refineLegacy(rng);
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const canGrow = this.iter < (this.opts.growUntil ?? 0.75 * this.horizon) && this.n < limit;
-    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n };
+    const growPhase = this.iter < (this.opts.growUntil ?? 0.90 * this.horizon);
+    const canGrow = growPhase && this.n < limit;
+    // capped: growth still scheduled but the TRUE cap is full. A growLimit
+    // hold (LOD levels) is not the ceiling — the session only prompts here.
+    const capped = growPhase && this.n >= limit && limit >= this.cap;
+    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n, capped };
     const d = this.device;
 
     // gather (o, w-mass, e-mass, mean logS) and zero the accumulator window
@@ -1705,6 +2041,7 @@ export class GSTrainer {
     await this.bufGatherRead.mapAsync(GPUMapMode.READ, 0, this.n * 16);
     const g = new Float32Array(this.bufGatherRead.getMappedRange(0, this.n * 16)).slice();
     this.bufGatherRead.unmap();
+    await tick(); // (6) drain resolved — breathe before the planning burst
 
     const sig = (x) => 1 / (1 + Math.exp(-x));
     // opts.deadThr: below it a splat is relocated (ours 0.02; LichtFeld
@@ -1728,12 +2065,18 @@ export class GSTrainer {
     let survived = 0;
     if (this._lastReloc) for (const i of this._lastReloc) if (sig(g[i * 4]) >= deadThr) survived++;
     const census = { dead: deadAll, survived, lastReloc: this._lastReloc ? this._lastReloc.length : 0 };
-    if (pool.length < 16) return { moved: 0, grown: 0, n: this.n, ...census };
+    if (pool.length < 16) return { moved: 0, grown: 0, n: this.n, capped, ...census };
     const moveCap = Math.ceil(this.n * (this.opts.moveCap ?? 1.0) * this._relocTaperFactor());
     if (dead.length > moveCap) dead = dead.slice(0, moveCap);
-    const grown = canGrow
+    let grown = canGrow
       ? Math.max(0, Math.min(Math.ceil(this.n * (this.opts.growRate ?? 0.15)), limit - this.n)) : 0;
-    if (dead.length === 0 && grown === 0) return { moved: 0, grown: 0, n: this.n };
+    // the plan buffer holds planCap ops and every clone brings a donor op
+    // (nOps <= 2 * nClone): cap the intake like _refineV3, or a death-heavy
+    // refine uploads past the plan and the write throws (2026-11)
+    const budget = Math.floor(this.planCap / 2) - 1;
+    if (dead.length > budget) dead = dead.slice(0, budget);
+    grown = Math.min(grown, Math.max(0, budget - dead.length));
+    if (dead.length === 0 && grown === 0) return { moved: 0, grown: 0, n: this.n, capped };
 
     // donor sampling ∝ accumulated error mass (fallback: opacity, e.g. the
     // first refine of a run before any window has accumulated)
@@ -1890,7 +2233,7 @@ export class GSTrainer {
       this.adamData[23] = this.n * STRIDE;
       this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
     }
-    return { moved: dead.length, grown, n: this.n, ...census };
+    return { moved: dead.length, grown, n: this.n, capped, ...census };
   }
 
   /** Legacy MCMC-lite refinement: relocate dead splats onto jittered copies of
@@ -1952,25 +2295,32 @@ export class GSTrainer {
 
   async _refineLegacy(rng = this.rand) {
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
-    const canGrow = this.iter < (this.opts.growUntil ?? 0.75 * this.horizon) && this.n < Math.min(this.cap, this.growLimit || this.cap);
-    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n };
+    const growPhase = this.iter < (this.opts.growUntil ?? 0.90 * this.horizon);
+    const canGrow = growPhase && this.n < Math.min(this.cap, this.growLimit || this.cap);
+    // capped: growth still scheduled but the TRUE cap is full (a growLimit
+    // hold — LOD levels — is not the ceiling; the session only prompts here)
+    const capped = growPhase && this.n >= this.cap && (this.growLimit || this.cap) >= this.cap;
+    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n, capped };
     const d = this.device;
-    const nb = this.cap * STRIDE * 4;
-    const readBuf = async (buf, bytes = nb) => {
-      const rb = d.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    // capacity-pooled densification: the live-rows readback reuses the
+    // cap-sized bufParamsRead (partial-range map, like the gather path)
+    // instead of creating + destroying a multi-MB staging buffer every
+    // refine — no per-densify GPU allocation churn. readGaussians is the
+    // only other user and never runs concurrently with refine.
+    const liveBytes = this.n * STRIDE * 4;
+    {
       const enc = d.createCommandEncoder();
-      enc.copyBufferToBuffer(buf, 0, rb, 0, bytes);
+      enc.copyBufferToBuffer(this.bufParams, 0, this.bufParamsRead, 0, liveBytes);
       d.queue.submit([enc.finish()]);
-      await rb.mapAsync(GPUMapMode.READ);
-      const out = new Float32Array(rb.getMappedRange()).slice();
-      rb.unmap(); rb.destroy();
-      return out;
-    };
+      await this.bufParamsRead.mapAsync(GPUMapMode.READ, 0, liveBytes);
+    }
+    await tick(); // (6) params drain resolved — breathe before processing them
     // speed plan #4: only the live rows of params come back; Adam moments and
     // SH never leave the GPU — every row this call touches is recorded and
     // applied by the refine-patch kernel at the end (same values as before).
     const params = new Float32Array(this.cap * STRIDE);
-    params.set(await readBuf(this.bufParams, this.n * STRIDE * 4));
+    params.set(new Float32Array(this.bufParamsRead.getMappedRange(0, liveBytes)));
+    this.bufParamsRead.unmap();
     const shr = this.shK * 3;
     const sh = this.shK ? true : null;   // truthy: the SH inheritance branch below records ops
     const touched = new Map();   // row -> { shSrc, zeroMV, zeroShMV }
@@ -2004,6 +2354,7 @@ export class GSTrainer {
       emass = new Float32Array(this.bufGatherRead.getMappedRange(0, this.n * 16)).slice();
       this.bufGatherRead.unmap();
     }
+    await tick(); // (6) gather drain resolved — breathe before the planning burst
 
     let dead = [];
     const donors = [];
@@ -2034,7 +2385,7 @@ export class GSTrainer {
       for (const i of this._lastReloc) if (sig(params[i * STRIDE + 13]) >= deadThr) survived++;
     }
     const census = { dead: deadAll, survived, lastReloc: this._lastReloc ? this._lastReloc.length : 0 };
-    if (donors.length < 16) return { moved: 0, grown: 0, n: this.n, ...census };
+    if (donors.length < 16) return { moved: 0, grown: 0, n: this.n, capped, ...census };
     // relocation ceiling per refine — at the old hard 5%, any dead fraction
     // above it stayed dead FOREVER (a monotonic capacity leak; the reference
     // relocates every dead splat every 100 iters)
@@ -2154,7 +2505,7 @@ export class GSTrainer {
     // growLimit: a soft, raisable ceiling below cap — LOD training holds the
     // model at each detail level, snapshots it, then lets it grow on
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const grown = this.iter < (this.opts.growUntil ?? 0.75 * this.horizon)
+    const grown = this.iter < (this.opts.growUntil ?? 0.90 * this.horizon)
       ? Math.max(0, Math.min(Math.ceil(this.n * (this.opts.growRate ?? 0.15)), limit - this.n)) : 0;
     for (let k = 0; k < grown; k++) spawnAt((this.n + k) * STRIDE, true);
     if (grown > 0) {
@@ -2164,21 +2515,151 @@ export class GSTrainer {
     }
     this._refinePatch(touched, params);
 
-    // tile-pressure telemetry (counts from the most recent render)
-    const rbT = d.createBuffer({ size: this.maxTiles * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    // tile-pressure telemetry (counts from the most recent render), read
+    // through a pooled staging buffer — refine allocates nothing per call
+    if (!this.bufTileCntRead) {
+      this.bufTileCntRead = d.createBuffer({ size: this.maxTiles * 4,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, label: 'tileCntRead' });
+    }
     const encT = d.createCommandEncoder();
-    encT.copyBufferToBuffer(this.bufTileCnt, 0, rbT, 0, this.maxTiles * 4);
+    encT.copyBufferToBuffer(this.bufTileCnt, 0, this.bufTileCntRead, 0, this.maxTiles * 4);
     d.queue.submit([encT.finish()]);
-    await rbT.mapAsync(GPUMapMode.READ);
-    const cnts = new Uint32Array(rbT.getMappedRange());
+    await this.bufTileCntRead.mapAsync(GPUMapMode.READ);
+    const cnts = new Uint32Array(this.bufTileCntRead.getMappedRange());
     let maxTile = 0;
     for (let i = 0; i < this.maxTiles; i++) {
       if (cnts[i] > maxTile) maxTile = cnts[i];
     }
-    rbT.unmap(); rbT.destroy();
+    this.bufTileCntRead.unmap();
     // entry-budget drops (whole tiles skipped) are counted by the scan pass
     // into stats[3] and surfaced via readLoss -> this.entryOverflowTiles
-    return { moved: dead.length, grown, n: this.n, maxTile, overflow: this.entryOverflowTiles || 0, ...census };
+    return { moved: dead.length, grown, n: this.n, capped, maxTile, overflow: this.entryOverflowTiles || 0, ...census };
+  }
+
+  /** Periodic importance culling (Speedy-Splat method, opt-in via
+   *  opts.softPrune { ratio, every, until, milestones }): drop the
+   *  lowest-rendered-mass
+   *  fraction of splats and compact every per-splat buffer GPU-side.
+   *  Survivors keep their Adam moments — unlike relocation and reseed, a
+   *  soft-prune never resets optimizer state. Scoring reads the mass
+   *  windows WITHOUT draining them (gather mode 2), so refine planning
+   *  never notices. Skips while a protected seed range is active (rows
+   *  permute) and whenever the plan refuses (too few rows, no signal).
+   *  ratioOverride (the session's early milestones) culls that fraction
+   *  instead of cfg.ratio. Every refine culls until `until` of the run;
+   *  milestones fire ahead of the schedule. Returns { culled, n, floorBound }. */
+  async softPrune(ratioOverride = null) {
+    const cfg = this.opts.softPrune;
+    if (!cfg) return { culled: 0, n: this.n };
+    const ratio = ratioOverride ?? cfg.ratio ?? 0.1;
+    if (!(ratio > 0 && ratio < 1)) return { culled: 0, n: this.n };
+    if (this.protect && this.iter < this.protect.until) return { culled: 0, n: this.n };
+    // an LOD level hold is a polish window at a fixed count — culling
+    // would eat the level out from under its snapshot
+    if (this.growLimit && this.growLimit < this.cap && this.n >= this.growLimit) {
+      return { culled: 0, n: this.n };
+    }
+    const d = this.device;
+    d.queue.writeBuffer(this.uniGather, 0, new Uint32Array([this.n, 2, 0, 0]));
+    {
+      const enc = d.createCommandEncoder();
+      const p = enc.beginComputePass();
+      p.setPipeline(this.pipeGather);
+      p.setBindGroup(0, this.bgGather);
+      const groups = Math.ceil(this.n / 256);
+      if (groups <= 65535) p.dispatchWorkgroups(groups);
+      else p.dispatchWorkgroups(65535, Math.ceil(groups / 65535));
+      p.end();
+      enc.copyBufferToBuffer(this.bufGather, 0, this.bufGatherRead, 0, this.n * 16);
+      d.queue.submit([enc.finish()]);
+    }
+    await this.bufGatherRead.mapAsync(GPUMapMode.READ, 0, this.n * 16);
+    const g = new Float32Array(this.bufGatherRead.getMappedRange(0, this.n * 16)).slice();
+    this.bufGatherRead.unmap();
+    const masses = new Float32Array(this.n);
+    const logitOp = new Float32Array(this.n);
+    const meanLogS = new Float32Array(this.n);
+    for (let i = 0; i < this.n; i++) { masses[i] = g[i * 4 + 2]; logitOp[i] = g[i * 4]; meanLogS[i] = g[i * 4 + 3]; }
+    const plan = planSoftPrune(masses, this.n, ratio, {
+      minCull: cfg.minCull ?? 1024, floor: cfg.floor ?? 8192,
+      last: this._softPruneFloor || 0, cap: this.cap, logitOp, meanLogS,
+    });
+    if (!plan) return { culled: 0, n: this.n };
+    this._ensureCompact();
+    d.queue.writeBuffer(this.bufCompactRank, 0, plan.rank);
+    const bufs = [
+      [this.bufParams, 16], [this.bufProj, 16], [this.bufGradP, 16],
+      [this.bufGradF, 16], [this.bufM, 16], [this.bufV, 16],
+    ];
+    if (this.shK) {
+      const s = this.shK * 3;
+      bufs.push([this.bufSH, s], [this.bufSHGrad, s], [this.bufSHM, s], [this.bufSHV, s]);
+    }
+    // one encoder per chunk: the chunk uniform is rewritten between them
+    // (a single submit would let the last write win for every dispatch).
+    // A chunk's destination sits at/below its source, so no chunk's
+    // writes overlap a later chunk's reads.
+    for (const [b, stride] of bufs) {
+      const bg = this._compactBg(b);
+      for (const c of chunkPlan(plan.rank, this.n, stride)) {
+        d.queue.writeBuffer(this.uniCompact, 0,
+          new Uint32Array([c.srcBase, c.count, stride, c.dstBase]));
+        const enc = d.createCommandEncoder();
+        const p = enc.beginComputePass();
+        p.setPipeline(this.pipeCompact);
+        p.setBindGroup(0, bg);
+        const groups = Math.ceil(c.count / 256);
+        if (groups <= 65535) p.dispatchWorkgroups(groups);
+        else p.dispatchWorkgroups(65535, Math.ceil(groups / 65535));
+        p.end();
+        enc.copyBufferToBuffer(this.bufCompactTmp, 0, b,
+          c.dstBase * stride * 4, c.survivors * stride * 4);
+        d.queue.submit([enc.finish()]);
+      }
+    }
+    this.n = plan.kept;
+    this.adamData[23] = this.n * STRIDE;
+    this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
+    // row-indexed CPU state dies with the permutation: the census baseline
+    this._lastReloc = null;
+    // the growth ratchet: the next prune (below the cap) holds this floor
+    this._softPruneFloor = plan.kept;
+    return { culled: plan.culled, n: this.n, floorBound: plan.floorBound };
+  }
+
+  /** Lazily built compaction kit: no buffers, no pipelines until the first
+   *  soft-prune fires (off by default = zero footprint). */
+  _ensureCompact() {
+    if (this.pipeCompact) return;
+    const d = this.device;
+    this.pipeCompact = d.createComputePipeline({
+      label: 'compact', layout: 'auto',
+      compute: { module: d.createShaderModule({ label: 'compact', code: COMPACT_SRC }), entryPoint: 'main' },
+    });
+    this.uniCompact = d.createBuffer({ size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'uniCompact' });
+    this.bufCompactTmp = d.createBuffer({ size: COMPACT_TEMP_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, label: 'compact-tmp' });
+    this.bufCompactRank = d.createBuffer({ size: this.cap * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, label: 'compact-rank' });
+    this._compactBgs = new Map();
+  }
+
+  _compactBg(b) {
+    let bg = this._compactBgs.get(b);
+    if (!bg) {
+      bg = this.device.createBindGroup({
+        layout: this.pipeCompact.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.uniCompact } },
+          { binding: 1, resource: { buffer: b } },
+          { binding: 2, resource: { buffer: this.bufCompactRank } },
+          { binding: 3, resource: { buffer: this.bufCompactTmp } },
+        ],
+      });
+      this._compactBgs.set(b, bg);
+    }
+    return bg;
   }
 
   /** Cheap health probe: sample the head of the params buffer. iOS Safari
