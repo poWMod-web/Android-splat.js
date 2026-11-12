@@ -148,4 +148,7 @@ await assert.rejects(modelFromEntries(new Map([['notes.txt', new Uint8Array([1])
   assert.deepEqual(miss.missing, ['b.jpg'], 'missing photos are named');
 }
 
+assert.match(appSource, /const cap = Math\.max\(g\.n, recon\.maxSplats \|\| 0, st\.splats \|\| 0\);/,
+  'the browser continuation should replay the recorded budget under the panel choice');
+
 console.log('browser session restore + continue intake: passed');

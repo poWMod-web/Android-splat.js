@@ -30,7 +30,11 @@ assert.match(card, /softRaw === 'custom'/,
 assert.match(card, /\.\.\.\[480, 640, 960, 1280, 1600, 1920\]\.map\(\(v\) =>/,
   'the card should list every start-panel resolution step, unfiltered');
 assert.match(card, /Same as current/,
-  'the splat budget should default to Same as current');
+  'the splat budget should fall back to Same as current without a recorded budget');
+assert.match(card, /const prevCap = r\.cap \|\| recon\.maxSplats \|\| 0;/,
+  'the card should resolve the run’s original budget first');
+assert.match(card, /Original budget \(\$\{fmt\(prevCap\)\}\)/,
+  'the splat budget should default to the original budget, stated plainly');
 assert.match(card, /const prevBuf = continuedBuf\(recon\.trainScale, r\.detailProgress && r\.detailProgress\.settings, prevDim \|\| undefined\);/,
   'the card should resolve the run’s buffer from the recon or its saved settings');
 assert.match(card, /<option value="same" selected>\$\{prevInputDim \? `\$\{prevInputDim\} px` : 'Run size'\}<\/option>/,
@@ -74,6 +78,10 @@ assert.match(cont, /Math\.max\(fr0\.nw \|\| fr0\.fw \|\| 0, fr0\.nh \|\| fr0\.fh
   'Full size should use the file’s own pixel size, not the feature-capped dims');
 assert.match(sessionIo, /\.\.\.\(Number\.isFinite\(f\.srcW\) \? \{ nw: f\.srcW, nh: f\.srcH \} : \{\}\)/,
   'the recon JSON should persist each frame’s native pixel size');
+assert.match(sessionIo, /maxSplats: ses\.trainer\.cap \|\| 0,/,
+  'the recon JSON should record the budget continuations replay');
+assert.match(cont, /const cap = Math\.max\(g\.n, lr\.splats \|\| 0, lr\.cap \|\| 0,/,
+  'the continuation should carry the run’s own budget, finished runs included');
 assert.match(cont, /Math\.max\(g\.n, lr\.splats \|\| 0,[\s\S]*opts\.splats \|\| 0\)/,
   'the continuation budget should honor a reselected splat count, never below the trained size');
 assert.match(cont, /frames: \{ trainMaxDim, \.\.\.\(bufScale != null \? \{ trainScale: bufScale \} : \{\}\) \}/,

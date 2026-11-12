@@ -4306,10 +4306,16 @@ function continueConfigCard(r) {
     '<option value="auto">Auto</option>',
     ...[480, 640, 960, 1280, 1600, 1920].map((v) => `<option value="${v}">${v} px</option>`),
     `<option value="full">Full size${nativeDim ? ` (${nativeDim} px)` : ''}</option>`].join('');
-  // budgets at or above the finished size (shrinking a trained model is not
-  // offered); Same as current keeps the run's own sizing
+  // the default keeps the run's ORIGINAL budget (the cap it trained under),
+  // not its current count — else a run that finished below budget would
+  // continue with no headroom to grow into. Records old enough to lack a
+  // stored cap fall back to the current count. Explicit steps stay at or
+  // above the finished size (shrinking a trained model is not offered).
+  const prevCap = r.cap || recon.maxSplats || 0;
+  const prevSplatLabel = prevCap ? `Original budget (${fmt(prevCap)})`
+    : `Same as current${prevSplats ? ` (${fmt(prevSplats)})` : ''}`;
   const budgets = [300000, 600000, 1000000, 2000000, 4000000].filter((v) => v >= prevSplats);
-  const splatOpts = [`<option value="" selected>Same as current${prevSplats ? ` (${fmt(prevSplats)})` : ''}</option>`,
+  const splatOpts = [`<option value="" selected>${prevSplatLabel}</option>`,
     ...budgets.map((v) => `<option value="${v}">${fmt(v)}</option>`)].join('');
   // extra cycles mirror the start panel's fixed 10k–50k menu
   const cycleSteps = [10000, 20000, 30000, 40000, 50000];
@@ -4554,7 +4560,10 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     const trainMaxDim = opts.res === 'auto' ? undefined
       : opts.res === 'full' ? nativeDim
       : Number.isFinite(opts.res) ? opts.res : prevInputDim;
-    const cap = Math.max(g.n, lr.splats || 0, lr.status !== 'finished' ? lr.cap || 0 : 0, opts.splats || 0);
+    // the run's own budget carries over (finished runs included — it is the
+    // cap they trained under, not their current count); the model size
+    // floors it, an explicit card choice raises it
+    const cap = Math.max(g.n, lr.splats || 0, lr.cap || 0, (recon && recon.maxSplats) || 0, opts.splats || 0);
     // LOD on a continuation starts a fresh halving schedule ABOVE the model's
     // current size (snapshotting below it would mislabel the levels); without
     // headroom there is nothing to schedule

@@ -1477,7 +1477,9 @@ async function continueRun(files, urls = null) {
     const prevBuf = continuedBuf(recon.trainScale, undefined, prevDim);
     const trainMaxDim = continuedInputDim(prevDim, prevBuf);
     const bufScale = prevBuf !== 1 ? prevBuf : undefined;
-    const cap = Math.max(g.n, st.splats || 0);
+    // the run's own budget carries over (the recon records it now); the
+    // model size floors it, an explicit panel choice raises it
+    const cap = Math.max(g.n, recon.maxSplats || 0, st.splats || 0);
     // rebuild the SAME trainer the run was made with: the recipe carries
     // the optimizer set and the refine cadence; sizing is per run
     const { refineEvery: recipeRefine, ...recipeTrainer } = recipe || {};
