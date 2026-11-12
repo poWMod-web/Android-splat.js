@@ -35,6 +35,7 @@ import { GSTrainer } from './gs/trainer.js';
 import { RemoteTrainer } from './gs/remote-trainer.js';
 import { createGpu } from './gpu/context.js';
 import { gaussiansToPly, bakeOpacityCompensation, unbakeOpacityCompensation } from './io/ply.js';
+import { simplifyGaussians } from './gs/simplify.js';
 
 /** One macrotask breath — lets a pending frame present go out before a GPU
  *  readback drains the queue behind it. */
@@ -1750,38 +1751,57 @@ export class Session {
     // shares the trainer's staging buffers with the metric readbacks
     return this._locked(async () => {
       const { data, n, sh, shK } = await this.trainer.readGaussians();
-      const meta = this.trainer.camMeta[0];
-      // a view-only restore has no training cameras — its model came from an
-      // export that already baked the compensation, so pass it through.
-      // A trainer without Mip compensation (opts.mipComp false) rendered
-      // exactly what external rasterizers render: nothing to bake.
-      const baked = (meta && this.trainer.mipComp !== false)
-        ? bakeOpacityCompensation(data, n, meta.f,
-            Float32Array.from(this.trainer.camMeta.flatMap(camPosition)), this.trainer.dilate)
-        : data;
-      // dead splats — invisible at the smallest 8-bit alpha — are pure
-      // file-size and render tax for every viewer. Long classic-era runs
-      // accumulated 50%+ of them (opacity-reg ratchet, lab log 2026-09-01):
-      // drop them at the door.
-      const A_DEAD = Math.log(1 / 254);   // logit of alpha 1/255
-      let live = 0;
-      for (let i = 0; i < n; i++) if (baked[i * 16 + 13] > A_DEAD) live++;
-      let oData = baked, oSh = sh, oN = n;
-      if (live < n) {
-        oData = new Float32Array(live * 16);
-        const shPer = sh ? sh.length / n : 0;
-        oSh = sh ? new Float32Array(live * shPer) : sh;
-        let w = 0;
-        for (let i = 0; i < n; i++) {
-          if (baked[i * 16 + 13] <= A_DEAD) continue;
-          oData.set(baked.subarray(i * 16, i * 16 + 16), w * 16);
-          if (sh) oSh.set(sh.subarray(i * shPer, (i + 1) * shPer), w * shPer);
-          w++;
-        }
-        oN = live;
-      }
-      return gaussiansToPly(oData, oN, oSh, shK, this.trainer.dcMode);
+      return this._bakedPly(data, n, sh, shK);
     });
+  }
+
+  /** Simplified .ply: training-free NanoGS-method merge-down to `ratio` of
+   *  the splats, then the same bake + dead-splat filter as a full export.
+   *  The live model is untouched — the simplification runs on a readback. */
+  exportSimplifiedPlyBlob(ratio, { onStatus = () => {}, onProgress = null } = {}) {
+    return this._locked(async () => {
+      const { data, n, sh, shK } = await this.trainer.readGaussians();
+      const simp = await simplifyGaussians(
+        { data, n, sh, shK, dc: this.trainer.dcMode },
+        { ratio, onStatus, onProgress });
+      return this._bakedPly(simp.data, simp.n, simp.sh, simp.shK);
+    });
+  }
+
+  /** Mip-compensation bake + dead-splat filter + PLY pack, shared by the
+   *  full and simplified export paths. */
+  _bakedPly(data, n, sh, shK) {
+    const meta = this.trainer.camMeta[0];
+    // a view-only restore has no training cameras — its model came from an
+    // export that already baked the compensation, so pass it through.
+    // A trainer without Mip compensation (opts.mipComp false) rendered
+    // exactly what external rasterizers render: nothing to bake.
+    const baked = (meta && this.trainer.mipComp !== false)
+      ? bakeOpacityCompensation(data, n, meta.f,
+          Float32Array.from(this.trainer.camMeta.flatMap(camPosition)), this.trainer.dilate)
+      : data;
+    // dead splats — invisible at the smallest 8-bit alpha — are pure
+    // file-size and render tax for every viewer. Long classic-era runs
+    // accumulated 50%+ of them (opacity-reg ratchet, lab log 2026-09-01):
+    // drop them at the door.
+    const A_DEAD = Math.log(1 / 254);   // logit of alpha 1/255
+    let live = 0;
+    for (let i = 0; i < n; i++) if (baked[i * 16 + 13] > A_DEAD) live++;
+    let oData = baked, oSh = sh, oN = n;
+    if (live < n) {
+      oData = new Float32Array(live * 16);
+      const shPer = sh ? sh.length / n : 0;
+      oSh = sh ? new Float32Array(live * shPer) : sh;
+      let w = 0;
+      for (let i = 0; i < n; i++) {
+        if (baked[i * 16 + 13] <= A_DEAD) continue;
+        oData.set(baked.subarray(i * 16, i * 16 + 16), w * 16);
+        if (sh) oSh.set(sh.subarray(i * shPer, (i + 1) * shPer), w * shPer);
+        w++;
+      }
+      oN = live;
+    }
+    return gaussiansToPly(oData, oN, oSh, shK, this.trainer.dcMode);
   }
 
   /** The trainer's RAW parameter state ({ data, n, sh, shK }) — the exact

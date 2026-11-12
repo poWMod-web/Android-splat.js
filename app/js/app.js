@@ -4651,6 +4651,54 @@ function exportActions() {
       flash(`PLY save failed: ${e.message}`, 6000);
     }
   } });
+  if (!S.restored) acts.push({ act: 'simplify', label: 'Download simplified .ply', sub: 'Fewer splats, same look · pick a size', run: async () => {
+    try {
+      stopWalk();
+      document.getElementById('simpcard')?.remove();
+      const card = document.createElement('div');
+      card.className = 'upcard';
+      card.id = 'simpcard';
+      card.innerHTML = `
+        <b>Shrink the model</b>
+        <span class="sog-status" id="simp-status">Merging nearby splats keeps the look — pick a target size.</span>
+        <div class="row" id="simp-pick">
+          <button class="btn" data-ratio="0.75">Keep ¾</button>
+          <button class="btn" data-ratio="0.5">Keep ½</button>
+          <button class="btn" data-ratio="0.25">Keep ¼</button>
+          <button class="btn linkish" data-ratio="">Cancel</button>
+        </div>
+        <div class="prep-meter"><i id="simp-bar" style="width:0%"></i></div>`;
+      $('stage').appendChild(card);
+      const ratio = await new Promise((resolve) => {
+        card.querySelector('#simp-pick').addEventListener('click', (e) => {
+          const r = e.target && e.target.dataset ? e.target.dataset.ratio : null;
+          if (r == null) return;   // tapped between the buttons
+          resolve(r === '' ? null : parseFloat(r));
+        });
+      });
+      if (ratio == null) { card.remove(); return; }
+      card.querySelector('#simp-pick').remove();
+      const st = card.querySelector('#simp-status');
+      const bar = card.querySelector('#simp-bar');
+      const from = S.splats;
+      let to = Math.ceil(from * ratio);
+      const blob = await S.session.exportSimplifiedPlyBlob(ratio, {
+        onStatus: (m) => { if (st) st.textContent = String(m).replace(/^simplify: /, ''); },
+        onProgress: (p) => {
+          to = p.currentCount;
+          const span = from - p.targetCount;
+          if (bar && span > 0) bar.style.width = `${(100 * (from - p.currentCount) / span).toFixed(1)}%`;
+        },
+      });
+      card.remove();
+      const saved = await downloadBlob(blob, 'ply');
+      flash(saved ? `${fmt(from)} → ${fmt(to)} splats saved (${(blob.size / 1e6).toFixed(1)} MB).` : 'Save cancelled.', 5000);
+    } catch (e) {
+      document.getElementById('simpcard')?.remove();
+      console.error(e);
+      flash(`Simplify failed: ${e.message}`, 6000);
+    }
+  } });
   if (!S.restored) acts.push({ act: 'session', label: 'Download session', sub: 'Re-loadable + resumable · sog, poses, raw state', run: async () => {
     try {
       const sog = await getSogBlob();

@@ -31,7 +31,7 @@ const ui = {
   iters: $('opt-iters'), gpu: $('opt-gpu'), gpuV: $('opt-gpu-v'), gap: $('opt-gap'),
   summary: $('input-summary'), start: $('btn-start'),
   run: $('run'), stage: $('stage-label'), bar: $('stage-bar'), metrics: $('metrics'),
-  pause: $('btn-pause'), finish: $('btn-finish'), ply: $('btn-ply'), sess: $('btn-session'),
+  pause: $('btn-pause'), finish: $('btn-finish'), ply: $('btn-ply'), simplify: $('btn-simplify'), sess: $('btn-session'),
   imgs: $('btn-photos'), cont: $('btn-continue'), tour: $('btn-tour'), strip: $('strip'),
   needphotos: $('needphotos'), photosHint: $('photos-hint'), photosFile: $('photos-file'),
   lodlinks: $('lodlinks'), status: $('status'),
@@ -538,6 +538,7 @@ async function run() {
   ui.run.hidden = false;
   ensureChart().resize();
   ui.ply.disabled = true;
+  ui.simplify.disabled = true;
   ui.sess.disabled = true;
   ui.imgs.disabled = true;
   ui.pause.disabled = true;
@@ -1349,6 +1350,7 @@ async function presentRestored({ gaussians, reconJson, state }, label) {
   ui.pause.disabled = true;
   ui.finish.disabled = true;
   ui.ply.disabled = false;
+  ui.simplify.disabled = true;   // needs the live trainer — continue first
   ui.sess.disabled = true;   // no live trainer state to pack — continue first
   ui.imgs.disabled = true;   // restores carry no photo pixels
   ui.cont.hidden = !reconJson;
@@ -1570,6 +1572,7 @@ function completeRun(e) {
   ui.pause.disabled = true;
   ui.finish.disabled = true;
   ui.ply.disabled = false;
+  ui.simplify.disabled = false;
   ui.sess.disabled = false;
   setStatus('Training finished — download the .ply, or keep orbiting the preview.');
   S.minutes = minutesLive();
@@ -1612,6 +1615,7 @@ function resetRun() {
   ui.metrics.textContent = '';
   ui.bar.style.width = '0%';
   ui.ply.disabled = true;
+  ui.simplify.disabled = true;
   ui.start.textContent = 'Start training →';
   setStatus('');
 }
@@ -2038,6 +2042,28 @@ ui.ply.addEventListener('click', async () => {
     setStatus(`PLY export failed: ${e.message}`, 'error');
   } finally {
     ui.ply.disabled = false;
+  }
+});
+ui.simplify.addEventListener('click', async () => {
+  const s = S.session;
+  if (!s || S.restored) return;   // the raw state needs its live trainer
+  ui.simplify.disabled = true;
+  try {
+    setStatus('Simplifying the model …');
+    const blob = await s.exportSimplifiedPlyBlob(0.5, {
+      onStatus: (m) => setStatus(String(m).replace(/^simplify: /, '')),
+    });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `splat-simplified-${Date.now()}.ply`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
+    setStatus(`Saved ${a.download} (${(blob.size / 1e6).toFixed(1)} MB, half the splats).`);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Simplify failed: ${e.message}`, 'error');
+  } finally {
+    ui.simplify.disabled = false;
   }
 });
 /** The compressed model, built once per run: GPU k-means over the .ply.
