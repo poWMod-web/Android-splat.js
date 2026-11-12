@@ -23,6 +23,10 @@ assert.match(card, /id="ltc-buf"/, 'the card should offer a working-buffer selec
 assert.match(card, /id="ltc-lod"/, 'the card should offer an LOD select');
 assert.match(card, /id="ltc-mcmc"/, 'the card should offer an MCMC-optimizer select');
 assert.match(card, /id="ltc-softprune"/, 'the card should offer a soft-prune select');
+assert.match(card, /<input id="ltc-softprune-custom" type="number" min="1" max="50"/,
+  'the card should offer a custom 1–50% trim');
+assert.match(card, /softRaw === 'custom'/,
+  'confirming the card should read the custom trim input');
 assert.match(card, /\.\.\.\[480, 640, 960, 1280, 1600, 1920\]\.map\(\(v\) =>/,
   'the card should list every start-panel resolution step, unfiltered');
 assert.match(card, /Same as current/,
@@ -41,7 +45,9 @@ assert.match(card, /const prevSoftRatio = recipe0 && recipe0\.softPrune && Numbe
   'the card should read the run’s own trim from its saved recipe');
 assert.match(card, /<option value="" selected>\$\{prevSoft\}<\/option>/,
   'soft prune should default to the run’s own trim, stated plainly');
-assert.match(card, /softprune: softRaw === '' \? undefined : parseFloat\(softRaw\)/,
+assert.match(card, /const softVal = softRaw === '' \? undefined : softRaw === 'custom'/,
+  'confirming the card should resolve the trim, honoring a custom percent');
+assert.match(card, /softprune: softVal,/,
   'confirming the card should pass the reselected soft-prune trim through');
 assert.ok(!/Same as (before|run)/.test(card),
   'only the splat budget should keep a Same-as label');

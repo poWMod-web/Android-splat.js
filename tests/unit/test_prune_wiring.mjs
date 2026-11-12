@@ -77,8 +77,14 @@ assert.match(appHtml, /<select id="set-softprune">/,
   'the gear panel offers soft prune');
 assert.match(appHtml, /<option value="0\.3">Trim 30%<\/option>/,
   'the trims run 5% to 30%');
-assert.match(app, /st\.softprune = \$\('set-softprune'\)\.value;/,
+assert.match(app, /st\.softprune = readSoftprune\(\);/,
   'the selection persists into settings');
+assert.match(appHtml, /<option value="custom">Custom…<\/option>/,
+  'the gear panel offers a custom trim');
+assert.match(appHtml, /<input id="set-softprune-custom" type="number" min="1" max="50"/,
+  'a custom trim reads 1–50%');
+assert.match(app, /showSoftprune\(st\.softprune\);/,
+  'a stored custom fraction restores into the custom input');
 assert.match(app, /trainerOpts\.softPrune = \{ ratio: parseFloat\(st\.softprune\), every: 3000, until: 0\.85 \};/,
   'fresh runs map it to trainer options');
 assert.match(app, /<button class="tbtn-sm" id="t-prune"/,
@@ -89,6 +95,14 @@ assert.match(app, /async function runPruneAndContinue\(ratio = 0\.5\) \{/,
   'the flow prunes to the picked ratio, default half');
 assert.match(app, /id="prunepick-pick"/,
   'the manual picker card offers the ratios');
+assert.match(app, /<input id="prunepick-custom" type="number" min="5" max="95"/,
+  'the manual picker offers a custom 5–95% keep');
+assert.match(app, /data-custom="1">Keep %<\/button>/,
+  'the custom keep runs the same prune flow');
+assert.match(app, /<input id="cap-custom" type="number" min="5" max="95"/,
+  'the ceiling card offers a custom 5–95% keep');
+assert.match(app, /function readKeepCustom\(id\) \{/,
+  'custom keeps clamp before the flow runs');
 assert.match(app, /data-ratio="0\.75">Prune to ¾<\/button>/,
   'the ceiling card offers pruning to three quarters');
 assert.match(app, /data-ratio="0\.5">Prune to ½<\/button>/,
@@ -103,8 +117,10 @@ assert.match(browserHtml, /<select id="opt-softprune">/,
   'the browser settings offer soft prune');
 assert.match(browserHtml, /<option value="0\.3">Trim 30%<\/option>/,
   'the trims run 5% to 30%');
-assert.match(browser, /softprune: ui\.softprune\.value,/,
+assert.match(browser, /softprune: readSoftprune\(\),/,
   'the browser reads the setting');
+assert.match(browserHtml, /<input id="opt-softprune-custom" type="number" min="1" max="50"/,
+  'the browser offers a custom 1–50% trim');
 assert.match(browserHtml, /<button id="btn-prune" class="btn" disabled>Prune\/Grow<\/button>/,
   'the run row carries a prune/grow button');
 assert.match(browser, /ui\.prune\.addEventListener\('click', showPrunePicker\);/,
@@ -145,5 +161,9 @@ assert.match(app, /async function runGrowNow\(\) \{/,
   'the flow triggers one immediate refine');
 assert.match(browser, /mk\('Grow now', runGrowNow\)/,
   'the browser picker offers a growth pass');
+assert.match(browser, /mk\('Keep %', goCustom\)/,
+  'the browser picker offers a custom keep');
+assert.match(browser, /mk\('Prune to %', 'btn', goCustom\)/,
+  'the browser ceiling prompt offers a custom keep');
 
 console.log('prune-and-continue + soft-prune wiring: passed');

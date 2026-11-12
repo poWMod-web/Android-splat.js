@@ -520,6 +520,7 @@ body { overflow: hidden; }
   font: 500 12px var(--mono); color: var(--paper);
   background: var(--panel-2); border: 1px solid transparent; border-radius: 8px;
 }
+#set-softprune-custom { width: 64px; }
 .setrow select:hover, .setrow input[type="number"]:hover { border-color: var(--line-2); }
 .setrow select:focus, .setrow input[type="number"]:focus { border-color: var(--accent-30); outline: none; }
 

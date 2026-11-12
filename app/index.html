@@ -181,7 +181,8 @@
           <option value="0.1">Trim 10%</option>
           <option value="0.2">Trim 20%</option>
           <option value="0.3">Trim 30%</option>
-        </select></div>
+          <option value="custom">Custom…</option>
+        </select><input id="set-softprune-custom" type="number" min="1" max="50" step="1" value="10" hidden title="Custom trim percent (1–50)"></div>
       <div class="setrow" title="Choose a training budget from 10,000 to 50,000 cycles. A finished run can continue with +10,000 more."><label for="set-iters">Cycles</label>
         <select id="set-iters" aria-describedby="set-iters-hint">
           <option value="10000">10,000</option>

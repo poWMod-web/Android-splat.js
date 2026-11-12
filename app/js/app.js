@@ -222,6 +222,36 @@ function saveSettings() {
   if (q) q.value = qualityOf(S.settings);
 }
 
+/** Effective soft-prune trim: '' off, else a decimal fraction string. A
+ *  Custom selection reads the adjacent percent input (clamped 1–50%). */
+function readSoftprune() {
+  const sel = $('set-softprune');
+  if (!sel || sel.value !== 'custom') return sel ? sel.value : '';
+  const pct = Math.min(50, Math.max(1, Math.round(parseFloat($('set-softprune-custom').value) || 0)));
+  return String(pct / 100);
+}
+/** Restore the soft-prune row: fixed trims select directly; a Custom
+ *  selection (or a stored non-preset fraction) shows the percent input. */
+function showSoftprune(v) {
+  const sel = $('set-softprune'), custom = $('set-softprune-custom');
+  const fixed = ['', '0.05', '0.1', '0.2', '0.3'];
+  if (fixed.includes(v) && sel.value !== 'custom') {
+    sel.value = v || '';
+    custom.hidden = true;
+    return;
+  }
+  sel.value = 'custom';
+  custom.hidden = false;
+  const pct = Math.round(parseFloat(v) * 100);
+  if (v !== 'custom' && Number.isFinite(pct)) custom.value = String(Math.min(50, Math.max(1, pct)));
+}
+/** Custom keep percentage from a picker input (clamped 5–95%, 50% when the
+ *  input is empty or garbage). Call BEFORE removing the card. */
+function readKeepCustom(id) {
+  const pct = Math.round(parseFloat($(id).value) || 0);
+  return (pct >= 5 ? Math.min(95, pct) : 50) / 100;
+}
+
 // quality macros: the one-knob row that drives the individual rows below it.
 // Standard = this device's defaults; anything that matches no macro shows as
 // Custom. Macros never touch the 2× working buffer (an experiment flag).
@@ -677,7 +707,7 @@ function boot() {
       ? `0 = Auto (${maxLODLevels(st.splats)} snapshots). Choose 1–${maxLODLevels(st.splats)} earlier saved snapshots; final full detail is always included.`
       : 'Enable LOD with a splat budget of at least 1,000,000. 0 = Auto.';
     $('set-mcmc').value = st.mcmc === '0' ? '0' : '';
-    $('set-softprune').value = st.softprune || '';
+    showSoftprune(st.softprune);
     $('set-gpu').value = String(st.gpu ?? 100);
     $('set-gpu-v').textContent = `${$('set-gpu').value}%`;
     if ($('t-gpu')) { $('t-gpu').value = String(st.gpu ?? 100); $('t-gpu-v').textContent = `${$('t-gpu').value}%`; }
@@ -744,7 +774,7 @@ function boot() {
     st.lod = lodEnabled;
     st.lodLevels = lodCount;
     st.mcmc = $('set-mcmc').value;  // '' Auto | '1' on | '0' off
-    st.softprune = $('set-softprune').value;  // '' off | '0.05'–'0.3' trim fraction
+    st.softprune = readSoftprune();  // '' off | decimal trim fraction (Custom reads 1–50%)
     st.gpu = Math.min(100, Math.max(10, parseInt($('set-gpu').value, 10) || 100));
     showSettings();
     saveSettings();
@@ -753,7 +783,7 @@ function boot() {
   S.commitSettings = readSettings;
   // every select in the panel persists on change — the avatar rows (and Horizontal SH) were
   // missing from this list, so their toggles changed the dropdown and nothing else (2026-09-17)
-  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-softprune', 'set-shup', 'set-gpu', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
+  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-softprune', 'set-softprune-custom', 'set-shup', 'set-gpu', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
     const el = $(id); if (el) el.addEventListener('change', readSettings);
   }
   // the avatar route: the box on the start card. It is a property of THIS run,
@@ -2774,14 +2804,23 @@ function showCapCard(e) {
       <button class="btn" data-ratio="0.75">Prune to ¾</button>
       <button class="btn btn-accent" data-ratio="0.5">Prune to ½</button>
       <button class="btn" data-ratio="0.25">Prune to ¼</button>
+      <input id="cap-custom" type="number" min="5" max="95" step="1" value="50" style="width:4.5em" title="Custom keep percentage (5–95)">
+      <button class="btn" data-custom="1">Prune to %</button>
       <button class="btn linkish" id="cap-keep">Keep training at cap</button>
     </div>`;
   $('stage').appendChild(card);
   card.querySelector('#cap-pick').addEventListener('click', (ev) => {
-    const r = ev.target && ev.target.dataset ? ev.target.dataset.ratio : null;
-    if (r == null || r === '') return;   // the keep button answers for itself
+    const d = ev.target && ev.target.dataset ? ev.target.dataset : null;
+    if (!d) return;
+    if (d.custom) {
+      const keep = readKeepCustom('cap-custom');
+      card.remove();
+      runPruneAndContinue(keep);
+      return;
+    }
+    if (d.ratio == null || d.ratio === '') return;   // the keep button answers for itself
     card.remove();
-    runPruneAndContinue(parseFloat(r));
+    runPruneAndContinue(parseFloat(d.ratio));
   });
   card.querySelector('#cap-keep').addEventListener('click', () => {
     card.remove();
@@ -2808,14 +2847,18 @@ function showPrunePicker() {
       <button class="btn" data-ratio="0.5">Keep ½</button>
       <button class="btn" data-ratio="0.25">Keep ¼</button>
       <button class="btn" data-grow="1">Grow now</button>
+      <input id="prunepick-custom" type="number" min="5" max="95" step="1" value="50" style="width:4.5em" title="Custom keep percentage (5–95)">
+      <button class="btn" data-custom="1">Keep %</button>
       <button class="btn linkish" data-ratio="">Cancel</button>
     </div>`;
   $('stage').appendChild(card);
   card.querySelector('#prunepick-pick').addEventListener('click', (e) => {
     const d = e.target && e.target.dataset ? e.target.dataset : null;
     if (!d) return;
+    const customKeep = d.custom ? readKeepCustom('prunepick-custom') : 0;
     card.remove();
     if (d.grow) { runGrowNow(); return; }
+    if (d.custom) { runPruneAndContinue(customKeep); return; }
     if (d.ratio != null && d.ratio !== '') runPruneAndContinue(parseFloat(d.ratio));
   });
 }
@@ -4292,7 +4335,8 @@ function continueConfigCard(r) {
     ? recipe0.softPrune.ratio : 0;
   const prevSoft = prevSoftRatio > 0 ? `${Math.round(prevSoftRatio * 100)}%` : 'Off';
   const softOpts = [`<option value="" selected>${prevSoft}</option>`, '<option value="0">Off</option>',
-    ...[0.05, 0.1, 0.2, 0.3].map((v) => `<option value="${v}">${Math.round(v * 100)}%</option>`)].join('');
+    ...[0.05, 0.1, 0.2, 0.3].map((v) => `<option value="${v}">${Math.round(v * 100)}%</option>`),
+    '<option value="custom">Custom…</option>'].join('');
   const card = document.createElement('div');
   card.className = 'upcard';
   card.id = 'ltconfig';
@@ -4308,12 +4352,15 @@ function continueConfigCard(r) {
     <label class="upcard-opt"><span>Working buffer</span><select id="ltc-buf">${bufOpts}</select></label>
     <label class="upcard-opt"><span>LOD levels</span><select id="ltc-lod">${lodOpts}</select></label>
     <label class="upcard-opt"><span>MCMC optimizer</span><select id="ltc-mcmc">${mcmcOpts}</select></label>
-    <label class="upcard-opt"><span>Soft prune</span><select id="ltc-softprune">${softOpts}</select></label>
+    <label class="upcard-opt"><span>Soft prune</span><select id="ltc-softprune">${softOpts}</select><input id="ltc-softprune-custom" type="number" min="1" max="50" step="1" value="10" style="width:4.5em" hidden title="Custom trim percent (1–50)"></label>
     <div class="upcard-row">
       <button class="btn btn-outline" id="ltc-cancel">Cancel</button>
       <button class="btn btn-accent" id="ltc-go">Continue training</button>
     </div>`;
   $('stage').appendChild(card);
+  $('ltc-softprune').addEventListener('change', () => {
+    $('ltc-softprune-custom').hidden = $('ltc-softprune').value !== 'custom';
+  });
   $('ltc-x').addEventListener('click', () => card.remove());
   $('ltc-cancel').addEventListener('click', () => card.remove());
   $('ltc-go').addEventListener('click', () => {
@@ -4325,6 +4372,12 @@ function continueConfigCard(r) {
     const lodRaw = $('ltc-lod').value;
     const mcmcRaw = $('ltc-mcmc').value;
     const softRaw = $('ltc-softprune').value;
+    // Custom reads the percent input (clamped 1–50); garbage falls back to
+    // untouched, so a typo never misconfigures the continuation
+    const softCustomPct = softRaw === 'custom' ? Math.round(parseFloat($('ltc-softprune-custom').value) || 0) : 0;
+    const softVal = softRaw === '' ? undefined : softRaw === 'custom'
+      ? (softCustomPct >= 1 ? Math.min(50, softCustomPct) / 100 : undefined)
+      : parseFloat(softRaw);
     card.remove();
     continueLocalRun(false, {
       res: resRaw === 'same' ? undefined : (resRaw === 'auto' ? 'auto' : (resRaw === 'full' ? 'full' : parseInt(resRaw, 10))),
@@ -4334,7 +4387,7 @@ function continueConfigCard(r) {
       buf: bufRaw === '' ? undefined : parseFloat(bufRaw),
       lod: lodRaw === '1' ? true : undefined,
       mcmc: mcmcRaw === '' ? undefined : mcmcRaw === '1',
-      softprune: softRaw === '' ? undefined : parseFloat(softRaw),
+      softprune: softVal,
     }).catch((e) => {
       console.error(e);
       flash(`Could not continue this run: ${e.message}`, 8000);

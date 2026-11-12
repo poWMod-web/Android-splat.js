@@ -27,7 +27,7 @@ const ui = {
   nogl: $('nogl'), files: $('files'), drop: $('drop'),
   q: $('opt-q'), res: $('opt-res'), feat: $('opt-feat'), tier: $('opt-tier'),
   buf: $('opt-buf'), sh: $('opt-sh'), splats: $('opt-splats'),
-  lod: $('opt-lod'), lodCount: $('opt-lod-count'), mcmc: $('opt-mcmc'), softprune: $('opt-softprune'),
+  lod: $('opt-lod'), lodCount: $('opt-lod-count'), mcmc: $('opt-mcmc'), softprune: $('opt-softprune'), softpruneCustom: $('opt-softprune-custom'),
   iters: $('opt-iters'), gpu: $('opt-gpu'), gpuV: $('opt-gpu-v'), gap: $('opt-gap'),
   summary: $('input-summary'), start: $('btn-start'),
   run: $('run'), stage: $('stage-label'), bar: $('stage-bar'), metrics: $('metrics'),
@@ -97,6 +97,13 @@ function trainWorkerOpt() {
 // ── settings: the same training knobs as the full app's start card ─────────
 // select values mirror the app's settings shape ('' = Auto/off, -1 = full
 // size, mcmc '' = on / '0' = off) so the session wiring below reads identically.
+/** Effective soft-prune trim: '' off, else a decimal fraction string. A
+ *  Custom selection reads the adjacent percent input (clamped 1–50%). */
+function readSoftprune() {
+  if (ui.softprune.value !== 'custom') return ui.softprune.value;
+  const pct = Math.min(50, Math.max(1, Math.round(parseFloat(ui.softpruneCustom.value) || 0)));
+  return String(pct / 100);
+}
 function readSettings() {
   return {
     res: ui.res.value === '' ? 0 : parseInt(ui.res.value, 10),
@@ -108,7 +115,7 @@ function readSettings() {
     lod: ui.lod.value === '1',
     lodLevels: Math.max(0, parseInt(ui.lodCount.value, 10) || 0),
     mcmc: ui.mcmc.value,
-    softprune: ui.softprune.value,
+    softprune: readSoftprune(),
     gpu: clamp(parseInt(ui.gpu.value, 10) || 100, 10, 100),
     iters: parseInt(ui.iters.value, 10) || 30000,
   };
@@ -1977,6 +1984,9 @@ ui.q.addEventListener('change', () => pickQuality(ui.q.value));
 for (const el of [ui.res, ui.feat, ui.tier, ui.buf, ui.sh, ui.splats, ui.lod, ui.lodCount, ui.mcmc, ui.softprune, ui.iters]) {
   el.addEventListener('change', syncQuality);
 }
+ui.softprune.addEventListener('change', () => {
+  ui.softpruneCustom.hidden = ui.softprune.value !== 'custom';
+});
 ui.gpu.addEventListener('input', () => {
   ui.gpuV.textContent = `${ui.gpu.value}%`;
   // live like the full app's dock slider: the loop reads opts.gpuUsage
@@ -2132,10 +2142,19 @@ function showCapPrompt(e) {
     return b;
   };
   const go = (ratio) => { setStatus('Pruning the model …'); runPruneContinue(ratio); };
+  const custom = document.createElement('input');
+  custom.type = 'number'; custom.min = '5'; custom.max = '95'; custom.value = '50';
+  custom.style.width = '4.5em'; custom.title = 'Custom keep percentage (5–95)';
+  const goCustom = () => {
+    const pct = Math.round(parseFloat(custom.value) || 0);
+    go((pct >= 5 ? Math.min(95, pct) : 50) / 100);
+  };
   st.append(span,
     mk('Prune to ¾', 'btn', () => go(0.75)), ' ',
     mk('Prune to ½', 'btn accent', () => go(0.5)), ' ',
     mk('Prune to ¼', 'btn', () => go(0.25)), ' ',
+    custom, ' ',
+    mk('Prune to %', 'btn', goCustom), ' ',
     mk('Keep training at cap', 'btn', () => {
       if (S.session) S.session.start();
       setStatus('Training on at the cap — growth stays off.');
@@ -2158,11 +2177,20 @@ function showPrunePicker() {
     return b;
   };
   const go = (ratio) => { setStatus('Pruning the model …'); runPruneContinue(ratio); };
+  const custom = document.createElement('input');
+  custom.type = 'number'; custom.min = '5'; custom.max = '95'; custom.value = '50';
+  custom.style.width = '4.5em'; custom.title = 'Custom keep percentage (5–95)';
+  const goCustom = () => {
+    const pct = Math.round(parseFloat(custom.value) || 0);
+    go((pct >= 5 ? Math.min(95, pct) : 50) / 100);
+  };
   st.append(span,
     mk('Keep ¾', () => go(0.75)), ' ',
     mk('Keep ½', () => go(0.5)), ' ',
     mk('Keep ¼', () => go(0.25)), ' ',
     mk('Grow now', runGrowNow), ' ',
+    custom, ' ',
+    mk('Keep %', goCustom), ' ',
     mk('Cancel', () => setStatus('')));
 }
 ui.simplify.addEventListener('click', async () => {
