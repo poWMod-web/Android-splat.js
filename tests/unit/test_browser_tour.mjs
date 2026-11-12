@@ -34,7 +34,7 @@ assert.match(appSource, /if \(S\.sogBlob\) return S\.sogBlob;/,
   'the compression runs once per run');
 assert.match(appSource, /const blob = f\.source \|\| f;/,
   'the photos zip covers Files and video-frame sources alike');
-assert.match(appSource, /ui\.ply\.disabled = false;\n  ui\.simplify\.disabled = false;\n  ui\.sess\.disabled = false;\n  setStatus\('Training finished/,
+assert.match(appSource, /ui\.ply\.disabled = false;\n  ui\.simplify\.disabled = false;\n  ui\.sess\.disabled = false;\n  ui\.prune\.disabled = true;\n  setStatus\('Training finished/,
   'finishing unlocks the session export');
 assert.match(appSource, /S\.stripUrls = \[\]; S\.photoBlobs = \[\];/,
   'a reset drops the photo pixels');

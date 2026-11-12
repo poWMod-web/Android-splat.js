@@ -265,6 +265,11 @@ export function createTrainWorkerHandler(deps = {}) {
         const r = await tr.refine();
         return { value: { ...r, iter: tr.iter, n: tr.n } };
       }
+      case 'softPrune': {
+        const tr = need();
+        const r = await tr.softPrune();
+        return { value: { ...r, iter: tr.iter, n: tr.n } };
+      }
       case 'readLoss': {
         const tr = need();
         return { value: { mse: await tr.readLoss(), entryOverflowTiles: tr.entryOverflowTiles || 0 } };

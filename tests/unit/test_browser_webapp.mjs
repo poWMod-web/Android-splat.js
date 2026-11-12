@@ -24,10 +24,10 @@ assert.match(html, /<link rel="stylesheet" href="\.\/styles\.css">/);
 assert.match(html, /<input id="files" type="file" multiple/);
 assert.match(html, /<canvas id="view"><\/canvas>/);
 for (const id of ['nogl', 'drop', 'opt-q', 'opt-res', 'opt-feat', 'opt-tier',
-    'opt-buf', 'opt-sh', 'opt-splats', 'opt-lod', 'opt-lod-count', 'opt-mcmc',
+    'opt-buf', 'opt-sh', 'opt-splats', 'opt-lod', 'opt-lod-count', 'opt-mcmc', 'opt-softprune',
     'opt-iters', 'opt-gpu', 'opt-gpu-v', 'opt-gap', 'input-summary',
     'btn-start', 'run', 'stage-label', 'stage-bar', 'metrics', 'btn-pause',
-    'btn-finish', 'btn-ply', 'btn-continue', 'needphotos', 'photos-hint',
+    'btn-finish', 'btn-prune', 'btn-ply', 'btn-simplify', 'btn-continue', 'needphotos', 'photos-hint',
     'photos-file', 'lodlinks', 'status', 'viewer', 'btn-recenter',
     'logwrap', 'log', 'chart', 'btn-scale', 'details', 'tab-score', 'tab-perf',
     'tab-cams', 'tab-gpu', 'detail-body', 'lastcap', 'lastcap-text', 'lastcap-use',

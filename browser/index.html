@@ -104,6 +104,13 @@
           <option value="0">Off</option>
         </select>
       </label>
+      <label title="Off by default. When enabled, training periodically culls the lowest-contributing fraction of splats (by accumulated render weight) and keeps going.">Soft prune
+        <select id="opt-softprune">
+          <option value="" selected>Off</option>
+          <option value="0.1">Trim 10%</option>
+          <option value="0.2">Trim 20%</option>
+        </select>
+      </label>
       <label>Iterations
         <select id="opt-iters">
           <option value="8000">8,000 · draft</option>
@@ -155,6 +162,7 @@
     <div class="row">
       <button id="btn-pause" class="btn" disabled>Pause</button>
       <button id="btn-finish" class="btn" disabled>Finish early</button>
+      <button id="btn-prune" class="btn" disabled>Prune ½</button>
       <button id="btn-ply" class="btn accent" disabled>Download .ply ↓</button>
       <button id="btn-simplify" class="btn" disabled>Simplify ½ ↓</button>
       <button id="btn-session" class="btn" disabled>Session ↓</button>

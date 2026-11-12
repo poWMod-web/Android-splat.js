@@ -1705,10 +1705,12 @@ fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
 
 // ---- phase-2 MCMC refine: gather + plan-apply (no CPU params round-trip) ----
 // GATHER compacts per-splat refine inputs to 4 floats — logit-opacity, the
-// two error-mass accumulators (gradP slots 10/11, zeroed here to start the
-// next window), and mean log-scale — so refine() reads back 16 bytes/splat
-// instead of params+moments+SH (~700 bytes). The relocation decisions stay
-// on the CPU; APPLY executes them GPU-side.
+// grad-stat window, the slot-10/11 mass window, and mean log-scale — so
+// refine() reads back 16 bytes/splat instead of params+moments+SH (~700
+// bytes). Modes 0/1 drain the windows (the next window starts here); mode 2
+// only LOADS them, so the soft-prune's scoring pass never steals a refine
+// window. The relocation decisions stay on the CPU; APPLY executes them
+// GPU-side.
 export const GATHER_SRC = /* wgsl */ `
 const WFIX = 8.0;
 struct GUni { n: u32, mode: u32, pad0: u32, pad1: u32 };
@@ -1725,12 +1727,14 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
   let b = i * 16u;
   outv[i * 4u] = params[b + 13u];
   let statSlot = select(12u, 13u, gu.pad0 == 1u); // pad0=1: windowed-max slot
-  outv[i * 4u + 1u] = f32(atomicExchange(&gradP[b + statSlot], 0)) / WFIX;
+  let drain = gu.mode != 2u;   // mode 2 scores without stealing the windows
+  outv[i * 4u + 1u] = (drain ? f32(atomicExchange(&gradP[b + statSlot], 0))
+                             : f32(atomicLoad(&gradP[b + statSlot]))) / WFIX;
   // slot 2 carries error mass (legacy donors, mode 0) or rendered mass
-  // (v2 growth normalization, mode 1); both windows drain either way
-  let wm = f32(atomicExchange(&gradP[b + 10u], 0)) / WFIX;
-  let em = f32(atomicExchange(&gradP[b + 11u], 0)) / WFIX;
-  outv[i * 4u + 2u] = select(em, wm, gu.mode == 1u);
+  // (v2 growth normalization, mode 1; soft-prune scoring, mode 2)
+  let wm = (drain ? f32(atomicExchange(&gradP[b + 10u], 0)) : f32(atomicLoad(&gradP[b + 10u]))) / WFIX;
+  let em = (drain ? f32(atomicExchange(&gradP[b + 11u], 0)) : f32(atomicLoad(&gradP[b + 11u]))) / WFIX;
+  outv[i * 4u + 2u] = select(em, wm, gu.mode != 0u);
   outv[i * 4u + 3u] = (params[b + 3u] + params[b + 4u] + params[b + 5u]) / 3.0;
 }
 `;

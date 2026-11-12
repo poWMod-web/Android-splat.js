@@ -27,11 +27,11 @@ const ui = {
   nogl: $('nogl'), files: $('files'), drop: $('drop'),
   q: $('opt-q'), res: $('opt-res'), feat: $('opt-feat'), tier: $('opt-tier'),
   buf: $('opt-buf'), sh: $('opt-sh'), splats: $('opt-splats'),
-  lod: $('opt-lod'), lodCount: $('opt-lod-count'), mcmc: $('opt-mcmc'),
+  lod: $('opt-lod'), lodCount: $('opt-lod-count'), mcmc: $('opt-mcmc'), softprune: $('opt-softprune'),
   iters: $('opt-iters'), gpu: $('opt-gpu'), gpuV: $('opt-gpu-v'), gap: $('opt-gap'),
   summary: $('input-summary'), start: $('btn-start'),
   run: $('run'), stage: $('stage-label'), bar: $('stage-bar'), metrics: $('metrics'),
-  pause: $('btn-pause'), finish: $('btn-finish'), ply: $('btn-ply'), simplify: $('btn-simplify'), sess: $('btn-session'),
+  pause: $('btn-pause'), finish: $('btn-finish'), prune: $('btn-prune'), ply: $('btn-ply'), simplify: $('btn-simplify'), sess: $('btn-session'),
   imgs: $('btn-photos'), cont: $('btn-continue'), tour: $('btn-tour'), strip: $('strip'),
   needphotos: $('needphotos'), photosHint: $('photos-hint'), photosFile: $('photos-file'),
   lodlinks: $('lodlinks'), status: $('status'),
@@ -108,6 +108,7 @@ function readSettings() {
     lod: ui.lod.value === '1',
     lodLevels: Math.max(0, parseInt(ui.lodCount.value, 10) || 0),
     mcmc: ui.mcmc.value,
+    softprune: ui.softprune.value,
     gpu: clamp(parseInt(ui.gpu.value, 10) || 100, 10, 100),
     iters: parseInt(ui.iters.value, 10) || 30000,
   };
@@ -524,6 +525,19 @@ function wireSession(session) {
         S.chartEvents.push({ iter: e.iter, kind: 'refine', label: 'refine' });
         log(`refine @${fmt(e.iter)}: ${fmt(e.kept)} kept`);
       }
+      else if (e.kind === 'soft-prune') {
+        S.chartEvents.push({ iter: e.iter, kind: 'soft-prune', label: `−${fmt(e.culled)}` });
+        log(`soft-prune @${fmt(e.iter)}: culled ${fmt(e.culled)} → ${fmt(e.n)} splats`);
+      }
+      else if (e.kind === 'cap-hit') showCapPrompt(e);
+      else if (e.kind === 'prune-continue') {
+        S.sogBlob = null;
+        S.maxIters = e.maxIters;
+        chart.maxIter = S.maxIters;
+        S.chartEvents.push({ iter: e.iter, kind: 'prune', label: `${fmt(e.from)}→${fmt(e.to)}` });
+        log(`prune-and-continue: ${fmt(e.from)} → ${fmt(e.to)} splats` +
+          (e.delta == null ? '' : ` (${e.delta >= 0 ? '+' : ''}${e.delta.toFixed(2)} dB)`));
+      }
       else if (e.kind === 'overflow' && S._ovWarned !== (S.runId ?? 'live')) {
         S._ovWarned = S.runId ?? 'live';
         log(`WARNING: tile-sort overflow — ${e.tiles} tiles dropped so far; lower the splat budget for this device.`);
@@ -538,6 +552,7 @@ async function run() {
   ui.run.hidden = false;
   ensureChart().resize();
   ui.ply.disabled = true;
+  ui.prune.disabled = true;
   ui.simplify.disabled = true;
   ui.sess.disabled = true;
   ui.imgs.disabled = true;
@@ -629,6 +644,8 @@ async function run() {
         ...(st.sh > 0 ? { shLr: 3e-4 } : {}),
       });
     }
+    // Soft prune (opt-in): periodic importance culls during growth
+    if (st.softprune) trainerOpts.softPrune = { ratio: parseFloat(st.softprune), every: 3000, from: 6000 };
     // Auto splat budget: the measured capacity law (~15 splats/cycle
     // classic, ~35 under MCMC), clamped to the device class
     const phone = phoneClass();
@@ -700,6 +717,7 @@ async function run() {
     S.phase = 'train';
     ui.pause.disabled = false;
     ui.finish.disabled = false;
+    ui.prune.disabled = false;
     S.trainT0 = performance.now();
     session.start();
     S.loadedFiles = files.map((f) => ({ name: f.name, url: null }));
@@ -1350,6 +1368,7 @@ async function presentRestored({ gaussians, reconJson, state }, label) {
   ui.pause.disabled = true;
   ui.finish.disabled = true;
   ui.ply.disabled = false;
+  ui.prune.disabled = true;   // same — no trainer, nothing to prune
   ui.simplify.disabled = true;   // needs the live trainer — continue first
   ui.sess.disabled = true;   // no live trainer state to pack — continue first
   ui.imgs.disabled = true;   // restores carry no photo pixels
@@ -1474,6 +1493,10 @@ async function continueRun(files, urls = null) {
     if ((contShDeg ?? recipeTrainer.shDeg ?? 3) > 0) recipeTrainer.shLr = 3e-4;
     log(`continuing from ${fmt(baseIter)} cycles — +${fmt(extra)} more · cap ${fmt(cap)} · ${engine}` +
       `${prevDim ? ` · ${prevDim}px input` : ''}${!hasState ? ' · unbaking export opacities' : ''}`);
+    // the panel's soft-prune selection applies to continuations like a fresh
+    // run; without it the recipe replays the run's own setting
+    if (st.softprune) recipeTrainer.softPrune = { ratio: parseFloat(st.softprune), every: 3000, from: 6000 };
+    else delete recipeTrainer.softPrune;
     const ses = createSession({
       maxIters: S.maxIters, holdout: -1,
       gpuUsage: st.gpu / 100,
@@ -1521,6 +1544,7 @@ async function continueRun(files, urls = null) {
     S.phase = 'train';
     ui.pause.disabled = false;
     ui.finish.disabled = false;
+    ui.prune.disabled = false;
     S.trainT0 = performance.now();
     ses.start();
     S.loadedFiles = files.map((f, i) => ({ name: f.name, url: (urls && urls[i]) || null }));
@@ -1574,6 +1598,7 @@ function completeRun(e) {
   ui.ply.disabled = false;
   ui.simplify.disabled = false;
   ui.sess.disabled = false;
+  ui.prune.disabled = true;
   setStatus('Training finished — download the .ply, or keep orbiting the preview.');
   S.minutes = minutesLive();
   secureFinishedRun();
@@ -1615,6 +1640,7 @@ function resetRun() {
   ui.metrics.textContent = '';
   ui.bar.style.width = '0%';
   ui.ply.disabled = true;
+  ui.prune.disabled = true;
   ui.simplify.disabled = true;
   ui.start.textContent = 'Start training →';
   setStatus('');
@@ -1943,7 +1969,7 @@ for (const ev of ['dragleave', 'drop']) {
 }
 ui.start.addEventListener('click', () => { if (S.staged) run(); });
 ui.q.addEventListener('change', () => pickQuality(ui.q.value));
-for (const el of [ui.res, ui.feat, ui.tier, ui.buf, ui.sh, ui.splats, ui.lod, ui.lodCount, ui.mcmc, ui.iters]) {
+for (const el of [ui.res, ui.feat, ui.tier, ui.buf, ui.sh, ui.splats, ui.lod, ui.lodCount, ui.mcmc, ui.softprune, ui.iters]) {
   el.addEventListener('change', syncQuality);
 }
 ui.gpu.addEventListener('input', () => {
@@ -2044,6 +2070,52 @@ ui.ply.addEventListener('click', async () => {
     ui.ply.disabled = false;
   }
 });
+async function runPruneContinue() {
+  const s = S.session;
+  if (!s || !s.trainer || S._pruning) return;
+  S._pruning = true;
+  ui.prune.disabled = true;
+  try {
+    setStatus('Pruning the model …');
+    const out = await s.pruneAndContinue(0.5, {
+      onStatus: (m) => setStatus(String(m).replace(/^prune: /, '')),
+    });
+    const d = out.delta == null ? 'no holdout to score against'
+      : `${out.delta >= 0 ? '+' : ''}${out.delta.toFixed(2)} dB holdout`;
+    setStatus(`Pruned ${fmt(out.from)} → ${fmt(out.to)} splats (${d}) — training on.`);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Prune failed: ${e.message} — resume to carry on.`, 'error');
+  } finally {
+    S._pruning = false;
+    ui.prune.disabled = S.phase !== 'train';
+  }
+}
+ui.prune.addEventListener('click', runPruneContinue);
+/** The ceiling's question, asked inline in the status line: the session
+ *  paused itself at a full cap — prune to half and grow on, or keep
+ *  training at this size. */
+function showCapPrompt(e) {
+  const st = ui.status;
+  st.replaceChildren();
+  const span = document.createElement('span');
+  span.textContent = `Splat cap reached (${fmt(e.splats)}). `;
+  const prune = document.createElement('button');
+  prune.className = 'btn accent';
+  prune.textContent = 'Prune to ½ & continue';
+  const keep = document.createElement('button');
+  keep.className = 'btn';
+  keep.textContent = 'Keep training at cap';
+  st.append(span, prune, ' ', keep);
+  prune.addEventListener('click', () => {
+    setStatus('Pruning the model …');
+    runPruneContinue();
+  });
+  keep.addEventListener('click', () => {
+    if (S.session) S.session.start();
+    setStatus('Training on at the cap — growth stays off.');
+  });
+}
 ui.simplify.addEventListener('click', async () => {
   const s = S.session;
   if (!s || S.restored) return;   // the raw state needs its live trainer

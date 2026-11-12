@@ -1062,6 +1062,58 @@ export class Session {
     return this.opts.maxIters;
   }
 
+  /** Prune-and-continue: compact the model to `ratio` of its splats with
+   *  the training-free merge-down, reseed the trainer on the compacted
+   *  model where the schedules stopped, stretch the horizon, and resume.
+   *  The holdout is probed before and after (skipped without one); a drop
+   *  past 0.5 dB warns but never blocks — training recovers it. Resets
+   *  the cap prompt, so the next ceiling hit asks again. */
+  async pruneAndContinue(ratio = 0.5, { extendIters = null, onStatus = null, onProgress = null } = {}) {
+    const trainer = this.trainer;
+    if (!trainer) throw new Error('seed() first');
+    return this._locked(async () => {
+      this.training = false;
+      const say = (m) => { this._log(m); if (onStatus) onStatus(m); };
+      try {
+        const before = this.holdout >= 0 ? await trainer.evalCamPsnr(this.holdout) : null;
+        const raw = await trainer.readGaussians();
+        say(`pruning ${raw.n.toLocaleString()} splats to ${Math.round(ratio * 100)}% …`);
+        const simp = await simplifyGaussians(
+          { data: raw.data, n: raw.n, sh: raw.sh, shK: raw.shK, dc: raw.dc ?? trainer.dcMode },
+          { ratio, onStatus: (m) => say(String(m).replace(/^simplify: /, 'prune: ')), onProgress });
+        const iter = trainer.iter;
+        await this.seedFrom(
+          { data: simp.data, n: simp.n, sh: simp.sh, shK: simp.shK, dc: simp.dc },
+          { iter });
+        this._lastSoftPrune = iter;
+        let after = null, delta = null;
+        if (this.holdout >= 0 && before != null) {
+          after = await this.trainer.evalCamPsnr(this.holdout);
+          delta = after - before;
+        }
+        const ext = extendIters ?? Math.round((this.opts.maxIters ?? 60000) * 0.25);
+        await this.continueFor(ext);
+        this._capAsked = false;
+        if (delta != null && delta < -0.5) {
+          this._log(`WARNING: prune cost ${(-delta).toFixed(2)} dB ` +
+            `(holdout ${before.toFixed(2)} → ${after.toFixed(2)}) — continuing anyway; training should recover it`);
+        } else if (delta != null) {
+          say(`prune holdout ${before.toFixed(2)} → ${after.toFixed(2)} dB`);
+        } else {
+          say(`pruned ${raw.n.toLocaleString()} → ${simp.n.toLocaleString()} splats (no holdout — flying blind)`);
+        }
+        const out = { from: raw.n, to: simp.n, before, after, delta, maxIters: this.opts.maxIters };
+        this._em.emit('event', { kind: 'prune-continue', iter, ...out });
+        return out;
+      } catch (e) {
+        // a failed prune must not swallow the prompt — the ceiling is
+        // still full and the user can retry (or keep training at the cap)
+        this._capAsked = false;
+        throw e;
+      }
+    });
+  }
+
   /** End the run early with the model as it stands: final metrics, then the
    *  same train-complete event an auto-stop emits. */
   async finish() {
@@ -1478,6 +1530,7 @@ export class Session {
           slope: this.opts.plateauSlope ?? 0.1,
         });
       }
+      let refineResult = null;
       if (trainer.iter > 1500 && (sinceRefine >= refineEvery || plateau)) {
         trainer.lastRefine = trainer.iter;
         const r0 = performance.now();
@@ -1485,6 +1538,7 @@ export class Session {
         // submitted meanwhile would be silently rewound by that write-back,
         // and the six snapshots would come from six different iterations
         const r = await trainer.refine();
+        refineResult = r;
         if (this.perf) {
           this.perf.marks.push({ t: Math.round(r0), kind: 'refine', iter: trainer.iter,
             ms: Math.round(performance.now() - r0), moved: r.moved, grown: r.grown });
@@ -1495,6 +1549,31 @@ export class Session {
             + (plateau ? ' [score plateaued]' : ''));
           this._em.emit('event', { kind: 'refine', iter: trainer.iter, ...r });
         }
+      }
+
+      // periodic soft-prune (opt-in): cull the lowest-rendered-mass
+      // fraction on its own cadence. Reads trainer.opts so the worker
+      // and remote paths (whose opts mirror boot) behave identically.
+      const sp = trainer.opts ? trainer.opts.softPrune : null;
+      if (sp && trainer.iter >= (sp.from ?? 6000) &&
+          trainer.iter - (this._lastSoftPrune || 0) >= (sp.every ?? 3000)) {
+        this._lastSoftPrune = trainer.iter;
+        const s = await trainer.softPrune();
+        if (s.culled) {
+          this._log(`soft-prune @${trainer.iter}: culled ${s.culled} -> ${s.n} splats`);
+          this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...s });
+        }
+      }
+      // the ceiling's own prompt: a refine reporting growth-still-scheduled
+      // against a full TRUE cap pauses and asks — keep training at the cap,
+      // or prune to half and grow on. The UI answers via start() (growth
+      // stays blocked by the limit) or pruneAndContinue() (which resets
+      // _capAsked, so the next ceiling hit asks again).
+      if (refineResult && refineResult.capped && !this._capAsked) {
+        this._capAsked = true;
+        this.training = false;
+        this._log(`splat cap reached at ${trainer.n} — paused: keep training at the cap, or prune and continue`);
+        this._em.emit('event', { kind: 'cap-hit', iter: trainer.iter, splats: trainer.n });
       }
 
       const now = performance.now();

@@ -10,6 +10,7 @@ import {
 import { rodrigues, m3mul, makeRng } from '../sfm/geometry.js';
 import { createGpu } from '../gpu/context.js';
 import { ssimIndexRgb } from './ssim.js';
+import { planSoftPrune, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES } from './softprune.js';
 
 // plan item (6): one event-loop turn between the stages of multi-second
 // queue drains (refine readbacks, refined-eval passes) — input and the
@@ -178,7 +179,7 @@ export class GSTrainer {
     // bufCamGrad without enabling camOpt/aspectOpt/expComp).
     this.camGrads = !!(this.opts.camGrads ?? (this.opts.camOpt || this.opts.aspectOpt || this.opts.expComp));
     this.useStats = !!(this.opts.useStats ?? (this.opts.engine === 'v2' || this.opts.refineV2 === true ||
-      this.opts.errDonors || this.opts.statMax));
+      this.opts.errDonors || this.opts.statMax || !!this.opts.softPrune));
     // covW: mask-supervised coverage (see makeRenderSrc). Off unless a masked
     // set asks for it, and compiled out of the kernel entirely when 0.
     this.renderFeat = { camGrad: this.camGrads, stats: this.useStats, robust: !!this.opts.robustLoss,
@@ -419,15 +420,15 @@ export class GSTrainer {
       this.n * STRIDE * 4);
     // proj carries a TAIL for the compaction list: [cap*16] = visible count,
     // [cap*16+1 ..] = visible splat ids (u32 bits) — the chain has no spare binding
-    this.bufProj = buf(nb + (this.cap + 16) * 4, B.STORAGE | B.COPY_SRC, 'proj');
+    this.bufProj = buf(nb + (this.cap + 16) * 4, B.STORAGE | B.COPY_SRC | B.COPY_DST, 'proj'); // COPY_DST: soft-prune compaction writes rows back
     if (this.compact) {
       this.bufVisBlocks = buf(Math.ceil(this.cap / 256) * 4 + 16, B.STORAGE, 'vis-blocks');
       this.bufVisDisp = buf(48, B.STORAGE | B.INDIRECT, 'vis-dispatch');
       this.uniVisScan = buf(16, B.UNIFORM | B.COPY_DST, 'uniVisScan');
       d.queue.writeBuffer(this.uniVisScan, 0, new Uint32Array([this.shK * 3, 0, 0, 0]));
     }
-    this.bufGradP = buf(nb, B.STORAGE | B.COPY_SRC, 'gradP'); // COPY_SRC: precision diagnostics
-    this.bufGradF = buf(nb, B.STORAGE | B.COPY_SRC, 'gradF');
+    this.bufGradP = buf(nb, B.STORAGE | B.COPY_SRC | B.COPY_DST, 'gradP'); // COPY_SRC: precision diagnostics; COPY_DST: soft-prune compaction
+    this.bufGradF = buf(nb, B.STORAGE | B.COPY_SRC | B.COPY_DST, 'gradF'); // COPY_DST: soft-prune compaction writes rows back
     this.bufM = buf(nb, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'adam-m');
     this.bufV = buf(nb, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'adam-v');
     d.queue.writeBuffer(this.bufM, 0, new Float32Array(this.cap * STRIDE));
@@ -489,7 +490,7 @@ export class GSTrainer {
       // pass) gradients + Adam moments; zero-initialized per the WebGPU spec
       const shb = this.cap * this.shK * 3 * 4;
       this.bufSH = buf(shb, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'sh');
-      this.bufSHGrad = buf(shb, B.STORAGE | B.COPY_SRC, 'shGrad');
+      this.bufSHGrad = buf(shb, B.STORAGE | B.COPY_SRC | B.COPY_DST, 'shGrad'); // COPY_DST: soft-prune compaction writes rows back
       // COPY_SRC is load-bearing: refine() reads these back to relocate donor
       // moments — without it the readback encoder errors and refine silently
       // wrote back ZEROED SH Adam moments every 2500 iters
@@ -1825,8 +1826,12 @@ export class GSTrainer {
     const d = this.device;
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const canGrow = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon) && this.n < limit;
-    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n };
+    const growPhase = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon);
+    const canGrow = growPhase && this.n < limit;
+    // capped: growth still scheduled but the TRUE cap is full. A growLimit
+    // hold (LOD levels) is not the ceiling — the session only prompts here.
+    const capped = growPhase && this.n >= limit && limit >= this.cap;
+    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n, capped };
 
     d.queue.writeBuffer(this.uniGather, 0, new Uint32Array([this.n, 1, this.opts.statMax ? 1 : 0, 0]));
     {
@@ -1855,7 +1860,7 @@ export class GSTrainer {
       if (o < 2 / 255 || g[i * 4 + 3] < minLog) { if (canReloc) dead.push(i); }
       else if (o >= 0.05) pool.push(i);
     }
-    if (pool.length < 16) return { moved: 0, grown: 0, n: this.n };
+    if (pool.length < 16) return { moved: 0, grown: 0, n: this.n, capped };
 
     // relocation donors ~ opacity; growth donors ~ grad-stat above threshold
     const opCdf = new Float64Array(pool.length);
@@ -1901,7 +1906,7 @@ export class GSTrainer {
       while (lo < hi) { const mid = (lo + hi) >> 1; if (gsCdf[mid] < r) lo = mid + 1; else hi = mid; }
       return gCands[lo];
     };
-    if (dead.length + grown === 0) return { moved: 0, grown: 0, n: this.n };
+    if (dead.length + grown === 0) return { moved: 0, grown: 0, n: this.n, capped };
     const budget = Math.floor(this.planCap / 2) - 1;
     if (dead.length > budget) dead = dead.slice(0, budget);
     grown = Math.min(grown, budget - dead.length);
@@ -1965,7 +1970,7 @@ export class GSTrainer {
       this.adamData[23] = this.n * STRIDE;
       this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
     }
-    return { moved: dead.length, grown, n: this.n };
+    return { moved: dead.length, grown, n: this.n, capped };
   }
 
   /** opts.relocTaper = f (fraction of the horizon, e.g. 0.5): the per-round
@@ -2011,8 +2016,12 @@ export class GSTrainer {
     if (this.opts.refineV2 !== true) return this._refineLegacy(rng);
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
     const limit = Math.min(this.cap, this.growLimit || this.cap);
-    const canGrow = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon) && this.n < limit;
-    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n };
+    const growPhase = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon);
+    const canGrow = growPhase && this.n < limit;
+    // capped: growth still scheduled but the TRUE cap is full. A growLimit
+    // hold (LOD levels) is not the ceiling — the session only prompts here.
+    const capped = growPhase && this.n >= limit && limit >= this.cap;
+    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n, capped };
     const d = this.device;
 
     // gather (o, w-mass, e-mass, mean logS) and zero the accumulator window
@@ -2056,7 +2065,7 @@ export class GSTrainer {
     let survived = 0;
     if (this._lastReloc) for (const i of this._lastReloc) if (sig(g[i * 4]) >= deadThr) survived++;
     const census = { dead: deadAll, survived, lastReloc: this._lastReloc ? this._lastReloc.length : 0 };
-    if (pool.length < 16) return { moved: 0, grown: 0, n: this.n, ...census };
+    if (pool.length < 16) return { moved: 0, grown: 0, n: this.n, capped, ...census };
     const moveCap = Math.ceil(this.n * (this.opts.moveCap ?? 1.0) * this._relocTaperFactor());
     if (dead.length > moveCap) dead = dead.slice(0, moveCap);
     let grown = canGrow
@@ -2067,7 +2076,7 @@ export class GSTrainer {
     const budget = Math.floor(this.planCap / 2) - 1;
     if (dead.length > budget) dead = dead.slice(0, budget);
     grown = Math.min(grown, Math.max(0, budget - dead.length));
-    if (dead.length === 0 && grown === 0) return { moved: 0, grown: 0, n: this.n };
+    if (dead.length === 0 && grown === 0) return { moved: 0, grown: 0, n: this.n, capped };
 
     // donor sampling ∝ accumulated error mass (fallback: opacity, e.g. the
     // first refine of a run before any window has accumulated)
@@ -2224,7 +2233,7 @@ export class GSTrainer {
       this.adamData[23] = this.n * STRIDE;
       this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
     }
-    return { moved: dead.length, grown, n: this.n, ...census };
+    return { moved: dead.length, grown, n: this.n, capped, ...census };
   }
 
   /** Legacy MCMC-lite refinement: relocate dead splats onto jittered copies of
@@ -2286,8 +2295,12 @@ export class GSTrainer {
 
   async _refineLegacy(rng = this.rand) {
     const canReloc = this.iter < (this.opts.relocUntil ?? this._annealEnd());
-    const canGrow = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon) && this.n < Math.min(this.cap, this.growLimit || this.cap);
-    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n };
+    const growPhase = this.iter < (this.opts.growUntil ?? 0.85 * this.horizon);
+    const canGrow = growPhase && this.n < Math.min(this.cap, this.growLimit || this.cap);
+    // capped: growth still scheduled but the TRUE cap is full (a growLimit
+    // hold — LOD levels — is not the ceiling; the session only prompts here)
+    const capped = growPhase && this.n >= this.cap && (this.growLimit || this.cap) >= this.cap;
+    if (!canReloc && !canGrow) return { moved: 0, grown: 0, n: this.n, capped };
     const d = this.device;
     // capacity-pooled densification: the live-rows readback reuses the
     // cap-sized bufParamsRead (partial-range map, like the gather path)
@@ -2372,7 +2385,7 @@ export class GSTrainer {
       for (const i of this._lastReloc) if (sig(params[i * STRIDE + 13]) >= deadThr) survived++;
     }
     const census = { dead: deadAll, survived, lastReloc: this._lastReloc ? this._lastReloc.length : 0 };
-    if (donors.length < 16) return { moved: 0, grown: 0, n: this.n, ...census };
+    if (donors.length < 16) return { moved: 0, grown: 0, n: this.n, capped, ...census };
     // relocation ceiling per refine — at the old hard 5%, any dead fraction
     // above it stayed dead FOREVER (a monotonic capacity leak; the reference
     // relocates every dead splat every 100 iters)
@@ -2520,7 +2533,120 @@ export class GSTrainer {
     this.bufTileCntRead.unmap();
     // entry-budget drops (whole tiles skipped) are counted by the scan pass
     // into stats[3] and surfaced via readLoss -> this.entryOverflowTiles
-    return { moved: dead.length, grown, n: this.n, maxTile, overflow: this.entryOverflowTiles || 0, ...census };
+    return { moved: dead.length, grown, n: this.n, capped, maxTile, overflow: this.entryOverflowTiles || 0, ...census };
+  }
+
+  /** Periodic importance culling (Speedy-Splat method, opt-in via
+   *  opts.softPrune { ratio, every, from }): drop the lowest-rendered-mass
+   *  fraction of splats and compact every per-splat buffer GPU-side.
+   *  Survivors keep their Adam moments — unlike relocation and reseed, a
+   *  soft-prune never resets optimizer state. Scoring reads the mass
+   *  windows WITHOUT draining them (gather mode 2), so refine planning
+   *  never notices. Skips while a protected seed range is active (rows
+   *  permute) and whenever the plan refuses (too few rows, no signal).
+   *  Returns { culled, n }. */
+  async softPrune() {
+    const cfg = this.opts.softPrune;
+    if (!cfg) return { culled: 0, n: this.n };
+    const ratio = cfg.ratio ?? 0.1;
+    if (!(ratio > 0 && ratio < 1)) return { culled: 0, n: this.n };
+    if (this.protect && this.iter < this.protect.until) return { culled: 0, n: this.n };
+    const d = this.device;
+    d.queue.writeBuffer(this.uniGather, 0, new Uint32Array([this.n, 2, 0, 0]));
+    {
+      const enc = d.createCommandEncoder();
+      const p = enc.beginComputePass();
+      p.setPipeline(this.pipeGather);
+      p.setBindGroup(0, this.bgGather);
+      const groups = Math.ceil(this.n / 256);
+      if (groups <= 65535) p.dispatchWorkgroups(groups);
+      else p.dispatchWorkgroups(65535, Math.ceil(groups / 65535));
+      p.end();
+      enc.copyBufferToBuffer(this.bufGather, 0, this.bufGatherRead, 0, this.n * 16);
+      d.queue.submit([enc.finish()]);
+    }
+    await this.bufGatherRead.mapAsync(GPUMapMode.READ, 0, this.n * 16);
+    const g = new Float32Array(this.bufGatherRead.getMappedRange(0, this.n * 16)).slice();
+    this.bufGatherRead.unmap();
+    const masses = new Float32Array(this.n);
+    for (let i = 0; i < this.n; i++) masses[i] = g[i * 4 + 2];
+    const plan = planSoftPrune(masses, this.n, ratio, {
+      minCull: cfg.minCull ?? 1024, floor: cfg.floor ?? 8192,
+    });
+    if (!plan) return { culled: 0, n: this.n };
+    this._ensureCompact();
+    d.queue.writeBuffer(this.bufCompactRank, 0, plan.rank);
+    const bufs = [
+      [this.bufParams, 16], [this.bufProj, 16], [this.bufGradP, 16],
+      [this.bufGradF, 16], [this.bufM, 16], [this.bufV, 16],
+    ];
+    if (this.shK) {
+      const s = this.shK * 3;
+      bufs.push([this.bufSH, s], [this.bufSHGrad, s], [this.bufSHM, s], [this.bufSHV, s]);
+    }
+    // one encoder per chunk: the chunk uniform is rewritten between them
+    // (a single submit would let the last write win for every dispatch).
+    // A chunk's destination sits at/below its source, so no chunk's
+    // writes overlap a later chunk's reads.
+    for (const [b, stride] of bufs) {
+      const bg = this._compactBg(b);
+      for (const c of chunkPlan(plan.rank, this.n, stride)) {
+        d.queue.writeBuffer(this.uniCompact, 0,
+          new Uint32Array([c.srcBase, c.count, stride, c.dstBase]));
+        const enc = d.createCommandEncoder();
+        const p = enc.beginComputePass();
+        p.setPipeline(this.pipeCompact);
+        p.setBindGroup(0, bg);
+        const groups = Math.ceil(c.count / 256);
+        if (groups <= 65535) p.dispatchWorkgroups(groups);
+        else p.dispatchWorkgroups(65535, Math.ceil(groups / 65535));
+        p.end();
+        enc.copyBufferToBuffer(this.bufCompactTmp, 0, b,
+          c.dstBase * stride * 4, c.survivors * stride * 4);
+        d.queue.submit([enc.finish()]);
+      }
+    }
+    this.n = plan.kept;
+    this.adamData[23] = this.n * STRIDE;
+    this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
+    // row-indexed CPU state dies with the permutation: the census baseline
+    this._lastReloc = null;
+    return { culled: plan.culled, n: this.n };
+  }
+
+  /** Lazily built compaction kit: no buffers, no pipelines until the first
+   *  soft-prune fires (off by default = zero footprint). */
+  _ensureCompact() {
+    if (this.pipeCompact) return;
+    const d = this.device;
+    this.pipeCompact = d.createComputePipeline({
+      label: 'compact', layout: 'auto',
+      compute: { module: d.createShaderModule({ label: 'compact', code: COMPACT_SRC }), entryPoint: 'main' },
+    });
+    this.uniCompact = d.createBuffer({ size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'uniCompact' });
+    this.bufCompactTmp = d.createBuffer({ size: COMPACT_TEMP_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, label: 'compact-tmp' });
+    this.bufCompactRank = d.createBuffer({ size: this.cap * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, label: 'compact-rank' });
+    this._compactBgs = new Map();
+  }
+
+  _compactBg(b) {
+    let bg = this._compactBgs.get(b);
+    if (!bg) {
+      bg = this.device.createBindGroup({
+        layout: this.pipeCompact.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.uniCompact } },
+          { binding: 1, resource: { buffer: b } },
+          { binding: 2, resource: { buffer: this.bufCompactRank } },
+          { binding: 3, resource: { buffer: this.bufCompactTmp } },
+        ],
+      });
+      this._compactBgs.set(b, bg);
+    }
+    return bg;
   }
 
   /** Cheap health probe: sample the head of the params buffer. iOS Safari

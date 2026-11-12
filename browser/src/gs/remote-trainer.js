@@ -85,6 +85,12 @@ export class RemoteTrainer {
     return r;
   }
 
+  async softPrune() {
+    const r = await this._rpc.call('softPrune', {});
+    this.iter = r.iter; this.n = r.n;
+    return r;
+  }
+
   async readLoss() {
     const r = await this._rpc.call('readLoss', {});
     if (r.entryOverflowTiles) this.entryOverflowTiles = r.entryOverflowTiles;

@@ -677,6 +677,7 @@ function boot() {
       ? `0 = Auto (${maxLODLevels(st.splats)} snapshots). Choose 1–${maxLODLevels(st.splats)} earlier saved snapshots; final full detail is always included.`
       : 'Enable LOD with a splat budget of at least 1,000,000. 0 = Auto.';
     $('set-mcmc').value = st.mcmc === '0' ? '0' : '';
+    $('set-softprune').value = st.softprune || '';
     $('set-gpu').value = String(st.gpu ?? 100);
     $('set-gpu-v').textContent = `${$('set-gpu').value}%`;
     if ($('t-gpu')) { $('t-gpu').value = String(st.gpu ?? 100); $('t-gpu-v').textContent = `${$('t-gpu').value}%`; }
@@ -743,6 +744,7 @@ function boot() {
     st.lod = lodEnabled;
     st.lodLevels = lodCount;
     st.mcmc = $('set-mcmc').value;  // '' Auto | '1' on | '0' off
+    st.softprune = $('set-softprune').value;  // '' off | '0.1' trim 10% | '0.2' trim 20%
     st.gpu = Math.min(100, Math.max(10, parseInt($('set-gpu').value, 10) || 100));
     showSettings();
     saveSettings();
@@ -751,7 +753,7 @@ function boot() {
   S.commitSettings = readSettings;
   // every select in the panel persists on change — the avatar rows (and Horizontal SH) were
   // missing from this list, so their toggles changed the dropdown and nothing else (2026-09-17)
-  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-shup', 'set-gpu', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
+  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-softprune', 'set-shup', 'set-gpu', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
     const el = $(id); if (el) el.addEventListener('change', readSettings);
   }
   // the avatar route: the box on the start card. It is a property of THIS run,
@@ -2114,6 +2116,9 @@ async function startPrep() {
       Object.assign(trainerOpts, { mipComp: false, anisoReg: 0, minScale: 1e-5, refineV2: true, growRate: 0.1 });
       flash('Placement set active — mipComp off, anisoReg 0, minScale 1e-5, refineV2, growRate 0.1 (?placement=0 clears)', 6000);
     }
+    // Soft prune (opt-in): periodic importance culls during growth — the
+    // model holds more detail under the same splat budget
+    if (st.softprune) trainerOpts.softPrune = { ratio: parseFloat(st.softprune), every: 3000, from: 6000 };
     // Auto splat budget: sized from the CYCLE budget, not just the solve —
     // the measured capacity law (~15 splats/cycle classic, ~35 under MCMC),
     // clamped to the device class. Explicit user choices always win.
@@ -2738,6 +2743,90 @@ function startTraining() {
   S.session.start();
 }
 
+function syncTrainButtons() {
+  const ses = S.session;
+  const on = !!(ses && ses.training);
+  const b = $('t-play');
+  if (b) {
+    b.dataset.state = on ? 'pause' : 'play';
+    b.innerHTML = on
+      ? '<svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z"/></svg>'
+      : '<svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M8 4.8v14.4l12.4-7.2z"/></svg>';
+  }
+  const f = $('t-finish');
+  if (f) f.hidden = on;
+  const p = $('t-prune');
+  if (p) p.disabled = !ses || !ses.trainer || !!S._pruning;
+}
+
+/** The ceiling's question: the session paused itself at a full cap — prune
+ *  to half and grow on, or keep training at this size. */
+function showCapCard(e) {
+  syncTrainButtons();
+  document.getElementById('capcard')?.remove();
+  const card = document.createElement('div');
+  card.className = 'upcard';
+  card.id = 'capcard';
+  card.innerHTML = `
+    <b>Splat cap reached (${fmt(e.splats)})</b>
+    <span class="sog-status">Growth is full. Prune to half and grow on, or keep training at this size.</span>
+    <div class="row">
+      <button class="btn btn-accent" id="cap-prune">Prune to ½ &amp; continue</button>
+      <button class="btn" id="cap-keep">Keep training at cap</button>
+    </div>`;
+  $('stage').appendChild(card);
+  card.querySelector('#cap-keep').addEventListener('click', () => {
+    card.remove();
+    if (S.session) S.session.start();
+    syncTrainButtons();
+    flash('Training on at the cap — growth stays off.', 4000);
+  });
+  card.querySelector('#cap-prune').addEventListener('click', () => {
+    card.remove();
+    runPruneAndContinue();
+  });
+}
+
+async function runPruneAndContinue() {
+  const ses = S.session;
+  if (!ses || !ses.trainer || S._pruning) return;
+  S._pruning = true;
+  syncTrainButtons();
+  document.getElementById('prunecard')?.remove();
+  const card = document.createElement('div');
+  card.className = 'upcard';
+  card.id = 'prunecard';
+  card.innerHTML = `
+    <b>Pruning the model</b>
+    <span class="sog-status" id="prune-status">Reading the model …</span>
+    <div class="prep-meter"><i id="prune-bar" style="width:0%"></i></div>`;
+  $('stage').appendChild(card);
+  try {
+    const st = card.querySelector('#prune-status');
+    const bar = card.querySelector('#prune-bar');
+    let from = 0;
+    const out = await ses.pruneAndContinue(0.5, {
+      onStatus: (m) => { if (st) st.textContent = String(m); },
+      onProgress: (p) => {
+        if (!from) from = p.currentCount;
+        const span = from - p.targetCount;
+        if (bar && span > 0) bar.style.width = `${(100 * (from - p.currentCount) / span).toFixed(1)}%`;
+      },
+    });
+    card.remove();
+    const d = out.delta == null ? 'no holdout to score against'
+      : `${out.delta >= 0 ? '+' : ''}${out.delta.toFixed(2)} dB holdout`;
+    flash(`Pruned ${fmt(out.from)} → ${fmt(out.to)} splats (${d}) — training on with room to grow.`, 7000);
+  } catch (err) {
+    card.remove();
+    console.error(err);
+    flash(`Prune failed: ${err.message} — press play to resume.`, 8000);
+  } finally {
+    S._pruning = false;
+    syncTrainButtons();
+  }
+}
+
 function toggleTrain() {
   if (!S.session) return;
   if (S.session.training) S.session.pause();
@@ -3091,6 +3180,22 @@ function onTrainEvent(e) {
   if (e.kind === 'overflow' && S._ovWarned !== (S.runId ?? 'live')) {
     S._ovWarned = S.runId ?? 'live';
     flash(`Tile-sort overflow — ${e.tiles} tiles dropped so far. Lower the splat budget for this device.`, 8000);
+  }
+  if (e.kind === 'soft-prune') {
+    S.chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned −${fmt(e.culled)}` });
+    S.growNote = { text: `−${fmt(e.culled)} splats`, until: performance.now() + 2200 };
+  }
+  if (e.kind === 'cap-hit') {
+    if (S.state !== 'train') return;
+    showCapCard(e);
+  }
+  if (e.kind === 'prune-continue') {
+    // the cached exports go stale the moment the model reseeds (like trainMore)
+    S.plyBlob = null; S.sogBlob = null;
+    S.maxIters = e.maxIters;
+    if (chart) chart.maxIter = S.maxIters;
+    S.chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned ${fmt(e.from)}→${fmt(e.to)}` });
+    S.growNote = { text: `−${fmt(e.from - e.to)} splats`, until: performance.now() + 2200 };
   }
   if (e.kind === 'train-complete') finish();
   if (e.kind === 'device-lost') deviceLostRecovery();
@@ -4365,6 +4470,10 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
       if (recipeTrainer.refineV2) recipeTrainer.growRate = 0.1;
       else delete recipeTrainer.growRate;
     }
+    // the panel's soft-prune selection applies to continuations like a fresh
+    // run; without it the recipe replays the run's own setting
+    if (S.settings.softprune) recipeTrainer.softPrune = { ratio: parseFloat(S.settings.softprune), every: 3000, from: 6000 };
+    else delete recipeTrainer.softPrune;
     const contRefine = opts.mcmc === true ? 500 : opts.mcmc === false ? undefined : recipeRefine;
     const bufScale = opts.buf ?? (prevBuf !== 1 ? prevBuf : undefined);
     // same OOM warning as a fresh run: the continue card reselects the
@@ -5452,7 +5561,7 @@ function dock(kind) {
   if (kind === 'train') {
     d.innerHTML = `
       <div class="tcontrols">
-        <span class="playwrap"><button class="play" id="t-play" data-state="pause"><svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z"/></svg></button><button class="tbtn-sm" id="t-finish" hidden title="End the run here — the model is kept as it is and ready to export">Stop &amp; keep</button></span>
+        <span class="playwrap"><button class="play" id="t-play" data-state="pause"><svg viewBox="0 0 24 24" class="pl" aria-hidden="true"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z"/></svg></button><button class="tbtn-sm" id="t-finish" hidden title="End the run here — the model is kept as it is and ready to export">Stop &amp; keep</button><button class="tbtn-sm" id="t-prune" title="Prune the model to half its splats and keep training with room to grow">Prune ½</button></span>
         <div class="tmeta">
           <span class="tmeta-1"><span id="t-iter">${pctOf(S.iter)}</span></span>
           <span class="tmeta-2">ETA <span id="t-eta">${etaText()}</span></span>
@@ -5474,6 +5583,7 @@ function dock(kind) {
       $('t-finish').disabled = true;
       await S.session.finish();   // emits train-complete -> finish()
     });
+    $('t-prune').addEventListener('click', runPruneAndContinue);
     // the GPU usage slider, mid-training edition: the same persisted knob
     // as the settings panel, mirrored both ways, live on every input
     const tGpu = $('t-gpu');
