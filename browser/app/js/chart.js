@@ -10,6 +10,24 @@ export function psnrToApproxSsimPercent(psnr) {
   return Math.max(0, Math.min(100, 100 / (1 + ratio ** 4)));
 }
 
+/** Samples dropped from the START of each drawn line: the first samples
+ *  climb almost vertically off a cold start, pinning the floor far below
+ *  the working range and flattening the rest of the curve. Raw samples
+ *  stay stored — hover still reads exact values; only the line is cut. */
+const SKIP_FIRST = 3;
+
+/** Centered 3-point moving average: damps sample-to-sample jitter so the
+ *  trend reads instead of the noise. Edges reuse the nearest sample, so
+ *  the line neither shortens nor shifts. */
+function smooth3(pts) {
+  if (pts.length < 3) return pts;
+  return pts.map(([iter, v], i) => {
+    const a = pts[Math.max(0, i - 1)][1];
+    const b = pts[Math.min(pts.length - 1, i + 1)][1];
+    return [iter, (a + v + b) / 3];
+  });
+}
+
 export class Chart {
   constructor(canvas, { onHover, onScrub } = {}) {
     this.cv = canvas;
@@ -56,7 +74,10 @@ export class Chart {
   }
 
   _displaySeries(series) {
-    return series.map(([iter, value]) => [iter, this._displayValue(value)]);
+    const conv = series.map(([iter, value]) => [iter, this._displayValue(value)]);
+    // too short to trim: plot everything (early runs land here)
+    const trimmed = conv.length > SKIP_FIRST + 1 ? conv.slice(SKIP_FIRST) : conv;
+    return smooth3(trimmed);
   }
 
   // top just fits the event dots; there are no x labels, so the bottom is
@@ -174,9 +195,12 @@ export class Chart {
       const x = X(this.mark != null ? this.mark : last[0]);
       ctx.strokeStyle = 'rgba(230,236,235,.25)'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(x, t); ctx.lineTo(x, t + ph); ctx.stroke();
-      if (this.mark == null) {
+      // the dot rides the drawn (trimmed, smoothed) line's end, not the raw
+      // sample — else it floats off the curve it terminates
+      const drawn = train[train.length - 1];
+      if (this.mark == null && drawn) {
         ctx.fillStyle = '#2fd4c1';
-        ctx.beginPath(); ctx.arc(X(last[0]), Y(this._displayValue(last[1])), 3 * dpr, 0, 7); ctx.fill();
+        ctx.beginPath(); ctx.arc(X(drawn[0]), Y(drawn[1]), 3 * dpr, 0, 7); ctx.fill();
       }
     }
 

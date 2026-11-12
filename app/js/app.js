@@ -4261,6 +4261,13 @@ function continueConfigCard(r) {
   const lodOpts = '<option value="" selected>Off</option><option value="1">On (auto levels)</option>';
   // MCMC optimizer: the run's own set unless toggled
   const mcmcOpts = `<option value="" selected>${prevMcmc ? 'On' : 'Off'}</option><option value="1">On</option><option value="0">Off</option>`;
+  // soft prune: the run's own trim unless reselected (the recipe carries
+  // the trainer's softPrune block, so a run pruned at 10% replays 10%)
+  const prevSoftRatio = recipe0 && recipe0.softPrune && Number.isFinite(recipe0.softPrune.ratio)
+    ? recipe0.softPrune.ratio : 0;
+  const prevSoft = prevSoftRatio > 0 ? `${Math.round(prevSoftRatio * 100)}%` : 'Off';
+  const softOpts = [`<option value="" selected>${prevSoft}</option>`, '<option value="0">Off</option>',
+    ...[0.05, 0.1, 0.2, 0.3].map((v) => `<option value="${v}">${Math.round(v * 100)}%</option>`)].join('');
   const card = document.createElement('div');
   card.className = 'upcard';
   card.id = 'ltconfig';
@@ -4276,6 +4283,7 @@ function continueConfigCard(r) {
     <label class="upcard-opt"><span>Working buffer</span><select id="ltc-buf">${bufOpts}</select></label>
     <label class="upcard-opt"><span>LOD levels</span><select id="ltc-lod">${lodOpts}</select></label>
     <label class="upcard-opt"><span>MCMC optimizer</span><select id="ltc-mcmc">${mcmcOpts}</select></label>
+    <label class="upcard-opt"><span>Soft prune</span><select id="ltc-softprune">${softOpts}</select></label>
     <div class="upcard-row">
       <button class="btn btn-outline" id="ltc-cancel">Cancel</button>
       <button class="btn btn-accent" id="ltc-go">Continue training</button>
@@ -4291,6 +4299,7 @@ function continueConfigCard(r) {
     const bufRaw = $('ltc-buf').value;
     const lodRaw = $('ltc-lod').value;
     const mcmcRaw = $('ltc-mcmc').value;
+    const softRaw = $('ltc-softprune').value;
     card.remove();
     continueLocalRun(false, {
       res: resRaw === 'same' ? undefined : (resRaw === 'auto' ? 'auto' : (resRaw === 'full' ? 'full' : parseInt(resRaw, 10))),
@@ -4300,6 +4309,7 @@ function continueConfigCard(r) {
       buf: bufRaw === '' ? undefined : parseFloat(bufRaw),
       lod: lodRaw === '1' ? true : undefined,
       mcmc: mcmcRaw === '' ? undefined : mcmcRaw === '1',
+      softprune: softRaw === '' ? undefined : parseFloat(softRaw),
     }).catch((e) => {
       console.error(e);
       flash(`Could not continue this run: ${e.message}`, 8000);
@@ -4313,7 +4323,7 @@ function continueConfigCard(r) {
  *  from the stored camera solve + the capture's photos, and run on. */
 /** viewOnly: reopen a FINISHED run from its state checkpoint straight into
  *  the done viewer (same run record, so Compress patches the sog in)
- *  opts: { res, splats, extraIters, sh, buf, lod, mcmc } from the
+ *  opts: { res, splats, extraIters, sh, buf, lod, mcmc, softprune } from the
  *  continue-config card — a reselected configuration for this continuation;
  *  unsettled knobs keep the run's own setup and automatic horizon extension. */
 async function continueLocalRun(viewOnly = false, opts = {}) {
@@ -4501,10 +4511,14 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
       if (recipeTrainer.refineV2) recipeTrainer.growRate = 0.1;
       else delete recipeTrainer.growRate;
     }
-    // the panel's soft-prune selection applies to continuations like a fresh
-    // run; without it the recipe replays the run's own setting
-    if (S.settings.softprune) recipeTrainer.softPrune = { ratio: parseFloat(S.settings.softprune), every: 3000, from: 6000 };
-    else delete recipeTrainer.softPrune;
+    // the card reselects soft-prune; untouched (and on resume/view paths,
+    // which pass no overrides), the recipe replays the run's own setting —
+    // a run pruned at 10% keeps pruning at 10%. The start panel stays out:
+    // its value may have drifted since the run and must not leak in.
+    if (opts.softprune !== undefined) {
+      if (opts.softprune > 0) recipeTrainer.softPrune = { ratio: opts.softprune, every: 3000, from: 6000 };
+      else delete recipeTrainer.softPrune;
+    }
     const contRefine = opts.mcmc === true ? 500 : opts.mcmc === false ? undefined : recipeRefine;
     const bufScale = opts.buf ?? (prevBuf !== 1 ? prevBuf : undefined);
     // same OOM warning as a fresh run: the continue card reselects the

@@ -1494,9 +1494,10 @@ async function continueRun(files, urls = null) {
     log(`continuing from ${fmt(baseIter)} cycles — +${fmt(extra)} more · cap ${fmt(cap)} · ${engine}` +
       `${prevDim ? ` · ${prevDim}px input` : ''}${!hasState ? ' · unbaking export opacities' : ''}`);
     // the panel's soft-prune selection applies to continuations like a fresh
-    // run; without it the recipe replays the run's own setting
+    // run; unset, the recipe replays the run's own setting (the spread above
+    // already carries it — deleting here silently unpruned continuations of
+    // pruned runs)
     if (st.softprune) recipeTrainer.softPrune = { ratio: parseFloat(st.softprune), every: 3000, from: 6000 };
-    else delete recipeTrainer.softPrune;
     const ses = createSession({
       maxIters: S.maxIters, holdout: -1,
       gpuUsage: st.gpu / 100,

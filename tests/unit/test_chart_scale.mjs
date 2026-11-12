@@ -83,4 +83,20 @@ assert.match(appSource, /\$\('d-chart-wrap'\)\.hidden = vis !== 'chart'/,
 assert.match(appCss, /\.sheet-vis canvas\[hidden\]\s*\{\s*display:\s*none\s*;/,
   'inactive Details canvases should stay hidden despite the general canvas display rule');
 
+// the cold-start transient is trimmed from the drawn line so the working
+// range fills the plot; the line is damped with a 3-point window average
+const trimChart = new Chart(chartCanvas);
+trimChart.train = [[0, 10], [100, 12], [200, 14], [300, 16], [400, 18], [500, 20]];
+assert.deepEqual(trimChart._displaySeries(trimChart.train).map((p) => p[0]), [300, 400, 500],
+  'the plot should drop the first few samples from the drawn line');
+const smoothChart = new Chart(chartCanvas);
+smoothChart.train = [[0, 10], [100, 20], [200, 30]];
+const smoothed = smoothChart._displaySeries(smoothChart.train).map((p) => p[1]);
+assert.ok(Math.abs(smoothed[0] - (10 + 10 + 20) / 3) < 1e-9 &&
+  Math.abs(smoothed[1] - 20) < 1e-9 &&
+  Math.abs(smoothed[2] - (20 + 30 + 30) / 3) < 1e-9,
+  'the plot should dampen samples with a centered 3-point window average');
+assert.match(chartSource, /SKIP_FIRST = 3/,
+  'the cold-start trim should drop the first three samples');
+
 console.log('PSNR and approximate SSIM graph scales: passed');
