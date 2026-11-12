@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { scorePlateaued } from '../../src/session.js';
+import { FastRobustZLEMA as EngineZLEMA, SKIP_FIRST } from '../../src/zlema.js';
+import { FastRobustZLEMA as ChartZLEMA } from '../../app/js/chart.js';
 
 const sessionSource = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
+const zlemaSource = readFileSync(new URL('../../src/zlema.js', import.meta.url), 'utf8');
 const trainerSource = readFileSync(new URL('../../src/gs/trainer.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 
@@ -42,8 +45,8 @@ assert.match(sessionSource, /if \(this\.opts\.refinePlateau !== false && trainer
   'plateau refines gate on the warmup iters and stay switchable');
 assert.match(sessionSource, /sinceRefine >= \(this\.opts\.plateauMinGap \?\? 400\)/,
   'a minimum gap keeps a flat score from storming refines');
-assert.match(sessionSource, /plateau = scorePlateaued\(this\.lossHistory, trainer\.iter, \{/,
-  'the live curve feeds the detector');
+assert.match(sessionSource, /plateau = scorePlateaued\(this\.zlemaHistory, trainer\.iter, \{/,
+  'the filtered curve feeds the detector');
 assert.match(sessionSource, /if \(trainer\.iter > 1500 && \(sinceRefine >= refineEvery \|\| plateau\)\) \{/,
   'the fixed cadence stays as the maximum gap');
 assert.match(sessionSource, /\[score plateaued\]/,
@@ -70,5 +73,35 @@ assert.match(sessionSource, /this\._em\.emit\('event', \{ kind: 'overflow', iter
   'each increase emits once');
 assert.match(appSource, /if \(e\.kind === 'overflow' && S\._ovWarned !== \(S\.runId \?\? 'live'\)\) \{/,
   'the app flashes once per run');
+
+// ---- the trigger reads the graph's history, not the raw readouts -------------
+assert.equal(ChartZLEMA, EngineZLEMA,
+  'the graph and the trigger should share one filter class');
+assert.equal(SKIP_FIRST, 3,
+  'the trigger should hold back the same cold-start samples as the graph');
+assert.match(sessionSource, /import \{ FastRobustZLEMA, SKIP_FIRST \} from '\.\/zlema\.js';/,
+  'the session should import the shared filter');
+assert.match(sessionSource, /this\.zlemaHistory = \[\];   \/\/ \[iter, filteredPsnrTrain\]/,
+  'the constructor should open an empty filtered history');
+assert.match(sessionSource, /if \(this\.lossHistory\.length > SKIP_FIRST\) \{/,
+  'every raw readout past the hold should also feed the shared filter');
+assert.match(sessionSource, /this\.zlemaHistory\.push\(\[trainer\.iter, this\._zlema\.update\(m\.psnrTrain\)\]\);/,
+  'the trigger history should store filtered values per iteration');
+assert.match(sessionSource, /setLossHistory\(rows\) \{[\s\S]*this\._zlema\.series\(this\.lossHistory\.slice\(SKIP_FIRST\)\)/,
+  'a restored history should replay the graph pass through a fresh filter');
+assert.match(appSource, /session\.setLossHistory\(history\);/,
+  'reopening a run should hydrate the filtered history with it');
+// the engine's incremental feed is the graph's fresh pass, sample for sample
+const spiky = Array(8).fill(0).map((_, k) => [NOW - W + k * 150, 20 + (k * 150 * 0.2) / 1000]);
+spiky[6][1] -= 2.5; spiky[7][1] -= 2.0;
+const incrFeed = new EngineZLEMA();
+const triggerHist = [];
+spiky.forEach(([i, v], k) => { if (k >= SKIP_FIRST) triggerHist.push([i, incrFeed.update(v)]); });
+assert.deepEqual(triggerHist, new EngineZLEMA().series(spiky.slice(SKIP_FIRST)),
+  'incremental per-push updates should equal the graph fresh pass');
+assert.equal(scorePlateaued(spiky, NOW, { window: W }), true,
+  'two eval-noise dips fake a stall on the raw readouts');
+assert.equal(scorePlateaued(triggerHist, NOW, { window: W }), false,
+  'the filtered slope should see through them to the healthy climb');
 
 console.log('plateau-driven refine + 1M mobile ceiling + overflow warnings: passed');

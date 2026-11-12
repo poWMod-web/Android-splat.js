@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { Chart, psnrToApproxSsimPercent, FastRobustZLEMA } from '../../app/js/chart.js';
 
 const chartSource = readFileSync(new URL('../../app/js/chart.js', import.meta.url), 'utf8');
+const zlemaSource = readFileSync(new URL('../../src/zlema.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 const appCss = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
@@ -102,8 +103,10 @@ assert.deepEqual(drawn.map((p) => p[0]), [300, 400, 500],
   'the plot should start the line past the held samples');
 assert.equal(drawn[0][1], 16,
   'the filter should latch the first plotted sample');
-assert.match(chartSource, /SKIP_FIRST = 3/,
+assert.match(zlemaSource, /export const SKIP_FIRST = 3;/,
   'the cold-start hold should cover the first three samples');
+assert.match(chartSource, /import \{ FastRobustZLEMA, SKIP_FIRST \} from '..\/..\/src\/zlema\.js';/,
+  'the graph should read the shared filter, not a private copy');
 // zero-lag EMA with a Z-score spike clamp: latch, track flats, tame spikes
 const zlatch = new FastRobustZLEMA();
 assert.equal(zlatch.update(20), 20, 'the first sample latches the level');
@@ -120,7 +123,7 @@ const zseries = new FastRobustZLEMA().series([[0, 10], [100, 12], [200, 14]]);
 assert.deepEqual(zseries.map((p) => p[0]), [0, 100, 200],
   'a series pass should keep every sample iteration');
 assert.equal(zseries[0][1], 10, 'a series pass should latch its first sample');
-assert.match(chartSource, /class FastRobustZLEMA/,
+assert.match(zlemaSource, /export class FastRobustZLEMA/,
   'the curve should run through the zero-lag filter');
 assert.match(chartSource, /new FastRobustZLEMA\(\)\.series\(held\)/,
   'each draw should run a fresh filter pass over the held samples');

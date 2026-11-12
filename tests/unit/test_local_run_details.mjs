@@ -23,7 +23,7 @@ assert.match(app, /detailSolve: captureRunSolveDetails\(\)[\s\S]*detailProgress:
   'new local runs should save solver, progress/timing, and GPU details');
 assert.match(app, /async function checkpointRun\([\s\S]*detailSolve: captureRunSolveDetails\(\)[\s\S]*detailProgress,[\s\S]*detailGpu: gpuFacts\(false\)/,
   'pause/finish checkpoints should refresh the saved Details payload');
-assert.match(app, /function restoreRunDetails\([\s\S]*session\.lossHistory = history\.map[\s\S]*session\.perf\.frames = frameRows\.map/,
+assert.match(app, /function restoreRunDetails\([\s\S]*session\.setLossHistory\(history\)[\s\S]*session\.perf\.frames = frameRows\.map/,
   'reopening a local model should hydrate its score history and timing samples');
 assert.match(app, /restoreRunDetails\(S\._localRun, ses\)/,
   'the local Details payload should be restored when the saved model opens');

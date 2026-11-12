@@ -3131,7 +3131,7 @@ function restoreRunDetails(run, session = S.session) {
   const fallbackChart = (S.restored && S.restored.stats && S.restored.stats.chart) || [];
   const history = Array.isArray(progress.chart) && progress.chart.length ? progress.chart : fallbackChart;
   if (session) {
-    session.lossHistory = history.map((r) => Array.from(r || []));
+    session.setLossHistory(history);
     session.perf = session.perf || { frames: [], marks: [] };
     const frameRows = ((progress.perf && progress.perf.frames) || []).map((r) => Array.from(r || []));
     const markRows = ((progress.perf && progress.perf.marks) || []).map((m) => ({ ...m }));

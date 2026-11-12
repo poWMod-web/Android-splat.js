@@ -24,6 +24,7 @@
 // batching, auto-stop, refine cadence, blur exclusion, holdout choice, PSNR
 // conversion, and the hidden-tab watchdog.
 
+import { FastRobustZLEMA, SKIP_FIRST } from './zlema.js';
 import { decodeFrames } from './io/frames.js';
 import { reconFromKnownCameras } from './io/cameras.js';
 import { focalPxFrom35 } from './io/exif.js';
@@ -232,7 +233,9 @@ class Emitter {
 }
 
 /** Plateau test for score-driven refine cadence: least-squares slope of
- *  train PSNR over the trailing `window` iters stays under `slope`
+ *  ZLEMA-filtered train PSNR over the trailing `window` iters stays under
+ *  `slope` — the graph's curve, not the raw readouts, so one spiky sample
+ *  can't fake a stall (or mask one) and pull a refine forward early
  *  dB/kiter. Needs minPoints finite samples spanning most of the window —
  *  anything less is "still warming up", never a plateau. Flat OR falling
  *  trips it: a stalled score wants fresh capacity, a falling one triage. */
@@ -268,6 +271,11 @@ export class Session {
     this.testCams = [];
     this.training = false;
     this.lossHistory = [];  // [iter, psnrTrain]
+    // the graph's curve, kept incrementally: same filter, same parameters,
+    // same cold-start hold as the score plot (zlema.js) — the plateau slope
+    // below reads THIS, so the trigger trips on the line the user sees
+    this.zlemaHistory = [];   // [iter, filteredPsnrTrain]
+    this._zlema = new FastRobustZLEMA();
     this._fences = [];      // in-flight batch fences (see _frameLoop)
     this._govAuto = 1;      // duty governor: auto duty, min()'d with the slider
     this._govLag = 0;       // event-loop lag EWMA (ms)
@@ -291,6 +299,16 @@ export class Session {
     this._em = new Emitter();
     this._debug = null;     // solver internals (feats/tracks) for UI beats
     this.view = new SessionView(this);
+  }
+
+  /** Hydrate a restored score history: raw rows stay raw (dots, exports),
+   *  and the filtered curve replays through a fresh filter — the same
+   *  fresh pass the graph runs per draw, so a reopened run's trigger
+   *  history matches its plotted line from the first slope test. */
+  setLossHistory(rows) {
+    this.lossHistory = rows.map((r) => Array.from(r || []));
+    this._zlema = new FastRobustZLEMA();
+    this.zlemaHistory = this._zlema.series(this.lossHistory.slice(SKIP_FIRST));
   }
 
   on(type, fn) { return this._em.on(type, fn); }
@@ -1239,6 +1257,8 @@ export class Session {
     this._readOverrun = false;
     this._framePending = false;
     this.lossHistory = [];
+    this.zlemaHistory = [];
+    this._zlema = new FastRobustZLEMA();
     this._lastHold = null;
     this._lastHoldEval = 0;
     this._itersAtStats = 0;
@@ -1572,7 +1592,7 @@ export class Session {
       let plateau = false;
       if (this.opts.refinePlateau !== false && trainer.iter > 1500 &&
           sinceRefine >= (this.opts.plateauMinGap ?? 400)) {
-        plateau = scorePlateaued(this.lossHistory, trainer.iter, {
+        plateau = scorePlateaued(this.zlemaHistory, trainer.iter, {
           window: this.opts.plateauWindow ?? 1200,
           slope: this.opts.plateauSlope ?? 0.1,
         });
@@ -1804,6 +1824,12 @@ export class Session {
     if (mse != null && mse > 0) {
       m.psnrTrain = -10 * Math.log10(mse);
       this.lossHistory.push([trainer.iter, m.psnrTrain]);
+      // the trigger's history shadows the graph's: past the cold-start
+      // hold, every raw readout also feeds the shared filter (one update
+      // per push — a causal pass, identical to the graph's fresh series)
+      if (this.lossHistory.length > SKIP_FIRST) {
+        this.zlemaHistory.push([trainer.iter, this._zlema.update(m.psnrTrain)]);
+      }
     }
     // tile-sort overflow used to be silent (dropped tiles render as
     // background): the count is cumulative on the trainer in both the
