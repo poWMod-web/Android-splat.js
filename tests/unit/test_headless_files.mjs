@@ -109,11 +109,13 @@ assert.ok(main.includes('ACTION_HANDOFF_TRAINING'), 'the handoff broadcast exist
 assert.ok(main.includes('public void handoffDone(String runId, boolean ok)'), 'the bridge carries the verdict');
 assert.match(main, /void onStop\(\)[^]*activity-background/,
   'normal Activity backgrounding should ask the foreground service to own training');
-assert.match(main, /void onStart\(\)[^]*activity-foreground/,
-  'a quick foreground return should cancel the debounced handoff');
+assert.match(main, /void onStart\(\)[^]*notifyActivityVisible\(\)/,
+  'a quick foreground return should cancel only the debounced handoff');
 assert.ok(app.includes("localStorage.getItem('splatjs_monitor_visuals') === '1'"),
   'the monitor visuals toggle defaults off, like the in-app training visuals');
 const svc = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
+assert.match(svc, /case "activity-visible":[\s\S]*removeCallbacks\(backgroundHandoff\)[\s\S]*break;/,
+  'foreground visibility must not stop an already-running service trainer');
 const runFiles = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/RunFiles.java', import.meta.url), 'utf8');
 for (const s of ['setDataDirectorySuffix("training")', 'AndroidHeadless', 'headless-snapshot', 'onTaskRemoved',
     'headless-ack', 'headless-ready', 'settleHandoff', 'HANDOFF_ACK_MS', 'handoffGen',
@@ -122,22 +124,34 @@ for (const s of ['setDataDirectorySuffix("training")', 'AndroidHeadless', 'headl
   assert.ok(svc.includes(s), `service implements ${s}`);
 }
 
-// Foreground/notification return is a real ownership transfer, not a monitor-only reopen.
-assert.match(main, /void onNewIntent\(Intent intent\)[\s\S]*ACTION_RETURN_TRAINING[\s\S]*requestTrainingReturn\(\)/,
-  'a notification tap on an existing Activity should explicitly request the model back');
-assert.match(svc, /case "activity-foreground":[\s\S]*returnToActivity = true[\s\S]*__headlessStop/,
-  'foregrounding should latch a stop/checkpoint request into the service trainer');
+// Notification return is monitor-only until explicit user consent.
+assert.match(main, /void onNewIntent\(Intent intent\)[\s\S]*notifyActivityVisible\(\)[\s\S]*__splatxrOpenMonitor/,
+  'a notification tap should bring the monitor forward without taking ownership');
+assert.match(app, /__splatxrOpenMonitor = \(\) => \{[\s\S]*headlessBootCheck\(\)/,
+  'an existing Activity should reopen only the file-backed monitor');
+assert.doesNotMatch(main, /requestTrainingReturn|activity-foreground/,
+  'foregrounding must not request an automatic service-to-Activity transfer');
+assert.doesNotMatch(svc, /case "activity-foreground"|returnToActivity|returnHandoff/,
+  'the service must have no automatic foreground-return path');
 assert.match(svc, /beat\.put\("alive", false\)[\s\S]*RunFiles\.writeJson[\s\S]*service\.json/,
   'Java should acknowledge service GPU teardown before Activity adoption');
 assert.match(driver, /const secured = await secureFileCheckpoint\(\);[\s\S]*if \(!secured\)[\s\S]*ses\.start\(\)/,
   'a failed handback checkpoint should keep service training instead of returning stale state');
-assert.match(app, /status\.status === 'interrupted' && status\.stopped[\s\S]*returnHeadlessRun\(runId\)/,
-  'a stopped service checkpoint should automatically resume in the Activity');
+assert.match(app, /status\.status === 'interrupted' && status\.stopped[\s\S]*showRecovery\(runId, status\)/,
+  'a stopped service checkpoint should wait on recovery UI for Continue here');
+assert.match(app, /'mon-continue'\)\.addEventListener\('click'[\s\S]*returnHeadlessRun\(S\._monRun\)/,
+  'only the Continue here button should request service ownership');
 assert.match(app, /service\.alive === false[\s\S]*Headless\.heartbeatFresh\(service\)/,
   'Activity adoption should wait for the post-teardown service acknowledgment');
 
 const adoptStart = app.indexOf('async function adoptHeadlessRun(runId, mode)');
 const adopt = app.slice(adoptStart, app.indexOf('/** The run died out of reach', adoptStart));
+assert.match(adopt, /closeOverlays\(\);[\s\S]*dock\(''\);[\s\S]*cv-monitor[\s\S]*window\.scrollTo\(0, 0\)/,
+  'explicit adoption should clear the monitor, old dock, and mobile home layout first');
+const monitorStart = app.indexOf('function enterMonitor(runId)');
+const monitor = app.slice(monitorStart, app.indexOf('function wireMonitorOnce()', monitorStart));
+assert.match(monitor, /closeOverlays\(\);[\s\S]*dock\(''\);[\s\S]*cv-model/,
+  'the monitor should not sit over the Activity training chart or model canvas');
 assert.match(adopt, /if \(mode === 'finished'\) \{[\s\S]*await continueLocalRun\(true\);[\s\S]*headlessClear\(runId\);/,
   'a finished handback should clear its marker only after the viewer rebuilds');
 assert.match(adopt, /await continueLocalRun\(false\);[\s\S]*S\.state !== 'train'[\s\S]*owner: 'activity'/,

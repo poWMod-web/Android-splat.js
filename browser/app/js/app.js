@@ -6405,7 +6405,7 @@ async function headlessBootCheck() {
   if (!status || typeof status.status !== 'string') { headlessDiscard(runId); return false; }
   if (status.status === 'finished') { await adoptHeadlessRun(runId, 'finished'); return true; }
   if (status.status === 'interrupted' && status.stopped) {
-    await returnHeadlessRun(runId);
+    showRecovery(runId, status);
     return true;
   }
   if (!Headless.isLiveStatus(status)) { showRecovery(runId, status); return true; }
@@ -6421,9 +6421,24 @@ async function headlessBootCheck() {
   showRecovery(runId, status);
   return true;
 }
+/** Notification tap into an existing Activity: reopen the file-backed
+ *  monitor, but never adopt or stop the service trainer automatically. */
+globalThis.__splatxrOpenMonitor = () => {
+  if (S.state === 'monitor') return;
+  headlessBootCheck().catch((e) => console.warn('[headless] monitor reopen failed', e));
+};
+
 /** The monitor: progress + snapshot viewer for a run owned by the service.
  *  No session, no GPU, no viewport — this process only watches files. */
 function enterMonitor(runId) {
+  // Cut away every surface from the Activity's former train/home state. The
+  // monitor is a real screen, not a modal over a still-mounted chart or wall.
+  closeOverlays();
+  dock('');
+  $('monitor').hidden = true;
+  document.getElementById('cv-model')?.remove();
+  gpuCanvas = null;
+  window.scrollTo(0, 0);
   S.state = 'monitor';
   S._monRun = runId; S._monAt = 0; S._monShotBusy = false; S._monShotAt = 0;
   // off by default, like the in-app training visuals — snapshots render on demand
@@ -6517,7 +6532,7 @@ async function monitorPoll(now, force = false) {
     if (!status) return;   // transient read failure — retry next poll
     if (status.status === 'finished') { adoptHeadlessRun(runId, 'finished'); return; }
     if (status.status === 'interrupted' && status.stopped) {
-      returnHeadlessRun(runId);
+      showRecovery(runId, status);
       return;
     }
     if (!Headless.isLiveStatus(status)) { showRecovery(runId, status); return; }
@@ -6622,6 +6637,16 @@ async function returnHeadlessRun(runId) {
  *  done viewer, continue resumes training locally under the same run id (the
  *  photos are already staged, so the handoff re-arms without re-uploading). */
 async function adoptHeadlessRun(runId, mode) {
+  // Continue is the sole transition out of the monitor. Remove its canvas and
+  // any stale wall/train dock before continuation creates a new chart/canvas.
+  closeOverlays();
+  dock('');
+  $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
+  $('monitor').hidden = true;
+  document.getElementById('cv-monitor')?.remove();
+  document.getElementById('cv-model')?.remove();
+  gpuCanvas = null;
+  window.scrollTo(0, 0);
   flash(mode === 'finished' ? 'Opening the finished model …' : 'Resuming training here …', 60000);
   let handbackStatus = {};
   try {
@@ -6727,6 +6752,12 @@ async function adoptHeadlessRun(runId, mode) {
 /** The run died out of reach (pressure kill, crash, pre-handoff swipe): offer
  *  Continue-here from the files, or Discard. */
 function showRecovery(runId, status) {
+  closeOverlays();
+  dock('');
+  $('monitor').hidden = true;
+  document.getElementById('cv-model')?.remove();
+  gpuCanvas = null;
+  window.scrollTo(0, 0);
   S.state = 'monitor';
   S._monRun = runId; S._monRecovery = true;
   $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;

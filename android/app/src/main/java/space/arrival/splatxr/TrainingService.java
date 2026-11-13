@@ -102,15 +102,10 @@ public final class TrainingService extends Service {
     private int handoffGen;   // the pass timers only settle the pass that armed them
     private boolean backgroundRequested;
     private boolean handoffFromBackground;
-    private boolean returnToActivity;
     private String backgroundRunId;
     private final Runnable backgroundHandoff = () -> {
         if (!backgroundRequested || backgroundRunId == null || headlessActive) return;
         beginHandoff(backgroundRunId, true);
-    };
-    private final Runnable returnHandoff = () -> {
-        if (returnToActivity && headlessActive)
-            headlessEval("window.__headlessStop&&window.__headlessStop()");
     };
     private final Runnable bootWatchdog = () -> {
         if (!headlessActive || headlessRunId == null) return;
@@ -197,23 +192,13 @@ public final class TrainingService extends Service {
                 }
                 break;
             }
-            case "activity-foreground": {
-                String runId = intent.getStringExtra("runId");
+            case "activity-visible": {
+                // Foregrounding is not consent to transfer the model. Cancel
+                // only a handoff which has not begun; an existing service
+                // trainer keeps running until the monitor's Continue button.
                 backgroundRequested = false;
                 backgroundRunId = null;
                 main.removeCallbacks(backgroundHandoff);
-                // Once the Activity comes back it must own the model again.
-                // Latch across a handoff/boot race; postProgress retries the
-                // guarded hook after the headless session is actually ready.
-                boolean returning = runId != null && runId.equals(RunFiles.readActive(this)) &&
-                        (headlessActive || (handoffRunId != null && runId.equals(handoffRunId)) ||
-                                "service".equals(ownerOf(runId)));
-                if (returning) {
-                    returnToActivity = true;
-                    if (headlessActive) headlessEval("window.__headlessStop&&window.__headlessStop()");
-                } else if (!foreground && !headlessActive) {
-                    stopSelf();
-                }
                 break;
             }
             case "headless-pause":
@@ -655,10 +640,6 @@ public final class TrainingService extends Service {
                     if (lastPaused) releaseWakeLock(); else acquireWakeLock();
                 }
                 showOngoing(lastTitle, lastText, lastDone, lastTotal, false);
-                if (returnToActivity && headlessActive) {
-                    main.removeCallbacks(returnHandoff);
-                    main.postDelayed(returnHandoff, 1500);
-                }
             } catch (Exception ignored) { /* progress display must never crash training */ }
         }
 
@@ -750,11 +731,9 @@ public final class TrainingService extends Service {
         handoffSettled = true;
         handoffRunId = null;
         backgroundRequested = false;
-        returnToActivity = false;
         backgroundRunId = null;
         if (main != null) {
             main.removeCallbacks(backgroundHandoff);
-            main.removeCallbacks(returnHandoff);
         }
         destroyHeadless();
         try { notifications().cancel(NOTIF_ID); } catch (Exception ignored) { /* already gone */ }

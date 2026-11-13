@@ -39,7 +39,7 @@ assert.match(trainShare, /closeOverlays\(\);/, 'leaving the viewer for setup sho
 
 // going back to a trained model or home closes overlays — every landing calls it
 const calls = (app.match(/\n\s*closeOverlays\(\);/g) || []).length;
-assert.equal(calls, 8, `all eight transition sites should call the closer (found ${calls})`);
+assert.equal(calls, 11, `all eleven transition sites, including monitor/recovery/adopt, should call the closer (found ${calls})`);
 for (const [name, from, to] of [
   ['closeDetailCard', 'function closeDetailCard()', 'function closeViewerToHome()'],
   ['closeViewerToHome', 'function closeViewerToHome()', 'async function fetchShareRecon('],

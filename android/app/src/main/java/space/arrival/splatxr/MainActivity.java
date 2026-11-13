@@ -361,31 +361,37 @@ public final class MainActivity extends Activity {
         } catch (Exception ignored) { /* the already-foreground service still has swipe fallback */ }
     }
 
-    /** Cancel only a handoff which is still in its debounce window. Once the
-     *  checkpoint request has been sent, the page deliberately becomes the
-     *  monitor and the service remains the sole GPU owner. */
+    /** Returning quickly may cancel only the service's debounce. If its
+     *  trainer already owns the run, leave it untouched until Continue here. */
     @Override protected void onStart() {
         super.onStart();
-        requestTrainingReturn();
+        notifyActivityVisible();
     }
 
+    /** A notification tap only brings the monitor to the front. It must not
+     *  stop the healthy service trainer behind the user's back: ownership moves
+     *  only after the user presses Continue here in that monitor. */
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        if (intent != null && ACTION_RETURN_TRAINING.equals(intent.getAction())) requestTrainingReturn();
+        notifyActivityVisible();
+        if (intent != null && ACTION_RETURN_TRAINING.equals(intent.getAction()) && webView != null) {
+            webView.post(() -> {
+                try { webView.evaluateJavascript(
+                        "window.__splatxrOpenMonitor&&window.__splatxrOpenMonitor()", null); }
+                catch (Exception ignored) { /* boot already checks the durable marker */ }
+            });
+        }
     }
 
-    /** Foregrounding means the Activity should own its live model again, not
-     *  merely display the service monitor. The service checkpoints first and
-     *  acknowledges GPU teardown through service.json. */
-    private void requestTrainingReturn() {
+    private void notifyActivityVisible() {
         String active = RunFiles.readActive(this);
         if (active == null) return;
         try {
             startService(new Intent(this, TrainingService.class)
-                    .putExtra("action", "activity-foreground")
+                    .putExtra("action", "activity-visible")
                     .putExtra("runId", active));
-        } catch (Exception ignored) { /* no service means boot recovery owns the files */ }
+        } catch (Exception ignored) { /* the monitor reads the durable files */ }
     }
 
     @Override protected void onDestroy() {
