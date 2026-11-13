@@ -1495,12 +1495,19 @@ async function useOwnPhotos(list, capture = null) {
   // capture zips (exported photos + camera JSON) unpack to files and join
   // the flow below; a session zip restores instead of training
   const all = [];
+  let fromZip = false;
+  const zipSkipped = [];
   for (const f of list) {
     if (f && /\.zip$/i.test(f.name || '')) {
       try {
         const u = await unpackZipFile(f);
         if (u.kind === 'session') { restoreSession({ bytes: u.bytes }); return; }
-        if (u.kind === 'capture') { all.push(...u.files); continue; }
+        if (u.kind === 'capture') {
+          fromZip = true;
+          all.push(...u.files);
+          for (const s of u.skipped || []) zipSkipped.push(s);
+          continue;
+        }
         flash(`"${f.name}" holds no photos or session — skipped.`, 5000);
       } catch (e) { flash(`Could not unpack "${f.name}": ${e.message}`, 8000); }
       continue;
@@ -1509,8 +1516,15 @@ async function useOwnPhotos(list, capture = null) {
   }
   if (!capture && all.some((f) => /\.json$/i.test(f.name))) {
     try {
-      capture = await reviewCapture(await datasetFromSelection(all));
+      capture = await reviewCapture(await datasetFromSelection(all, fromZip ? { fromZip: true } : {}));
       if (!capture) return;
+      // folder zips carry strays (OS metadata, thumbnails, second copies):
+      // name them so the review count never surprises
+      const leftOut = [...zipSkipped, ...(capture.dropped || [])];
+      if (leftOut.length) {
+        flash(`Left out of the zip import: ${leftOut.slice(0, 3).join('; ')}` +
+          `${leftOut.length > 3 ? `; +${leftOut.length - 3} more` : ''}.`, 9000);
+      }
     } catch (e) { flash(`Could not import capture: ${e.message}`, 9000); return; }
   }
   // video intake is back on (2026-09-08): the v2 extractor decodes every frame

@@ -115,54 +115,150 @@ export function storedCapture(dataset) {
   };
 }
 
-export async function datasetFromSelection(files) {
+export async function datasetFromSelection(files, opts = {}) {
+  // fromZip: a folder zip carries strays a hand pick never would (OS
+  // metadata, thumbnails, second copies) — drop them with names attached
+  // instead of failing the import. Hand picks stay strict.
+  const fromZip = !!opts.fromZip;
+  const dropped = [];
   const images = files.filter((f) => f.type.startsWith('image/'));
   const jsons = files.filter((f) => /\.json$/i.test(f.name));
   if (!jsons.length) return { kind: 'photos', files: images, points: [] };
-  let transforms = null, points = [], pointsByFrame = null, metadata = {};
+  let transforms = null, keptCam = null, points = [], pointsByFrame = null, metadata = {};
   for (const file of jsons) {
+    // a saved run zipped beside a capture: it restores through the session
+    // door, never as cameras (its frames[] are viewer records, not poses)
+    if (fromZip && SESSION_MARKERS.has(file.name.toLowerCase())) {
+      dropped.push(`${file.name} (a saved run, not a capture — left out)`);
+      continue;
+    }
     const json = JSON.parse((await file.text()).replace(/^\uFEFF/, ''));
     if (Array.isArray(json.frames) || Array.isArray(json.cameras)) {
-      if (transforms) throw new Error('Choose only one camera JSON file with the matching photos.');
-      transforms = json;
+      if (transforms) {
+        if (!fromZip) throw new Error('Choose only one camera JSON file with the matching photos.');
+        if (file.name.toLowerCase() === 'transforms.json' && keptCam.toLowerCase() !== 'transforms.json') {
+          dropped.push(`${keptCam} (a second camera file — kept transforms.json)`);
+          transforms = json; keptCam = file.name;
+        } else {
+          dropped.push(`${file.name} (a second camera file — kept ${keptCam})`);
+        }
+        continue;
+      }
+      transforms = json; keptCam = file.name;
     } else if (Array.isArray(json.points)) { points = json.points; pointsByFrame = json.pointsByFrame || pointsByFrame; }
-    else if (file.name === 'capture.json') metadata = json;
+    else if (/^capture\.json$/i.test(file.name)) metadata = json;
   }
   if (!transforms) throw new Error('No camera definitions found. Select transforms.json or cameras.json with the matching photos.');
+  let kept = images;
+  if (fromZip) {
+    const defs = transforms.frames || transforms.cameras;
+    const camKeys = new Set(), camFull = new Set();
+    for (const fr of defs) {
+      const p = fr.file_path || fr.image;
+      if (p) { camKeys.add(frameKey(p)); camFull.add(baseOf(p).toLowerCase()); }
+    }
+    const groups = new Map();
+    for (const img of images) {
+      if (!camKeys.has(frameKey(img.name))) { dropped.push(`${img.name} (no camera names it — left out)`); continue; }
+      const k = frameKey(img.name);
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(img);
+    }
+    kept = [];
+    for (const g of groups.values()) {
+      if (g.length === 1) { kept.push(g[0]); continue; }
+      const win = g.find((img) => camFull.has(img.name.toLowerCase())) || g[0];
+      for (const img of g) if (img !== win) dropped.push(`${img.name} (same photo as ${win.name} — kept one)`);
+      kept.push(win);
+    }
+  }
   pointsByFrame = pointsByFrame || metadata.pointsByFrame || null;
-  const dataset = validateDataset({ kind: 'ar', files: images, transforms, points, pointsByFrame, metadata: { ...metadata, imported: true } });
-  return validateDataset(filterDataset(dataset, images.map((f) => f.name)));
+  const dataset = validateDataset({ kind: 'ar', files: kept, transforms, points, pointsByFrame, metadata: { ...metadata, imported: true } });
+  const shaped = validateDataset(filterDataset(dataset, kept.map((f) => f.name)));
+  if (dropped.length) shaped.dropped = dropped;
+  return shaped;
 }
 
 const IMAGE_MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
   webp: 'image/webp', bmp: 'image/bmp', gif: 'image/gif', avif: 'image/avif' };
 const baseOf = (p) => String(p).split(/[\\/]/).pop();
 
+/** Directory of a zip entry path (zips always use forward slashes). */
+const dirOf = (p) => {
+  const s = String(p);
+  const i = s.lastIndexOf('/');
+  return i < 0 ? '' : s.slice(0, i);
+};
+/** Basenames that mark a saved run (session restore), never a capture. */
+const SESSION_MARKERS = new Set(['recon.json', 'state.bin', 'model.sog']);
+
+/** OS metadata inside folder zips: macOS resource forks (`._photo.jpg`)
+ *  and `__MACOSX` folders, Windows thumbnails, desktop settings. Never
+ *  photos, never poses — skipped wherever they appear. */
+export function isZipJunk(path) {
+  const lower = String(path).toLowerCase();
+  if (lower === '__macosx' || lower.startsWith('__macosx/') || lower.includes('/__macosx/')) return true;
+  const base = baseOf(path);
+  if (base.startsWith('._')) return true;
+  return ['.ds_store', 'thumbs.db', 'desktop.ini'].includes(base.toLowerCase());
+}
+
 /** What a zip holds, by entry basenames (folders ignored — OS zips nest):
- *  'session' restores, 'capture' trains, anything else is skipped. */
+ *  photos train ('capture') even beside a stray saved run — our own
+ *  session zips never hold photos, so photos-first can't misroute them;
+ *  'session' restores, anything else is skipped. */
 export function zipEntryKind(names) {
-  const base = names.map((n) => baseOf(n).toLowerCase());
-  if (base.includes('recon.json') || base.includes('state.bin') || base.includes('model.sog')) return 'session';
+  const base = names.filter((n) => !isZipJunk(n)).map((n) => baseOf(n).toLowerCase());
   if (base.some((n) => IMAGE_MIME[n.split('.').pop()])) return 'capture';
+  if (base.some((n) => SESSION_MARKERS.has(n))) return 'session';
   return null;
 }
 
 /** Unpack an exported capture zip (photos + camera JSON, flat or nested)
  *  into Files the photo flow already understands: images typed by
- *  extension, camera/seed/capture JSONs by name. READMEs and strays are
- *  dropped; basenames keep pose↔photo matching exact. Returns the raw
- *  bytes too, so session zips restore without a second read. */
+ *  extension, camera/seed/capture JSONs by name. OS metadata (`._` forks,
+ *  `__MACOSX`, thumbnails) is skipped, second copies of a basename keep
+ *  the one next to the camera file, and READMEs plus strays are dropped —
+ *  basenames still keep pose↔photo matching exact. `skipped` names every
+ *  entry left out so the call site can say so. Returns the raw bytes too,
+ *  so session zips restore without a second read. */
 export async function unpackZipFile(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const entries = await readZip(bytes);
   const kind = zipEntryKind([...entries.keys()]);
-  if (kind !== 'capture') return { kind, files: [], bytes };
+  if (kind !== 'capture') return { kind, files: [], bytes, skipped: [] };
+  const skipped = [];
+  // the camera JSON's folder is home: a second copy of a basename (another
+  // capture zipped alongside) keeps the photo next to the poses
+  let home = null;
+  for (const name of entries.keys()) {
+    const b = baseOf(name).toLowerCase();
+    if (b === 'transforms.json' || b === 'cameras.json') { home = dirOf(name).toLowerCase(); break; }
+  }
+  const seen = new Map();
   const files = [];
-  for (const [name, data] of entries) {
+  const pushFile = (name, data) => {
     const base = baseOf(name);
     const ext = base.split('.').pop().toLowerCase();
     if (IMAGE_MIME[ext]) files.push(new File([data], base, { type: IMAGE_MIME[ext] }));
     else if (ext === 'json') files.push(new File([data], base, { type: 'application/json' }));
+  };
+  for (const [name, data] of entries) {
+    if (isZipJunk(name)) { skipped.push(`${baseOf(name)} (OS metadata — left out)`); continue; }
+    const base = baseOf(name);
+    const ext = base.split('.').pop().toLowerCase();
+    if (!IMAGE_MIME[ext] && ext !== 'json') continue;
+    const key = base.toLowerCase();
+    if (!seen.has(key)) { seen.set(key, name); pushFile(name, data); continue; }
+    const prev = seen.get(key);
+    if (home != null && dirOf(prev).toLowerCase() !== home && dirOf(name).toLowerCase() === home) {
+      seen.set(key, name);
+      skipped.push(`${prev} (same file as ${name} — kept the one next to the camera file)`);
+      files.splice(files.findIndex((f) => f.name.toLowerCase() === key), 1);
+      pushFile(name, data);
+    } else {
+      skipped.push(`${name} (same file as ${prev} — kept one)`);
+    }
   }
-  return { kind, files, bytes };
+  return { kind, files, bytes, skipped };
 }
