@@ -657,7 +657,10 @@ export class Session {
     // lowMem released the frame pixels after the first boot (and the worker
     // owns the seed) — a second seed (recover) has nothing to boot from.
     // Say so plainly instead of crashing inside setup on null rgb.
-    if (this.frames && this.frames.some((f) => !f.rgb)) {
+    // (recover's catch shows the device-lost screen, so this text is for
+    // the log — and it stays "reload": the old trainer died with the
+    // device, so unlike a refused prune there is nothing to resume.)
+    if (this._seedPixelsReleased()) {
       throw new Error('seed data was released after the first boot (lowMem) — reload to train again');
     }
     await this._bootTrainer(trainerOpts, {
@@ -1024,8 +1027,22 @@ export class Session {
    * camera wiring happens exactly like seed(); pass opts.iter to continue the
    * schedules where the saved run stopped.
    */
+  /** True when a reseed has no pixels to re-upload: lowMem released the
+   *  frame buffers after the first boot. View-only boots need no pixels.
+   *  One predicate for seed(), seedFrom() and prune's pre-check, so the
+   *  three cannot drift apart. */
+  _seedPixelsReleased(viewOnly = false) {
+    return !viewOnly && !!this.frames && this.frames.some((f) => !f.rgb);
+  }
+
   async seedFrom(gaussians, opts = {}) {
     if (!this.recon && !opts.viewOnly) throw new Error('useReconstruction() first');
+    // fail BEFORE touching this.model: a refused reseed leaves the session
+    // bit-identical, so the prune catch resumes the previous trainer onto
+    // the same model it paused (a failed prune never bricks the run)
+    if (this._seedPixelsReleased(opts.viewOnly)) {
+      throw new Error('seed data was released after the first boot (lowMem) — the current run is intact, but it cannot reseed');
+    }
     this._stage({ stage: 'seed', done: 0, total: 1 });
     const radius = opts.sceneRadius ?? this.recon?.sceneRadius ?? 10;
     this.model = { data: gaussians.data, n: gaussians.n, radius, dc: gaussians.dc };
@@ -1070,12 +1087,6 @@ export class Session {
       const dilate = trainerOpts.dilate ?? 0.1;
       this.model.data = unbakeOpacityCompensation(this.model.data, this.model.n, f0, pos, dilate);
       this._log(`unbaked the export's opacity compensation (f ${f0.toFixed(1)}, ${this.recon.cams.length} cams, dilate ${dilate})`);
-    }
-    // lowMem released the frame pixels after the first boot — a reseed
-    // (prune-and-continue, checkpoint resume) has nothing to re-upload.
-    // Say so plainly instead of crashing inside setup on null rgb.
-    if (!opts.viewOnly && this.frames && this.frames.some((f) => !f.rgb)) {
-      throw new Error('seed data was released after the first boot (lowMem) — reload to train again');
     }
     await this._bootTrainer(trainerOpts, {
       gaussians: {
@@ -1159,6 +1170,12 @@ export class Session {
       // run stays paused (the cap-hit card's prune included).
       const resume = () => { if (wasTraining) { this.training = false; this.start(); } };
       try {
+        // refuse BEFORE the readback + simplify: on a phone the merge-down
+        // burns minutes of CPU on a model the reseed cannot take (lowMem
+        // released the pixels after the first boot)
+        if (this._seedPixelsReleased()) {
+          throw new Error('seed data was released after the first boot (lowMem) — the current run is intact, but it cannot reseed');
+        }
         const before = this.holdout >= 0 ? await trainer.evalCamPsnr(this.holdout) : null;
         const raw = await trainer.readGaussians();
         say(`pruning ${raw.n.toLocaleString()} splats to ${Math.round(ratio * 100)}% …`);

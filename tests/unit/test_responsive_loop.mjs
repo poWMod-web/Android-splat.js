@@ -592,6 +592,12 @@ async function smallTrainer(trainerOpts = {}) {
   // (which then dies on the shim GPU — the guard is what we pin)
   await assert.rejects(mk(new Float32Array(64 * 48 * 3).fill(0.5)).seed({ hull: false, maskPoints: false }),
     /requestAdapter|WebGPU not available/);
+  // seedFrom (prune's reseed) refuses with the run-intact message — the old
+  // trainer was never touched, so training (not a reload) is the way on
+  await assert.rejects(mk(null).seedFrom({ data: new Float32Array(16), n: 1 }, {}), /cannot reseed/);
+  // positive control: pixels present sails past the guard into boot
+  await assert.rejects(mk(new Float32Array(64 * 48 * 3).fill(0.5)).seedFrom({ data: new Float32Array(16), n: 1 }, {}),
+    /requestAdapter|WebGPU not available/);
 }
 
 // ---- opts.timestamps === false kills the timer, keeps the merge ----

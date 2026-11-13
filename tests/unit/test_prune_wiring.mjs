@@ -221,8 +221,19 @@ assert.match(trainer, /if \(!this\.ready\) throw new Error\('GSTrainer\.stepOnce
   'steps on a half-booted trainer fail loud, not as .length on a missing deck');
 assert.match(session, /if \(trainer\.ready === false\) \{/,
   'the frame loop refuses a half-booted trainer loudly');
+assert.match(session, /seed data was released after the first boot \(lowMem\) — the current run is intact, but it cannot reseed/,
+  'a refused reseed says the run trains on (prune keeps its never-bricks promise)');
 assert.match(session, /seed data was released after the first boot \(lowMem\) — reload to train again/,
-  'a lowMem reseed says plainly its pixels are gone (prune and checkpoint resume alike)');
+  'recover-after-device-loss still says reload (its trainer is dead, not intact)');
+// fail fast: the prune pre-check runs before the expensive merge-down, and
+// seedFrom's guard runs before it touches this.model (a refused reseed
+// leaves the session bit-identical for the resume in the prune catch)
+const pruneFn = session.slice(session.indexOf('async pruneAndContinue('), session.indexOf('async recover()'));
+assert.ok(pruneFn.indexOf('_seedPixelsReleased()') < pruneFn.indexOf('simplifyGaussians('),
+  'prune refuses before the merge-down burns phone CPU');
+const seedFromFn = session.slice(session.indexOf('async seedFrom('), session.indexOf('async pruneAndContinue('));
+assert.ok(seedFromFn.indexOf('_seedPixelsReleased(opts.viewOnly)') < seedFromFn.indexOf('this.model = '),
+  'seedFrom guards before it touches the model');
 assert.match(session, /trainerOpts = \{ \.\.\.trainerOpts, useStats: true \};/,
   'soft-prune-off boots accumulate the mass window the dead cull scores');
 assert.match(app, /training on with the unpruned model\./,
