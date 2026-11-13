@@ -25,6 +25,7 @@ import { Viewport, camCentre, quatFromR, quatToR, qslerp, rollAngleToUp, snapRol
 import { Developer, fitRect } from './develop.js';
 import { Chart, psnrToApproxSsimPercent } from './chart.js';
 import { bmp, readyBmp, sizedUrl } from './img.js';
+import * as Headless from './headless.js';
 
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => Math.round(n).toLocaleString('en-US');
@@ -982,7 +983,7 @@ function boot() {
   // a shared result: load it straight into the done-state viewer
   if (mp.get('space') && SHELL !== 'browser') restoreShared(mp.get('space'));
   else if (mp.get('model')) restoreSession({ url: mp.get('model'), reconUrl: mp.get('recon') });
-  else mountWall();
+  else headlessBootCheck().then((took) => { if (!took) mountWall(); });
 }
 
 // WebGPU probe: navigator.gpu can EXIST while the adapter is unavailable
@@ -2060,6 +2061,12 @@ async function avatarPrep(gen) {
 async function startPrep() {
   document.getElementById('failcard')?.remove();
   if (S.commitSettings && !S.commitSettings()) return;
+  // migrate-on-swipe: one GPU — a live headless run owns it until adopted,
+  // recovered or discarded (the monitor is the way back to it)
+  if (await headlessMarkerLive()) {
+    flash('A training run is still going in the background — reopen it from the monitor instead of starting over it.', 8000);
+    return;
+  }
   if (!S.preset || S.photos.length < 3) { flash('Use at least 3 overlapping views; 20–200 are recommended.', 7000); return; }
   if (S.preset.capture?.transforms) {
     try { validateDataset(S.preset.capture); }
@@ -2779,6 +2786,7 @@ function startTraining() {
   const keepId = resumeId || S.runId || null;
   S.runId = keepId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
   androidNotifStart();   // background-safe from the first cycle
+  stageHeadlessRun();   // migrate-on-swipe: the files-dir handoff stages from the first cycle
   S._ckptIter = 0;
   (async () => {
     const runGen = S.gen;
@@ -3043,6 +3051,7 @@ function toggleTrain() {
   // a user-pressed pause takes ownership from any touch-hold: the release
   // must not resume over it
   if (!on) { S._dragPaused = false; checkpointRun('pause').catch(() => {}); }
+  headlessStatusWrite(on ? 'active' : 'paused');
   // Shade control: where the bridge can flip the notification's button the
   // service stays up across the pause (Resume in the shade); old bridges
   // shed it and restart it instead.
@@ -3561,6 +3570,7 @@ if (IOS) document.addEventListener('visibilitychange', () => {
 if (!IOS) document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden' && S.state === 'train') {
     checkpointRun('hidden').catch(() => {});
+    maybeFileCheckpoint();   // migrate-on-swipe lottery ticket: best-effort, may not land
   }
 });
 
@@ -3721,6 +3731,7 @@ async function runAvatarStages() {
 
 async function finish() {
   androidNotifStop(true);   // the shade keeps the final score
+  headlessClear();   // locally finished: nothing for the service to take over
   S.iter = S.session.trainer.iter;   // honest count — the run may end early
   S.minutes = Math.max(1, Math.round((performance.now() - S.trainT0) / 60000));
   enterDone();
@@ -5962,6 +5973,459 @@ function renderHud() {
   hud.replaceChildren(row);
 }
 
+// ── migrate-on-swipe (Android headless handoff) ─────────────────────────────
+// Design B: this Activity trains locally (live session, live viewer) and stages
+// a run directory under files/runs/<runId>/ from the first cycle — manifest,
+// photos, periodic state checkpoints. On swipe-away the :training service
+// resumes from the last file checkpoint in its headless WebView; the reopened
+// app monitors (snapshot viewer + progress when Show-visuals is on), adopts
+// the finish, or recovers. File shapes + cadence live in ./headless.js (shared
+// with the driver, unit-pinned); this side only stages, checkpoints, watches.
+//
+// Every entry here is best-effort and bridge-gated: without the files-dir
+// bridge (desktop, old app builds) each function returns silently and the run
+// continues exactly as without the feature.
+/** The files-dir bridge (MainActivity, new enough to stage runs). */
+const headlessBridge = () => {
+  const b = globalThis.AndroidARBridge;
+  return b && typeof b.writeRunJson === 'function' && typeof b.writeRunChunk === 'function' ? b : null;
+};
+/** True when a run directory claims a live run (staging/booting/active/paused). */
+async function headlessMarkerLive() {
+  if (!headlessBridge()) return false;
+  try {
+    const r = await fetch(Headless.activeUrl());
+    if (!r.ok) return false;
+    const { runId } = await r.json();
+    if (!Headless.validRunId(runId)) return false;
+    const st = await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
+    if (!st.ok) return false;
+    return Headless.isLiveStatus(await st.json());
+  } catch { return false; }
+}
+/** Stage the handoff for this run: manifest + marker now, photos in the
+ *  background (native captures retain their disk files, everything else
+ *  uploads its bytes), status flips to live when the photos land. */
+function stageHeadlessRun() {
+  const b = headlessBridge();
+  // the avatar route never stages (its post-training stages have no headless twin)
+  if (!b || !S.runId || S.avatar || S._hlStaged) return;
+  S._hlStaged = S.runId;
+  S._hlPhotos = false; S._hlCkptAt = 0; S._hlCkptIter = 0; S._hlCkptBusy = false;
+  (async () => {
+    const runId = S.runId, gen = S.gen;
+    try {
+      const files = (S.loadedFiles || []).filter((f) => f && f.name);
+      if (files.length < 3) throw new Error('no photos in hand');
+      const names = files.map((f) => f.name);
+      if (!names.every(Headless.validName)) throw new Error('photo names outside the handoff set');
+      b.writeRunJson(runId, 'manifest.json', JSON.stringify(Headless.buildManifest({
+        runId, name: (S._localRun && S._localRun.name) || (S.preset && S.preset.name) || 'model',
+        maxIters: S.maxIters, gpu: S.settings.gpu, srcKey: null,
+        photos: names, photoSource: 'files', settings: S.settings,
+      })));
+      b.writeRunJson(runId, 'status.json', JSON.stringify(
+        { status: 'staging', owner: 'activity', iter: 0, at: Date.now() }));
+      b.setActiveRun(runId);
+      // previous runs' dirs go now: the active one is the only resume source
+      if (typeof b.cleanRunDirs === 'function') { try { b.cleanRunDirs(runId); } catch { /* best-effort */ } }
+      const cap = S.preset && S.preset.capture;
+      const native = !!(cap && cap.metadata && cap.metadata.nativeARCore) && typeof b.retainCapture === 'function';
+      if (native) {
+        // zero-copy path: the AR frames still sit in captures/current (the
+        // post-import reset is skipped on headless-capable bridges) — the
+        // native side copies them into the run dir, no bytes cross the bridge
+        try {
+          b.retainCapture(runId);
+          await pollRetain(runId, names);
+          // the copy matches: the captures/current originals are redundant
+          try { b.resetCaptureSession(); } catch { /* best-effort */ }
+        } catch (e) {
+          console.warn('[headless] retain fell back to upload', e);
+          await stagePhotoBlobs(runId, files);
+        }
+      } else {
+        await stagePhotoBlobs(runId, files);
+      }
+      if (S.gen !== gen || S.runId !== runId) return;   // the run moved on without us
+      S._hlPhotos = true;
+      headlessStatusWrite(S.session && S.session.training ? 'active' : 'paused');
+    } catch (e) {
+      // staging failed: the handoff stays disarmed (no photos.json, no live
+      // status) and the run continues locally exactly as without the feature
+      console.warn('[headless] staging failed — local training unaffected', e);
+    }
+  })().catch(() => {});
+}
+/** Wait for the native retain (polls the status the bridge thread writes). */
+async function pollRetain(runId, names) {
+  const b = headlessBridge();
+  for (let i = 0; i < 120; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    let st = null;
+    try { st = JSON.parse(b.retainStatus(runId)); } catch { throw new Error('retain unreadable'); }
+    if (st && st.error) throw new Error(st.error);
+    if (st && st.done) {
+      const kept = new Set(st.names || []);
+      const missing = names.filter((n) => !kept.has(n));
+      if (missing.length) throw new Error(`${missing.length} photos not retained`);
+      return;
+    }
+  }
+  throw new Error('retain timed out');
+}
+/** Upload photo bytes into the run dir (uploads, picker shots, video frames —
+ *  everything without disk files). Chunked base64, sequential, throttled past
+ *  the training loop's own hunger: one photo per macrotask at most. */
+async function stagePhotoBlobs(runId, files) {
+  const b = headlessBridge();
+  const names = [];
+  for (const f of files) {
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    for (let o = 0; o < bytes.length; o += 262144) {
+      b.writeRunChunk(runId, `photos/${f.name}`, Headless.encodeB64(bytes.subarray(o, o + 262144)),
+        o + 262144 >= bytes.length);
+    }
+    names.push(f.name);
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  b.writeRunJson(runId, 'photos.json', JSON.stringify({ names, complete: true, at: Date.now() }));
+}
+/** The periodic file checkpoint (same cadence module as the driver). Called
+ *  from the frame loop; the gate inside keeps it to a timestamp compare. */
+function maybeFileCheckpoint() {
+  const b = headlessBridge();
+  if (!b || !S._hlStaged || S.runId !== S._hlStaged || !S._hlPhotos) return;
+  if (!S.session || !S.session.trainer || !S.session.training || S._hlCkptBusy) return;
+  const iter = S.session.trainer.iter | 0;
+  const shK = S.session.trainer.shK | 0;
+  const approx = S.session.trainer.n * (16 * 4 + shK * 3 * 4);
+  if (!Headless.checkpointDue({ now: Date.now(), lastAt: S._hlCkptAt, lastIter: S._hlCkptIter, iter, bytes: approx })) return;
+  S._hlCkptBusy = true;
+  (async () => {
+    const gen = S.gen;
+    try {
+      const { packState, buildReconJson } = await import('./session_io.js');
+      const state = await packState(S.session);
+      if (S.gen !== gen) return;
+      for (let o = 0; o < state.length; o += 262144) {
+        if (!b.writeRunChunk(S.runId, 'state.bin', Headless.encodeB64(state.subarray(o, o + 262144)),
+          o + 262144 >= state.length)) throw new Error('state chunk refused');
+      }
+      const recon = buildReconJson(S);
+      if (S.gen !== gen) return;
+      b.writeRunJson(S.runId, 'recon.json', JSON.stringify(recon));
+      S._hlCkptAt = Date.now(); S._hlCkptIter = iter;
+      headlessStatusWrite('active', iter);
+    } catch (e) {
+      console.warn('[headless] file checkpoint failed', e);   // never disturb the run
+    } finally { S._hlCkptBusy = false; }
+  })().catch(() => { S._hlCkptBusy = false; });
+}
+/** Best-effort status write for the staged run (pause/active/iter). */
+function headlessStatusWrite(status, iter = null) {
+  const b = headlessBridge();
+  if (!b || !S._hlStaged || S.runId !== S._hlStaged) return;
+  try {
+    b.writeRunJson(S.runId, 'status.json', JSON.stringify({
+      status, owner: 'activity',
+      iter: iter ?? (S.session && S.session.trainer ? S.session.trainer.iter | 0 : 0),
+      at: Date.now(),
+    }));
+  } catch { /* best-effort */ }
+}
+/** The Activity's liveness beat: the service refuses the takeover while this
+ *  is fresh (a fast reopen + Continue-here must win over a booting twin). */
+function headlessActivityBeat(now) {
+  const b = headlessBridge();
+  if (!b || !S._hlStaged || S.runId !== S._hlStaged) return;
+  if (now - (S._hlBeatAt || 0) < 5000) return;
+  S._hlBeatAt = now;
+  try {
+    b.writeRunJson(S.runId, 'activity.json', JSON.stringify({ alive: true, at: Date.now() }));
+  } catch { /* best-effort */ }
+}
+/** Release the marker (local finish, adopt, discard). Only clears when the
+ *  marker still names this run — a newer run's claim is never touched. */
+function headlessClear(runId = S.runId) {
+  const b = headlessBridge();
+  S._hlStaged = null; S._hlPhotos = false;
+  if (!b || !runId) return;
+  try { b.clearActiveRun(runId); } catch { /* best-effort */ }
+}
+/** Boot hijack: a marker from an outlived run opens adopt / monitor /
+ *  recover instead of home. True when it took over boot. */
+async function headlessBootCheck() {
+  if (!headlessBridge()) return false;
+  let runId = null;
+  try {
+    const r = await fetch(Headless.activeUrl());
+    if (!r.ok) return false;
+    runId = (await r.json()).runId;
+    if (!Headless.validRunId(runId)) return false;
+  } catch { return false; }
+  let status = null;
+  try {
+    status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json();
+  } catch { status = null; }
+  if (!status || typeof status.status !== 'string') { headlessDiscard(runId); return false; }
+  if (status.status === 'finished') { await adoptHeadlessRun(runId, 'finished'); return true; }
+  if (!Headless.isLiveStatus(status)) { showRecovery(runId, status); return true; }
+  let service = null;
+  try {
+    service = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json();
+  } catch { service = null; }
+  // owner activity + live status with no service heartbeat: the Activity died
+  // before any takeover (a crash, or a swipe racing the service boot) —
+  // recover from the files. A fresh service heartbeat means the takeover is
+  // already under way: monitor it instead of fighting it.
+  if (status.owner === 'service' || Headless.heartbeatFresh(service)) { enterMonitor(runId); return true; }
+  showRecovery(runId, status);
+  return true;
+}
+/** The monitor: progress + snapshot viewer for a run owned by the service.
+ *  No session, no GPU, no viewport — this process only watches files. */
+function enterMonitor(runId) {
+  S.state = 'monitor';
+  S._monRun = runId; S._monAt = 0; S._monShotBusy = false; S._monShotAt = 0;
+  try { S._monVisuals = localStorage.getItem('splatjs_monitor_visuals') !== '0'; }
+  catch { S._monVisuals = true; }
+  $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
+  if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
+  let mc = document.getElementById('cv-monitor');
+  if (!mc) {
+    mc = document.createElement('canvas');
+    mc.id = 'cv-monitor';
+    $('stage').insertBefore(mc, $('cv'));
+  }
+  mc.style.display = S._monVisuals ? '' : 'none';
+  paintMonitorHead(runId);
+  wireMonitorOnce();
+  $('monitor').hidden = false;
+  syncMonitorButtons();
+  monitorPoll(0, true);
+}
+function wireMonitorOnce() {
+  if (S._monWired) return;
+  S._monWired = true;
+  $('mon-visuals').addEventListener('click', () => {
+    S._monVisuals = !S._monVisuals;
+    try { localStorage.setItem('splatjs_monitor_visuals', S._monVisuals ? '1' : '0'); } catch { /* private mode */ }
+    const mc = document.getElementById('cv-monitor');
+    if (mc) mc.style.display = S._monVisuals ? '' : 'none';
+    syncMonitorButtons();
+    if (S._monVisuals) monitorPoll(0, true);   // visuals on: a snapshot now, not next poll
+  });
+  $('mon-pause').addEventListener('click', () => {
+    const b = headlessBridge();
+    if (!b || !S._monRun) return;
+    try { b.headlessCommand(S._monPaused ? 'headless-resume' : 'headless-pause', S._monRun); } catch { /* best-effort */ }
+    S._monPaused = !S._monPaused;
+    syncMonitorButtons();
+  });
+  $('mon-stop').addEventListener('click', async () => {
+    if (!S._monRun) return;
+    $('mon-stop').disabled = true;
+    flash('Stopping the background run …', 60000);
+    if (await headlessTakeover(S._monRun)) adoptHeadlessRun(S._monRun, 'continue');
+    else { $('mon-stop').disabled = false; flash('The background run is still taking over — try again in half a minute.', 8000); }
+  });
+  $('mon-continue').addEventListener('click', async () => {
+    if (!S._monRun) return;
+    $('mon-continue').disabled = true;
+    if (await headlessTakeover(S._monRun)) adoptHeadlessRun(S._monRun, 'continue');
+    else { $('mon-continue').disabled = false; flash('The background run is still taking over — try again in half a minute.', 8000); }
+  });
+  $('mon-discard').addEventListener('click', () => {
+    if (S._monRun) headlessDiscard(S._monRun);
+    S._monRun = null;
+    $('monitor').hidden = true;
+    document.getElementById('cv-monitor')?.remove();
+    S.state = 'ready';
+    showHome();
+  });
+  $('mon-x').addEventListener('click', () => {
+    // step aside to the wall (the run keeps training headless); Start stays
+    // guarded by the live marker until adopted, recovered or discarded
+    $('monitor').hidden = true;
+    document.getElementById('cv-monitor')?.remove();
+    S.state = 'ready';
+    showHome();
+  });
+}
+function syncMonitorButtons() {
+  const v = $('mon-visuals'), p = $('mon-pause');
+  if (v) v.textContent = S._monVisuals ? 'Hide visuals' : 'Show visuals';
+  if (p) p.textContent = S._monPaused ? 'Resume' : 'Pause';
+  for (const id of ['mon-live', 'mon-rec']) {
+    const el = $(id);
+    if (el) el.hidden = (id === 'mon-live') === !!S._monRecovery;
+  }
+}
+function paintMonitorHead(runId) {
+  S._monRecovery = false;
+  $('mon-name').textContent = 'Background training';
+  $('mon-sub').textContent = `run ${runId}`;
+  syncMonitorButtons();
+}
+/** The monitor tick (5 s): status/progress paint, snapshot when visuals are
+ *  on, and the transitions — finished adopts, dead/interrupted recovers. */
+async function monitorPoll(now, force = false) {
+  if (S.state !== 'monitor' || !S._monRun || S._monRecovery) return;
+  if (!force && now - S._monAt < 5000) return;
+  S._monAt = now;
+  const runId = S._monRun;
+  try {
+    const status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json().catch(() => null);
+    if (!status) return;   // transient read failure — retry next poll
+    if (status.status === 'finished') { adoptHeadlessRun(runId, 'finished'); return; }
+    if (!Headless.isLiveStatus(status)) { showRecovery(runId, status); return; }
+    let service = null, progress = null;
+    try { service = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json(); } catch { /* quiet */ }
+    try { progress = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'progress.json')))).json(); } catch { /* quiet */ }
+    if (status.owner === 'service' && !Headless.heartbeatFresh(service)) { showRecovery(runId, status); return; }
+    S._monPaused = status.status === 'paused';
+    paintMonitorProgress(status, progress);
+    syncMonitorButtons();
+    if (S._monVisuals) monitorSnapshot(runId);
+  } catch (e) { console.warn('[headless] monitor poll failed', e); }
+}
+function paintMonitorProgress(status, progress) {
+  const p = progress || {};
+  const iter = p.iter ?? status.iter ?? 0, max = p.maxIters || 0;
+  $('mon-state').textContent = status.status === 'paused' ? 'Paused' :
+    status.status === 'staging' ? 'Preparing …' : status.status === 'booting' ? 'Taking over …' : 'Training';
+  $('mon-iter').textContent = max > 0
+    ? `${fmt(iter)} / ${fmt(max)} cycles (${Math.min(99, Math.round(100 * iter / max))}%)`
+    : `${fmt(iter)} cycles`;
+  $('mon-score').textContent = p.psnr != null ? `${(+p.psnr).toFixed(1)} dB` : '—';
+  $('mon-splats').textContent = p.splats != null ? fmt(p.splats) : '—';
+  const age = p.at ? Math.max(0, Math.round((Date.now() - p.at) / 1000)) : null;
+  $('mon-updated').textContent = age == null ? '' : age < 8 ? 'live' : `updated ${age}s ago`;
+}
+/** Demand-driven snapshot: ask the headless twin for a fresh render, show the
+ *  newest PNG on disk (it lands a poll or two after the request). */
+async function monitorSnapshot(runId) {
+  if (S._monShotBusy) return;
+  S._monShotBusy = true;
+  try {
+    const b = headlessBridge();
+    try { b && b.headlessCommand('headless-snapshot', runId); } catch { /* best-effort */ }
+    const meta = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.json')))).json().catch(() => null);
+    if (!meta || !(meta.at > S._monShotAt)) return;
+    const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.png')));
+    if (!r.ok) return;
+    const bmp = await createImageBitmap(await r.blob());
+    if (S._monRun !== runId || !S._monVisuals) { bmp.close(); return; }
+    const mc = document.getElementById('cv-monitor');
+    if (!mc) { bmp.close(); return; }
+    if (mc.width !== bmp.width || mc.height !== bmp.height) { mc.width = bmp.width; mc.height = bmp.height; }
+    mc.getContext('2d').drawImage(bmp, 0, 0);
+    bmp.close();
+    S._monShotAt = meta.at;
+  } catch (e) { console.warn('[headless] snapshot poll failed', e); }
+  finally { S._monShotBusy = false; }
+}
+/** Take the run back from the service: stop any live twin, then verify it
+ *  stood down (or was already dead) before local training touches the GPU.
+ *  False = a takeover is still in flight, retry shortly. */
+async function headlessTakeover(runId) {
+  const b = headlessBridge();
+  try { b && b.headlessCommand('headless-stop', runId); } catch { /* best-effort */ }
+  for (let i = 0; i < 12; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    let s = null;
+    try { s = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json(); }
+    catch { return true; }   // unreadable: nothing live left to fight
+    if (!s || !Headless.isLiveStatus(s) || s.owner === 'activity') return true;
+    if (Date.now() - (s.at || 0) > 60000) return true;   // stale twin: dead
+  }
+  return false;
+}
+/** Adopt a background run into this Activity: finished opens view-only in the
+ *  done viewer, continue resumes training locally under the same run id (the
+ *  photos are already staged, so the handoff re-arms without re-uploading). */
+async function adoptHeadlessRun(runId, mode) {
+  flash(mode === 'finished' ? 'Opening the finished model …' : 'Resuming training here …', 60000);
+  try {
+    const manifest = Headless.validateManifest(
+      await (await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')))).json());
+    const recon = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'recon.json')))).json();
+    const stateBytes = new Uint8Array(
+      await (await fetch(Headless.fresh(Headless.runUrl(runId, 'state.bin')))).arrayBuffer());
+    const status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json().catch(() => ({}));
+    const { parseState } = await import('./session_io.js');
+    parseState(stateBytes);   // torn writes refuse HERE, not mid-rebuild
+    let thumb = null;
+    try {
+      const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.png')));
+      if (r.ok) thumb = await r.blob();
+    } catch { /* the tile just goes textless */ }
+    // photos resolve as URL-backed: the runs handler serves the staged bytes
+    recon.source = {
+      preset: null,
+      names: [...manifest.photos],
+      urls: manifest.photos.map((n) => Headless.photoUrl(runId, n)),
+    };
+    const rec = {
+      id: runId, name: manifest.name, status: 'finished',
+      createdAt: manifest.stagedAt || Date.now(), updatedAt: Date.now(),
+      iter: status.iter ?? recon.iter ?? 0, maxIters: manifest.maxIters,
+      splats: status.splats ?? recon.splats ?? 0,
+      psnr: status.psnr ?? (recon.stats && recon.stats.psnrTrain) ?? null,
+      frames: manifest.photos.length, ownSrc: false,
+      state: new Blob([stateBytes]), recon, ...(thumb ? { thumb } : {}),
+    };
+    const { saveRun, patchRun } = await import('./store.js');
+    // same id as the run's own record: adopting patches it, never duplicates it
+    if (!(await patchRun(runId, rec))) await saveRun(rec);
+    S._localRun = { ...rec };
+    headlessClear(runId);
+    $('monitor').hidden = true;
+    document.getElementById('cv-monitor')?.remove();
+    if (mode === 'finished') await continueLocalRun(true);
+    else {
+      // the handoff re-arms around the already-staged photos (no re-upload)
+      S._hlStaged = runId; S._hlPhotos = true;
+      S._hlCkptAt = Date.now(); S._hlCkptIter = rec.iter; S._hlCkptBusy = false;
+      const b = headlessBridge();
+      if (b) {
+        try {
+          b.setActiveRun(runId);
+          b.writeRunJson(runId, 'status.json', JSON.stringify(
+            { status: 'active', owner: 'activity', iter: rec.iter, at: Date.now() }));
+        } catch { /* best-effort */ }
+      }
+      await continueLocalRun(false);
+    }
+  } catch (e) {
+    console.error(e);
+    flash(`Could not open the background run (${e.message}) — it stays stored for another try.`, 9000);
+  }
+}
+/** The run died out of reach (pressure kill, crash, pre-handoff swipe): offer
+ *  Continue-here from the files, or Discard. */
+function showRecovery(runId, status) {
+  S.state = 'monitor';
+  S._monRun = runId; S._monRecovery = true;
+  $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
+  document.getElementById('cv-monitor')?.remove();
+  $('mon-name').textContent = 'Background training interrupted';
+  const iter = status && status.iter ? ` at cycle ${fmt(status.iter)}` : '';
+  const why = status && status.error ? ` — ${status.error}` :
+    ' — the system reclaimed it while the app was away.';
+  $('mon-sub').textContent = `The run's last checkpoint${iter} is stored on this device${why}`;
+  wireMonitorOnce();
+  $('monitor').hidden = false;
+  syncMonitorButtons();
+}
+/** Drop the marker (unreadable status, user discard). The files stay until the
+ *  next staged run cleans them — a discard must never strand a booting twin
+ *  by deleting the bytes under it. */
+function headlessDiscard(runId) {
+  headlessClear(runId);
+}
+
 // ── training notification (Android) ─────────────────────────────────────────
 // A foreground-service notification carries the live score + splat count and
 // keeps the process (and its GPU work) alive while the app runs in the
@@ -6286,6 +6750,9 @@ function loop() {
     lastPulse = now;
     paintStrip();          // the pulse on the frame being trained on
   }
+  if (S.state === 'train') maybeFileCheckpoint();
+  if (S.state === 'train') headlessActivityBeat(now);
+  if (S.state === 'monitor') monitorPoll(now);
 
   renderHud();
   draw();
@@ -6332,6 +6799,9 @@ function prepSub() {
 
 // ── drawing ─────────────────────────────────────────────────────────────────
 function draw() {
+  // migrate-on-swipe monitor: the snapshot canvas paints itself on poll —
+  // no viewport overlays over another process's training
+  if (S.state === 'monitor') return;
   const cv = $('cv');
   const r = cv.getBoundingClientRect();
   if (Math.abs(r.width * (vp.dpr || 1) - cv.width) > 2 || Math.abs(r.height * (vp.dpr || 1) - cv.height) > 2) vp.resize();

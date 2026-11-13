@@ -191,8 +191,13 @@ export function initXRUI({ onCapture, flash }) {
         await onCapture(reviewed);
         // the frames now live in the app as Blobs (IndexedDB) — the native
         // copies are redundant, so drop them instead of leaving up to 200
-        // JPEGs in app storage until the next capture
-        try { nativeBridge.resetCaptureSession(); } catch { /* best-effort */ }
+        // JPEGs in app storage until the next capture. Except on
+        // headless-capable bridges: the migrate-on-swipe retain copies them
+        // into the run dir at Start (zero bytes over the bridge) and the
+        // staging path resets the session once the copy matches.
+        if (typeof nativeBridge.writeRunJson !== 'function') {
+          try { nativeBridge.resetCaptureSession(); } catch { /* best-effort */ }
+        }
       } catch (e) {
         console.error('[SplatXR] Native capture import failed:', e);
         showXRHelp(e.message || 'Native ARCore capture could not be imported.');

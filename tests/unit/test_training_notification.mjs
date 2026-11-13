@@ -15,8 +15,8 @@ assert.match(manifest, /<uses-permission android:name="android\.permission\.WAKE
   'the manifest should allow the training wake lock');
 assert.match(manifest, /<uses-permission android:name="android\.permission\.POST_NOTIFICATIONS" \/>/,
   'the manifest should allow progress notifications');
-assert.match(manifest, /<service android:name="\.TrainingService" android:exported="false" android:foregroundServiceType="specialUse">/,
-  'the manifest should declare the training service as special-use');
+assert.match(manifest, /<service android:name="\.TrainingService" android:exported="false" android:process=":training" android:foregroundServiceType="specialUse">/,
+  'the manifest should declare the training service as special-use in the :training process');
 assert.match(manifest, /PROPERTY_SPECIAL_USE_FGS_SUBTYPE/,
   'the service should declare its special-use subtype property');
 
@@ -37,7 +37,9 @@ assert.match(service, /setProgress\(total, Math\.min\(done, total\), false\)/,
 assert.match(service, /notifications\(\)\.notify\(DONE_ID/,
   'a finish should leave one dismissible summary notification');
 assert.match(service, /public void onTaskRemoved\(Intent rootIntent\) \{/,
-  'swiping the app away should tear the service down');
+  'swiping the app away should reach the takeover-or-teardown branch');
+assert.match(service, /String active = RunFiles\.readActive\(this\);[\s\S]*?if \(active == null\) \{[\s\S]*?teardown\(\);[\s\S]*?main\.postDelayed\(\(\) -> bootHeadlessNow\(runId\), TAKEOVER_DELAY_MS\);/,
+  'a swipe with no outlived run should tear down; with one, the headless trainer should boot after the GPU delay');
 assert.match(service, /checkSelfPermission\(Manifest\.permission\.POST_NOTIFICATIONS\)[\s\S]*?!= PackageManager\.PERMISSION_GRANTED\) return;/,
   'the finish summary should be skipped when notifications are denied instead of crashing');
 assert.match(service, /catch \(Exception ignored\) \{ \/\* progress display must never crash training \*\/ \}/,
@@ -46,8 +48,8 @@ assert.match(service, /catch \(Exception ignored\) \{ \/\* a summary must never 
   'the finish summary should never crash the app');
 assert.match(service, /startForeground\(NOTIF_ID, notification[\s\S]*?catch \(Exception e\) \{[\s\S]*?teardown\(\);/,
   'a refused foreground start should stop quietly instead of crashing');
-assert.match(service, /if \(intent == null\) \{ stopSelf\(\); return START_NOT_STICKY; \}/,
-  'a restart without a command should stop instead of going zombie');
+assert.match(service, /if \(intent == null\) \{[\s\S]*?resurrectIfOurs\(active\)[\s\S]*?stopSelf\(\);/,
+  'a restart without a command should resurrect only a service-owned run, else stop instead of going zombie');
 assert.match(service, /releaseWakeLock\(\);/,
   'every teardown path should release the wake lock');
 assert.match(service, /case "paused":/,

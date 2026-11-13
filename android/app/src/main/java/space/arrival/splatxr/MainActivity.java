@@ -62,9 +62,11 @@ public final class MainActivity extends Activity {
 
         File captureRoot = new File(getFilesDir(), "captures");
         if (!captureRoot.exists()) captureRoot.mkdirs();
+        File runsRoot = RunFiles.runsDir(this);
         assetLoader = new WebViewAssetLoader.Builder()
                 .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
                 .addPathHandler("/captures/", new WebViewAssetLoader.InternalStoragePathHandler(this, captureRoot))
+                .addPathHandler("/runs/", new WebViewAssetLoader.InternalStoragePathHandler(this, runsRoot))
                 .build();
 
         webView = new WebView(this);
@@ -298,7 +300,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         try { unregisterReceiver(toggleTrainingReceiver); } catch (Exception ignored) { /* never registered */ }
-        stopTrainingService();
+        if (RunFiles.readActive(this) == null) stopTrainingService();
         cancelFileSave();
         if (fileChooserCallback != null) {
             fileChooserCallback.onReceiveValue(null);
@@ -362,6 +364,74 @@ public final class MainActivity extends Activity {
 
         @JavascriptInterface public void setTrainingPaused(boolean paused) {
             sendTrainingPaused(paused);
+        }
+
+        // ── migrate-on-swipe: the files-dir bus (RunFiles). Small atomic
+        // JSON writes, chunked large writes, the active marker, the native
+        // photo retain, and commands to the headless twin. Reads go through
+        // the /runs/ path handler as plain fetches, not through here.
+        @JavascriptInterface public boolean writeRunJson(String runId, String name, String json) {
+            return RunFiles.writeJson(MainActivity.this, runId, name, json);
+        }
+
+        @JavascriptInterface public boolean writeRunChunk(String runId, String name, String base64, boolean last) {
+            return RunFiles.writeChunk(MainActivity.this, runId, name, base64, last);
+        }
+
+        @JavascriptInterface public boolean setActiveRun(String runId) {
+            return RunFiles.writeActive(MainActivity.this, runId);
+        }
+
+        @JavascriptInterface public boolean clearActiveRun(String runId) {
+            return RunFiles.clearActive(MainActivity.this, runId);
+        }
+
+        @JavascriptInterface public void cleanRunDirs(String keepId) {
+            RunFiles.cleanRunDirs(MainActivity.this, keepId);
+        }
+
+        @JavascriptInterface public String retainStatus(String runId) {
+            String done = RunFiles.readJson(MainActivity.this, runId, "photos.json");
+            return done != null ? done : "{\"pending\":true}";
+        }
+
+        /** Copy the native capture's frames into the run dir (background
+         *  thread; the page polls retainStatus). Zero bytes cross the bridge. */
+        @JavascriptInterface public void retainCapture(final String runId) {
+            new Thread(() -> {
+                try {
+                    java.util.List<String> kept = RunFiles.retainCaptureFrames(MainActivity.this, runId);
+                    JSONObject status = new JSONObject();
+                    if (kept.isEmpty()) {
+                        status.put("error", "no capture frames left to retain");
+                    } else {
+                        status.put("names", new JSONArray(kept));
+                        status.put("complete", true);
+                    }
+                    status.put("at", System.currentTimeMillis());
+                    RunFiles.writeJson(MainActivity.this, runId, "photos.json", status.toString());
+                } catch (Exception e) {
+                    try {
+                        JSONObject status = new JSONObject();
+                        status.put("error", e.getMessage() == null ? "retain failed" : e.getMessage());
+                        RunFiles.writeJson(MainActivity.this, runId, "photos.json", status.toString());
+                    } catch (Exception ignored) { /* status is best-effort */ }
+                }
+            }).start();
+        }
+
+        /** A command to the headless twin (pause/resume/stop/snapshot). Plain
+         *  start: the service is already foreground while a run lives. */
+        @JavascriptInterface public void headlessCommand(String action, String runId) {
+            if (action == null || runId == null) return;
+            if (!action.equals("headless-pause") && !action.equals("headless-resume") &&
+                    !action.equals("headless-stop") && !action.equals("headless-snapshot")) return;
+            if (!RunFiles.validRunId(runId)) return;
+            try {
+                startService(new Intent(MainActivity.this, TrainingService.class)
+                        .putExtra("action", action)
+                        .putExtra("runId", runId));
+            } catch (Exception ignored) { /* the twin is gone; the files say so */ }
         }
 
         @JavascriptInterface public String exportDataset() {

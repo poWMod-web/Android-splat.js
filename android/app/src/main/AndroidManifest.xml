@@ -25,7 +25,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <service android:name=".TrainingService" android:exported="false" android:foregroundServiceType="specialUse">
+        <!-- :training isolates the migrate-on-swipe trainer: swiping the task away
+             kills the Activity's process, and this process (already foreground
+             from training start) survives it with the headless WebView. -->
+        <service android:name=".TrainingService" android:exported="false" android:process=":training" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="On-device 3D Gaussian splat training with live progress." />
         </service>

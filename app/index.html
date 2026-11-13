@@ -52,6 +52,29 @@
 
   <div class="controls" id="controls" hidden></div>
 
+  <!-- migrate-on-swipe monitor: a run owned by the :training service while the
+       app was away — progress + snapshot viewer, no local session. -->
+  <div class="card-start" id="monitor" hidden>
+    <button class="card-x" id="mon-x" aria-label="Leave the monitor">&times;</button>
+    <p class="eyebrow">BACKGROUND TRAINING</p>
+    <h1 id="mon-name">Background training</h1>
+    <p class="origin" id="mon-sub"></p>
+    <div class="xr-capabilities" aria-label="Run status"><span id="mon-state">—</span><span id="mon-iter">—</span><span id="mon-score">—</span><span id="mon-splats">—</span><span id="mon-updated"></span></div>
+    <div class="upload" id="mon-live">
+      <div class="upload-btns">
+        <button class="btn btn-accent" id="mon-visuals">Show visuals</button>
+        <button class="btn btn-outline" id="mon-pause">Pause</button>
+        <button class="btn btn-outline" id="mon-stop">Stop &amp; continue here</button>
+      </div>
+    </div>
+    <div class="upload" id="mon-rec" hidden>
+      <div class="upload-btns">
+        <button class="btn btn-accent" id="mon-continue">Continue here</button>
+        <button class="btn btn-outline" id="mon-discard">Discard</button>
+      </div>
+    </div>
+  </div>
+
   <div class="card-start" id="start" hidden>
     <button class="card-x" id="card-x" hidden aria-label="Keep the current run">&times;</button>
 
