@@ -38,8 +38,8 @@ assert.match(service, /notifications\(\)\.notify\(DONE_ID/,
   'a finish should leave one dismissible summary notification');
 assert.match(service, /public void onTaskRemoved\(Intent rootIntent\) \{/,
   'swiping the app away should reach the takeover-or-teardown branch');
-assert.match(service, /String active = RunFiles\.readActive\(this\);[\s\S]*?if \(active == null\) \{[\s\S]*?teardown\(\);[\s\S]*?main\.postDelayed\(\(\) -> bootHeadlessNow\(runId\), TAKEOVER_DELAY_MS\);/,
-  'a swipe with no outlived run should tear down; with one, the headless trainer should boot after the GPU delay');
+assert.match(service, /String active = RunFiles\.readActive\(this\);[\s\S]*?if \(active == null\) \{[\s\S]*?teardown\(\);[\s\S]*?sendBroadcast\(handoff\);[\s\S]*?HANDOFF_ACK_MS/,
+  'a swipe with no outlived run should tear down; with one, the service should ask for the pass, settling on a timer');
 assert.match(service, /checkSelfPermission\(Manifest\.permission\.POST_NOTIFICATIONS\)[\s\S]*?!= PackageManager\.PERMISSION_GRANTED\) return;/,
   'the finish summary should be skipped when notifications are denied instead of crashing');
 assert.match(service, /catch \(Exception ignored\) \{ \/\* progress display must never crash training \*\/ \}/,

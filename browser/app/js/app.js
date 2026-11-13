@@ -598,35 +598,7 @@ function boot() {
   });
   $('btn-new').addEventListener('click', async (e) => {
     e.stopPropagation();
-    const runId = S.runId || (S._localRun && S._localRun.id);
-    if (runId) await persistRunDetails(runId, { full: true }).catch(() => {});
-    // a shared creation holds nothing precious — Back is simply the way
-    // home. When the visitor came from within the app, real history.back()
-    // is better: the bfcache restores the feed with its scroll intact.
-    if (S._localRun && S._viewerOpen) { closeViewerToHome(); return; }
-    if (S.restored) {
-      let fromApp = false;
-      try {
-        const r = document.referrer && new URL(document.referrer);
-        fromApp = !!r && r.origin === location.origin;
-      } catch (err) { /* opaque referrer -> treat as external */ }
-      if (fromApp && history.length > 1) history.back();
-      else location.href = 'index.html';
-      return;
-    }
-    // Back out of a live run secures it first (the checkpoint lives here
-    // now — pausing is free). ?back=1 tells the fresh boot this was a
-    // deliberate leave: the handoff marker stands down instead of hijacking
-    // the boot into recovery, and the Yours tile is the way back. Cancelling
-    // the beforeunload confirm keeps training AND the armed handoff: nothing
-    // below runs until the navigation commits.
-    if ((S.state === 'train' || S.state === 'prep') && S.runId) {
-      await checkpointRun('back').catch(() => {});
-    }
-    // Back from a run leaves the same way the logo does: a page navigation
-    // home. The wall is never rendered OVER a live scene — the beforeunload
-    // confirm guards a training in progress.
-    location.href = (S.state === 'train' || S.state === 'prep') ? 'index.html?back=1' : 'index.html';
+    await goBack();
   });
   $('btn-training-visuals').addEventListener('click', toggleTrainingVisuals);
   $('card-x').addEventListener('click', closePicker);
@@ -916,10 +888,10 @@ function boot() {
     history.replaceState(null, '', aboutUrl(false));
   };
   window.closeAbout = closeAbout;
-  $('brand').addEventListener('click', () => {
+  $('brand').addEventListener('click', async () => {
     const atHome = !$('start').hidden && $('detail').hidden;
     if (atHome) openAbout();
-    else location.href = 'index.html';
+    else await goBack();   // off the home tile the brand IS Back (checkpoint included)
   });
   $('read-more').addEventListener('click', (e) => {
     e.preventDefault(); e.stopPropagation();
@@ -2487,6 +2459,46 @@ function trainDeadEnd() {
   backToSetup();
 }
 
+/** Back — one routine for every door that means it (the header Back, the
+ *  brand title off the home tile, the phone's own Back through popstate's
+ *  sibling path): a live run is secured first (IDB for Yours, files for the
+ *  handoff), then home. */
+async function goBack() {
+  const runId = S.runId || (S._localRun && S._localRun.id);
+  if (runId) await persistRunDetails(runId, { full: true }).catch(() => {});
+  // a shared creation holds nothing precious — Back is simply the way
+  // home. When the visitor came from within the app, real history.back()
+  // is better: the bfcache restores the feed with its scroll intact.
+  if (S._localRun && S._viewerOpen) { closeViewerToHome(); return; }
+  if (S.restored) {
+    let fromApp = false;
+    try {
+      const r = document.referrer && new URL(document.referrer);
+      fromApp = !!r && r.origin === location.origin;
+    } catch (err) { /* opaque referrer -> treat as external */ }
+    if (fromApp && history.length > 1) history.back();
+    else location.href = 'index.html';
+    return;
+  }
+  // Back out of a live run secures it first (the checkpoint lives here
+  // now — pausing is free). ?back=1 tells the fresh boot this was a
+  // deliberate leave: the handoff marker stands down instead of hijacking
+  // the boot into recovery, and the Yours tile is the way back. Cancelling
+  // the beforeunload confirm keeps training AND the armed handoff: nothing
+  // below runs until the navigation commits.
+  if ((S.state === 'train' || S.state === 'prep') && S.runId) {
+    await checkpointRun('back').catch(() => {});
+    // the handoff-format copy alongside: strictly, the ?back boot stands the
+    // marker down and orphans these files — but a swipe landing mid-reload
+    // (killed before the boot clears the marker) settles the handoff from
+    // exactly this copy instead of interrupting
+    await secureFileCheckpoint().catch(() => {});
+  }
+  // Back from a run leaves the same way the logo does: a page navigation
+  // home. The wall is never rendered OVER a live scene — the beforeunload
+  // confirm guards a training in progress.
+  location.href = (S.state === 'train' || S.state === 'prep') ? 'index.html?back=1' : 'index.html';
+}
 /** After a failed solve: back to the setup card the run started from — with
  *  its settings and Start button, so a different resolution is one tap away.
  *  (In classic mode Start lives ON the detail card; the bare start card was
@@ -3595,7 +3607,6 @@ if (IOS) document.addEventListener('visibilitychange', () => {
 if (!IOS) document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden' && S.state === 'train') {
     checkpointRun('hidden').catch(() => {});
-    maybeFileCheckpoint();   // migrate-on-swipe lottery ticket: best-effort, may not land
   }
 });
 
@@ -5392,7 +5403,9 @@ addEventListener('popstate', () => {
   // Back does — a page navigation home (the wall is never rendered OVER a
   // live scene; beforeunload asks before a training is thrown away)
   if ((S.state === 'prep' || S.state === 'train') && $('start').hidden) {
-    checkpointRun('back').catch(() => {}).finally(() => { location.href = 'index.html?back=1'; });
+    checkpointRun('back').catch(() => {})
+      .then(() => secureFileCheckpoint().catch(() => {}))
+      .then(() => { location.href = 'index.html?back=1'; });
   }
 });
 
@@ -6036,7 +6049,7 @@ function stageHeadlessRun() {
   // the avatar route never stages (its post-training stages have no headless twin)
   if (!b || !S.runId || S.avatar || S._hlStaged) return;
   S._hlStaged = S.runId;
-  S._hlPhotos = false; S._hlCkptAt = 0; S._hlCkptIter = 0; S._hlCkptBusy = false;
+  S._hlPhotos = false; S._hlCkptBusy = false;
   (async () => {
     const runId = S.runId, gen = S.gen;
     try {
@@ -6116,36 +6129,28 @@ async function stagePhotoBlobs(runId, files) {
   }
   b.writeRunJson(runId, 'photos.json', JSON.stringify({ names, complete: true, at: Date.now() }));
 }
-/** The periodic file checkpoint (same cadence module as the driver). Called
- *  from the frame loop; the gate inside keeps it to a timestamp compare. */
-function maybeFileCheckpoint() {
+/** One-shot file checkpoint: the handoff-format copy (state.bin + recon +
+ *  status iter). Written ONLY on transitions — leaving (Back) and the
+ *  swipe-away handoff — never periodically. Awaits; true when it landed. */
+async function secureFileCheckpoint() {
   const b = headlessBridge();
-  if (!b || !S._hlStaged || S.runId !== S._hlStaged || !S._hlPhotos) return;
-  if (!S.session || !S.session.trainer || !S.session.training || S._hlCkptBusy) return;
-  const iter = S.session.trainer.iter | 0;
-  const shK = S.session.trainer.shK | 0;
-  const approx = S.session.trainer.n * (16 * 4 + shK * 3 * 4);
-  if (!Headless.checkpointDue({ now: Date.now(), lastAt: S._hlCkptAt, lastIter: S._hlCkptIter, iter, bytes: approx })) return;
+  if (!b || !S._hlStaged || S.runId !== S._hlStaged || !S._hlPhotos) return false;
+  if (!S.session || !S.session.trainer || S._hlCkptBusy) return false;
   S._hlCkptBusy = true;
-  (async () => {
-    const gen = S.gen;
-    try {
-      const { packState, buildReconJson } = await import('./session_io.js');
-      const state = await packState(S.session);
-      if (S.gen !== gen) return;
-      for (let o = 0; o < state.length; o += 262144) {
-        if (!b.writeRunChunk(S.runId, 'state.bin', Headless.encodeB64(state.subarray(o, o + 262144)),
-          o + 262144 >= state.length)) throw new Error('state chunk refused');
-      }
-      const recon = buildReconJson(S);
-      if (S.gen !== gen) return;
-      b.writeRunJson(S.runId, 'recon.json', JSON.stringify(recon));
-      S._hlCkptAt = Date.now(); S._hlCkptIter = iter;
-      headlessStatusWrite('active', iter);
-    } catch (e) {
-      console.warn('[headless] file checkpoint failed', e);   // never disturb the run
-    } finally { S._hlCkptBusy = false; }
-  })().catch(() => { S._hlCkptBusy = false; });
+  try {
+    const { packState, buildReconJson } = await import('./session_io.js');
+    const state = await packState(S.session);
+    for (let o = 0; o < state.length; o += 262144) {
+      if (!b.writeRunChunk(S.runId, 'state.bin', Headless.encodeB64(state.subarray(o, o + 262144)),
+        o + 262144 >= state.length)) return false;
+    }
+    b.writeRunJson(S.runId, 'recon.json', JSON.stringify(buildReconJson(S)));
+    headlessStatusWrite(S.session.training ? 'active' : 'paused', S.session.trainer.iter | 0);
+    return true;
+  } catch (e) {
+    console.warn('[headless] file checkpoint failed', e);   // never disturb the run
+    return false;
+  } finally { S._hlCkptBusy = false; }
 }
 /** Best-effort status write for the staged run (pause/active/iter). */
 function headlessStatusWrite(status, iter = null) {
@@ -6425,8 +6430,7 @@ async function adoptHeadlessRun(runId, mode) {
     if (mode === 'finished') await continueLocalRun(true);
     else {
       // the handoff re-arms around the already-staged photos (no re-upload)
-      S._hlStaged = runId; S._hlPhotos = true;
-      S._hlCkptAt = Date.now(); S._hlCkptIter = rec.iter; S._hlCkptBusy = false;
+      S._hlStaged = runId; S._hlPhotos = true; S._hlCkptBusy = false;
       const b = headlessBridge();
       if (b) {
         try {
@@ -6464,6 +6468,15 @@ function showRecovery(runId, status) {
 function headlessDiscard(runId) {
   headlessClear(runId);
 }
+/** The swipe-away handoff: the service asked for the run — secure it to files
+ *  and report back (headless-ready carries the verdict; silence times out). */
+globalThis.__splatxrHandoff = async () => {
+  const b = headlessBridge();
+  const runId = S.runId;
+  let ok = false;
+  try { ok = await secureFileCheckpoint(); } catch { ok = false; }
+  try { b && b.handoffDone(runId, ok); } catch { /* the service times out instead */ }
+};
 
 // ── training notification (Android) ─────────────────────────────────────────
 // A foreground-service notification carries the live score + splat count and
@@ -6789,7 +6802,6 @@ function loop() {
     lastPulse = now;
     paintStrip();          // the pulse on the frame being trained on
   }
-  if (S.state === 'train') maybeFileCheckpoint();
   if (S.state === 'train') headlessActivityBeat(now);
   if (S.state === 'monitor') monitorPoll(now);
 

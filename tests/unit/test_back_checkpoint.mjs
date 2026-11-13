@@ -19,13 +19,21 @@ assert.ok(app.includes("if (reason === 'back') flash('Progress saved on this dev
 assert.ok(app.includes("await checkpointRun('back')"), 'the header Back awaits the checkpoint');
 assert.ok(app.includes("location.href = (S.state === 'train' || S.state === 'prep') ? 'index.html?back=1' : 'index.html';"),
   'leaving a live run boots the deliberate-leave home');
-assert.ok(app.includes("checkpointRun('back').catch(() => {}).finally(() => { location.href = 'index.html?back=1'; });"),
-  'popstate checkpoints before leaving too');
+assert.ok(app.includes("checkpointRun('back').catch(() => {})\n      .then(() => secureFileCheckpoint().catch(() => {}))\n      .then(() => { location.href = 'index.html?back=1'; });"),
+  'popstate secures both formats before leaving too');
 assert.ok(app.includes("history.pushState({ sj: 'run' }, '')"),
   'training owns a history entry so Back pops into the checkpoint-leave');
 assert.ok(app.includes("else if (mp.get('back')) headlessClearMarker().finally(() => mountWall());"),
   'the deliberate-leave boot stands the handoff down instead of recovering');
 assert.ok(app.includes('async function headlessClearMarker()'), 'the marker stand-down exists');
+
+// The brand title IS Back off the home tile: one shared routine, same effect.
+// (On the home tile it still opens About.)
+assert.ok(app.includes('async function goBack()'), 'Back lives in one shared routine');
+assert.match(app, /\$\('btn-new'\)\.addEventListener\('click', async \(e\) => \{\s*e\.stopPropagation\(\);\s*await goBack\(\);/,
+  'the header Back runs the shared routine');
+assert.match(app, /\$\('brand'\)\.addEventListener\('click', async \(\) => \{[\s\S]*?else await goBack\(\);/,
+  'the brand title runs the same routine off the home tile');
 
 // Android system Back routes through the page history (same checkpoint-leave),
 // finishing the activity only with no history left.

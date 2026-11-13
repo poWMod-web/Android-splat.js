@@ -76,18 +76,6 @@ const LIVE = new Set(['staging', 'booting', 'active', 'paused']);
 export const isLiveStatus = (s) => LIVE.has(s && s.status);
 export const isOwnedBy = (s, owner) => !!s && s.owner === owner;
 
-/** Periodic file-checkpoint gate: time AND progress, with the interval scaled
- *  by checkpoint size (a 244 MB write must not fire as often as a 15 MB one).
- *  The FIRST checkpoint only waits out a short grace — an early swipe-away
- *  otherwise has nothing to resume from. Pure, so the cadence is unit-pinned. */
-export function checkpointDue({ now, lastAt, lastIter, iter, bytes }) {
-  if (!Number.isFinite(iter) || iter < 200) return false;
-  if (iter - (lastIter | 0) < 500) return false;
-  if (!(lastAt > 0)) return now >= 15000;   // first: past the boot grace
-  const interval = bytes > 200e6 ? 480000 : bytes > 100e6 ? 300000 : 180000;
-  return now - lastAt >= interval;
-}
-
 /** A monitor treats a live status with a heartbeat older than this as dead
  *  (service pressure-killed) and offers recovery instead of a frozen view. */
 export const HEARTBEAT_STALE_MS = 30000;

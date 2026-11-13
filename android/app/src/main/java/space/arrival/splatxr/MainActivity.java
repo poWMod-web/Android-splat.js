@@ -38,6 +38,10 @@ public final class MainActivity extends Activity {
     /** The training notification's Pause/Resume button: the service fires it,
      *  the activity turns it into a WebView toggle call. */
     public static final String ACTION_TOGGLE_TRAINING = "space.arrival.splatxr.TOGGLE_TRAINING";
+    /** The swipe-away handoff: the service fires it from onTaskRemoved, the
+     *  activity acks at once and runs the page's file checkpoint — the
+     *  verdict follows as headless-ready (or the service times out). */
+    public static final String ACTION_HANDOFF_TRAINING = "space.arrival.splatxr.HANDOFF_TRAINING";
     private ValueCallback<Uri[]> fileChooserCallback;
     private WebView webView;
     private WebViewAssetLoader assetLoader;
@@ -50,6 +54,22 @@ public final class MainActivity extends Activity {
             webView.post(() -> {
                 try { webView.evaluateJavascript("window.__splatxrNotifToggle&&window.__splatxrNotifToggle()", null); }
                 catch (Exception ignored) { /* the shade toggle must never crash the app */ }
+            });
+        }
+    };
+    private final BroadcastReceiver handoffReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context ctx, Intent intent) {
+            // ack FIRST (the service stops its absence timer), then run the
+            // page's handoff — the verdict follows as headless-ready
+            try {
+                startService(new Intent(MainActivity.this, TrainingService.class)
+                        .putExtra("action", "headless-ack")
+                        .putExtra("runId", intent.getStringExtra("runId")));
+            } catch (Exception ignored) { /* the service times out instead */ }
+            if (webView == null) return;
+            webView.post(() -> {
+                try { webView.evaluateJavascript("window.__splatxrHandoff&&window.__splatxrHandoff()", null); }
+                catch (Exception ignored) { /* the service times out instead */ }
             });
         }
     };
@@ -116,6 +136,11 @@ public final class MainActivity extends Activity {
             ContextCompat.registerReceiver(this, toggleTrainingReceiver, toggleFilter,
                     ContextCompat.RECEIVER_NOT_EXPORTED);
         } catch (Exception ignored) { /* shade control is best-effort */ }
+        try {
+            IntentFilter handoffFilter = new IntentFilter(ACTION_HANDOFF_TRAINING);
+            ContextCompat.registerReceiver(this, handoffReceiver, handoffFilter,
+                    ContextCompat.RECEIVER_NOT_EXPORTED);
+        } catch (Exception ignored) { /* the handoff falls back to the files on disk */ }
     }
 
     private void applySafeAreaInsets(FrameLayout content) {
@@ -317,6 +342,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         try { unregisterReceiver(toggleTrainingReceiver); } catch (Exception ignored) { /* never registered */ }
+        try { unregisterReceiver(handoffReceiver); } catch (Exception ignored) { /* never registered */ }
         if (RunFiles.readActive(this) == null) stopTrainingService();
         cancelFileSave();
         if (fileChooserCallback != null) {
@@ -435,6 +461,18 @@ public final class MainActivity extends Activity {
                     } catch (Exception ignored) { /* status is best-effort */ }
                 }
             }).start();
+        }
+
+        /** The handoff verdict: the page secured the run to files (or failed
+         *  to) — the service boots the headless twin off it, or settles. */
+        @JavascriptInterface public void handoffDone(String runId, boolean ok) {
+            if (runId == null || !RunFiles.validRunId(runId)) return;
+            try {
+                startService(new Intent(MainActivity.this, TrainingService.class)
+                        .putExtra("action", "headless-ready")
+                        .putExtra("runId", runId)
+                        .putExtra("ok", ok));
+            } catch (Exception ignored) { /* the service times out instead */ }
         }
 
         /** A command to the headless twin (pause/resume/stop/snapshot). Plain

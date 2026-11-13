@@ -60,6 +60,11 @@ public final class TrainingService extends Service {
     /** Swipe-away to headless boot: let the dying Activity process release
      *  the GPU first (two live WebGPU devices briefly would OOM small phones). */
     private static final long TAKEOVER_DELAY_MS = 8000;
+    /** The handoff handshake: acked in 5 s (alive and working — the verdict
+     *  then gets 90 s for a large checkpoint) or never (gone — settle from
+     *  whatever the handoff files hold). */
+    private static final long HANDOFF_ACK_MS = 5000;
+    private static final long HANDOFF_VERDICT_MS = 90000;
     /** A boot that posts nothing (no status flip off 'booting') in this long
      *  is wedged: mark interrupted and stand down. */
     private static final long BOOT_WATCHDOG_MS = 180000;
@@ -85,6 +90,10 @@ public final class TrainingService extends Service {
     private WebViewAssetLoader assetLoader;
     private String headlessRunId;
     private boolean headlessActive;
+    private String handoffRunId;
+    private boolean handoffAcked;
+    private boolean handoffSettled;
+    private int handoffGen;   // the pass timers only settle the pass that armed them
     private final Runnable bootWatchdog = () -> {
         if (!headlessActive || headlessRunId == null) return;
         if ("booting".equals(statusOf(headlessRunId))) {
@@ -169,6 +178,34 @@ public final class TrainingService extends Service {
             case "headless-snapshot":
                 headlessCommand(intent, "window.__headlessSnapshot&&window.__headlessSnapshot()");
                 break;
+            case "headless-ack": {
+                String runId = intent.getStringExtra("runId");
+                if (runId != null && runId.equals(handoffRunId) && !handoffSettled) {
+                    handoffAcked = true;
+                    final String id = runId;
+                    final int gen = handoffGen;
+                    main.postDelayed(() -> {
+                        if (gen == handoffGen) settleHandoff(id, "the handoff verdict never came");
+                    }, HANDOFF_VERDICT_MS);
+                }
+                break;
+            }
+            case "headless-ready": {
+                String runId = intent.getStringExtra("runId");
+                if (runId != null && runId.equals(handoffRunId) && !handoffSettled) {
+                    if (intent.getBooleanExtra("ok", false)) {
+                        // secured: boot after the GPU delay (the boot
+                        // re-validates the marker, the files and the Activity
+                        // heartbeat before touching anything)
+                        handoffSettled = true;
+                        final String id = runId;
+                        main.postDelayed(() -> bootHeadlessNow(id), TAKEOVER_DELAY_MS);
+                    } else {
+                        settleHandoff(runId, "the handoff checkpoint failed");
+                    }
+                }
+                break;
+            }
             case "headless-stop":
                 // never boots a trainer just to stop it: with no live twin the
                 // status file is the whole story
@@ -200,11 +237,23 @@ public final class TrainingService extends Service {
             super.onTaskRemoved(rootIntent);
             return;
         }
-        // a run outlived the Activity: take it over after the dying process
-        // releases the GPU (the boot re-validates the marker, the handoff
-        // files and the Activity heartbeat before touching anything)
+        // a run outlived the Activity: ask the dying process for the pass —
+        // a fresh file checkpoint it writes before it goes. Acked in 5 s or
+        // never (settled from the files on disk either way: the Back-leave
+        // copy arms exactly the swipe-during-reload case).
+        handoffRunId = active;
+        handoffAcked = false;
+        handoffSettled = false;
+        handoffGen++;
+        Intent handoff = new Intent(MainActivity.ACTION_HANDOFF_TRAINING);
+        handoff.setPackage(getPackageName());
+        handoff.putExtra("runId", active);
+        try { sendBroadcast(handoff); } catch (Exception ignored) { /* nobody home: the timer settles */ }
         final String runId = active;
-        main.postDelayed(() -> bootHeadlessNow(runId), TAKEOVER_DELAY_MS);
+        final int gen = handoffGen;
+        main.postDelayed(() -> {
+            if (gen == handoffGen && !handoffAcked) settleHandoff(runId, "the app was gone before the pass");
+        }, HANDOFF_ACK_MS);
         super.onTaskRemoved(rootIntent);
     }
 
@@ -370,9 +419,28 @@ public final class TrainingService extends Service {
         else main.post(kill);
     }
 
-    /** The takeover preconditions: a live status, staged photos and at least
-     *  one state checkpoint. A swipe before the first checkpoint cannot resume
-     *  (resume-from-state only, V1) and interrupts instead. */
+    /** Settle the pass: boot the twin off whatever the handoff files hold
+     *  (the fresh handoff copy, or the Back-leave copy when the app died
+     *  mid-reload), else interrupt with a summary. Once only; a stale settle
+     *  (marker moved on, Activity alive and training) stands down. */
+    private void settleHandoff(String runId, String why) {
+        if (handoffSettled) return;
+        handoffSettled = true;
+        if (runId == null || !runId.equals(RunFiles.readActive(this))) return;
+        if (activityFresh(runId)) return;   // the Activity owns it — stand down
+        if (handoffReady(runId)) {
+            final String id = runId;
+            main.postDelayed(() -> bootHeadlessNow(id), TAKEOVER_DELAY_MS);
+            return;
+        }
+        markInterrupted(runId, why);
+        showDone("Training interrupted", "The background pass failed — reopen to continue from the last save.");
+        teardown();
+    }
+
+    /** The takeover preconditions: a live status, staged photos and a state
+     *  checkpoint from the pass (or the Back-leave copy). Nothing to resume
+     *  from (resume-from-state only, V1) interrupts instead. */
     private boolean handoffReady(String runId) {
         try {
             String photos = RunFiles.readJson(this, runId, "photos.json");
@@ -578,6 +646,7 @@ public final class TrainingService extends Service {
     }
 
     private void teardown() {
+        handoffSettled = true;
         destroyHeadless();
         try { notifications().cancel(NOTIF_ID); } catch (Exception ignored) { /* already gone */ }
         try { stopForeground(true); } catch (Exception ignored) { /* never foregrounded */ }

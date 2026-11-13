@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import {
   RUNS_BASE, runUrl, photoUrl, activeUrl, fresh,
   validRunId, validName, buildManifest, validateManifest,
-  isLiveStatus, isOwnedBy, checkpointDue,
+  isLiveStatus, isOwnedBy,
   HEARTBEAT_STALE_MS, heartbeatFresh, encodeB64,
   snapshotSize, snapshotCam,
 } from '../../app/js/headless.js';
@@ -48,22 +48,6 @@ for (const s of ['finished', 'interrupted', null, undefined, 'bogus']) {
 assert.ok(isOwnedBy({ owner: 'service' }, 'service'));
 assert.ok(!isOwnedBy({ owner: 'activity' }, 'service'));
 
-// ── checkpoint cadence ──────────────────────────────────────────────────────
-// nothing worth keeping below iter 200, nothing new below +500 iters
-assert.ok(!checkpointDue({ now: 1e6, lastAt: 0, lastIter: 0, iter: 199, bytes: 1e6 }));
-assert.ok(!checkpointDue({ now: 1e6, lastAt: 0, lastIter: 0, iter: 600, bytes: 1e6 }) === false);
-// the first checkpoint only waits out the boot grace, not the full interval
-assert.ok(checkpointDue({ now: 20000, lastAt: 0, lastIter: 0, iter: 600, bytes: 1e6 }));
-assert.ok(!checkpointDue({ now: 10000, lastAt: 0, lastIter: 0, iter: 600, bytes: 1e6 }));
-// then time AND progress, with the interval scaled by checkpoint size
-assert.ok(checkpointDue({ now: 200000, lastAt: 10000, lastIter: 600, iter: 1200, bytes: 50e6 }));
-assert.ok(!checkpointDue({ now: 100000, lastAt: 10000, lastIter: 600, iter: 1200, bytes: 50e6 }));
-assert.ok(!checkpointDue({ now: 500000, lastAt: 10000, lastIter: 600, iter: 900, bytes: 50e6 }));
-assert.ok(!checkpointDue({ now: 350000, lastAt: 100000, lastIter: 600, iter: 2000, bytes: 150e6 }));
-assert.ok(checkpointDue({ now: 500000, lastAt: 100000, lastIter: 600, iter: 2000, bytes: 150e6 }));
-assert.ok(!checkpointDue({ now: 500000, lastAt: 100000, lastIter: 600, iter: 2000, bytes: 250e6 }));
-assert.ok(checkpointDue({ now: 700000, lastAt: 100000, lastIter: 600, iter: 2000, bytes: 250e6 }));
-
 // ── heartbeat ───────────────────────────────────────────────────────────────
 assert.equal(HEARTBEAT_STALE_MS, 30000);
 assert.ok(heartbeatFresh({ alive: true, at: Date.now() - 5000 }));
@@ -101,13 +85,27 @@ for (const call of ['postProgress', 'writeRunJson', 'writeRunChunk', 'writeSnaps
   assert.ok(driver.includes(call), `driver calls bridge.${call}`);
 }
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
-for (const fn of ['stageHeadlessRun', 'maybeFileCheckpoint', 'enterMonitor', 'adoptHeadlessRun']) {
+for (const fn of ['stageHeadlessRun', 'secureFileCheckpoint', 'enterMonitor', 'adoptHeadlessRun']) {
   assert.ok(app.includes(`function ${fn}`), `app implements ${fn}`);
 }
+// transitions only: no periodic file checkpoints anywhere on either side
+for (const [src, name] of [[app, 'app'], [driver, 'driver']]) {
+  assert.ok(!src.includes('maybeFileCheckpoint') && !src.includes('maybeCheckpoint'),
+    `${name} writes file checkpoints on transitions only, never periodically`);
+}
+assert.ok(!readFileSync(new URL('../../app/js/headless.js', import.meta.url), 'utf8').includes('checkpointDue'),
+  'the cadence gate is gone with the periodics');
+// the swipe-away handoff: the service asks, the page secures + reports back
+assert.ok(app.includes('globalThis.__splatxrHandoff'), 'app exposes the handoff hook');
+assert.ok(app.includes('b.handoffDone(runId, ok)'), 'the handoff verdict rides handoffDone');
+const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
+assert.ok(main.includes('ACTION_HANDOFF_TRAINING'), 'the handoff broadcast exists');
+assert.ok(main.includes('public void handoffDone(String runId, boolean ok)'), 'the bridge carries the verdict');
 assert.ok(app.includes("localStorage.getItem('splatjs_monitor_visuals') === '1'"),
   'the monitor visuals toggle defaults off, like the in-app training visuals');
 const svc = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
-for (const s of ['setDataDirectorySuffix("training")', 'AndroidHeadless', 'headless-snapshot', 'onTaskRemoved']) {
+for (const s of ['setDataDirectorySuffix("training")', 'AndroidHeadless', 'headless-snapshot', 'onTaskRemoved',
+    'headless-ack', 'headless-ready', 'settleHandoff', 'HANDOFF_ACK_MS', 'handoffGen']) {
   assert.ok(svc.includes(s), `service implements ${s}`);
 }
 console.log('test_headless_files: OK');

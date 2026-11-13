@@ -30,7 +30,6 @@ let snapCam = null;
 let files = [];
 let ending = false;        // finalize/abort in flight — the tick stands down
 let ckptBusy = false;
-let ckptAt = 0, ckptIter = 0;
 let lastProgAt = 0, lastProgIter = -1;
 let ips = 0, ipsAt = 0, ipsIter = 0;
 let shotBusy = false;
@@ -134,7 +133,6 @@ async function boot() {
     snapCam = H.snapshotCam(recon);
     if (snapCam) ses.view.setCamera(snapCam);
     else log('no usable monitor camera — snapshots off');
-    ckptIter = st.iter; ckptAt = Date.now();
     ipsIter = st.iter; ipsAt = Date.now();
     const wasPaused = (await fetchJson('status.json').catch(() => null) || {}).status === 'paused';
     postStatus({ status: wasPaused ? 'paused' : 'active' });
@@ -182,42 +180,36 @@ function postProgress(force = false) {
 
 async function tick() {
   if (ending || !ses || !ses.trainer) return;
-  postProgress();
-  await maybeCheckpoint();
+  postProgress();   // progress only — file checkpoints are transition-driven (finish/stop)
 }
 
-/** The periodic file checkpoint: the raw state plus a recon that carries the
+/** One-shot file checkpoint: the raw state plus a recon that carries the
  *  display cloud and leveling forward (the rebuilt session has neither — its
- *  recon holds no points and no capture metadata). */
-async function maybeCheckpoint(force = false) {
-  if (ckptBusy || !ses || !ses.trainer || !ses.training) return;
+ *  recon holds no points and no capture metadata). Transitions only. */
+async function secureFileCheckpoint() {
+  if (ckptBusy || !ses || !ses.trainer) return false;
   const iter = ses.trainer.iter | 0;
-  // size the gate without a readback: params + SH at the current count
-  const shK = ses.trainer.shK | 0;
-  const approx = ses.trainer.n * (16 * 4 + shK * 3 * 4);
-  if (!force && !H.checkpointDue({ now: Date.now(), lastAt: ckptAt, lastIter: ckptIter, iter, bytes: approx })) return;
   ckptBusy = true;
   try {
     const state = await packState(ses);
     const chunks = b64(state);
     for (let i = 0; i < chunks.length; i++) {
-      if (!bridge.writeRunChunk(runId, 'state.bin', chunks[i], i === chunks.length - 1)) {
-        throw new Error('state chunk refused');
-      }
+      if (!bridge.writeRunChunk(runId, 'state.bin', chunks[i], i === chunks.length - 1)) return false;
     }
     const S = {
       session: ses, preset: { name: manifest.name }, loadedFiles: filesWithUrls(),
-      minutes: Math.max(1, Math.round((Date.now() - ckptAt) / 60000)),
+      minutes: 0,   // headless wall-clock is unmeasured in V1 (adopt carries iter/score, not minutes)
       psnrTrain: psnr, psnrHold: null, holdHist: [], _localRun: { recon },
     };
     const next = buildReconJson(S);
     next.cloud = recon.cloud || next.cloud;   // the checkpoint's display cloud survives
     bridge.writeRunJson(runId, 'recon.json', JSON.stringify(next));
     recon = next;
-    ckptAt = Date.now(); ckptIter = iter;
     log(`checkpoint at iter ${iter} (${(state.length / 1048576).toFixed(1)} MB)`);
+    return true;
   } catch (e) {
     log('checkpoint failed', e);   // best-effort: never disturb the run
+    return false;
   } finally { ckptBusy = false; }
 }
 
@@ -233,7 +225,7 @@ async function finalize() {
     try { ses.pause(); } catch { /* already down */ }
     const iter = ses && ses.trainer ? ses.trainer.iter | 0 : 0;
     const splats = ses && ses.trainer ? ses.trainer.n | 0 : 0;
-    await maybeCheckpoint(true);
+    await secureFileCheckpoint();
     await snapshot();
     postStatus({ status: 'finished', iter, splats, psnr });
     postProgress(true);
@@ -292,7 +284,7 @@ globalThis.__headlessStop = async () => {
   ending = true;
   try {
     try { ses.pause(); } catch { /* already down */ }
-    await maybeCheckpoint(true);
+    await secureFileCheckpoint();
     await snapshot();
     const iter = ses.trainer ? ses.trainer.iter | 0 : 0;
     postStatus({ status: 'interrupted', iter, stopped: true });
@@ -303,9 +295,5 @@ globalThis.__headlessStop = async () => {
   }
 };
 globalThis.__headlessSnapshot = () => snapshot();
-
-// Dying-process lottery ticket (see the app's own): the periodic checkpoint
-// is the guaranteed resume point; this one is free to attempt.
-globalThis.addEventListener('pagehide', () => { maybeCheckpoint().catch(() => {}); });
 
 boot();
