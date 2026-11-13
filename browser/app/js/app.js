@@ -1343,18 +1343,27 @@ async function androidRunTiles(ids = null) {
   if (!Array.isArray(ids) || !ids.length) return [];
   const { deleteRun } = await import('./store.js');
   const tiles = [];
-  for (const runId of ids) {
+  for (const entry of ids) {
+    const runId = typeof entry === 'string' ? entry : entry && entry.runId;
     if (!Headless.validRunId(runId)) continue;
     try {
-      const manifestResponse = await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')));
-      if (!manifestResponse.ok) continue;
-      const manifest = await manifestResponse.json();
-      const photoCount = Array.isArray(manifest.photos) ? manifest.photos.length : 0;
+      let manifest = null;
       let status = { status: 'interrupted', owner: 'activity', iter: 0, at: 0 };
-      try {
-        const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
-        if (response.ok) status = { ...status, ...(await response.json()) };
-      } catch { /* checkpoint remains usable without control metadata */ }
+      let photoCount = 0;
+      if (entry && typeof entry === 'object') {
+        manifest = { name: entry.name || 'Training run' };
+        photoCount = entry.photoCount | 0;
+        status = { ...status, ...entry };
+      } else {
+        const manifestResponse = await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')));
+        if (!manifestResponse.ok) continue;
+        manifest = await manifestResponse.json();
+        photoCount = Array.isArray(manifest.photos) ? manifest.photos.length : 0;
+        try {
+          const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
+          if (response.ok) status = { ...status, ...(await response.json()) };
+        } catch { /* checkpoint remains usable without control metadata */ }
+      }
       const tile = document.createElement('div');
       tile.className = 'galtile'; tile.style.cursor = 'pointer'; tile.dataset.runId = runId;
       const finished = status.status === 'finished';
@@ -1365,6 +1374,9 @@ async function androidRunTiles(ids = null) {
         <span class="galname">${esc(manifest.name || 'Training run')}</span>
         <span class="galdesc">Stored in Android app data${photoCount ? ` · ${fmt(photoCount)} photos` : ''}.</span>
         <span class="galmeta">${state}</span>`;
+      if (entry && typeof entry === 'object' && entry.previewUri) {
+        tile.prepend(Object.assign(new Image(), { src: entry.previewUri, alt: '' }));
+      }
       const openFileRun = async () => {
         flash('Opening the saved model …', 60000);
         try {
@@ -4089,6 +4101,7 @@ async function finish() {
       try {
         const thumb = await renderShareThumb();
         if (S.gen !== gen) return;
+        if (thumb) await writeRunBlob(S.runId, 'thumb.webp', thumb).catch(() => false);
         const { patchRun } = await import('./store.js');
         await patchRun(S.runId, {
           status: 'finished', iter: S.iter, splats: S.splats,
@@ -6526,6 +6539,18 @@ async function stagePhotoBlobs(runId, files) {
   }
   b.writeRunJson(runId, 'photos.json', JSON.stringify({ names, complete: true, at: Date.now() }));
 }
+/** Store a small run-owned artifact such as its Home preview. */
+async function writeRunBlob(runId, name, blob) {
+  const b = headlessBridge();
+  if (!b || !Headless.validRunId(runId) || !Headless.validName(name) || !blob) return false;
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  for (let o = 0; o < bytes.length; o += 262144) {
+    if (!b.writeRunChunk(runId, name, Headless.encodeB64(bytes.subarray(o, o + 262144)),
+      o + 262144 >= bytes.length)) return false;
+  }
+  return true;
+}
+
 /** Mirror an already-packed checkpoint into Android app data. This is the
  * durable model record used by Home; source photos remain references to their
  * canonical scan archive. */

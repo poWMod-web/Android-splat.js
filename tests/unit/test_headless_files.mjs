@@ -213,8 +213,12 @@ assert.match(app, /async function nativeCaptureTiles\(rows = null\)[\s\S]*listCa
   'Home should enumerate native Android scan archives independently of IndexedDB');
 assert.match(main, /public String listRecoverableRuns\(\)[\s\S]*RunFiles\.listDurableRuns/,
   'the bridge should expose complete Android run directories to Home');
-assert.match(main, /public String listHomeLibrary\(\)[\s\S]*captures[\s\S]*listCaptureArchives\(\)[\s\S]*runs[\s\S]*RunFiles\.listDurableRuns/,
-  'Android Home should enumerate one native catalog of canonical scans and referencing model checkpoints');
+assert.match(main, /public String listHomeLibrary\(\)[\s\S]*listCaptureArchives\(\)[\s\S]*RunFiles\.listDurableRuns[\s\S]*previewUri/,
+  'one native Home catalog should include canonical scans and model checkpoint metadata/previews');
+assert.match(app, /entry\.previewUri[\s\S]*new Image\(\)[\s\S]*src: entry\.previewUri/,
+  'file-backed model cards should restore main-style image previews when available');
+assert.match(app, /writeRunBlob\(S\.runId, 'thumb\.webp', thumb\)/,
+  'finished Android models should persist their Home preview beside the checkpoint');
 const durableList = runFiles.slice(runFiles.indexOf('List<String> listDurableRuns(Context ctx)'),
   runFiles.indexOf('String recoverActive(Context ctx)'));
 assert.match(durableList, /state\.bin[\s\S]*recon\.json[\s\S]*manifest\.json/,

@@ -33,22 +33,29 @@ assert.equal(scorePlateaued([[9000, 20], [9200, NaN], [9400, 20], [9600, 20], [9
   'a NaN readout is skipped, not fatal');
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.0), NOW - 5000, { window: W }), false,
   'points past the horizon do not count');
+assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.0), NOW,
+  { window: W, after: NOW - 300 }), false,
+  'score evidence from before the prior growth must not trigger another growth');
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.09), NOW, { window: W }), true,
   'the default trips under 0.1 dB/kiter');
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.11), NOW, { window: W }), false,
   'the default holds at and above 0.1 dB/kiter');
 
-// ---- wiring pins: plateau pulls refines forward, cadence backstops ---------
+// ---- wiring pins: growth is plateau-only with bounded backoff --------------
 assert.match(sessionSource, /export function scorePlateaued\(history, nowIter/,
   'the detector is exported for tests and reuse');
 assert.match(sessionSource, /if \(this\.opts\.refinePlateau !== false && trainer\.iter > 1500 &&/,
-  'plateau refines gate on the warmup iters and stay switchable');
-assert.match(sessionSource, /sinceRefine >= \(this\.opts\.plateauMinGap \?\? 400\)/,
-  'a minimum gap keeps a flat score from storming refines');
-assert.match(sessionSource, /plateau = scorePlateaued\(this\.zlemaHistory, trainer\.iter, \{/,
-  'the filtered curve feeds the detector');
-assert.match(sessionSource, /if \(trainer\.iter > 1500 && \(sinceRefine >= refineEvery \|\| plateau\)\) \{/,
-  'the fixed cadence stays as the maximum gap');
+  'plateau growth gates on the warmup iters and stays switchable');
+assert.match(sessionSource, /sinceRefine >= this\._plateauGap/,
+  'the current backoff gap must elapse before another plateau test');
+assert.match(sessionSource, /plateau = scorePlateaued\(this\.zlemaHistory, trainer\.iter, \{[\s\S]*after: trainer\.lastRefine \|\| 0/,
+  'the filtered detector must use only evidence newer than the prior growth');
+assert.match(sessionSource, /if \(trainer\.iter > 1500 && plateau\) \{/,
+  'automatic growth should run only on a measured score plateau');
+assert.doesNotMatch(sessionSource, /sinceRefine >= refineEvery \|\| plateau/,
+  'a fixed cadence must not bypass the plateau requirement');
+assert.match(sessionSource, /this\._plateauGap = Math\.min\(plateauMaxGap,[\s\S]*this\._plateauGap \* 2/,
+  'each accepted plateau should exponentially back off the next growth');
 assert.match(sessionSource, /\[score plateaued\]/,
   'plateau-triggered refines say so in the log');
 assert.match(sessionSource, /slope: this\.opts\.plateauSlope \?\? 0\.1,/,

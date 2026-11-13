@@ -239,11 +239,11 @@ class Emitter {
  *  dB/kiter. Needs minPoints finite samples spanning most of the window —
  *  anything less is "still warming up", never a plateau. Flat OR falling
  *  trips it: a stalled score wants fresh capacity, a falling one triage. */
-export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, minPoints = 4 } = {}) {
+export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, minPoints = 4, after = -Infinity } = {}) {
   if (!Array.isArray(history) || !history.length) return false;
   const pts = [];
   for (const [i, p] of history) {
-    if (Number.isFinite(i) && Number.isFinite(p) && i >= nowIter - window && i <= nowIter) pts.push([i, p]);
+    if (Number.isFinite(i) && Number.isFinite(p) && i >= Math.max(nowIter - window, after) && i <= nowIter) pts.push([i, p]);
   }
   if (pts.length < minPoints) return false;
   if (pts[pts.length - 1][0] - pts[0][0] < window * 0.75) return false;
@@ -276,6 +276,9 @@ export class Session {
     // below reads THIS, so the trigger trips on the line the user sees
     this.zlemaHistory = [];   // [iter, filteredPsnrTrain]
     this._zlema = new FastRobustZLEMA();
+    // Automatic growth is plateau-only. Repeated plateaus back off so a flat
+    // score cannot trigger capacity changes every few hundred iterations.
+    this._plateauGap = opts.plateauMinGap ?? 1200;
     this._fences = [];      // in-flight batch fences (see _frameLoop)
     this._govAuto = 1;      // duty governor: auto duty, min()'d with the slider
     this._govLag = 0;       // event-loop lag EWMA (ms)
@@ -1330,6 +1333,7 @@ export class Session {
     this.lossHistory = [];
     this.zlemaHistory = [];
     this._zlema = new FastRobustZLEMA();
+    this._plateauGap = this.opts.plateauMinGap ?? 1200;
     this._lastHold = null;
     this._lastHoldEval = 0;
     this._itersAtStats = 0;
@@ -1680,24 +1684,28 @@ export class Session {
 
       const tEnc = performance.now() - t0;
 
-      // periodic refinement: relocate dead splats + grow capacity (MCMC-lite).
-      // Cadence is score-driven: a plateaued PSNR pulls the next refine
-      // forward (past a minimum gap, so a flat score can't storm); the
-      // refineEvery cadence stays as the maximum gap, so fast-rising early
-      // training — and any metric outage — still refines on schedule.
-      const refineEvery = this.opts.refineEvery ?? 2500;
+      // Score-driven refinement: automatic relocation/growth happens ONLY
+      // after the filtered PSNR has plateaued. Each accepted plateau doubles
+      // the minimum gap (bounded), and evidence must be newer than the prior
+      // refine. There is no fixed-cadence growth backstop.
       const sinceRefine = trainer.iter - (trainer.lastRefine || 0);
+      const plateauWindow = this.opts.plateauWindow ?? 1200;
+      const plateauBaseGap = this.opts.plateauMinGap ?? 1200;
+      const plateauMaxGap = this.opts.plateauMaxGap ?? 10000;
       let plateau = false;
       if (this.opts.refinePlateau !== false && trainer.iter > 1500 &&
-          sinceRefine >= (this.opts.plateauMinGap ?? 400)) {
+          sinceRefine >= this._plateauGap) {
         plateau = scorePlateaued(this.zlemaHistory, trainer.iter, {
-          window: this.opts.plateauWindow ?? 1200,
+          window: plateauWindow,
           slope: this.opts.plateauSlope ?? 0.1,
+          after: trainer.lastRefine || 0,
         });
       }
       let refineResult = null;
-      if (trainer.iter > 1500 && (sinceRefine >= refineEvery || plateau)) {
+      if (trainer.iter > 1500 && plateau) {
         trainer.lastRefine = trainer.iter;
+        this._plateauGap = Math.min(plateauMaxGap,
+          Math.max(plateauBaseGap, this._plateauGap * 2));
         // tandem prune: cull the lowest-mass fraction FIRST (until 85% of
         // the run), so this same refine regrows the freed capacity into
         // the highest-error donors — one prune/multiply cycle, not two

@@ -638,13 +638,33 @@ public final class MainActivity extends Activity {
          * model checkpoints and references to those archives. */
         @JavascriptInterface public String listHomeLibrary() {
             JSONObject out = new JSONObject();
-            try {
-                out.put("captures", new JSONArray(listCaptureArchives()));
-                out.put("runs", new JSONArray(RunFiles.listDurableRuns(MainActivity.this)));
-            } catch (Exception e) {
-                try { out.put("captures", new JSONArray()); out.put("runs", new JSONArray()); }
-                catch (Exception ignored) { }
+            JSONArray captures;
+            try { captures = new JSONArray(listCaptureArchives()); }
+            catch (Exception ignored) { captures = new JSONArray(); }
+            JSONArray runs = new JSONArray();
+            for (String runId : RunFiles.listDurableRuns(MainActivity.this)) {
+                try {
+                    JSONObject row = new JSONObject();
+                    row.put("runId", runId);
+                    String manifestRaw = RunFiles.readJson(MainActivity.this, runId, "manifest.json");
+                    JSONObject manifest = manifestRaw == null ? new JSONObject() : new JSONObject(manifestRaw);
+                    row.put("name", manifest.optString("name", "Training run"));
+                    row.put("photoCount", manifest.optJSONArray("photos") == null ? 0 : manifest.optJSONArray("photos").length());
+                    String statusRaw = RunFiles.readJson(MainActivity.this, runId, "status.json");
+                    JSONObject status = statusRaw == null ? new JSONObject() : new JSONObject(statusRaw);
+                    row.put("status", status.optString("status", "interrupted"));
+                    row.put("iter", status.optInt("iter", 0));
+                    row.put("splats", status.optInt("splats", 0));
+                    if (status.has("psnr")) row.put("psnr", status.optDouble("psnr"));
+                    File thumb = new File(RunFiles.runDir(MainActivity.this, runId), "thumb.webp");
+                    File snapshot = new File(RunFiles.runDir(MainActivity.this, runId), "snapshot.png");
+                    if (thumb.isFile()) row.put("previewUri", "https://appassets.androidplatform.net/runs/" + runId + "/thumb.webp");
+                    else if (snapshot.isFile()) row.put("previewUri", "https://appassets.androidplatform.net/runs/" + runId + "/snapshot.png");
+                    runs.put(row);
+                } catch (Exception ignored) { /* one malformed run cannot empty Home */ }
             }
+            try { out.put("captures", captures); out.put("runs", runs); }
+            catch (Exception ignored) { }
             return out.toString();
         }
 
