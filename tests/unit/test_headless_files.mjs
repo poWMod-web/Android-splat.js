@@ -191,10 +191,12 @@ assert.match(driver, /const priorChart = \(recon\.stats && recon\.stats\.chart\)
   'service training should append metrics to the Activity score graph');
 assert.match(driver, /holdHist: \(recon\.stats && recon\.stats\.holds\)[\s\S]*chartEvents/,
   'service checkpoints should carry holds and graph annotations forward');
-const fileCheckpoint = app.slice(app.indexOf('async function secureFileCheckpoint()'),
-  app.indexOf('/** Best-effort status write', app.indexOf('async function secureFileCheckpoint()')));
-assert.match(fileCheckpoint, /writeRunJson\(S\.runId, 'recon\.json'[\s\S]*patchRun\(S\.runId,[\s\S]*state: new Blob[\s\S]*detailProgress/,
-  'every Android-file handoff checkpoint should be mirrored into IndexedDB with its graph');
+const fileCheckpoint = app.slice(app.indexOf('async function writeDurableRunCheckpoint('),
+  app.indexOf('/** Best-effort status write', app.indexOf('async function writeDurableRunCheckpoint(')));
+assert.match(fileCheckpoint, /writeRunChunk\(S\.runId, 'state\.bin'[\s\S]*writeRunJson\(S\.runId, 'recon\.json'/,
+  'Android app data should receive the exact state and reconstruction checkpoint');
+assert.match(app, /async function checkpointRun\(reason\)[\s\S]*writeDurableRunCheckpoint\(state, recon[\s\S]*IndexedDB mirror failed/,
+  'Back and Stop & keep must persist to Android files independently of IndexedDB');
 assert.match(app, /async function mirrorHeadlessRun\(runId, status\)[\s\S]*state\.bin[\s\S]*saveRun\(rec\)/,
   'boot should rediscover an Android run directory as a Home library record');
 assert.match(app, /async function nativeCaptureTiles\(\)[\s\S]*listCaptureArchives\(\)[\s\S]*importNativeCapture\(b, row\.captureId\)/,
@@ -203,8 +205,12 @@ assert.match(main, /public String listRecoverableRuns\(\)[\s\S]*RunFiles\.listDu
   'the bridge should expose complete Android run directories to Home');
 assert.match(runFiles, /List<String> listDurableRuns\(Context ctx\)[\s\S]*state\.bin[\s\S]*photos\.optBoolean\("complete"/,
   'Android discovery should require a checkpoint and complete retained images');
-assert.match(app, /async function mirrorAndroidRunDirs\(\)[\s\S]*listRecoverableRuns\(\)[\s\S]*mirrorHeadlessRun/,
-  'Home should rebuild missing IndexedDB run records from Android files');
+assert.match(app, /async function androidRunTiles\(\)[\s\S]*listRecoverableRuns\(\)[\s\S]*Stored in Android app data/,
+  'Home should show lightweight Android-file models without first copying state into IndexedDB');
+assert.doesNotMatch(app, /for \(const runId of ids\.slice\(0, 12\)\)/,
+  'Android model discovery must not retain the old twelve-run display cap');
+assert.match(runFiles, /listDurableRuns\(Context ctx\)[\s\S]*"discarded"\.equals\(value\)[\s\S]*out\.add\(id\)/,
+  'ordinary dismissed/Back checkpoints must remain discoverable on Home');
 const stage = app.slice(app.indexOf('function stageHeadlessRun()'), app.indexOf('/** Upload photo bytes'));
 assert.doesNotMatch(stage, /cleanRunDirs|resetCaptureSession/,
   'handoff must not delete old run directories or native scan archives');

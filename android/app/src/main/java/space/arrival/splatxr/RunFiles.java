@@ -238,8 +238,9 @@ public final class RunFiles {
     }
 
     /** Enumerate every self-contained run directory for Home recovery after
-     *  IndexedDB eviction. No marker is changed and deliberately discarded or
-     *  dismissed directories stay invisible. */
+     *  IndexedDB eviction. Control-plane metadata is not required: a complete
+     *  checkpoint is itself a durable model. Explicitly discarded runs alone
+     *  stay invisible; ordinary Back/dismissed runs remain discoverable. */
     public static List<String> listDurableRuns(Context ctx) {
         List<String> out = new ArrayList<>();
         File[] dirs = runsDir(ctx).listFiles(File::isDirectory);
@@ -254,14 +255,14 @@ public final class RunFiles {
             if (!state.isFile() || state.length() < 16 || !recon.isFile() || !manifest.isFile()) continue;
             try {
                 String photosRaw = readJson(ctx, id, "photos.json");
-                String statusRaw = readJson(ctx, id, "status.json");
-                if (photosRaw == null || statusRaw == null) continue;
+                if (photosRaw == null) continue;
                 JSONObject photos = new JSONObject(photosRaw);
                 if (!photos.optBoolean("complete", photos.optBoolean("done", false))) continue;
-                String value = new JSONObject(statusRaw).optString("status", "");
-                if ("discarded".equals(value) || "dismissed".equals(value)) continue;
-                if (!("staging".equals(value) || "booting".equals(value) || "active".equals(value) ||
-                        "paused".equals(value) || "interrupted".equals(value) || "finished".equals(value))) continue;
+                String statusRaw = readJson(ctx, id, "status.json");
+                String value = "";
+                try { if (statusRaw != null) value = new JSONObject(statusRaw).optString("status", ""); }
+                catch (Exception ignored) { /* control metadata is not the model */ }
+                if ("discarded".equals(value)) continue;
                 out.add(id);
             } catch (Exception ignored) { /* malformed dirs are invisible */ }
         }

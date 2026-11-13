@@ -19,13 +19,12 @@ assert.ok(app.includes("if (reason === 'back') flash('Progress saved on this dev
 assert.ok(app.includes("await checkpointRun('back')"), 'the header Back awaits the checkpoint');
 assert.ok(app.includes("location.href = (S.state === 'train' || S.state === 'prep') ? 'index.html?back=1' : 'index.html';"),
   'leaving a live run boots the deliberate-leave home');
-assert.ok(app.includes("checkpointRun('back').catch(() => {})\n      .then(() => { S._leaving = true; location.href = 'index.html?back=1'; });"),
-  'popstate secures the IDB checkpoint and waves through before leaving too');
-// Back is IDB-only: the Yours resume is the way back, no file copy.
+assert.match(app, /checkpointRun\('back'\)\.catch\(\(\) => null\)\.then\(\(saved\) => \{[\s\S]*if \(!saved\)[\s\S]*location\.href = 'index\.html\?back=1'/,
+  'popstate leaves only after a checkpoint reaches durable storage');
 const back = app.slice(app.indexOf('async function goBack()'), app.indexOf('function backToSetup()'));
-assert.ok(!back.includes('secureFileCheckpoint'), 'goBack secures IDB only, never files');
+assert.match(back, /const saved = await checkpointRun\('back'\)[\s\S]*if \(!saved\)[\s\S]*return;/,
+  'header Back must remain in training when every checkpoint backend fails');
 const pop = app.slice(app.indexOf("addEventListener('popstate'"), app.indexOf('function detailClose()'));
-assert.ok(!pop.includes('secureFileCheckpoint'), 'system Back secures IDB only, never files');
 // A Back-leave waves past beforeunload with no confirm — the checkpoint is
 // the save. Refresh/close still ask (nothing secured them).
 assert.ok(app.includes('if (S._leaving) return;   // Back already saved — wave it through'),

@@ -62,4 +62,10 @@ assert.match(pop, /const detailOpen =/, 'popstate should snapshot the detail lay
 assert.match(pop, /closeOverlays\(\);/, 'phone Back should dismiss modals and score graphs');
 assert.match(pop, /if \(aboutOpen\) return;/, 'phone Back should still close About first');
 
+
+
+const dockStart = app.indexOf('function dock(kind)');
+const dockFn = app.slice(dockStart, app.indexOf('function syncScoreScaleControls', dockStart));
+assert.match(dockFn, /#stage > \.chartwrap, #stage > \.chartwrap-expanded[\s\S]*forEach\(\(el\) => el\.remove\(\)\)/,
+  'every dock transition must destroy a score graph reparented into stage');
 console.log('back-button visibility + overlay cleanup on navigation: passed');

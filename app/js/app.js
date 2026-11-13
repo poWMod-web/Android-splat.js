@@ -1327,6 +1327,67 @@ async function localRunTiles() {
   return tiles;
 }
 
+
+/** Lightweight Home tiles for checkpoints in Android app data. Unlike the
+ * old rediscovery pass, this does not copy every state.bin into IndexedDB
+ * before Home can paint. The full checkpoint is loaded only when tapped. */
+async function androidRunTiles() {
+  const bridge = headlessBridge();
+  if (!bridge || typeof bridge.listRecoverableRuns !== 'function') return [];
+  let ids = [];
+  try { ids = JSON.parse(bridge.listRecoverableRuns()); } catch { return []; }
+  if (!Array.isArray(ids) || !ids.length) return [];
+  const { listRuns, deleteRun } = await import('./store.js');
+  const existing = new Set((await listRuns()).filter((r) => r && r.id && r.state && r.recon).map((r) => r.id));
+  const tiles = [];
+  for (const runId of ids) {
+    if (!Headless.validRunId(runId) || existing.has(runId)) continue;
+    try {
+      const manifestResponse = await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')));
+      if (!manifestResponse.ok) continue;
+      const manifest = Headless.validateManifest(await manifestResponse.json());
+      let status = { status: 'interrupted', owner: 'activity', iter: 0, at: 0 };
+      try {
+        const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
+        if (response.ok) status = { ...status, ...(await response.json()) };
+      } catch { /* checkpoint remains usable without control metadata */ }
+      const tile = document.createElement('div');
+      tile.className = 'galtile'; tile.style.cursor = 'pointer'; tile.dataset.runId = runId;
+      const finished = status.status === 'finished';
+      const state = finished
+        ? `${fmt(status.splats || 0)} splats${status.psnr != null ? ` · ${(+status.psnr).toFixed(1)} dB` : ''}`
+        : `saved checkpoint · ${fmt(status.iter || 0)} cycles`;
+      tile.innerHTML = `<button class="run-menu" title="Options">⋯</button>
+        <span class="galname">${esc(manifest.name || 'Training run')}</span>
+        <span class="galdesc">Stored in Android app data · ${fmt(manifest.photos.length)} photos.</span>
+        <span class="galmeta">${state}</span>`;
+      const openFileRun = async () => {
+        flash('Opening the saved model …', 60000);
+        try {
+          const rec = await mirrorHeadlessRun(runId, status);
+          S._localRun = rec;
+          await continueLocalRun(finished);
+        } catch (e) {
+          console.error(e);
+          flash(`Could not open this saved model: ${e.message}`, 9000);
+        }
+      };
+      tileMenu(tile.querySelector('.run-menu'), [
+        { label: finished ? 'View' : 'Continue', act: openFileRun },
+        { label: 'Delete', danger: true, act: async () => {
+          if (typeof bridge.deleteRunArchive === 'function' && bridge.deleteRunArchive(runId) === false) {
+            flash('A running model cannot be deleted.', 6000); return;
+          }
+          await deleteRun(runId); tile.remove();
+        } },
+      ]);
+      tile.addEventListener('click', openFileRun);
+      tiles.push(tile);
+    } catch (e) { console.warn(`[home] unreadable Android run ${runId}`, e); }
+  }
+  return tiles;
+}
+
 /** the first `cnt` photos of a preset, honouring its skip list */
 function presetPhotoList(preset, cnt) {
   // a set rebuilt from stored addresses (an interrupted run's record)
@@ -2579,8 +2640,8 @@ function trainDeadEnd() {
 
 /** Back — one routine for every door that means it (the header Back, the
  *  brand title off the home tile, the phone's own Back through popstate's
- *  sibling path): a live run is secured first (IDB only — the Yours resume;
- *  no file copy), then home. */
+ *  sibling path): a live run is secured in IndexedDB and Android app data,
+ *  then home. */
 async function goBack() {
   const runId = S.runId || (S._localRun && S._localRun.id);
   if (runId) await persistRunDetails(runId, { full: true }).catch(() => {});
@@ -2604,12 +2665,14 @@ async function goBack() {
   // boot this was a deliberate leave: the handoff marker stands down
   // instead of hijacking the boot into recovery, and the Yours tile is
   // the way back.
-  // IDB only, deliberately: the Yours resume is the way back, and the ?back
-  // boot stands the marker down anyway. A swipe landing mid-reload
-  // (killed before the boot clears the marker) settles from no files and
-  // interrupts — the IDB checkpoint still resumes from Yours.
-  if ((S.state === 'train' || S.state === 'prep') && S.runId) {
-    await checkpointRun('back').catch(() => {});
+  // The checkpoint is mirrored to Android app data before navigation, so
+  // Home can rediscover it even if IndexedDB is unavailable or evicted.
+  if (S.state === 'train' && S.runId) {
+    const saved = await checkpointRun('back').catch(() => null);
+    if (!saved) {
+      flash('Could not save this model yet. Training is still open; free storage and try Back again.', 9000);
+      return;
+    }
   }
   // Back from a run leaves the same way the logo does: a page navigation
   // home. The wall is never rendered OVER a live scene. The flag waves the
@@ -3376,7 +3439,7 @@ async function checkpointRun(reason) {
   // secured even if sog compression or the device dies right after training
   if (reason === 'finish' ? S.state !== 'done' : S.state !== 'train') return null;
   const it = S.session.trainer.iter | 0;
-  if (it < 200 || S._ckptBusy) return null;   // nothing worth keeping yet
+  if (S._ckptBusy || (reason === 'hidden' && it < 200)) return null;
   // hidden fires on every tab switch — only rewrite after real progress
   if (reason === 'hidden' && it - (S._ckptIter || 0) < 500) return null;
   S._ckptBusy = true;
@@ -3387,8 +3450,7 @@ async function checkpointRun(reason) {
     if (S.gen !== gen) return null;
     const recon = buildReconJson(S);
     const detailProgress = captureRunProgressDetails();
-    const { patchRun } = await import('./store.js');
-    await patchRun(S.runId, {
+    const patch = {
       iter: it, splats: S.splats || S.session.trainer.n,
       psnr: S.psnrHold ?? S.psnrTrain ?? null,
       cap: trainBudget(S.session),   // the configured budget carries over, not the allocation (seed x capMult under-allocates — the continue card must see the limit training runs under)
@@ -3396,7 +3458,25 @@ async function checkpointRun(reason) {
       detailSolve: captureRunSolveDetails(),
       detailProgress,
       detailGpu: gpuFacts(false),
-    });
+    };
+    // Android app data is the durable fallback and must not depend on an IDB
+    // write succeeding: quota/process-profile loss was hiding completed runs.
+    const fileSaved = await writeDurableRunCheckpoint(state, recon, {
+      status: reason === 'finish' ? 'finished' : (S.session.training ? 'active' : 'paused'),
+      owner: 'activity', iter: it, at: Date.now(),
+    }).catch((e) => { console.warn('[checkpoint] Android mirror failed', e); return false; });
+    let idbSaved = false;
+    try {
+      const { patchRun, saveRun } = await import('./store.js');
+      idbSaved = await patchRun(S.runId, patch);
+      if (!idbSaved) {
+        await saveRun({ id: S.runId, name: localRunName(S.preset), status: 'training',
+          createdAt: Date.now(), updatedAt: Date.now(), maxIters: S.maxIters,
+          frames: (S.loadedFiles || []).length, ownSrc: true, ...patch });
+        idbSaved = true;
+      }
+    } catch (e) { console.warn('[checkpoint] IndexedDB mirror failed', e); }
+    if (!fileSaved && !idbSaved) throw new Error('neither Android app data nor IndexedDB accepted the checkpoint');
     S._ckptIter = it;
     if (reason === 'back') flash('Progress saved on this device — safe to close, continue anytime from Yours.', 6000);
     return { state, recon };
@@ -3947,7 +4027,6 @@ async function runAvatarStages() {
 
 async function finish() {
   androidNotifStop(true);   // the shade keeps the final score
-  headlessClear();   // locally finished: nothing for the service to take over
   S.iter = S.session.trainer.iter;   // honest count — the run may end early
   S.minutes = Math.max(1, Math.round((performance.now() - S.trainT0) / 60000));
   enterDone();
@@ -3981,6 +4060,9 @@ async function finish() {
     while (S._ckptBusy) await new Promise((r) => setTimeout(r, 200));   // a 'hidden' write in flight
     let ckpt = null;
     try { ckpt = await checkpointRun('finish'); } catch { /* best-effort */ }
+    // The final checkpoint is now in Android files as well as IndexedDB; only
+    // then release the live marker so Home can rediscover the finished model.
+    headlessClear();
     if (S.gen !== gen) return;
     if (S.runId && S.gen === gen) {
       try {
@@ -5583,8 +5665,17 @@ addEventListener('popstate', () => {
   // Back does — secure it, then a page navigation home (the wall is never
   // rendered OVER a live scene). No confirm: the checkpoint is the save.
   if ((S.state === 'prep' || S.state === 'train') && $('start').hidden) {
-    checkpointRun('back').catch(() => {})
-      .then(() => { S._leaving = true; location.href = 'index.html?back=1'; });
+    if (S.state === 'prep') {
+      S._leaving = true; location.href = 'index.html?back=1';
+    } else {
+      checkpointRun('back').catch(() => null).then((saved) => {
+        if (!saved) {
+          flash('Could not save this model yet. Training is still open; free storage and try Back again.', 9000);
+          return;
+        }
+        S._leaving = true; location.href = 'index.html?back=1';
+      });
+    }
   }
 });
 
@@ -5687,15 +5778,15 @@ async function mountWall() {
   const host = $('gallery');
   if (!host) return;
   try {
-    // Rebuild missing IndexedDB library entries from Android files before the
-    // wall decides there is nothing to show.
-    await mirrorAndroidRunDirs();
-    const [nativeTiles, capTile, runTiles] = await Promise.all([
+    // File-backed model tiles are lightweight: Home never waits for or
+    // duplicates every state.bin into IndexedDB before showing saved work.
+    const [scanTiles, fileRunTiles, capTile, runTiles] = await Promise.all([
       nativeCaptureTiles().catch(() => []),
+      androidRunTiles().catch(() => []),
       lastCaptureTile().catch(() => null),
       localRunTiles().catch(() => []),
     ]);
-    const tiles = [...nativeTiles, ...(capTile ? [capTile] : []), ...runTiles];
+    const tiles = [...scanTiles, ...fileRunTiles, ...(capTile ? [capTile] : []), ...runTiles];
     host.replaceChildren();
     if (!tiles.length) { host.hidden = true; return; }
     const heading = document.createElement('p');
@@ -6044,8 +6135,17 @@ function paintStrip() {
 // ── dock ────────────────────────────────────────────────────────────────────
 function dock(kind) {
   const d = $('dock');
+  // Hide-visuals reparents the score graph into stage. A recovered trainer
+  // creates a new dock graph; remove every prior direct-stage graph first or
+  // both canvases remain visible (the large translucent overlay in reports).
+  document.querySelectorAll('#stage > .chartwrap, #stage > .chartwrap-expanded')
+    .forEach((el) => el.remove());
   d.className = 'dock' + (kind ? ` dock-${kind}` : '');
-  if (!kind) { d.innerHTML = ''; return; }
+  if (!kind) {
+    d.innerHTML = '';
+    chart = null;
+    return;
+  }
 
   if (kind === 'prep') {
     // the stage sequence IS the header: the current beat reads as the title,
@@ -6290,7 +6390,7 @@ function stageHeadlessRun() {
   if (!b || !S.runId || S.avatar || S._hlStaged) return;
   S._hlStaged = S.runId;
   S._hlPhotos = false; S._hlCkptBusy = false;
-  (async () => {
+  S._hlStagePromise = (async () => {
     const runId = S.runId, gen = S.gen;
     try {
       const files = (S.loadedFiles || []).filter((f) => f && f.name);
@@ -6331,7 +6431,7 @@ function stageHeadlessRun() {
       // status) and the run continues locally exactly as without the feature
       console.warn('[headless] staging failed — local training unaffected', e);
     }
-  })().catch(() => {});
+  })().catch((e) => { console.warn('[headless] staging task failed', e); });
 }
 /** Upload photo bytes into the run dir (uploads, picker shots, video frames —
  *  everything without disk files). Chunked base64, sequential, throttled past
@@ -6350,10 +6450,24 @@ async function stagePhotoBlobs(runId, files) {
   }
   b.writeRunJson(runId, 'photos.json', JSON.stringify({ names, complete: true, at: Date.now() }));
 }
-/** One-shot file checkpoint: the handoff-format copy (state.bin + recon +
- *  status iter). Written ONLY on the swipe-away handoff — Back is IDB-only
- *  (the Yours resume), and nothing writes periodically. Awaits; true when
- *  it landed. */
+/** Mirror an already-packed checkpoint into Android app data. This is the
+ * durable model record used by Home; source photos remain references to their
+ * canonical scan archive. */
+async function writeDurableRunCheckpoint(state, recon, status = null) {
+  const b = headlessBridge();
+  if (S._hlStagePromise) await S._hlStagePromise;
+  if (!b || !S._hlStaged || S.runId !== S._hlStaged || !S._hlPhotos) return false;
+  const bytes = state instanceof Blob ? new Uint8Array(await state.arrayBuffer()) : new Uint8Array(state);
+  for (let o = 0; o < bytes.length; o += 262144) {
+    if (!b.writeRunChunk(S.runId, 'state.bin', Headless.encodeB64(bytes.subarray(o, o + 262144)),
+      o + 262144 >= bytes.length)) return false;
+  }
+  if (!b.writeRunJson(S.runId, 'recon.json', JSON.stringify(recon))) return false;
+  if (status) b.writeRunJson(S.runId, 'status.json', JSON.stringify(status));
+  return true;
+}
+
+/** One-shot file checkpoint used for Activity→service ownership transfer. */
 async function secureFileCheckpoint() {
   const b = headlessBridge();
   if (!b || !S._hlStaged || S.runId !== S._hlStaged || !S._hlPhotos) return false;
@@ -6362,12 +6476,8 @@ async function secureFileCheckpoint() {
   try {
     const { packState, buildReconJson } = await import('./session_io.js');
     const state = await packState(S.session);
-    for (let o = 0; o < state.length; o += 262144) {
-      if (!b.writeRunChunk(S.runId, 'state.bin', Headless.encodeB64(state.subarray(o, o + 262144)),
-        o + 262144 >= state.length)) return false;
-    }
     const recon = buildReconJson(S);
-    b.writeRunJson(S.runId, 'recon.json', JSON.stringify(recon));
+    if (!(await writeDurableRunCheckpoint(state, recon))) return false;
     // Mirror the same exact checkpoint into IndexedDB before relinquishing the
     // Activity. The run then remains a visible, tappable Home tile even if the
     // service process or active.json disappears.
@@ -6501,8 +6611,14 @@ async function mirrorHeadlessRun(runId, status) {
     state: new Blob([stateBytes]), recon, detailProgress,
     ...(thumb ? { thumb } : {}),
   };
-  const { saveRun, patchRun } = await import('./store.js');
-  if (!(await patchRun(runId, rec))) await saveRun(rec);
+  try {
+    const { saveRun, patchRun } = await import('./store.js');
+    if (!(await patchRun(runId, rec))) await saveRun(rec);
+  } catch (e) {
+    // The Android checkpoint remains authoritative and openable even when
+    // IndexedDB is full, unavailable, or belongs to another WebView profile.
+    console.warn(`[headless] IndexedDB mirror failed for ${runId}`, e);
+  }
   return rec;
 }
 
@@ -6518,10 +6634,14 @@ async function mirrorAndroidRunDirs() {
     const { listRuns } = await import('./store.js');
     const existing = new Set((await listRuns()).filter((r) => r && r.state && r.recon).map((r) => r.id));
     let restored = 0;
-    for (const runId of ids.slice(0, 12)) {
+    for (const runId of ids) {
       if (!Headless.validRunId(runId) || existing.has(runId)) continue;
       try {
-        const status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json();
+        let status = { status: 'interrupted', owner: 'activity', at: 0 };
+        try {
+          const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
+          if (response.ok) status = await response.json();
+        } catch { /* a checkpoint is still a durable Home model without control metadata */ }
         await mirrorHeadlessRun(runId, status);
         restored++;
       } catch (e) { console.warn(`[headless] could not mirror ${runId}`, e); }
