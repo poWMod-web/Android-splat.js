@@ -6188,8 +6188,9 @@ async function headlessBootCheck() {
 function enterMonitor(runId) {
   S.state = 'monitor';
   S._monRun = runId; S._monAt = 0; S._monShotBusy = false; S._monShotAt = 0;
-  try { S._monVisuals = localStorage.getItem('splatjs_monitor_visuals') !== '0'; }
-  catch { S._monVisuals = true; }
+  // off by default, like the in-app training visuals — snapshots render on demand
+  try { S._monVisuals = localStorage.getItem('splatjs_monitor_visuals') === '1'; }
+  catch { S._monVisuals = false; }
   $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
   if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
   let mc = document.getElementById('cv-monitor');

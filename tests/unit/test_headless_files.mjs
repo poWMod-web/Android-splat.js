@@ -104,6 +104,8 @@ const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8'
 for (const fn of ['stageHeadlessRun', 'maybeFileCheckpoint', 'enterMonitor', 'adoptHeadlessRun']) {
   assert.ok(app.includes(`function ${fn}`), `app implements ${fn}`);
 }
+assert.ok(app.includes("localStorage.getItem('splatjs_monitor_visuals') === '1'"),
+  'the monitor visuals toggle defaults off, like the in-app training visuals');
 const svc = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
 for (const s of ['setDataDirectorySuffix("training")', 'AndroidHeadless', 'headless-snapshot', 'onTaskRemoved']) {
   assert.ok(svc.includes(s), `service implements ${s}`);
