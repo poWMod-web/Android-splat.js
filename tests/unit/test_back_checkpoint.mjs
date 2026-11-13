@@ -7,7 +7,7 @@ const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival
 // Pausing is free: toggleTrain must not checkpoint (the write moved to leaving).
 const toggle = app.slice(app.indexOf('function toggleTrain()'), app.indexOf('function toggleTrain()') + 1400);
 assert.ok(!toggle.includes('checkpointRun'), 'pause must not write a checkpoint');
-assert.ok(!toggle.includes('headlessStatusWrite'), 'pause should not publish service-handoff ownership');
+assert.ok(toggle.includes('headlessStatusWrite'), 'pause still follows the handoff status');
 assert.ok(toggle.includes('splatjs_pause_hint'), 'pause teaches the new model once');
 
 // The checkpoint reason is the leave, and it keeps the saved-on-device promise.
@@ -36,8 +36,9 @@ assert.ok(back.includes('S._leaving = true;'), 'goBack waves its navigation thro
 assert.ok(pop.includes('S._leaving = true;'), 'system Back waves its navigation through');
 assert.ok(app.includes("history.pushState({ sj: 'run' }, '')"),
   'training owns a history entry so Back pops into the checkpoint-leave');
-assert.match(app, /else mountWall\(\);/,
-  'a deliberate leave should return directly to the local wall without handoff recovery');
+assert.ok(app.includes("else if (mp.get('back')) headlessClearMarker().finally(() => mountWall());"),
+  'the deliberate-leave boot stands the handoff down instead of recovering');
+assert.ok(app.includes('async function headlessClearMarker()'), 'the marker stand-down exists');
 
 // The brand title IS Back off the home tile: one shared routine, same effect.
 // (On the home tile it still opens About.)

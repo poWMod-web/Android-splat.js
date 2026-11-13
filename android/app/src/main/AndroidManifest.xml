@@ -25,7 +25,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <service android:name=".TrainingService" android:exported="false" android:foregroundServiceType="specialUse">
+        <!-- :training isolates the foreground-service trainer. When the Activity
+             backgrounds it checkpoints and releases its GPU; this process
+             resumes in a headless WebView and survives task removal. -->
+        <service android:name=".TrainingService" android:exported="false" android:process=":training" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="On-device 3D Gaussian splat training with live progress." />
         </service>

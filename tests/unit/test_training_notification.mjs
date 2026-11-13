@@ -15,10 +15,8 @@ assert.match(manifest, /<uses-permission android:name="android\.permission\.WAKE
   'the manifest should allow the training wake lock');
 assert.match(manifest, /<uses-permission android:name="android\.permission\.POST_NOTIFICATIONS" \/>/,
   'the manifest should allow progress notifications');
-assert.match(manifest, /<service android:name="\.TrainingService" android:exported="false" android:foregroundServiceType="specialUse">/,
-  'the manifest should declare the notification service without a trainer process');
-assert.doesNotMatch(manifest, /android:process=":training"/,
-  'the retired service trainer must not create a second app process');
+assert.match(manifest, /<service android:name="\.TrainingService" android:exported="false" android:process=":training" android:foregroundServiceType="specialUse">/,
+  'the manifest should declare the training service as special-use in the :training process');
 assert.match(manifest, /PROPERTY_SPECIAL_USE_FGS_SUBTYPE/,
   'the service should declare its special-use subtype property');
 
@@ -30,8 +28,8 @@ assert.match(service, /startForeground\(NOTIF_ID, notification, ServiceInfo\.FOR
   'the service should start foreground as special-use on Android 14+');
 assert.match(service, /setOngoing\(ongoing\)/,
   'training should keep a persistent, non-dismissible ongoing notification');
-assert.doesNotMatch(service, /new WebView|AndroidHeadless|RunFiles/,
-  'the foreground service should only notify and hold the wake lock, never train');
+assert.match(service, /setForegroundServiceBehavior\(Notification\.FOREGROUND_SERVICE_IMMEDIATE\)/,
+  'Android 12+ should expose the foreground-service notification immediately');
 assert.match(service, /PARTIAL_WAKE_LOCK, "SplatXR:training"/,
   'the service should hold a partial wake lock while training');
 assert.match(service, /case "start":[\s\S]*case "update":[\s\S]*case "finish":[\s\S]*default:/,
@@ -44,8 +42,8 @@ assert.match(service, /notifications\(\)\.notify\(DONE_ID/,
   'a finish should leave one dismissible summary notification');
 assert.match(service, /public void onTaskRemoved\(Intent rootIntent\) \{/,
   'swiping the app away should reach the takeover-or-teardown branch');
-assert.match(service, /onTaskRemoved\(Intent rootIntent\) \{[\s\S]*?teardown\(\);[\s\S]*?super\.onTaskRemoved/,
-  'swiping the app away should simply stop the notification-only service');
+assert.match(service, /String active = RunFiles\.readActive\(this\);[\s\S]*?if \(active == null\) \{[\s\S]*?teardown\(\);[\s\S]*?sendBroadcast\(handoff\);[\s\S]*?HANDOFF_ACK_MS/,
+  'a swipe with no outlived run should tear down; with one, the service should ask for the pass, settling on a timer');
 assert.match(service, /checkSelfPermission\(Manifest\.permission\.POST_NOTIFICATIONS\)[\s\S]*?!= PackageManager\.PERMISSION_GRANTED\) return;/,
   'the finish summary should be skipped when notifications are denied instead of crashing');
 assert.match(service, /catch \(Exception ignored\) \{ \/\* progress display must never crash training \*\/ \}/,
@@ -54,8 +52,8 @@ assert.match(service, /catch \(Exception ignored\) \{ \/\* a summary must never 
   'the finish summary should never crash the app');
 assert.match(service, /startForeground\(NOTIF_ID, notification[\s\S]*?catch \(Exception e\) \{[\s\S]*?teardown\(\);/,
   'a refused foreground start should stop quietly instead of crashing');
-assert.match(service, /if \(intent == null\) \{ stopSelf\(\); return START_NOT_STICKY; \}/,
-  'a notification-service restart without a command should stop immediately');
+assert.match(service, /if \(intent == null\) \{[\s\S]*?resurrectIfOurs\(active\)[\s\S]*?stopSelf\(\);/,
+  'a restart without a command should resurrect only a service-owned run, else stop instead of going zombie');
 assert.match(service, /releaseWakeLock\(\);/,
   'every teardown path should release the wake lock');
 assert.match(service, /case "paused":/,
@@ -64,8 +62,8 @@ assert.match(service, /builder\.addAction\(lastPaused \? android\.R\.drawable\.i
   'the ongoing notification should carry a Pause/Resume action');
 assert.match(service, /PendingIntent\.getBroadcast\(this, 1, toggle,/,
   'the shade button should fire a broadcast instead of opening the app');
-assert.match(service, /setAction\(Intent\.ACTION_MAIN\)[\s\S]*addCategory\(Intent\.CATEGORY_LAUNCHER\)/,
-  'tapping the notification should only reopen the original Activity session');
+assert.match(service, /setAction\(MainActivity\.ACTION_RETURN_TRAINING\)[\s\S]*FLAG_ACTIVITY_CLEAR_TOP \| Intent\.FLAG_ACTIVITY_SINGLE_TOP/,
+  'tapping the notification should target the existing Activity and request training ownership');
 assert.match(service, /if \(lastPaused\) releaseWakeLock\(\); else acquireWakeLock\(\);/,
   'a shade pause should free the CPU while keeping the notification up');
 

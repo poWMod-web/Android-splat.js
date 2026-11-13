@@ -973,7 +973,8 @@ function boot() {
   // a shared result: load it straight into the done-state viewer
   if (mp.get('space') && SHELL !== 'browser') restoreShared(mp.get('space'));
   else if (mp.get('model')) restoreSession({ url: mp.get('model'), reconUrl: mp.get('recon') });
-  else mountWall();
+  else if (mp.get('back')) headlessClearMarker().finally(() => mountWall());
+  else headlessBootCheck().then((took) => { if (!took) mountWall(); });
 }
 
 // WebGPU probe: navigator.gpu can EXIST while the adapter is unavailable
@@ -2103,6 +2104,16 @@ async function startPrepInner() {
   }
   document.getElementById('failcard')?.remove();
   if (S.commitSettings && !S.commitSettings()) return;
+  // migrate-on-swipe: one GPU — a live headless run owns it until adopted,
+  // recovered or discarded (the monitor is the way back to it)
+  if (await headlessMarkerLive()) {
+    // Do not leave the user on a Start button which can never start. Put the
+    // already-running job in front of them; if its files race this read, the
+    // explanation remains as a fallback.
+    if (!(await headlessBootCheck()))
+      flash('A training run is still going in the background — reopen it from the monitor instead of starting over it.', 8000);
+    return false;
+  }
   if (!S.preset || S.photos.length < 3) { flash('Use at least 3 overlapping views; 20–200 are recommended.', 7000); return; }
   if (S.preset.capture?.transforms) {
     try { validateDataset(S.preset.capture); }
@@ -2864,7 +2875,8 @@ function startTraining() {
   S._resumeRunId = null;
   const keepId = resumeId || S.runId || null;
   S.runId = keepId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-  androidNotifStart();   // notification + wake lock; this Activity remains the only trainer
+  androidNotifStart();   // background-safe from the first cycle
+  stageHeadlessRun();   // migrate-on-swipe: the files-dir handoff stages from the first cycle
   S._ckptIter = 0;
   (async () => {
     const runGen = S.gen;
@@ -3140,6 +3152,7 @@ function toggleTrain() {
       }
     } catch { /* private mode */ }
   }
+  headlessStatusWrite(on ? 'active' : 'paused');
   // Shade control: where the bridge can flip the notification's button the
   // service stays up across the pause (Resume in the shade); old bridges
   // shed it and restart it instead.
@@ -3878,6 +3891,7 @@ async function runAvatarStages() {
 
 async function finish() {
   androidNotifStop(true);   // the shade keeps the final score
+  headlessClear();   // locally finished: nothing for the service to take over
   S.iter = S.session.trainer.iter;   // honest count — the run may end early
   S.minutes = Math.max(1, Math.round((performance.now() - S.trainT0) / 60000));
   enterDone();
@@ -6133,14 +6147,11 @@ function renderHud() {
 // Every entry here is best-effort and bridge-gated: without the files-dir
 // bridge (desktop, old app builds) each function returns silently and the run
 // continues exactly as without the feature.
-/** Service-owned WebGPU training is disabled. Android WebView cannot
- *  reliably migrate a live low-memory worker between renderer processes: on
- *  affected devices foregrounding destroys the service GPU and the transferred
- *  CPU seed cannot be recovered in place. Keep training in the Activity, as in
- *  the original reliable implementation; the foreground service is notification
- *  + wake-lock only. The dormant file format remains readable by newer builds,
- *  but this build never stages, hands off, adopts, or deletes a headless run. */
-const headlessBridge = () => null;
+/** The files-dir bridge (MainActivity, new enough to stage runs). */
+const headlessBridge = () => {
+  const b = globalThis.AndroidARBridge;
+  return b && typeof b.writeRunJson === 'function' && typeof b.writeRunChunk === 'function' ? b : null;
+};
 /** A files-dir read must never own the Start button forever. Android's asset
  *  handler is local, so seconds of silence means a wedged request, not useful
  *  evidence that another trainer exists. */
@@ -7088,6 +7099,7 @@ function loop() {
     lastPulse = now;
     paintStrip();          // the pulse on the frame being trained on
   }
+  if (S.state === 'train') headlessActivityBeat(now);
   if (S.state === 'monitor') monitorPoll(now);
 
   renderHud();
