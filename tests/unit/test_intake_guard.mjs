@@ -17,11 +17,19 @@ const session = readFileSync(resolve(root, 'src/session.js'), 'utf8');
 const mainAct = readFileSync(resolve(root, 'android/app/src/main/java/space/arrival/splatxr/MainActivity.java'), 'utf8');
 const service = readFileSync(resolve(root, 'android/app/src/main/java/space/arrival/splatxr/TrainingService.java'), 'utf8');
 
-// --- the intake guard: Start refuses while a set is still landing ---
+// --- the intake gate: the first tap queues while a set is still landing ---
 const prepStart = app.indexOf('async function startPrep()');
-const prep = app.slice(prepStart, prepStart + 600);
-assert.match(prep, /\(S\._intakeN \|\| 0\) > 0/, 'startPrep should check the intake counter first');
-assert.match(prep, /frames are still landing/, 'the refusal should say the frames are still landing');
+const prep = app.slice(prepStart, app.indexOf('document.getElementById(\'failcard\')', prepStart));
+assert.match(prep, /if \(S\._startBusy\) return false;/,
+  'one Start request should own the button and suppress double taps');
+assert.match(prep, /go\.disabled = true;[\s\S]*Preparing photos…/,
+  'a fast Start tap should immediately show visible work on the button');
+assert.match(prep, /while \(\(S\._intakeN \|\| 0\) > 0[\s\S]*setTimeout\(resolve, 50\)/,
+  'Start should wait for the intake wrapper instead of rejecting the first tap');
+assert.match(app, /await startPrep\(\);\n  \}\);/,
+  'the click handler should await the whole Start request');
+assert.match(app, /if \(autostart\) await startPrep\(\);/,
+  'picker autostart should await and surface the same guarded request');
 
 assert.match(app,
   /async function useOwnPhotos\(list, capture = null\) \{\n  S\._intakeN = \(S\._intakeN \|\| 0\) \+ 1;\n  try \{ return await useOwnPhotosInner\(list, capture\); \}\n  finally \{ S\._intakeN--; \}/,
@@ -57,6 +65,16 @@ assert.match(guard, /status\.owner === 'service' && !\(await headlessServiceAliv
   'service-owned live markers should get a liveness check');
 assert.match(guard, /status: 'interrupted', at: Date\.now\(\),/,
   'a dead service should release its run to recovery');
+assert.match(guard, /status\.owner === 'activity' && S\.state === 'ready'/,
+  'an activity-owned marker cannot brick Start when this Activity is in setup');
+assert.match(guard, /headlessBridge\(\)\.clearActiveRun\(runId\)/,
+  'the stale local marker should be released before the new run stages');
+assert.match(app, /async function headlessFetch\(url, timeoutMs = 2500\)[\s\S]*ctl\.abort\(\)/,
+  'a wedged Android files-dir read must not own Start indefinitely');
+assert.match(guard, /headlessFetch\(Headless\.activeUrl\(\)\)/,
+  'the Start preflight should use the bounded local-file read');
+assert.match(app, /if \(!\(await headlessBootCheck\(\)\)\)/,
+  'a genuinely live background run should open its monitor, not leave a dead Start card');
 
 const aliveStart = app.indexOf('async function headlessServiceAlive(runId)');
 const alive = app.slice(aliveStart, aliveStart + 1200);

@@ -594,7 +594,7 @@ function boot() {
       }
       go.disabled = false;
     }
-    startPrep();
+    await startPrep();
   });
   $('btn-new').addEventListener('click', async (e) => {
     e.stopPropagation();
@@ -1480,8 +1480,8 @@ function persistCapture(rec) {
 }
 
 // Async intake funnels through here (file picker, drops, captures, zips):
-// the landing set's open() bumps S.gen, which silently kills a startPrep in
-// flight — Start refuses while the counter stands (see startPrep).
+// the landing set's open() bumps S.gen, which can kill startPrep in flight.
+// Start now queues behind this counter instead of making the user tap twice.
 async function useOwnPhotos(list, capture = null) {
   S._intakeN = (S._intakeN || 0) + 1;
   try { return await useOwnPhotosInner(list, capture); }
@@ -1962,7 +1962,7 @@ async function open(preset, autostart = false) {
   // load once training starts (or a tile is touched), not now
   buildStrip(true);
   paintCard(preset);
-  if (autostart) startPrep();
+  if (autostart) await startPrep();
   else $('start').hidden = false;
 }
 
@@ -2061,17 +2061,54 @@ async function avatarPrep(gen) {
   return true;
 }
 
+/** One Start request owns the button until it enters prep or explains why it
+ *  cannot. Await every preflight (including AR intake completion and Android
+ *  run ownership) under visible button state and one top-level error boundary:
+ *  no guard or rejected promise may look like an inert button. */
 async function startPrep() {
-  // a photo/capture/video set still landing (its open() would bump the
-  // generation and silently kill this start below): say so, don't just die
-  if ((S._intakeN || 0) > 0) { flash('The frames are still landing — Start again in a moment.', 4000); return; }
+  if (S._startBusy) return false;
+  S._startBusy = true;
+  const go = $('btn-go');
+  const oldLabel = go.textContent;
+  go.disabled = true;
+  go.textContent = (S._intakeN || 0) > 0 ? 'Preparing photos…' : 'Starting…';
+  try {
+    return await startPrepInner();
+  } catch (e) {
+    console.error('[start]', e);
+    flash(`Could not start training: ${e && e.message ? e.message : e}`, 9000);
+    return false;
+  } finally {
+    S._startBusy = false;
+    if (S.state === 'ready' || !$('detail').hidden || !$('start').hidden) {
+      go.textContent = oldLabel;
+      go.disabled = !!S.noGpu;
+    }
+  }
+}
+
+async function startPrepInner() {
+  if ((S._intakeN || 0) > 0) {
+    const until = performance.now() + 15000;
+    while ((S._intakeN || 0) > 0 && performance.now() < until) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if ((S._intakeN || 0) > 0) {
+      flash('The photos are still being prepared. Please try again.', 7000);
+      return false;
+    }
+  }
   document.getElementById('failcard')?.remove();
   if (S.commitSettings && !S.commitSettings()) return;
   // migrate-on-swipe: one GPU — a live headless run owns it until adopted,
   // recovered or discarded (the monitor is the way back to it)
   if (await headlessMarkerLive()) {
-    flash('A training run is still going in the background — reopen it from the monitor instead of starting over it.', 8000);
-    return;
+    // Do not leave the user on a Start button which can never start. Put the
+    // already-running job in front of them; if its files race this read, the
+    // explanation remains as a fallback.
+    if (!(await headlessBootCheck()))
+      flash('A training run is still going in the background — reopen it from the monitor instead of starting over it.', 8000);
+    return false;
   }
   if (!S.preset || S.photos.length < 3) { flash('Use at least 3 overlapping views; 20–200 are recommended.', 7000); return; }
   if (S.preset.capture?.transforms) {
@@ -6053,18 +6090,41 @@ const headlessBridge = () => {
   const b = globalThis.AndroidARBridge;
   return b && typeof b.writeRunJson === 'function' && typeof b.writeRunChunk === 'function' ? b : null;
 };
+/** A files-dir read must never own the Start button forever. Android's asset
+ *  handler is local, so seconds of silence means a wedged request, not useful
+ *  evidence that another trainer exists. */
+async function headlessFetch(url, timeoutMs = 2500) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try { return await fetch(url, { signal: ctl.signal }); }
+  finally { clearTimeout(timer); }
+}
+
 /** True when a run directory claims a live run (staging/booting/active/paused). */
 async function headlessMarkerLive() {
   if (!headlessBridge()) return false;
   try {
-    const r = await fetch(Headless.activeUrl());
+    const r = await headlessFetch(Headless.activeUrl());
     if (!r.ok) return false;
     const { runId } = await r.json();
     if (!Headless.validRunId(runId)) return false;
-    const st = await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
+    const st = await headlessFetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
     if (!st.ok) return false;
     const status = await st.json();
     if (!Headless.isLiveStatus(status)) return false;
+    // This guard is reached only by a new Start request. An activity-owned
+    // live marker cannot own GPU work here (this page is still in setup), so
+    // it is debris from a failed/old local run. Do not let it brick Start.
+    if (status.owner === 'activity' && S.state === 'ready') {
+      try {
+        headlessBridge().writeRunJson(runId, 'status.json', JSON.stringify({
+          ...status, status: 'interrupted', at: Date.now(),
+          error: 'the previous local trainer was no longer running',
+        }));
+        headlessBridge().clearActiveRun(runId);
+      } catch { /* the new staging pass will replace an un-clearable marker */ }
+      return false;
+    }
     // a live run owned by a service that answers no ping died with its
     // process (killed, crashed, updated): release it to recovery instead of
     // blocking every new start behind a run that will never finish
