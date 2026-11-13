@@ -1228,6 +1228,7 @@ async function localRunTiles() {
     const retrainable = !!(r.ownSrc || urlSrc);
     const b = document.createElement('div');
     b.className = 'galtile';
+    b.dataset.runId = r.id;
     b.style.cursor = (r.sog || (r.state && r.recon) || retrainable) ? 'pointer' : 'default';
     // finished scenes wear the same sub-header as the preset tiles:
     // splats · dB · MB — a scene is a scene, wherever it was trained
@@ -1337,15 +1338,15 @@ async function androidRunTiles() {
   let ids = [];
   try { ids = JSON.parse(bridge.listRecoverableRuns()); } catch { return []; }
   if (!Array.isArray(ids) || !ids.length) return [];
-  const { listRuns, deleteRun } = await import('./store.js');
-  const existing = new Set((await listRuns()).filter((r) => r && r.id && r.state && r.recon).map((r) => r.id));
+  const { deleteRun } = await import('./store.js');
   const tiles = [];
   for (const runId of ids) {
-    if (!Headless.validRunId(runId) || existing.has(runId)) continue;
+    if (!Headless.validRunId(runId)) continue;
     try {
       const manifestResponse = await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')));
       if (!manifestResponse.ok) continue;
-      const manifest = Headless.validateManifest(await manifestResponse.json());
+      const manifest = await manifestResponse.json();
+      const photoCount = Array.isArray(manifest.photos) ? manifest.photos.length : 0;
       let status = { status: 'interrupted', owner: 'activity', iter: 0, at: 0 };
       try {
         const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
@@ -1359,7 +1360,7 @@ async function androidRunTiles() {
         : `saved checkpoint · ${fmt(status.iter || 0)} cycles`;
       tile.innerHTML = `<button class="run-menu" title="Options">⋯</button>
         <span class="galname">${esc(manifest.name || 'Training run')}</span>
-        <span class="galdesc">Stored in Android app data · ${fmt(manifest.photos.length)} photos.</span>
+        <span class="galdesc">Stored in Android app data${photoCount ? ` · ${fmt(photoCount)} photos` : ''}.</span>
         <span class="galmeta">${state}</span>`;
       const openFileRun = async () => {
         flash('Opening the saved model …', 60000);
@@ -5786,7 +5787,12 @@ async function mountWall() {
       lastCaptureTile().catch(() => null),
       localRunTiles().catch(() => []),
     ]);
-    const tiles = [...scanTiles, ...fileRunTiles, ...(capTile ? [capTile] : []), ...runTiles];
+    // Prefer the Android-file tile when the same run also has an IDB mirror:
+    // it remains openable after WebView quota/profile loss and guarantees one
+    // visible card rather than allowing a stale IDB record to suppress it.
+    const fileIds = new Set(fileRunTiles.map((tile) => tile.dataset.runId).filter(Boolean));
+    const uniqueLocalRuns = runTiles.filter((tile) => !fileIds.has(tile.dataset.runId));
+    const tiles = [...scanTiles, ...fileRunTiles, ...(capTile ? [capTile] : []), ...uniqueLocalRuns];
     host.replaceChildren();
     if (!tiles.length) { host.hidden = true; return; }
     const heading = document.createElement('p');

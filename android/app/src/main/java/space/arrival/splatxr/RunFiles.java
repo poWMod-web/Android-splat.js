@@ -239,8 +239,9 @@ public final class RunFiles {
 
     /** Enumerate every self-contained run directory for Home recovery after
      *  IndexedDB eviction. Control-plane metadata is not required: a complete
-     *  checkpoint is itself a durable model. Explicitly discarded runs alone
-     *  stay invisible; ordinary Back/dismissed runs remain discoverable. */
+     *  state.bin + recon.json are themselves a viewable durable model, even
+     *  when an older build lost its photo handoff metadata. Explicitly
+     *  discarded runs alone stay invisible; Back runs remain discoverable. */
     public static List<String> listDurableRuns(Context ctx) {
         List<String> out = new ArrayList<>();
         File[] dirs = runsDir(ctx).listFiles(File::isDirectory);
@@ -254,10 +255,10 @@ public final class RunFiles {
             File manifest = new File(dir, "manifest.json");
             if (!state.isFile() || state.length() < 16 || !recon.isFile() || !manifest.isFile()) continue;
             try {
-                String photosRaw = readJson(ctx, id, "photos.json");
-                if (photosRaw == null) continue;
-                JSONObject photos = new JSONObject(photosRaw);
-                if (!photos.optBoolean("complete", photos.optBoolean("done", false))) continue;
+                // A state + reconstruction is independently viewable. Older
+                // builds may have lost photos.json or its copied images; that
+                // must not erase the trained model from Home. Source presence
+                // is checked only when the user asks to continue training.
                 String statusRaw = readJson(ctx, id, "status.json");
                 String value = "";
                 try { if (statusRaw != null) value = new JSONObject(statusRaw).optString("status", ""); }

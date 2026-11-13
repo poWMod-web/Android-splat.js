@@ -203,10 +203,16 @@ assert.match(app, /async function nativeCaptureTiles\(\)[\s\S]*listCaptureArchiv
   'Home should enumerate native Android scan archives independently of IndexedDB');
 assert.match(main, /public String listRecoverableRuns\(\)[\s\S]*RunFiles\.listDurableRuns/,
   'the bridge should expose complete Android run directories to Home');
-assert.match(runFiles, /List<String> listDurableRuns\(Context ctx\)[\s\S]*state\.bin[\s\S]*photos\.optBoolean\("complete"/,
-  'Android discovery should require a checkpoint and complete retained images');
+const durableList = runFiles.slice(runFiles.indexOf('List<String> listDurableRuns(Context ctx)'),
+  runFiles.indexOf('String recoverActive(Context ctx)'));
+assert.match(durableList, /state\.bin[\s\S]*recon\.json[\s\S]*manifest\.json/,
+  'Android Home discovery should require a complete trained-model checkpoint');
+assert.doesNotMatch(durableList, /readJson\(ctx, id, \"photos\.json\"\)|photos\.optBoolean/,
+  'loss of old photo handoff metadata must not hide an independently viewable model');
 assert.match(app, /async function androidRunTiles\(\)[\s\S]*listRecoverableRuns\(\)[\s\S]*Stored in Android app data/,
   'Home should show lightweight Android-file models without first copying state into IndexedDB');
+assert.match(app, /fileIds = new Set\(fileRunTiles[\s\S]*uniqueLocalRuns = runTiles\.filter/,
+  'a stale IDB record must not suppress its authoritative Android-file Home tile');
 assert.doesNotMatch(app, /for \(const runId of ids\.slice\(0, 12\)\)/,
   'Android model discovery must not retain the old twelve-run display cap');
 assert.match(runFiles, /listDurableRuns\(Context ctx\)[\s\S]*"discarded"\.equals\(value\)[\s\S]*out\.add\(id\)/,
