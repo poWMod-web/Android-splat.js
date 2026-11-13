@@ -3242,8 +3242,9 @@ function restoreRunDetails(run, session = S.session, opts = {}) {
 // in-app or the phone's), and (desktop only) when the tab goes hidden
 // mid-training. Pausing writes nothing: it is just a breather. One slot per
 // run, overwritten: leaving means the page may be closed, and the Yours tile
-// continues the run bit-exactly from where it stopped. The blob is dropped
-// again the moment the run finishes properly — the sog takes over.
+// continues the run from where it stopped (float16-close — training
+// re-converges the quantization noise). The blob is dropped again the
+// moment the run finishes properly — the sog takes over.
 /** Crash-safe checkpoint. Returns the secured { state, recon } on success
  *  (finish() adopts them into the in-memory run record — no second GPU
  *  readback, no store round-trip), null when there was nothing to keep. */

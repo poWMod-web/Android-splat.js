@@ -6,8 +6,10 @@
 //     sparse cloud, the source file list: everything the app needs to
 //     PRESENT a model (capture-path tour, frustums, orbit pivot) without
 //     re-solving, and to refetch the images for a training resume.
-//   state.bin  — the trainer's raw float parameters and SH coefficients:
-//     a bit-exact resume, no opacity baking, no SOG quantization.
+//   state.bin  — the trainer's parameters and SH coefficients as float16
+//     words (v2 — half the bytes; a resume re-converges the quantization
+//     noise, and v1 float32 blobs still read): no opacity baking, no SOG
+//     quantization.
 //
 // ?model=<url> accepts a session .zip, a .ply, or a .sog (decoded via the
 // vendored splat-transform); &recon=<url> adds presentation state to bare
@@ -210,23 +212,75 @@ export function convertSHDegree(g, degree) {
   return g;
 }
 
-/** The trainer's exact float state as one binary blob. */
+// float16 word codec for the v2 state payload — plain bit-twiddling, no
+// DataView float16 (too new for the WebViews this ships in). Round to
+// nearest, ties to even; NaN -> quiet NaN, overflow -> infinity.
+const _f32u = new Float32Array(1);
+const _f32b = new Uint32Array(_f32u.buffer);
+export function floatToHalf(v) {
+  _f32u[0] = v;
+  const x = _f32b[0];
+  const s = (x >> 16) & 0x8000;
+  const be = (x >> 23) & 0xff;
+  // inf, or quiet NaN for NaN — tested BEFORE the rebias, so a nonzero
+  // mantissa on an overflowing (but finite) value still saturates to inf
+  if (be === 255) return s | 0x7c00 | (x & 0x7fffff ? 0x200 : 0);
+  const e = be - 112;   // rebias the exponent 127 -> 15
+  const m = x & 0x7fffff;
+  if (e <= 0) {
+    if (e < -10) return s;   // underflows to signed zero
+    const sub = (m | 0x800000) >> (1 - e);
+    return s | ((sub + 0xfff + ((sub >> 13) & 1)) >> 13);
+  }
+  if (e >= 31) return s | 0x7c00;   // overflow -> infinity
+  // ADD, not OR: a mantissa rounding up to 0x400 carries into the exponent,
+  // and OR would swallow that carry whenever e is odd (e.g. 0.49999… -> 0.25)
+  return s | ((e << 10) + (((m + 0xfff + ((m >> 13) & 1)) >> 13)));
+}
+export function halfToFloat(h) {
+  const s = (h & 0x8000) << 16;
+  const e = (h >> 10) & 0x1f;
+  const m = h & 0x3ff;
+  if (e === 0) {
+    if (m === 0) { _f32b[0] = s; return _f32u[0]; }
+    let mm = m, ee = -14;   // subnormal: renormalize
+    while (!(mm & 0x400)) { mm <<= 1; ee--; }
+    _f32b[0] = s | ((ee + 127) << 23) | ((mm & 0x3ff) << 13);
+    return _f32u[0];
+  }
+  if (e === 31) { _f32b[0] = s | 0x7f800000 | (m << 13); return _f32u[0]; }
+  _f32b[0] = s | ((e + 112) << 23) | (m << 13);
+  return _f32u[0];
+}
+const floatsToHalfs = (src, dst) => { for (let i = 0; i < src.length; i++) dst[i] = floatToHalf(src[i]); };
+const halfsToFloats = (src, dst) => { for (let i = 0; i < src.length; i++) dst[i] = halfToFloat(src[i]); };
+
+/** The trainer's state as one binary blob: float16 params + SH (v2 — half
+ *  the bytes of the v1 float32 layout, for values a resume re-converges
+ *  within a few hundred iterations; the optimizer already cold-starts, so
+ *  nothing else is lost). */
 export async function packState(ses) {
   const { data, n, sh, shK, dc } = await ses.exportRawState();
   const head = new TextEncoder().encode(JSON.stringify({
-    magic: 'splatjs-state', version: 1, n, shK, iter: ses.trainer.iter,
+    magic: 'splatjs-state', version: 2, n, shK, iter: ses.trainer.iter,
     // convention tags (absent in old blobs = the v1 defaults): dc names the
     // color-slot encoding, engine picks the trainer a resume must rebuild
     dc: dc || 'sigmoid', engine: ses.trainer.v2 ? 'v2' : 'v1',
     recipe: trainRecipe(ses),
   }));
-  const params = new Uint8Array(data.buffer, data.byteOffset, n * STRIDE * 4);
-  const shBytes = sh ? new Uint8Array(sh.buffer, sh.byteOffset, n * shK * 3 * 4) : new Uint8Array(0);
-  const out = new Uint8Array(4 + head.length + params.length + shBytes.length);
+  // explicit-length views: short export buffers throw here, not silently
+  // (readGaussians hands over fresh float32 arrays, so these views align)
+  const src = new Float32Array(data.buffer, data.byteOffset, n * STRIDE);
+  const params = new Uint16Array(n * STRIDE);
+  floatsToHalfs(src, params);
+  const shCount = sh ? n * shK * 3 : 0;
+  const shHalf = new Uint16Array(shCount);
+  if (sh) floatsToHalfs(new Float32Array(sh.buffer, sh.byteOffset, shCount), shHalf);
+  const out = new Uint8Array(4 + head.length + params.byteLength + shHalf.byteLength);
   new DataView(out.buffer).setUint32(0, head.length, true);
   out.set(head, 4);
-  out.set(params, 4 + head.length);
-  out.set(shBytes, 4 + head.length + params.length);
+  out.set(new Uint8Array(params.buffer), 4 + head.length);
+  out.set(new Uint8Array(shHalf.buffer), 4 + head.length + params.byteLength);
   return out;
 }
 
@@ -285,7 +339,7 @@ export function parseState(bytes) {
   const headLen = new DataView(bytes.buffer, bytes.byteOffset).getUint32(0, true);
   if (headLen > bytes.length - 4) throw new Error('truncated state header');
   const head = JSON.parse(new TextDecoder().decode(bytes.subarray(4, 4 + headLen)));
-  if (head.magic !== 'splatjs-state' || head.version !== 1) {
+  if (head.magic !== 'splatjs-state' || (head.version !== 1 && head.version !== 2)) {
     throw new Error('not a supported splat.js state blob');
   }
   if (!Number.isSafeInteger(head.n) || head.n < 1 ||
@@ -293,18 +347,30 @@ export function parseState(bytes) {
       !Number.isSafeInteger(head.iter) || head.iter < 0) {
     throw new Error('invalid state metadata');
   }
-  let o = 4 + headLen;
-  const expected = head.n * (STRIDE * 4 + head.shK * 3 * 4);
+  const o = 4 + headLen;
+  const word = head.version === 2 ? 2 : 4;   // v2 stores float16 words
+  const expected = head.n * (STRIDE + head.shK * 3) * word;
   if (!Number.isSafeInteger(expected) || bytes.length - o !== expected) {
     throw new Error('state data length does not match its header');
   }
   const params = new Float32Array(head.n * STRIDE);
-  new Uint8Array(params.buffer).set(bytes.subarray(o, o + params.byteLength));
-  o += params.byteLength;
   let sh = null;
-  if (head.shK) {
-    sh = new Float32Array(head.n * head.shK * 3);
-    new Uint8Array(sh.buffer).set(bytes.subarray(o, o + sh.byteLength));
+  if (head.version === 2) {
+    // the JSON header is an arbitrary length, so the payload is rarely
+    // 2-aligned: one copy onto an aligned buffer (the constructor copies
+    // even Buffer views), then typed views over it
+    const body = new Uint8Array(bytes.subarray(o));
+    halfsToFloats(new Uint16Array(body.buffer, 0, params.length), params);
+    if (head.shK) {
+      sh = new Float32Array(head.n * head.shK * 3);
+      halfsToFloats(new Uint16Array(body.buffer, params.length * 2, sh.length), sh);
+    }
+  } else {
+    new Uint8Array(params.buffer).set(bytes.subarray(o, o + params.byteLength));
+    if (head.shK) {
+      sh = new Float32Array(head.n * head.shK * 3);
+      new Uint8Array(sh.buffer).set(bytes.subarray(o + params.byteLength, o + params.byteLength + sh.byteLength));
+    }
   }
   return {
     gaussians: { data: params, n: head.n, sh, shK: head.shK, dc: head.dc === 'sh' ? 'sh' : 'sigmoid' },
