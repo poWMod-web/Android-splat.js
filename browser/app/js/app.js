@@ -261,13 +261,12 @@ function readKeepCustom(id) {
   const pct = Math.round(parseFloat($(id).value) || 0);
   return (pct >= 5 ? Math.min(95, pct) : 50) / 100;
 }
-/** Custom PRUNE percentage from a picker input (clamped 1–95%, 50% only
- *  when the input is empty or garbage): returns the KEEP fraction the flow
- *  wants. A valid low value such as 3 must remain 3, never fall back to 50. */
+/** Custom PRUNE percentage from a picker input. Only whole values 1–99
+ *  are accepted; invalid input returns null and must not execute a prune. */
 function readPruneCustom(id) {
-  const raw = parseFloat($(id).value);
-  const pct = Number.isFinite(raw) ? Math.min(95, Math.max(1, Math.round(raw))) : 50;
-  return 1 - pct / 100;
+  const raw = Number($(id).value);
+  if (!Number.isInteger(raw) || raw < 1 || raw > 99) return null;
+  return 1 - raw / 100;
 }
 
 // quality macros: the one-knob row that drives the individual rows below it.
@@ -3172,7 +3171,7 @@ function showPrunePicker() {
       <button class="btn" data-ratio="0.75">Prune ¼</button>
       <button class="btn" data-ratio="0.5">Prune ½</button>
       <button class="btn" data-grow="1">Grow now</button>
-      <input id="prunepick-custom" type="number" min="1" max="95" step="1" value="50" style="width:4.5em" title="Custom prune percentage (1–95)">
+      <input id="prunepick-custom" type="number" min="1" max="99" step="1" value="50" style="width:4.5em" title="Custom prune percentage (1–99)">
       <button class="btn" data-custom="1">Prune %</button>
       <button class="btn linkish" data-ratio="">Cancel</button>
     </div>`;
@@ -3183,6 +3182,12 @@ function showPrunePicker() {
     if (!e.target || e.target.tagName !== 'BUTTON') return;
     const d = e.target.dataset;
     const customKeep = d.custom ? readPruneCustom('prunepick-custom') : 0;
+    if (d.custom && customKeep == null) {
+      const input = $('prunepick-custom');
+      input.focus(); input.select();
+      flash('Enter a whole prune percentage from 1 to 99.', 6000);
+      return;
+    }
     card.remove();
     if (d.grow) { runGrowNow(); return; }
     if (d.custom) { runPruneAndContinue(customKeep); return; }
@@ -5796,36 +5801,49 @@ function textCard(heading, value, { action = 'Save', max = 80 } = {}) {
   });
 }
 
-/** Rebuild the local library from captures and runs in this browser's storage. */
+/** Rebuild the local library progressively. The main-branch behavior painted
+ * IndexedDB immediately; Android archive discovery must enhance that wall,
+ * never block every capture/model/training tile behind one slow source. */
+let wallMountToken = 0;
 async function mountWall() {
   const host = $('gallery');
   if (!host) return;
-  try {
-    // File-backed model tiles are lightweight: Home never waits for or
-    // duplicates every state.bin into IndexedDB before showing saved work.
-    const [scanTiles, fileRunTiles, capTile, runTiles] = await Promise.all([
-      nativeCaptureTiles().catch(() => []),
-      androidRunTiles().catch(() => []),
-      lastCaptureTile().catch(() => null),
-      localRunTiles().catch(() => []),
-    ]);
-    // Prefer the Android-file tile when the same run also has an IDB mirror:
-    // it remains openable after WebView quota/profile loss and guarantees one
-    // visible card rather than allowing a stale IDB record to suppress it.
-    const fileIds = new Set(fileRunTiles.map((tile) => tile.dataset.runId).filter(Boolean));
-    const uniqueLocalRuns = runTiles.filter((tile) => !fileIds.has(tile.dataset.runId));
-    const tiles = [...scanTiles, ...fileRunTiles, ...(capTile ? [capTile] : []), ...uniqueLocalRuns];
-    host.replaceChildren();
+  const token = ++wallMountToken;
+  const heading = document.createElement('p');
+  heading.className = 'eyebrow';
+  heading.textContent = 'SAVED ON THIS DEVICE';
+  const grid = document.createElement('div');
+  grid.className = 'galgrid';
+  const slots = { scans: [], files: [], capture: [], local: [] };
+  host.replaceChildren();
+  host.hidden = true;
+
+  const paint = () => {
+    if (token !== wallMountToken) return;
+    const fileIds = new Set(slots.files.map((tile) => tile.dataset.runId).filter(Boolean));
+    const uniqueLocal = slots.local.filter((tile) => !fileIds.has(tile.dataset.runId));
+    const tiles = [...slots.scans, ...slots.files, ...slots.capture, ...uniqueLocal];
+    grid.replaceChildren(...tiles);
     if (!tiles.length) { host.hidden = true; return; }
-    const heading = document.createElement('p');
-    heading.className = 'eyebrow';
-    heading.textContent = 'SAVED ON THIS DEVICE';
-    const grid = document.createElement('div');
-    grid.className = 'galgrid';
-    grid.append(...tiles);
-    host.append(heading, grid);
+    if (!heading.isConnected) host.append(heading, grid);
     host.hidden = false;
-  } catch { host.hidden = true; }
+  };
+  const load = (key, task, fallback = []) => {
+    Promise.resolve(task).then((value) => {
+      slots[key] = Array.isArray(value) ? value : (value ? [value] : []);
+      paint();
+    }, (e) => {
+      console.warn(`[home] ${key} library unavailable`, e);
+      slots[key] = fallback;
+      paint();
+    });
+  };
+
+  // Preserve main's proven fast path first; native sources arrive independently.
+  load('capture', lastCaptureTile());
+  load('local', localRunTiles());
+  load('scans', nativeCaptureTiles());
+  load('files', androidRunTiles());
 }
 
 window.addEventListener('pageshow', (e) => {
@@ -6809,6 +6827,12 @@ function syncMonitorButtons() {
   const v = $('mon-visuals'), p = $('mon-pause');
   if (v) v.textContent = S._monVisuals ? 'Hide visuals' : 'Show visuals';
   if (p) p.textContent = S._monPaused ? 'Resume' : 'Pause';
+  // wireMonitorOnce persists across monitor visits. Reset the transfer buttons
+  // from current state so a successful first handback cannot leave the second
+  // visit permanently disabled.
+  const transferring = !!S._handbackRun;
+  if ($('mon-stop')) $('mon-stop').disabled = transferring;
+  if ($('mon-continue')) $('mon-continue').disabled = transferring;
   for (const id of ['mon-live', 'mon-rec']) {
     const el = $(id);
     if (el) el.hidden = (id === 'mon-live') === !!S._monRecovery;
@@ -6939,6 +6963,7 @@ async function returnHeadlessRun(runId) {
     return await adoptHeadlessRun(runId, 'continue');
   } finally {
     if (S._handbackRun === runId) S._handbackRun = null;
+    if (S.state === 'monitor') syncMonitorButtons();
   }
 }
 /** Adopt a background run into this Activity: finished opens view-only in the

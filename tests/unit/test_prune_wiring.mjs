@@ -146,14 +146,16 @@ assert.match(app, /data-ratio="0\.75">Prune ¼<\/button>/,
   'the manual picker offers pruning a quarter');
 assert.match(app, /data-ratio="0\.5">Prune ½<\/button>/,
   'the manual picker offers pruning half');
-assert.match(app, /<input id="prunepick-custom" type="number" min="1" max="95"/,
-  'the manual picker offers a custom 1–95% prune');
+assert.match(app, /<input id="prunepick-custom" type="number" min="1" max="99"/,
+  'the manual picker offers a custom 1–99% prune');
 assert.match(app, /function readPruneCustom\(id\) \{/,
   'a custom prune amount converts to the keep fraction the flow wants');
-assert.match(app, /Number\.isFinite\(raw\) \? Math\.min\(95, Math\.max\(1, Math\.round\(raw\)\)\) : 50/,
-  'valid low custom values such as 3% clamp to 1–95 instead of falling back to 50%');
-assert.match(app, /return 1 - pct \/ 100;/,
-  'the entered prune percentage converts to its complementary keep fraction');
+assert.match(app, /if \(!Number\.isInteger\(raw\) \|\| raw < 1 \|\| raw > 99\) return null;/,
+  'invalid custom values must be rejected instead of falling back to 50%');
+assert.match(app, /return 1 - raw \/ 100;/,
+  'a valid 1–99 prune percentage converts to its complementary keep fraction');
+assert.match(app, /customKeep == null[\s\S]*Enter a whole prune percentage from 1 to 99[\s\S]*return;/,
+  'invalid custom input should keep the picker open, explain the range, and not prune');
 assert.match(app, /data-custom="1">Prune %<\/button>/,
   'the custom prune runs the same prune flow');
 assert.match(app, /if \(!e\.target \|\| e\.target\.tagName !== 'BUTTON'\) return;/,

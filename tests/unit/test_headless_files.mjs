@@ -147,6 +147,10 @@ const monitorPollStart = app.indexOf('async function monitorPoll(now, force = fa
 const monitorPoll = app.slice(monitorPollStart, app.indexOf('function paintMonitorProgress', monitorPollStart));
 assert.ok((monitorPoll.match(/S\._handbackRun === (?:S\._monRun|runId)/g) || []).length >= 3,
   'monitor polling must ignore the intentional stopped checkpoint throughout ownership transfer');
+assert.match(app, /function syncMonitorButtons\(\)[\s\S]*mon-stop'\)\) \$\('mon-stop'\)\.disabled = transferring[\s\S]*mon-continue'\)\) \$\('mon-continue'\)\.disabled = transferring/,
+  'every monitor visit must reset transfer buttons rather than retaining disabled DOM state');
+assert.match(app, /finally \{[\s\S]*S\._handbackRun = null;[\s\S]*S\.state === 'monitor'\) syncMonitorButtons\(\)/,
+  'a failed or completed transfer should immediately synchronize button state');
 assert.match(svc, /public void stopRun\([\s\S]*endRun\(runId, title, text, false\)/,
   'an ownership transfer must not post an interruption summary notification');
 
@@ -217,7 +221,7 @@ assert.doesNotMatch(durableList, /readJson\(ctx, id, \"photos\.json\"\)|photos\.
   'loss of old photo handoff metadata must not hide an independently viewable model');
 assert.match(app, /async function androidRunTiles\(\)[\s\S]*listRecoverableRuns\(\)[\s\S]*Stored in Android app data/,
   'Home should show lightweight Android-file models without first copying state into IndexedDB');
-assert.match(app, /fileIds = new Set\(fileRunTiles[\s\S]*uniqueLocalRuns = runTiles\.filter/,
+assert.match(app, /fileIds = new Set\(slots\.files[\s\S]*uniqueLocal = slots\.local\.filter/,
   'a stale IDB record must not suppress its authoritative Android-file Home tile');
 assert.doesNotMatch(app, /for \(const runId of ids\.slice\(0, 12\)\)/,
   'Android model discovery must not retain the old twelve-run display cap');
