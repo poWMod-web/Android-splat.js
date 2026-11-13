@@ -6,6 +6,29 @@ import { saveBlob } from './download.js';
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+/** Rehydrate a completed native ARCore scan directly from Android app
+ * storage. Used both by the capture-return event and by home boot recovery
+ * when IndexedDB was cleared or its original write failed. */
+export async function importNativeCapture(nativeBridge = globalThis.AndroidARBridge) {
+  if (!nativeBridge || typeof nativeBridge.exportDataset !== 'function') throw new Error('Native capture storage is unavailable.');
+  const payload = JSON.parse(nativeBridge.exportDataset());
+  if (!payload.ready || payload.frameCount < 3) throw new Error(payload.error || 'Capture at least three frames before importing.');
+  const metadataUri = 'https://appassets.androidplatform.net/captures/current/capture.json';
+  const responses = await Promise.all([
+    fetch(payload.transformsUri), fetch(payload.pointsUri), fetch(metadataUri),
+  ]);
+  if (responses.some((response) => !response.ok)) throw new Error('Native capture files could not be read from app storage.');
+  const [transforms, pointDocument, metadata] = await Promise.all(responses.map((response) => response.json()));
+  const files = await Promise.all(payload.frames.map(async (frame) => {
+    const response = await fetch(frame.uri);
+    if (!response.ok) throw new Error(`Could not read ${frame.name} from the native capture.`);
+    return new File([await response.blob()], frame.name, { type: 'image/jpeg' });
+  }));
+  return validateDataset({ kind: 'ar', files, transforms, points: pointDocument.points || [],
+    pointsByFrame: pointDocument.pointsByFrame || null,
+    metadata: { ...metadata, ...pointDocument.metadata, nativeARCore: true } });
+}
+
 function modal(html, className = '') {
   const dialog = document.createElement('dialog');
   dialog.className = `xr-dialog ${className}`;
@@ -144,25 +167,6 @@ export function initXRUI({ onCapture, flash, setBusy }) {
   try { embedded = window.self !== window.top; } catch { /* cross-origin embedding */ }
   $('xr-open-tab').hidden = !embedded;
 
-  const importNativeCapture = async () => {
-    const payload = JSON.parse(nativeBridge.exportDataset());
-    if (!payload.ready || payload.frameCount < 3) throw new Error(payload.error || 'Capture at least three frames before importing.');
-    const metadataUri = 'https://appassets.androidplatform.net/captures/current/capture.json';
-    const responses = await Promise.all([
-      fetch(payload.transformsUri), fetch(payload.pointsUri), fetch(metadataUri),
-    ]);
-    if (responses.some((response) => !response.ok)) throw new Error('Native capture files could not be read from app storage.');
-    const [transforms, pointDocument, metadata] = await Promise.all(responses.map((response) => response.json()));
-    const files = await Promise.all(payload.frames.map(async (frame) => {
-      const response = await fetch(frame.uri);
-      if (!response.ok) throw new Error(`Could not read ${frame.name} from the native capture.`);
-      return new File([await response.blob()], frame.name, { type: 'image/jpeg' });
-    }));
-    return validateDataset({ kind: 'ar', files, transforms, points: pointDocument.points || [],
-      pointsByFrame: pointDocument.pointsByFrame || null,
-      metadata: { ...metadata, ...pointDocument.metadata, nativeARCore: true } });
-  };
-
   button.onclick = async () => {
     if (!capability.supported) { showXRHelp(capability.reason); return; }
     button.disabled = true;
@@ -193,7 +197,7 @@ export function initXRUI({ onCapture, flash, setBusy }) {
       // queues behind the counter (the app's setBusy)
       setBusy?.(true);
       try {
-        const dataset = await importNativeCapture();
+        const dataset = await importNativeCapture(nativeBridge);
         const reviewed = await reviewCapture(dataset);
         if (!reviewed) return;
         await onCapture(reviewed);

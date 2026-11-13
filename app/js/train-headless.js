@@ -34,6 +34,7 @@ let lastProgAt = 0, lastProgIter = -1;
 let ips = 0, ipsAt = 0, ipsIter = 0;
 let shotBusy = false;
 let psnr = null;
+let chartEvents = [];
 
 const b64 = (u8, size = 262144) => {
   const out = [];
@@ -80,6 +81,7 @@ async function boot() {
     const st = parseState(await fetchBytes('state.bin'));
     recon = await fetchJson('recon.json');
     if (!recon || !Array.isArray(recon.cams) || !recon.cams.length) throw new Error('recon has no cameras');
+    chartEvents = Array.isArray(recon.stats?.events) ? recon.stats.events.map((e) => ({ ...e })) : [];
     // photos matched BY NAME to the run's own frame order (same rule as the
     // app's continue path — re-sorting against imgIdx would mis-train)
     const staged = new Set(manifest.photos);
@@ -128,6 +130,13 @@ async function boot() {
     });
     undistortFrames(ses.frames, ses.recon);
     await ses.seedFrom(g, { iter: st.iter, sceneRadius: recon.sceneRadius || undefined });
+    // The curve is part of the model transaction, not UI decoration. Continue
+    // from the Activity samples so service metrics append instead of replacing
+    // everything before the handoff.
+    const priorChart = (recon.stats && recon.stats.chart) || [];
+    ses.setLossHistory(priorChart);
+    if (priorChart.length && Number.isFinite(+priorChart[priorChart.length - 1][1]))
+      psnr = +priorChart[priorChart.length - 1][1];
     // the monitor camera lives on the view but renders to nothing until a
     // snapshot asks: capture() rasterizes canvas-free from this camera
     snapCam = H.snapshotCam(recon);
@@ -150,6 +159,12 @@ async function boot() {
 
 function onEvent(e) {
   if (!e) return;
+  if (e.kind === 'refine' && e.grown > 0)
+    chartEvents.push({ iter: e.iter, kind: 'grow', label: `Capacity +${e.grown.toLocaleString('en-US')}` });
+  if (e.kind === 'soft-prune')
+    chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned −${(e.culled || 0).toLocaleString('en-US')}` });
+  if (e.kind === 'dead-cull')
+    chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned −${(e.culled || 0).toLocaleString('en-US')} dead` });
   if (e.kind === 'train-complete') finalize();
   else if (e.kind === 'device-lost' || e.kind === 'worker-error' || e.kind === 'train-error') {
     fail(`headless run faulted: ${e.message || e.kind} (last checkpoint kept)`);
@@ -197,7 +212,9 @@ async function secureFileCheckpoint() {
     const S = {
       session: ses, preset: { name: manifest.name }, loadedFiles: filesWithUrls(),
       minutes: 0,   // headless wall-clock is unmeasured in V1 (adopt carries iter/score, not minutes)
-      psnrTrain: psnr, psnrHold: null, holdHist: [], _localRun: { recon },
+      psnrTrain: psnr, psnrHold: recon.stats?.psnrHold ?? null,
+      holdHist: (recon.stats && recon.stats.holds) || [],
+      chartEvents, _localRun: { recon },
     };
     const next = buildReconJson(S);
     next.cloud = recon.cloud || next.cloud;   // the checkpoint's display cloud survives

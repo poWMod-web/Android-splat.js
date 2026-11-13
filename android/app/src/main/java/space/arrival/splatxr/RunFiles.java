@@ -15,6 +15,7 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -234,6 +235,37 @@ public final class RunFiles {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    /** Enumerate every self-contained run directory for Home recovery after
+     *  IndexedDB eviction. No marker is changed and deliberately discarded or
+     *  dismissed directories stay invisible. */
+    public static List<String> listDurableRuns(Context ctx) {
+        List<String> out = new ArrayList<>();
+        File[] dirs = runsDir(ctx).listFiles(File::isDirectory);
+        if (dirs == null) return out;
+        Arrays.sort(dirs, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+        for (File dir : dirs) {
+            String id = dir.getName();
+            if (!validRunId(id)) continue;
+            File state = new File(dir, "state.bin");
+            File recon = new File(dir, "recon.json");
+            File manifest = new File(dir, "manifest.json");
+            if (!state.isFile() || state.length() < 16 || !recon.isFile() || !manifest.isFile()) continue;
+            try {
+                String photosRaw = readJson(ctx, id, "photos.json");
+                String statusRaw = readJson(ctx, id, "status.json");
+                if (photosRaw == null || statusRaw == null) continue;
+                JSONObject photos = new JSONObject(photosRaw);
+                if (!photos.optBoolean("complete", photos.optBoolean("done", false))) continue;
+                String value = new JSONObject(statusRaw).optString("status", "");
+                if ("discarded".equals(value) || "dismissed".equals(value)) continue;
+                if (!("staging".equals(value) || "booting".equals(value) || "active".equals(value) ||
+                        "paused".equals(value) || "interrupted".equals(value) || "finished".equals(value))) continue;
+                out.add(id);
+            } catch (Exception ignored) { /* malformed dirs are invisible */ }
+        }
+        return out;
     }
 
     /** Recover a marker cleared by an interrupted Activity handback. The run

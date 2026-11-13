@@ -182,8 +182,9 @@ export function buildReconJson(S) {
       psnrHold: S.psnrHold ?? null,
       psnrTest: S.psnrTest ? { psnr: S.psnrTest.psnr, frames: S.psnrTest.frames.length } : null,
       // the training curve, decimated to ~400 points
-      chart: decimate(ses.lossHistory || [], 400).map(([i, p]) => [i, +p.toFixed(3)]),
+      chart: decimate(ses.lossHistory || [], 800).map(([i, p]) => [i, +p.toFixed(3)]),
       holds: (S.holdHist || []).map(([i, p]) => [i, +p.toFixed(3)]),
+      events: (S.chartEvents || []).slice(-300).map((e) => ({ ...e })),
     },
     cloud,
   };

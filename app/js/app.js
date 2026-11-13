@@ -12,7 +12,7 @@ import { createSession, parseCameras, gaussiansToPly, undistortFrames, solveTier
 import { extractSharpFrames, isVideoFile } from '../../src/io/video.js';
 import { recordCaptureVideo, cameraSupported } from './camera.js';
 import { saveLastCapture, loadLastCapture } from './store.js';
-import { initXRUI, reviewCapture, exportCapture } from './xr-ui.js';
+import { initXRUI, reviewCapture, exportCapture, importNativeCapture } from './xr-ui.js';
 import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture, unpackZipFile } from './xr-dataset.js';
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from '../../src/training-settings.js';
 import { zipStore } from './zip.js';
@@ -1082,7 +1082,25 @@ async function openCaptureSet(rec = null) {
 
 /** The previous own capture, restored from this device's storage — a local-library tile. */
 async function lastCaptureTile() {
-  const rec = await loadLastCapture();
+  let rec = await loadLastCapture();
+  // Android's files directory is a second durable source of truth. If the
+  // IndexedDB capture slot vanished (quota eviction, failed write, app/WebView
+  // upgrade), rebuild it silently so the scan is visible on Home again.
+  if (!rec || !rec.files || rec.files.length < 2) {
+    const b = globalThis.AndroidARBridge;
+    if (b && typeof b.exportDataset === 'function') {
+      try {
+        const capture = await importNativeCapture(b);
+        const files = [...capture.files];
+        rec = {
+          kind: 'photos', created: Date.now(),
+          files: files.map((f) => ({ name: f.name, blob: f })),
+          ...storedCapture({ ...capture, files }),
+        };
+        await saveLastCapture(rec).catch(() => {});
+      } catch { /* no completed native scan in the Android folder */ }
+    }
+  }
   if (!rec || !rec.files || rec.files.length < 2) return null;
   const b = document.createElement('div');
   b.className = 'galtile';
@@ -5631,6 +5649,9 @@ async function mountWall() {
   const host = $('gallery');
   if (!host) return;
   try {
+    // Rebuild missing IndexedDB library entries from Android files before the
+    // wall decides there is nothing to show.
+    await mirrorAndroidRunDirs();
     const [capTile, runTiles] = await Promise.all([
       lastCaptureTile().catch(() => null),
       localRunTiles().catch(() => []),
@@ -6245,8 +6266,9 @@ function stageHeadlessRun() {
       b.writeRunJson(runId, 'status.json', JSON.stringify(
         { status: 'staging', owner: 'activity', iter: 0, at: Date.now() }));
       b.setActiveRun(runId);
-      // previous runs' dirs go now: the active one is the only resume source
-      if (typeof b.cleanRunDirs === 'function') { try { b.cleanRunDirs(runId); } catch { /* best-effort */ } }
+      // Never delete older run directories here. Their state.bin, recon and
+      // retained photos are durable recovery sources backing Home tiles; only
+      // an explicit user deletion may remove them.
       const cap = S.preset && S.preset.capture;
       const native = !!(cap && cap.metadata && cap.metadata.nativeARCore) && typeof b.retainCapture === 'function';
       if (native) {
@@ -6256,8 +6278,9 @@ function stageHeadlessRun() {
         try {
           b.retainCapture(runId);
           await pollRetain(runId, names);
-          // the copy matches: the captures/current originals are redundant
-          try { b.resetCaptureSession(); } catch { /* best-effort */ }
+          // Keep captures/current as an independent recovery source. It is
+          // intentionally redundant with both IndexedDB and the run directory;
+          // the next native capture replaces it, never a training handoff.
         } catch (e) {
           console.warn('[headless] retain fell back to upload', e);
           await stagePhotoBlobs(runId, files);
@@ -6325,7 +6348,32 @@ async function secureFileCheckpoint() {
       if (!b.writeRunChunk(S.runId, 'state.bin', Headless.encodeB64(state.subarray(o, o + 262144)),
         o + 262144 >= state.length)) return false;
     }
-    b.writeRunJson(S.runId, 'recon.json', JSON.stringify(buildReconJson(S)));
+    const recon = buildReconJson(S);
+    b.writeRunJson(S.runId, 'recon.json', JSON.stringify(recon));
+    // Mirror the same exact checkpoint into IndexedDB before relinquishing the
+    // Activity. The run then remains a visible, tappable Home tile even if the
+    // service process or active.json disappears.
+    try {
+      const { patchRun, saveRun } = await import('./store.js');
+      const detailProgress = captureRunProgressDetails();
+      const localPatch = {
+        status: 'training', iter: S.session.trainer.iter | 0,
+        splats: S.session.trainer.n | 0, state: new Blob([state]), recon,
+        ckptAt: Date.now(), minutes: detailProgress.minutes,
+        detailSolve: captureRunSolveDetails(), detailProgress, detailGpu: gpuFacts(false),
+      };
+      if (!(await patchRun(S.runId, localPatch))) {
+        await saveRun({
+          id: S.runId, name: (S.preset && S.preset.name) || 'Local Scene',
+          createdAt: Date.now(), updatedAt: Date.now(), maxIters: S.maxIters,
+          psnr: S.psnrHold ?? S.psnrTrain ?? null, frames: (S.loadedFiles || []).length,
+          ownSrc: !!(S.preset && (S.preset.id === '__own' || S.preset.id === '__last')),
+          ...localPatch,
+        });
+      }
+      if (S._localRun && S._localRun.id === S.runId) Object.assign(S._localRun,
+        { state: new Blob([state]), recon, detailProgress });
+    } catch (e) { console.warn('[headless] IndexedDB checkpoint mirror failed', e); }
     headlessStatusWrite(S.session.training ? 'active' : 'paused', S.session.trainer.iter | 0);
     return true;
   } catch (e) {
@@ -6383,6 +6431,87 @@ function headlessClear(runId = S.runId) {
   if (!b || !runId) return;
   try { b.clearActiveRun(runId); } catch { /* best-effort */ }
 }
+/** Convert the file-backed reconstruction's score history into the same
+ * IndexedDB detail shape used by local runs. */
+function headlessProgressDetails(recon, manifest, status = {}) {
+  const stats = (recon && recon.stats) || {};
+  return {
+    chart: Array.isArray(stats.chart) ? stats.chart.map((r) => Array.from(r || [])) : [],
+    holds: Array.isArray(stats.holds) ? stats.holds.map((r) => Array.from(r || [])) : [],
+    events: Array.isArray(stats.events) ? stats.events.map((e) => ({ ...e })) : [],
+    perf: { frames: [], marks: [] }, metrics: [],
+    settings: { ...((manifest && manifest.settings) || {}) },
+    maxIters: (manifest && manifest.maxIters) || 0,
+    iter: status.iter ?? recon.iter ?? 0,
+    minutes: stats.minutes || 0,
+    psnrTrain: status.psnr ?? stats.psnrTrain ?? null,
+    psnrHold: stats.psnrHold ?? null,
+  };
+}
+
+/** Mirror Android's durable run directory into the local library. This makes
+ * a service checkpoint visible on Home even when IndexedDB was evicted before
+ * handoff, and keeps a second independently discoverable copy of state.bin. */
+async function mirrorHeadlessRun(runId, status) {
+  const manifest = Headless.validateManifest(
+    await (await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')))).json());
+  const recon = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'recon.json')))).json();
+  const stateBytes = new Uint8Array(
+    await (await fetch(Headless.fresh(Headless.runUrl(runId, 'state.bin')))).arrayBuffer());
+  const { parseState } = await import('./session_io.js');
+  const parsed = parseState(stateBytes);
+  recon.source = {
+    preset: null, names: [...manifest.photos],
+    urls: manifest.photos.map((n) => Headless.photoUrl(runId, n)),
+  };
+  let thumb = null;
+  try {
+    const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.png')));
+    if (r.ok) thumb = await r.blob();
+  } catch { /* optional */ }
+  const detailProgress = headlessProgressDetails(recon, manifest, status);
+  const rec = {
+    id: runId, name: manifest.name,
+    status: status.status === 'finished' ? 'finished' : 'training',
+    createdAt: manifest.stagedAt || Date.now(), updatedAt: Date.now(),
+    iter: parsed.iter, maxIters: manifest.maxIters,
+    splats: status.splats ?? recon.splats ?? parsed.gaussians.n,
+    psnr: status.psnr ?? recon.stats?.psnrTrain ?? null,
+    frames: manifest.photos.length, ownSrc: false,
+    state: new Blob([stateBytes]), recon, detailProgress,
+    ...(thumb ? { thumb } : {}),
+  };
+  const { saveRun, patchRun } = await import('./store.js');
+  if (!(await patchRun(runId, rec))) await saveRun(rec);
+  return rec;
+}
+
+let androidRunMirror = null;
+async function mirrorAndroidRunDirs() {
+  if (androidRunMirror) return androidRunMirror;
+  const b = headlessBridge();
+  if (!b || typeof b.listRecoverableRuns !== 'function') return 0;
+  androidRunMirror = (async () => {
+    let ids = [];
+    try { ids = JSON.parse(b.listRecoverableRuns()); } catch { return 0; }
+    if (!Array.isArray(ids) || !ids.length) return 0;
+    const { listRuns } = await import('./store.js');
+    const existing = new Set((await listRuns()).filter((r) => r && r.state && r.recon).map((r) => r.id));
+    let restored = 0;
+    for (const runId of ids.slice(0, 12)) {
+      if (!Headless.validRunId(runId) || existing.has(runId)) continue;
+      try {
+        const status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json();
+        await mirrorHeadlessRun(runId, status);
+        restored++;
+      } catch (e) { console.warn(`[headless] could not mirror ${runId}`, e); }
+    }
+    return restored;
+  })();
+  try { return await androidRunMirror; }
+  finally { androidRunMirror = null; }
+}
+
 /** Boot hijack: a marker from an outlived run opens adopt / monitor /
  *  recover instead of home. True when it took over boot. */
 async function headlessBootCheck() {
@@ -6403,6 +6532,9 @@ async function headlessBootCheck() {
     status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json();
   } catch { status = null; }
   if (!status || typeof status.status !== 'string') { headlessDiscard(runId); return false; }
+  // Populate Home before showing monitor/recovery. A failure here never blocks
+  // the authoritative Android files from opening in the monitor.
+  await mirrorHeadlessRun(runId, status).catch((e) => console.warn('[headless] Home mirror failed', e));
   if (status.status === 'finished') { await adoptHeadlessRun(runId, 'finished'); return true; }
   if (status.status === 'interrupted' && status.stopped) {
     showRecovery(runId, status);
@@ -6678,7 +6810,9 @@ async function adoptHeadlessRun(runId, mode) {
       splats: status.splats ?? recon.splats ?? 0,
       psnr: status.psnr ?? (recon.stats && recon.stats.psnrTrain) ?? null,
       frames: manifest.photos.length, ownSrc: false,
-      state: new Blob([stateBytes]), recon, ...(thumb ? { thumb } : {}),
+      state: new Blob([stateBytes]), recon,
+      detailProgress: headlessProgressDetails(recon, manifest, status),
+      ...(thumb ? { thumb } : {}),
     };
     const { saveRun, patchRun } = await import('./store.js');
     // same id as the run's own record: adopting patches it, never duplicates it

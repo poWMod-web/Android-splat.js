@@ -500,6 +500,11 @@ public final class MainActivity extends Activity {
             return runId == null ? "" : runId;
         }
 
+        /** All complete Android-file runs, for rebuilding Home after IDB eviction. */
+        @JavascriptInterface public String listRecoverableRuns() {
+            return new JSONArray(RunFiles.listDurableRuns(MainActivity.this)).toString();
+        }
+
         /** Replace the visible WebView after a handback device loss. The run's
          *  durable marker must still match, and onStop must not bounce it back
          *  into the service while this renderer-only restart is in flight. */
@@ -509,10 +514,6 @@ public final class MainActivity extends Activity {
                 gpuRendererRestart = true;
                 recreate();
             });
-        }
-
-        @JavascriptInterface public void cleanRunDirs(String keepId) {
-            RunFiles.cleanRunDirs(MainActivity.this, keepId);
         }
 
         @JavascriptInterface public String retainStatus(String runId) {
