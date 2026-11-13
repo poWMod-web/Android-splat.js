@@ -97,7 +97,7 @@ const indexHtml = readFileSync(new URL('../../app/index.html', import.meta.url),
     'every new touch should refresh the quiet window');
   assert.match(app, /S\._dragPaused = false;\s*if \(S\.state === 'train'\) S\.session\.start\(\);/,
     'the quiet window should resume a hold-paused training');
-  assert.match(app, /if \(!on\) \{ S\._dragPaused = false; checkpointRun\('pause'\)/,
+  assert.match(app, /if \(!on\) \{\s*S\._dragPaused = false;/,
     'a user-pressed pause should take ownership so the window never resumes over it');
   assert.match(sessionSrc, /this\.training = true;\n(\s*\/\/.*\n)+\s*this\._thrT = null;/,
     'resuming should restart the throughput window instead of reading the pause gap as GPU slowness');

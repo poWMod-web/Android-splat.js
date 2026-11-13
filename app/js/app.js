@@ -614,10 +614,19 @@ function boot() {
       else location.href = 'index.html';
       return;
     }
+    // Back out of a live run secures it first (the checkpoint lives here
+    // now — pausing is free). ?back=1 tells the fresh boot this was a
+    // deliberate leave: the handoff marker stands down instead of hijacking
+    // the boot into recovery, and the Yours tile is the way back. Cancelling
+    // the beforeunload confirm keeps training AND the armed handoff: nothing
+    // below runs until the navigation commits.
+    if ((S.state === 'train' || S.state === 'prep') && S.runId) {
+      await checkpointRun('back').catch(() => {});
+    }
     // Back from a run leaves the same way the logo does: a page navigation
     // home. The wall is never rendered OVER a live scene — the beforeunload
     // confirm guards a training in progress.
-    location.href = 'index.html';
+    location.href = (S.state === 'train' || S.state === 'prep') ? 'index.html?back=1' : 'index.html';
   });
   $('btn-training-visuals').addEventListener('click', toggleTrainingVisuals);
   $('card-x').addEventListener('click', closePicker);
@@ -983,6 +992,7 @@ function boot() {
   // a shared result: load it straight into the done-state viewer
   if (mp.get('space') && SHELL !== 'browser') restoreShared(mp.get('space'));
   else if (mp.get('model')) restoreSession({ url: mp.get('model'), reconUrl: mp.get('recon') });
+  else if (mp.get('back')) headlessClearMarker().finally(() => mountWall());
   else headlessBootCheck().then((took) => { if (!took) mountWall(); });
 }
 
@@ -1272,7 +1282,7 @@ async function localRunTiles() {
         // state (Compress there turns it into a sog tile)
         viewFromState(r);
       } else if (r.state && r.recon && !(S.runId === r.id && S.state === 'train')) {
-        // a pause checkpoint: no sog to view yet, but the run continues
+        // a leave checkpoint: no sog to view yet, but the run continues
         // exactly where it stopped
         resumeRun();
       } else if (retrainable && !(S.runId === r.id && S.state === 'train')) {
@@ -2754,6 +2764,9 @@ function localRunName(preset) {
 
 function startTraining() {
   S.state = 'train';
+  // a history entry of our own: the phone's Back (and the browser's) pops
+  // here, into the popstate checkpoint-leave — never straight out of the app
+  if (!(history.state && history.state.sj === 'run')) history.pushState({ sj: 'run' }, '');
   S.trainVisuals = false;
   syncTrainingVisualsControl();
   const carryMinutes = S._carryTrainElapsed ? (S.minutes || 0) : 0;
@@ -3050,7 +3063,18 @@ function toggleTrain() {
   if (f) f.hidden = on;   // paused = the moment "stop here" makes sense
   // a user-pressed pause takes ownership from any touch-hold: the release
   // must not resume over it
-  if (!on) { S._dragPaused = false; checkpointRun('pause').catch(() => {}); }
+  if (!on) {
+    S._dragPaused = false;
+    // pausing is free now — the checkpoint moved to leaving (Back). Say so
+    // once: the old pause flash promised "safe to close", which pause no
+    // longer means.
+    try {
+      if (!localStorage.getItem('splatjs_pause_hint')) {
+        localStorage.setItem('splatjs_pause_hint', '1');
+        flash('Paused. Your progress saves when you leave with Back.', 7000);
+      }
+    } catch { /* private mode */ }
+  }
   headlessStatusWrite(on ? 'active' : 'paused');
   // Shade control: where the bridge can flip the notification's button the
   // service stays up across the pause (Resume in the shade); old bridges
@@ -3203,11 +3227,12 @@ function restoreRunDetails(run, session = S.session, opts = {}) {
 
 // ── crash-safe checkpoint ───────────────────────────────────────────────────
 // The raw trainer state — a straight GPU readback, no PLY text, no SOG
-// k-means — goes into the run record whenever the user pauses, and (desktop
-// only) when the tab goes hidden mid-training. One slot per run, overwritten:
-// pausing means the browser may be closed, and the Yours tile continues the
-// run bit-exactly from where it stopped. The blob is dropped again the moment
-// the run finishes properly — the sog takes over.
+// k-means — goes into the run record when the user leaves the run (Back,
+// in-app or the phone's), and (desktop only) when the tab goes hidden
+// mid-training. Pausing writes nothing: it is just a breather. One slot per
+// run, overwritten: leaving means the page may be closed, and the Yours tile
+// continues the run bit-exactly from where it stopped. The blob is dropped
+// again the moment the run finishes properly — the sog takes over.
 /** Crash-safe checkpoint. Returns the secured { state, recon } on success
  *  (finish() adopts them into the in-memory run record — no second GPU
  *  readback, no store round-trip), null when there was nothing to keep. */
@@ -3239,7 +3264,7 @@ async function checkpointRun(reason) {
       detailGpu: gpuFacts(false),
     });
     S._ckptIter = it;
-    if (reason === 'pause') flash('Progress saved on this device — safe to close, continue anytime from Yours.', 6000);
+    if (reason === 'back') flash('Progress saved on this device — safe to close, continue anytime from Yours.', 6000);
     return { state, recon };
   } catch (e) {
     console.warn('checkpoint failed', e);   // best-effort: never disturb a run
@@ -4585,7 +4610,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
   flash('Preparing to continue training …', 60000);
   let g, engine, stateIter = null, recipe = null;
   if (lr.state) {
-    // pause checkpoint: the trainer's raw floats — nothing baked, nothing
+    // leave checkpoint: the trainer's raw floats — nothing baked, nothing
     // quantized, tagged with the engine that wrote them. Bit-exact resume.
     const { parseState } = await import('./session_io.js');
     const st = parseState(new Uint8Array(await lr.state.arrayBuffer()));
@@ -4669,7 +4694,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     S.plyBlob = null; S.sogBlob = null;
     // keep the source identity: own captures stay '__own' (the next resume goes
     // back to the capture store), URL-backed runs keep their preset/urls so a
-    // pause during THIS run checkpoints a resumable source list again
+    // leaving during THIS run checkpoints a resumable source list again
     S.preset = lr.ownSrc
       ? { id: '__own', name: `${lr.name || 'Your photos'}` }
       : { id: (recon.source && recon.source.preset) || '__url', name: `${lr.name || 'Your photos'}` };
@@ -5367,7 +5392,7 @@ addEventListener('popstate', () => {
   // Back does — a page navigation home (the wall is never rendered OVER a
   // live scene; beforeunload asks before a training is thrown away)
   if ((S.state === 'prep' || S.state === 'train') && $('start').hidden) {
-    location.href = 'index.html';
+    checkpointRun('back').catch(() => {}).finally(() => { location.href = 'index.html?back=1'; });
   }
 });
 
@@ -6143,6 +6168,19 @@ function headlessActivityBeat(now) {
   S._hlBeatAt = now;
   try {
     b.writeRunJson(S.runId, 'activity.json', JSON.stringify({ alive: true, at: Date.now() }));
+  } catch { /* best-effort */ }
+}
+/** Deliberate leave (Back): the IDB checkpoint is the resume path (Yours),
+ *  so the files-dir handoff stands down instead of hijacking the fresh boot
+ *  into recovery. Only ever clears the live marker, if one exists. */
+async function headlessClearMarker() {
+  const b = headlessBridge();
+  if (!b) return;
+  try {
+    const r = await fetch(Headless.activeUrl());
+    if (!r.ok) return;
+    const { runId } = await r.json();
+    if (Headless.validRunId(runId)) { try { b.clearActiveRun(runId); } catch { /* best-effort */ } }
   } catch { /* best-effort */ }
 }
 /** Release the marker (local finish, adopt, discard). Only clears when the

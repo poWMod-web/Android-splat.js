@@ -298,6 +298,23 @@ public final class MainActivity extends Activity {
         catch (Exception ignored) { /* the service was never started */ }
     }
 
+    /** System Back goes through the page's history first: Back closes pushed UI
+     *  layers and checkpoints out of a live run (the page's popstate leave —
+     *  same effect as the header Back) instead of killing the app. Only with
+     *  no history left does Back finish the activity as before. */
+    @SuppressWarnings("deprecation")
+    @Override public void onBackPressed() {
+        if (webView != null) {
+            try {
+                if (webView.canGoBack()) {
+                    webView.goBack();
+                    return;
+                }
+            } catch (Exception ignored) { /* fall through to the default */ }
+        }
+        super.onBackPressed();
+    }
+
     @Override protected void onDestroy() {
         try { unregisterReceiver(toggleTrainingReceiver); } catch (Exception ignored) { /* never registered */ }
         if (RunFiles.readActive(this) == null) stopTrainingService();
