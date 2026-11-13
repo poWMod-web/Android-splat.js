@@ -225,12 +225,29 @@ assert.match(session, /seed data was released after the first boot \(lowMem\) â€
   'a refused reseed says the run trains on (prune keeps its never-bricks promise)');
 assert.match(session, /seed data was released after the first boot \(lowMem\) â€” reload to train again/,
   'recover-after-device-loss still says reload (its trainer is dead, not intact)');
-// fail fast: the prune pre-check runs before the expensive merge-down, and
-// seedFrom's guard runs before it touches this.model (a refused reseed
-// leaves the session bit-identical for the resume in the prune catch)
+// pixel-less prune: the worker (no row-upload RPC) refuses before the
+// expensive merge-down; the local trainer applies it in place instead.
+// seedFrom's guard still runs before it touches this.model (a refused
+// reseed leaves the session bit-identical for the resume in the prune catch)
 const pruneFn = session.slice(session.indexOf('async pruneAndContinue('), session.indexOf('async recover()'));
-assert.ok(pruneFn.indexOf('_seedPixelsReleased()') < pruneFn.indexOf('simplifyGaussians('),
-  'prune refuses before the merge-down burns phone CPU');
+assert.ok(pruneFn.includes('if (noPixels && this._remote)'),
+  'pixel-less prune on a worker refuses (rows cannot cross the RPC)');
+assert.ok(pruneFn.indexOf('const noPixels = this._seedPixelsReleased()') < pruneFn.indexOf('simplifyGaussians('),
+  'the pixel check runs before the merge-down burns phone CPU');
+assert.ok(pruneFn.includes('await trainer.applyPrunedModel('),
+  'pixel-less prune on a local trainer applies in place, no reseed');
+// the in-place apply: refine-patch for params+moments, direct SH upload,
+// then the shared count-shrink tail (votes reset, ratchet floor held)
+assert.match(trainer, /applyPrunedModel\(\{ data, n: kept, sh = null, shK = 0 \}\) \{/,
+  'the trainer serves an in-place pruned-model apply');
+assert.ok(trainer.includes('this._refinePatch(touched, data);'),
+  "the apply patches params and zeroes moments through growth's own kernel");
+assert.ok(trainer.includes('this.device.queue.writeBuffer(this.bufSH, 0, sh.subarray(0, kept * this.shK * 3));'),
+  'merged SH uploads direct (recomputed values, not a permutation)');
+assert.ok(trainer.includes('this._pruneVotes = new Uint16Array(kept);'),
+  'merged rows start with no vote history');
+assert.ok(trainer.includes('this._softPruneFloor = kept;'),
+  'the soft-prune ratchet holds the hard-pruned floor');
 const seedFromFn = session.slice(session.indexOf('async seedFrom('), session.indexOf('async pruneAndContinue('));
 assert.ok(seedFromFn.indexOf('_seedPixelsReleased(opts.viewOnly)') < seedFromFn.indexOf('this.model = '),
   'seedFrom guards before it touches the model');

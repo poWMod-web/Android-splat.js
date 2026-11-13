@@ -1148,7 +1148,8 @@ export class Session {
 
   /** Prune-and-continue: compact the model to `ratio` of its splats with
    *  the training-free merge-down, reseed the trainer on the compacted
-   *  model where the schedules stopped, stretch the horizon, and resume.
+   *  model where the schedules stopped (in place when lowMem released
+   *  the pixels — no pixels, no fresh boot), stretch the horizon, and resume.
    *  The holdout is probed before and after (skipped without one); a drop
    *  past 0.5 dB warns but never blocks — training recovers it. Resets
    *  the cap prompt, so the next ceiling hit asks again. A failed reseed
@@ -1170,10 +1171,12 @@ export class Session {
       // run stays paused (the cap-hit card's prune included).
       const resume = () => { if (wasTraining) { this.training = false; this.start(); } };
       try {
-        // refuse BEFORE the readback + simplify: on a phone the merge-down
-        // burns minutes of CPU on a model the reseed cannot take (lowMem
-        // released the pixels after the first boot)
-        if (this._seedPixelsReleased()) {
+        // pixel-less (lowMem) + local trainer: the merge-down applies IN
+        // PLACE below — the button works mid-run on phones with no reseed
+        // and no pixels. Pixel-less + worker has no row-upload RPC, so it
+        // refuses here, before the merge-down burns minutes of phone CPU.
+        const noPixels = this._seedPixelsReleased();
+        if (noPixels && this._remote) {
           throw new Error('seed data was released after the first boot (lowMem) — the current run is intact, but it cannot reseed');
         }
         const before = this.holdout >= 0 ? await trainer.evalCamPsnr(this.holdout) : null;
@@ -1183,7 +1186,8 @@ export class Session {
           { data: raw.data, n: raw.n, sh: raw.sh, shK: raw.shK, dc: raw.dc ?? trainer.dcMode },
           { ratio, onStatus: (m) => say(String(m).replace(/^simplify: /, 'prune: ')), onProgress });
         const iter = trainer.iter;
-        await this.seedFrom(
+        if (noPixels) await trainer.applyPrunedModel({ data: simp.data, n: simp.n, sh: simp.sh, shK: simp.shK });
+        else await this.seedFrom(
           { data: simp.data, n: simp.n, sh: simp.sh, shK: simp.shK, dc: simp.dc },
           { iter });
         let after = null, delta = null;

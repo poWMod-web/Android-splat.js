@@ -2664,11 +2664,56 @@ export class GSTrainer {
         d.queue.submit([enc.finish()]);
       }
     }
-    this.n = plan.kept;
+    this._setLiveCount(plan.kept);
+  }
+
+  /** Retire the live count after an in-place row change: the GPU rows are
+   *  already right — this drops the count, the Adam horizon word and the
+   *  relocation census, and rebuilds the per-cam uniforms. Shared by
+   *  _compactToPlan and applyPrunedModel. */
+  _setLiveCount(kept) {
+    this.n = kept;
     this.adamData[23] = this.n * STRIDE;
     this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
     // row-indexed CPU state dies with the permutation: the census baseline
     this._lastReloc = null;
+  }
+
+  /** In-place hard prune: the CPU merge-down's rows take over the live
+   *  trainer — no reseed, no pixels, no fresh boot. Params ride the
+   *  refine-patch kernel (growth's own path) with zeroed Adam moments:
+   *  merged rows are new values, their history is meaningless. SH uploads
+   *  direct — the patch kernel can only copy SH between rows, and merged
+   *  SH is recomputed. Grads and projections need no handling: the chain
+   *  zeroes grads and the projection pass rewrites proj rows every frame.
+   *  Targets, split, schedules and iter continue untouched — continuity a
+   *  reseed cannot match. Returns { kept, n }. */
+  applyPrunedModel({ data, n: kept, sh = null, shK = 0 }) {
+    if (!this.ready) throw new Error('GSTrainer.applyPrunedModel: setup() did not complete');
+    if (!Number.isInteger(kept) || kept < 1 || kept > this.n) {
+      throw new Error(`GSTrainer.applyPrunedModel: kept ${kept} out of range 1..${this.n}`);
+    }
+    if (!data || data.length < kept * STRIDE) {
+      throw new Error('GSTrainer.applyPrunedModel: params short for the kept rows');
+    }
+    if ((shK || 0) !== this.shK) {
+      throw new Error(`GSTrainer.applyPrunedModel: shK ${shK} does not match the trainer's ${this.shK}`);
+    }
+    if (this.shK && (!sh || sh.length < kept * this.shK * 3)) {
+      throw new Error('GSTrainer.applyPrunedModel: SH short for the kept rows');
+    }
+    // every kept row: fresh params, zeroed moments (growth's own path)
+    const touched = new Map();
+    for (let i = 0; i < kept; i++) touched.set(i, { shSrc: null, zeroMV: true, zeroShMV: true });
+    this._refinePatch(touched, data);
+    // merged SH is recomputed values, not a permutation — upload direct
+    if (this.shK) this.device.queue.writeBuffer(this.bufSH, 0, sh.subarray(0, kept * this.shK * 3));
+    // merged rows are new: no vote history, and the soft-prune ratchet
+    // holds this floor (later prunes eat regrowth, not the curve)
+    this._pruneVotes = new Uint16Array(kept);
+    this._softPruneFloor = kept;
+    this._setLiveCount(kept);
+    return { kept, n: this.n };
   }
 
   async softPrune(ratioOverride = null, { skipRatchet = false } = {}) {
