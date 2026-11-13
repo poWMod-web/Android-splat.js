@@ -42,6 +42,10 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
 const SHELL = new URLSearchParams(location.search).get('shell') || globalThis.__SPLAT_SHELL || 'app';
 const WALL_FIRST = SHELL === 'browser' || /splat-js2/.test(location.pathname)
   || new URLSearchParams(location.search).has('v2');
+// main's browser trainer always exposed its orbit preview. The shared app
+// may default visuals off on phones, but /browser is a trainer/viewer and
+// presents the evolving splat without another opt-in.
+const defaultTrainingVisuals = () => SHELL === 'browser';
 
 // short first run (phones especially) — the done screen offers "+10k cycles"
 // which stretches the trainer's schedules and resumes. 20k, not 10k: with a
@@ -2840,7 +2844,7 @@ function startTraining() {
   // a history entry of our own: the phone's Back (and the browser's) pops
   // here, into the popstate checkpoint-leave — never straight out of the app
   if (!(history.state && history.state.sj === 'run')) history.pushState({ sj: 'run' }, '');
-  S.trainVisuals = false;
+  S.trainVisuals = defaultTrainingVisuals();
   syncTrainingVisualsControl();
   const carryMinutes = S._carryTrainElapsed ? (S.minutes || 0) : 0;
   S._carryTrainElapsed = false;
@@ -4954,7 +4958,7 @@ async function continueTraining() {
   S.maxIters = await S.session.continueFor(MORE_ITERS);
   if (S.gen !== gen || !S.session || S.state !== 'done') return;
   S.state = 'train';
-  S.trainVisuals = false;
+  S.trainVisuals = defaultTrainingVisuals();
   syncTrainingVisualsControl();
   S.trainT0 = performance.now() - S.minutes * 60000;   // minutes stay cumulative
   S.growthStopped = false;

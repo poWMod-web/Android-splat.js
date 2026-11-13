@@ -27,6 +27,15 @@ assert.match(html, /<script>window\.__SPLAT_SHELL="browser";<\/script><script ty
 assert.match(html, /<link rel="stylesheet" href="app\/css\/app\.css">/,
   'the entry should load the vendored app stylesheet');
 assert.ok(!html.includes('manifest.webmanifest'), 'the browser is not installable');
+const app = read('app/js/app.js');
+assert.match(app, /const defaultTrainingVisuals = \(\) => SHELL === 'browser';/,
+  "the browser profile should keep main's always-visible orbit preview");
+assert.equal((app.match(/S\.trainVisuals = defaultTrainingVisuals\(\);/g) || []).length, 2,
+  'fresh and continued browser runs should both show the trained splat');
+assert.match(app, /quietView\(S\.session\.view\.attach\(gpuCanvas\)\)/,
+  'the browser preview should attach the live trainer view to its model canvas');
+assert.match(app, /quietView\(S\.session\.view\.renderNow\(\)\)/,
+  'the orbit draw should request presentation as the model or camera changes');
 // same UI, same mount points: the entry owns the ids the app boots against
 for (const id of ['brand', 'btn-new', 'start', 'detail', 'detail-back',
     'btn-go', 'settings', 'dock', 'strip', 'details', 'd-chart', 'about',
