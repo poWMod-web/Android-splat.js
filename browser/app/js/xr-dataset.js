@@ -1,4 +1,5 @@
 import { parseCameras, frameKey } from '../../src/io/cameras.js';
+import { readZip } from './zip.js';
 
 const finite = (values, length) => Array.isArray(values) && values.length === length && values.every(Number.isFinite);
 const validPoint = (p) => finite(p?.X, 3) && finite(p?.rgb, 3) && p.rgb.every((v) => v >= 0 && v <= 1);
@@ -131,4 +132,37 @@ export async function datasetFromSelection(files) {
   pointsByFrame = pointsByFrame || metadata.pointsByFrame || null;
   const dataset = validateDataset({ kind: 'ar', files: images, transforms, points, pointsByFrame, metadata: { ...metadata, imported: true } });
   return validateDataset(filterDataset(dataset, images.map((f) => f.name)));
+}
+
+const IMAGE_MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+  webp: 'image/webp', bmp: 'image/bmp', gif: 'image/gif', avif: 'image/avif' };
+const baseOf = (p) => String(p).split(/[\\/]/).pop();
+
+/** What a zip holds, by entry basenames (folders ignored — OS zips nest):
+ *  'session' restores, 'capture' trains, anything else is skipped. */
+export function zipEntryKind(names) {
+  const base = names.map((n) => baseOf(n).toLowerCase());
+  if (base.includes('recon.json') || base.includes('state.bin') || base.includes('model.sog')) return 'session';
+  if (base.some((n) => IMAGE_MIME[n.split('.').pop()])) return 'capture';
+  return null;
+}
+
+/** Unpack an exported capture zip (photos + camera JSON, flat or nested)
+ *  into Files the photo flow already understands: images typed by
+ *  extension, camera/seed/capture JSONs by name. READMEs and strays are
+ *  dropped; basenames keep pose↔photo matching exact. Returns the raw
+ *  bytes too, so session zips restore without a second read. */
+export async function unpackZipFile(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const entries = await readZip(bytes);
+  const kind = zipEntryKind([...entries.keys()]);
+  if (kind !== 'capture') return { kind, files: [], bytes };
+  const files = [];
+  for (const [name, data] of entries) {
+    const base = baseOf(name);
+    const ext = base.split('.').pop().toLowerCase();
+    if (IMAGE_MIME[ext]) files.push(new File([data], base, { type: IMAGE_MIME[ext] }));
+    else if (ext === 'json') files.push(new File([data], base, { type: 'application/json' }));
+  }
+  return { kind, files, bytes };
 }

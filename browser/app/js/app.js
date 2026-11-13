@@ -13,7 +13,7 @@ import { extractSharpFrames, isVideoFile } from '../../src/io/video.js';
 import { recordCaptureVideo, cameraSupported } from './camera.js';
 import { saveLastCapture, loadLastCapture } from './store.js';
 import { initXRUI, reviewCapture, exportCapture } from './xr-ui.js';
-import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } from './xr-dataset.js';
+import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture, unpackZipFile } from './xr-dataset.js';
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from '../../src/training-settings.js';
 import { zipStore } from './zip.js';
 import { saveBlob } from './download.js';
@@ -239,7 +239,7 @@ function readSoftprune() {
  *  selection (or a stored non-preset fraction) shows the percent input. */
 function showSoftprune(v) {
   const sel = $('set-softprune'), custom = $('set-softprune-custom');
-  const fixed = ['', '0.05', '0.1', '0.2', '0.3'];
+  const fixed = ['', '0.01', '0.02', '0.05', '0.1'];
   if (fixed.includes(v) && sel.value !== 'custom') {
     sel.value = v || '';
     custom.hidden = true;
@@ -255,6 +255,12 @@ function showSoftprune(v) {
 function readKeepCustom(id) {
   const pct = Math.round(parseFloat($(id).value) || 0);
   return (pct >= 5 ? Math.min(95, pct) : 50) / 100;
+}
+/** Custom PRUNE percentage from a picker input (clamped 5–95%, 50% when the
+ *  input is empty or garbage): returns the KEEP fraction the flow wants. */
+function readPruneCustom(id) {
+  const pct = Math.round(parseFloat($(id).value) || 0);
+  return 1 - (pct >= 5 ? Math.min(95, pct) : 50) / 100;
 }
 
 // quality macros: the one-knob row that drives the individual rows below it.
@@ -659,10 +665,11 @@ function boot() {
     e.preventDefault(); card.classList.remove('drop');
     const files = e.dataTransfer.files;
     // a saved run comes back through the same door as photos
-    if (files.length === 1 && /\.(zip|sog|ply)$/i.test(files[0].name)) {
+    if (files.length === 1 && /\.(sog|ply)$/i.test(files[0].name)) {
       restoreSession({ bytes: new Uint8Array(await files[0].arrayBuffer()) });
       return;
     }
+    // zips ride the photo flow: useOwnPhotos sniffs session vs capture
     useOwnPhotos(files);
   });
   $('d-close').addEventListener('click', closeDetails);
@@ -963,7 +970,7 @@ function boot() {
     // the browser profile boots this same UI local-only: no AR capture
     // actions, no avatar route, no backend — files in, training, model
     // out. Reviews of picked photo+pose sets stay (they are local).
-    for (const id of ['btn-ar', 'btn-xr-help', 'xr-open-tab', 'xr-ar-state', 'xr-device-guide', 'av-choice']) {
+    for (const id of ['btn-ar', 'btn-record', 'btn-xr-help', 'xr-open-tab', 'xr-ar-state', 'xr-device-guide', 'av-choice']) {
       const el = $(id);
       if (el) el.hidden = true;
     }
@@ -1485,7 +1492,21 @@ function persistCapture(rec) {
 }
 
 async function useOwnPhotos(list, capture = null) {
-  const all = [...list];
+  // capture zips (exported photos + camera JSON) unpack to files and join
+  // the flow below; a session zip restores instead of training
+  const all = [];
+  for (const f of list) {
+    if (f && /\.zip$/i.test(f.name || '')) {
+      try {
+        const u = await unpackZipFile(f);
+        if (u.kind === 'session') { restoreSession({ bytes: u.bytes }); return; }
+        if (u.kind === 'capture') { all.push(...u.files); continue; }
+        flash(`"${f.name}" holds no photos or session — skipped.`, 5000);
+      } catch (e) { flash(`Could not unpack "${f.name}": ${e.message}`, 8000); }
+      continue;
+    }
+    all.push(f);
+  }
   if (!capture && all.some((f) => /\.json$/i.test(f.name))) {
     try {
       capture = await reviewCapture(await datasetFromSelection(all));
@@ -2893,7 +2914,7 @@ function showCapCard(e) {
   });
 }
 
-/** Manual prune/grow, any time: pick how much to keep (the flow reseeds
+/** Manual prune/grow, any time: pick how much to prune (the flow reseeds
  *  the trainer and grows on), or trigger one growth pass right now. */
 function showPrunePicker() {
   const ses = S.session;
@@ -2906,19 +2927,21 @@ function showPrunePicker() {
     <b>Prune / grow</b>
     <span class="sog-status">Fewer splats with room to regrow — or grow into the error right now.</span>
     <div class="row" id="prunepick-pick">
-      <button class="btn" data-ratio="0.75">Keep ¾</button>
-      <button class="btn" data-ratio="0.5">Keep ½</button>
-      <button class="btn" data-ratio="0.25">Keep ¼</button>
+      <!-- labels prune; data-ratio stays the keep fraction the flow wants -->
+      <button class="btn" data-ratio="0.75">Prune ¼</button>
+      <button class="btn" data-ratio="0.5">Prune ½</button>
       <button class="btn" data-grow="1">Grow now</button>
-      <input id="prunepick-custom" type="number" min="5" max="95" step="1" value="50" style="width:4.5em" title="Custom keep percentage (5–95)">
-      <button class="btn" data-custom="1">Keep %</button>
+      <input id="prunepick-custom" type="number" min="5" max="95" step="1" value="50" style="width:4.5em" title="Custom prune percentage (5–95)">
+      <button class="btn" data-custom="1">Prune %</button>
       <button class="btn linkish" data-ratio="">Cancel</button>
     </div>`;
   $('stage').appendChild(card);
   card.querySelector('#prunepick-pick').addEventListener('click', (e) => {
-    const d = e.target && e.target.dataset ? e.target.dataset : null;
-    if (!d) return;
-    const customKeep = d.custom ? readKeepCustom('prunepick-custom') : 0;
+    // the custom input lives in this row: only BUTTON clicks answer —
+    // tapping the input to type must not dismiss the card
+    if (!e.target || e.target.tagName !== 'BUTTON') return;
+    const d = e.target.dataset;
+    const customKeep = d.custom ? readPruneCustom('prunepick-custom') : 0;
     card.remove();
     if (d.grow) { runGrowNow(); return; }
     if (d.custom) { runPruneAndContinue(customKeep); return; }
@@ -4419,7 +4442,7 @@ function continueConfigCard(r) {
     ? recipe0.softPrune.ratio : 0;
   const prevSoft = prevSoftRatio > 0 ? `${Math.round(prevSoftRatio * 100)}%` : 'Off';
   const softOpts = [`<option value="" selected>${prevSoft}</option>`, '<option value="0">Off</option>',
-    ...[0.05, 0.1, 0.2, 0.3].map((v) => `<option value="${v}">${Math.round(v * 100)}%</option>`),
+    ...[0.01, 0.02, 0.05, 0.1].map((v) => `<option value="${v}">${Math.round(v * 100)}%</option>`),
     '<option value="custom">Custom…</option>'].join('');
   const card = document.createElement('div');
   card.className = 'upcard';

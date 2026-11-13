@@ -11,8 +11,8 @@ assert.match(app, /const WALL_FIRST = SHELL === 'browser' \|\|/,
 
 // the browser profile hides AR capture, the avatar route and backend links;
 // photo/pose review stays (it is local)
-assert.match(app, /for \(const id of \['btn-ar', 'btn-xr-help', 'xr-open-tab', 'xr-ar-state', 'xr-device-guide', 'av-choice'\]\)/,
-  'the browser profile should hide AR actions, guides and the avatar choice');
+assert.match(app, /for \(const id of \['btn-ar', 'btn-record', 'btn-xr-help', 'xr-open-tab', 'xr-ar-state', 'xr-device-guide', 'av-choice'\]\)/,
+  'the browser profile should hide AR and camera actions, guides and the avatar choice');
 assert.match(app, /document\.querySelector\('\.xr-flow'\)\?\.remove\(\);/,
   'the browser profile should drop the AR marketing strip');
 assert.match(app, /if \(SHELL === 'browser'\) S\.avatarWanted = false;/,

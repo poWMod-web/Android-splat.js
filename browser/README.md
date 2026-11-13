@@ -42,9 +42,9 @@ card and dock — a config here trains exactly as it would there. The
 profile (`SHELL` in `app/js/app.js`, set by the generated entry's
 marker or `?shell=browser`) hides only what doesn't fit a plain tab:
 
-- No AR capture actions or guides — intake is files (photos, video,
-  capture `.zip`) plus the plain camera button, which is standard
-  web capture. Reviewing picked photo+pose sets stays.
+- No AR capture, no camera mode, no guides — intake is files only
+  (photos, video, capture `.zip`). Reviewing picked photo+pose
+  sets stays.
 - No avatar route (its ML models don't ship in this folder).
 - No share backend: no arrival-space restore, no share links, no
   service worker. Runs, captures, and models stay in this origin's

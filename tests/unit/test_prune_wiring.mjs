@@ -73,8 +73,12 @@ assert.match(session, /kind: 'prune-continue', iter, \.\.\.out/,
 // ---- the full app: setting, button, card -----------------------------------
 assert.match(appHtml, /<select id="set-softprune">/,
   'the gear panel offers soft prune');
-assert.match(appHtml, /<option value="0\.3">Trim 30%<\/option>/,
-  'the trims run 5% to 30%');
+assert.match(appHtml, /<option value="0\.01">Trim 1%<\/option>/,
+  'the trims start at 1%');
+assert.match(appHtml, /<option value="0\.1">Trim 10%<\/option>/,
+  'the trims top out at 10%');
+assert.doesNotMatch(appHtml, /Trim (20|30)%/,
+  'the old 20–30% trims are gone from the presets');
 assert.match(app, /st\.softprune = readSoftprune\(\);/,
   'the selection persists into settings');
 assert.match(appHtml, /<option value="custom">Custom…<\/option>/,
@@ -93,10 +97,18 @@ assert.match(app, /async function runPruneAndContinue\(ratio = 0\.5\) \{/,
   'the flow prunes to the picked ratio, default half');
 assert.match(app, /id="prunepick-pick"/,
   'the manual picker card offers the ratios');
+assert.match(app, /data-ratio="0\.75">Prune ¼<\/button>/,
+  'the manual picker offers pruning a quarter');
+assert.match(app, /data-ratio="0\.5">Prune ½<\/button>/,
+  'the manual picker offers pruning half');
 assert.match(app, /<input id="prunepick-custom" type="number" min="5" max="95"/,
-  'the manual picker offers a custom 5–95% keep');
-assert.match(app, /data-custom="1">Keep %<\/button>/,
-  'the custom keep runs the same prune flow');
+  'the manual picker offers a custom 5–95% prune');
+assert.match(app, /function readPruneCustom\(id\) \{/,
+  'a custom prune amount converts to the keep fraction the flow wants');
+assert.match(app, /data-custom="1">Prune %<\/button>/,
+  'the custom prune runs the same prune flow');
+assert.match(app, /if \(!e\.target \|\| e\.target\.tagName !== 'BUTTON'\) return;/,
+  'tapping the custom input must not dismiss the picker');
 assert.match(app, /<input id="cap-custom" type="number" min="5" max="95"/,
   'the ceiling card offers a custom 5–95% keep');
 assert.match(app, /function readKeepCustom\(id\) \{/,
@@ -133,5 +145,8 @@ assert.match(app, /data-grow="1">Grow now<\/button>/,
   'the manual picker offers a growth pass');
 assert.match(app, /async function runGrowNow\(\) \{/,
   'the flow triggers one immediate refine');
+const growBody = session.slice(session.indexOf('async growNow()'), session.indexOf('async finish()'));
+assert.ok(!growBody.includes('softPrune'),
+  'a manual growth pass never culls, even with soft prune on');
 
 console.log('prune-and-continue + soft-prune wiring: passed');

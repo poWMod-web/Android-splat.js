@@ -63,7 +63,7 @@
     <div class="upload" id="upload">
       <div class="upload-btns">
         <button class="btn btn-accent btn-cta" id="btn-ar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H4a1 1 0 0 0-1 1v4m13-5h4a1 1 0 0 1 1 1v4M3 16v4a1 1 0 0 0 1 1h4m13-5v4a1 1 0 0 1-1 1h-4"/><circle cx="12" cy="12" r="4"/><path d="M12 7v2m0 6v2m-5-5h2m6 0h2"/></svg><span>Checking AR…</span></button>
-        <label class="btn btn-outline">Choose photos / import<input type="file" id="file-input" multiple accept="image/*,video/*,.json,.mov,.mp4,.m4v,.webm,.mkv" hidden></label>
+        <label class="btn btn-outline">Choose photos / import<input type="file" id="file-input" multiple accept="image/*,video/*,.json,.zip,.mov,.mp4,.m4v,.webm,.mkv" hidden></label>
         <button class="btn btn-outline" id="btn-record" hidden><svg viewBox="0 0 24 24" class="capicon" aria-hidden="true"><path d="M4.5 7.5h2.6l1.5-2h6.8l1.5 2h2.6a1.4 1.4 0 0 1 1.4 1.4v8.6a1.4 1.4 0 0 1-1.4 1.4h-15a1.4 1.4 0 0 1-1.4-1.4V8.9a1.4 1.4 0 0 1 1.4-1.4z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="12" cy="12.7" r="3.3" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Camera</button>
       </div>
     </div>
@@ -174,10 +174,10 @@
       <div class="setrow" title="Off by default. When enabled, training periodically culls the lowest-contributing fraction of splats (by accumulated render weight) and keeps going — the model holds more detail under the same splat budget."><label for="set-softprune">Soft prune</label>
         <select id="set-softprune">
           <option value="">Off</option>
+          <option value="0.01">Trim 1%</option>
+          <option value="0.02">Trim 2%</option>
           <option value="0.05">Trim 5%</option>
           <option value="0.1">Trim 10%</option>
-          <option value="0.2">Trim 20%</option>
-          <option value="0.3">Trim 30%</option>
           <option value="custom">Custom…</option>
         </select><input id="set-softprune-custom" type="number" min="1" max="50" step="1" value="10" hidden title="Custom trim percent (1–50)"></div>
       <div class="setrow" title="Choose a training budget from 10,000 to 50,000 cycles. A finished run can continue with +10,000 more."><label for="set-iters">Cycles</label>
