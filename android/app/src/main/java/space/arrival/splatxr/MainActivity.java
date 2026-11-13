@@ -633,6 +633,21 @@ public final class MainActivity extends Activity {
             return file.delete();
         }
 
+        /** One Android-app-data catalog for Home. ARCore archives are the
+         * canonical image/pose source; run directories contain only their own
+         * model checkpoints and references to those archives. */
+        @JavascriptInterface public String listHomeLibrary() {
+            JSONObject out = new JSONObject();
+            try {
+                out.put("captures", new JSONArray(listCaptureArchives()));
+                out.put("runs", new JSONArray(RunFiles.listDurableRuns(MainActivity.this)));
+            } catch (Exception e) {
+                try { out.put("captures", new JSONArray()); out.put("runs", new JSONArray()); }
+                catch (Exception ignored) { }
+            }
+            return out.toString();
+        }
+
         @JavascriptInterface public String listCaptureArchives() {
             JSONArray out = new JSONArray();
             try {

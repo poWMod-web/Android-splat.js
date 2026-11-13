@@ -209,17 +209,19 @@ assert.match(app, /async function checkpointRun\(reason\)[\s\S]*writeDurableRunC
   'Back and Stop & keep must persist to Android files independently of IndexedDB');
 assert.match(app, /async function mirrorHeadlessRun\(runId, status\)[\s\S]*state\.bin[\s\S]*saveRun\(rec\)/,
   'boot should rediscover an Android run directory as a Home library record');
-assert.match(app, /async function nativeCaptureTiles\(\)[\s\S]*listCaptureArchives\(\)[\s\S]*importNativeCapture\(b, row\.captureId\)/,
+assert.match(app, /async function nativeCaptureTiles\(rows = null\)[\s\S]*listCaptureArchives\(\)[\s\S]*importNativeCapture\(b, row\.captureId\)/,
   'Home should enumerate native Android scan archives independently of IndexedDB');
 assert.match(main, /public String listRecoverableRuns\(\)[\s\S]*RunFiles\.listDurableRuns/,
   'the bridge should expose complete Android run directories to Home');
+assert.match(main, /public String listHomeLibrary\(\)[\s\S]*captures[\s\S]*listCaptureArchives\(\)[\s\S]*runs[\s\S]*RunFiles\.listDurableRuns/,
+  'Android Home should enumerate one native catalog of canonical scans and referencing model checkpoints');
 const durableList = runFiles.slice(runFiles.indexOf('List<String> listDurableRuns(Context ctx)'),
   runFiles.indexOf('String recoverActive(Context ctx)'));
 assert.match(durableList, /state\.bin[\s\S]*recon\.json[\s\S]*manifest\.json/,
   'Android Home discovery should require a complete trained-model checkpoint');
 assert.doesNotMatch(durableList, /readJson\(ctx, id, \"photos\.json\"\)|photos\.optBoolean/,
   'loss of old photo handoff metadata must not hide an independently viewable model');
-assert.match(app, /async function androidRunTiles\(\)[\s\S]*listRecoverableRuns\(\)[\s\S]*Stored in Android app data/,
+assert.match(app, /async function androidRunTiles\(ids = null\)[\s\S]*listRecoverableRuns\(\)[\s\S]*Stored in Android app data/,
   'Home should show lightweight Android-file models without first copying state into IndexedDB');
 assert.match(app, /fileIds = new Set\(slots\.files[\s\S]*uniqueLocal = slots\.local\.filter/,
   'a stale IDB record must not suppress its authoritative Android-file Home tile');
@@ -232,6 +234,12 @@ assert.doesNotMatch(stage, /cleanRunDirs|resetCaptureSession/,
   'handoff must not delete old run directories or native scan archives');
 assert.match(stage, /photoSource = native \? 'urls' : 'files'[\s\S]*photoUrls: files\.map/,
   'native handoff manifests should reference canonical archive URLs');
+assert.match(app, /function updateHeadlessGpu\(value\)[\s\S]*gpu: v[\s\S]*writeRunJson\(S\.runId, 'manifest\.json'/,
+  'the live GPU duty slider should update the recipe the background service boots');
+assert.match(app, /S\.session\.opts\.gpuUsage = v \/ 100;[\s\S]*updateHeadlessGpu\(v\)/,
+  'one slider event should update both the Activity trainer and staged service trainer');
+assert.match(driver, /gpuUsage: \(manifest\.gpu \?\? 100\) \/ 100/,
+  'background training should apply the staged GPU duty percentage');
 assert.doesNotMatch(stage, /retainCapture/,
   'native handoff must not copy canonical photos into each run');
 const store = readFileSync(new URL('../../app/js/store.js', import.meta.url), 'utf8');

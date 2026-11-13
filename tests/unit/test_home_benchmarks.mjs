@@ -15,10 +15,10 @@ assert.doesNotMatch(app, /onExample|btn-xr-example|fetchGallery|HOME_BENCHMARK_I
 const wall = app.match(/async function mountWall\(\)[\s\S]*?(?=\/\*\* From the viewer into the studio)/)?.[0] || '';
 assert.match(wall, /lastCaptureTile\(\)[\s\S]*localRunTiles\(\)/,
   'the saved-work area should be populated only from local captures and runs');
-assert.match(wall, /load\('capture', lastCaptureTile\(\)\);[\s\S]*load\('local', localRunTiles\(\)\);[\s\S]*load\('scans', nativeCaptureTiles\(\)\);[\s\S]*load\('files', androidRunTiles\(\)\);/,
-  'main-branch IDB tiles should paint independently before native discovery completes');
+assert.match(wall, /typeof native\.listHomeLibrary === 'function'[\s\S]*listHomeLibrary\(\)[\s\S]*nativeCaptureTiles\(catalog\.captures\)[\s\S]*androidRunTiles\(catalog\.runs\)[\s\S]*else \{[\s\S]*lastCaptureTile\(\)[\s\S]*localRunTiles\(\)/,
+  'Android must use one app-data catalog while browser main keeps one IndexedDB library');
 assert.doesNotMatch(wall, /Promise\.all\(/,
-  'one slow Android catalog must not block every Home tile');
+  'catalog tile groups should paint independently');
 assert.doesNotMatch(wall, /fetch\(|import\(['"]\.\/share\.js/,
   'mounting saved work must not issue network requests');
 assert.doesNotMatch(xrUi, /btn-xr-example|onExample/,

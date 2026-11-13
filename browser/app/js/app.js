@@ -1131,11 +1131,12 @@ async function lastCaptureTile() {
 
 /** Every native ARCore archive is a ground-truth scan tile. Only references
  * cross into JS; opening one fetches its files from the stable native folder. */
-async function nativeCaptureTiles() {
+async function nativeCaptureTiles(rows = null) {
   const b = globalThis.AndroidARBridge;
   if (!b || typeof b.listCaptureArchives !== 'function') return [];
-  let rows = [];
-  try { rows = JSON.parse(b.listCaptureArchives()); } catch { return []; }
+  if (rows == null) {
+    try { rows = JSON.parse(b.listCaptureArchives()); } catch { return []; }
+  }
   if (!Array.isArray(rows)) return [];
   return rows.map((row) => {
     const tile = document.createElement('div');
@@ -1333,11 +1334,12 @@ async function localRunTiles() {
 /** Lightweight Home tiles for checkpoints in Android app data. Unlike the
  * old rediscovery pass, this does not copy every state.bin into IndexedDB
  * before Home can paint. The full checkpoint is loaded only when tapped. */
-async function androidRunTiles() {
+async function androidRunTiles(ids = null) {
   const bridge = headlessBridge();
   if (!bridge || typeof bridge.listRecoverableRuns !== 'function') return [];
-  let ids = [];
-  try { ids = JSON.parse(bridge.listRecoverableRuns()); } catch { return []; }
+  if (ids == null) {
+    try { ids = JSON.parse(bridge.listRecoverableRuns()); } catch { return []; }
+  }
   if (!Array.isArray(ids) || !ids.length) return [];
   const { deleteRun } = await import('./store.js');
   const tiles = [];
@@ -5839,11 +5841,22 @@ async function mountWall() {
     });
   };
 
-  // Preserve main's proven fast path first; native sources arrive independently.
-  load('capture', lastCaptureTile());
-  load('local', localRunTiles());
-  load('scans', nativeCaptureTiles());
-  load('files', androidRunTiles());
+  const native = globalThis.AndroidARBridge;
+  if (native && typeof native.listHomeLibrary === 'function') {
+    // Android has ONE catalog rooted in app data. Captures are canonical
+    // image+pose archives; runs are model checkpoints referencing capture IDs.
+    // IndexedDB is not a second Android Home library.
+    let catalog = { captures: [], runs: [] };
+    try { catalog = JSON.parse(native.listHomeLibrary()); } catch (e) {
+      console.warn('[home] native catalog unavailable', e);
+    }
+    load('scans', nativeCaptureTiles(catalog.captures));
+    load('files', androidRunTiles(catalog.runs));
+  } else {
+    // Browser/main behavior: its origin-local IndexedDB is the sole library.
+    load('capture', lastCaptureTile());
+    load('local', localRunTiles());
+  }
 }
 
 window.addEventListener('pageshow', (e) => {
@@ -6241,6 +6254,7 @@ function dock(kind) {
         S.settings.gpu = v;
         $('t-gpu-v').textContent = `${tGpu.value}%`;
         if (S.session) S.session.opts.gpuUsage = v / 100;
+        updateHeadlessGpu(v);
         const panel = $('set-gpu');
         if (panel) { panel.value = String(v); $('set-gpu-v').textContent = `${v}%`; }
       });
@@ -6427,6 +6441,20 @@ async function headlessServiceAlive(runId) {
     return Headless.heartbeatFresh(s);
   } catch { return false; }
 }
+/** Keep the staged service recipe in sync with the live GPU duty slider.
+ * The service reads this manifest when it boots after backgrounding. */
+function updateHeadlessGpu(value) {
+  const b = headlessBridge();
+  const v = Math.min(100, Math.max(10, Math.round(+value || 100)));
+  if (!b || !S._hlManifest || S._hlManifest.runId !== S.runId || S._hlStaged !== S.runId) return;
+  S._hlManifest = {
+    ...S._hlManifest, gpu: v,
+    settings: { ...(S._hlManifest.settings || {}), gpu: v },
+  };
+  try { b.writeRunJson(S.runId, 'manifest.json', JSON.stringify(S._hlManifest)); }
+  catch (e) { console.warn('[headless] GPU duty update failed', e); }
+}
+
 /** Stage the handoff for this run: manifest + marker now, photos in the
  *  background (native captures retain their disk files, everything else
  *  uploads its bytes), status flips to live when the photos land. */
@@ -6447,12 +6475,14 @@ function stageHeadlessRun() {
       const native = !!(cap && cap.metadata && cap.metadata.nativeARCore &&
         cap.metadata.nativeCaptureId && files.every((f) => f.url));
       const photoSource = native ? 'urls' : 'files';
-      b.writeRunJson(runId, 'manifest.json', JSON.stringify(Headless.buildManifest({
+      const manifest = Headless.buildManifest({
         runId, name: (S._localRun && S._localRun.name) || (S.preset && S.preset.name) || 'model',
         maxIters: S.maxIters, gpu: S.settings.gpu, srcKey: cap?.metadata?.nativeCaptureId || null,
         photos: names, photoSource,
         ...(native ? { photoUrls: files.map((f) => f.url) } : {}), settings: S.settings,
-      })));
+      });
+      S._hlManifest = manifest;
+      b.writeRunJson(runId, 'manifest.json', JSON.stringify(manifest));
       b.writeRunJson(runId, 'status.json', JSON.stringify(
         { status: 'staging', owner: 'activity', iter: 0, at: Date.now() }));
       b.setActiveRun(runId);
@@ -6601,7 +6631,7 @@ async function headlessClearMarker() {
  *  marker still names this run — a newer run's claim is never touched. */
 function headlessClear(runId = S.runId) {
   const b = headlessBridge();
-  S._hlStaged = null; S._hlPhotos = false;
+  S._hlStaged = null; S._hlPhotos = false; S._hlManifest = null;
   if (!b || !runId) return;
   try { b.clearActiveRun(runId); } catch { /* best-effort */ }
 }
@@ -6985,6 +7015,7 @@ async function adoptHeadlessRun(runId, mode) {
   try {
     const manifest = Headless.validateManifest(
       await (await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')))).json());
+    S._hlManifest = manifest;
     const recon = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'recon.json')))).json();
     const stateBytes = new Uint8Array(
       await (await fetch(Headless.fresh(Headless.runUrl(runId, 'state.bin')))).arrayBuffer());
