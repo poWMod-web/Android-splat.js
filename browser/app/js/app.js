@@ -1051,9 +1051,19 @@ function showIntro() {
  *  in stored order — sorted on the way out, same rules as a fresh pick. */
 async function openCaptureSet(rec = null) {
   rec = rec || await loadLastCapture();
+  if (rec && rec.nativeCaptureId) {
+    try {
+      const capture = await importNativeCapture(globalThis.AndroidARBridge, rec.nativeCaptureId);
+      rec = {
+        ...rec, files: capture.files.map((f) => ({ name: f.name, blob: f, url: f.url })),
+        ...storedCapture(capture), metadata: capture.metadata,
+      };
+    } catch (e) { throw new Error(`The native scan archive is unreadable: ${e.message}`); }
+  }
   if (!rec || !rec.files || rec.files.length < 2) return null;
   const files = rec.files.map((e) => {
-    const f = new File([e.blob], e.name, { type: e.blob.type || 'image/jpeg' });
+    const f = Object.assign(new File([e.blob], e.name, { type: e.blob.type || 'image/jpeg' }),
+      { ...(e.url ? { url: e.url } : {}) });
     if (e.mask) f.mask = e.mask;   // avatar mode: the person's matte rides with the frame
     return f;
   });
@@ -1082,32 +1092,14 @@ async function openCaptureSet(rec = null) {
 
 /** The previous own capture, restored from this device's storage — a local-library tile. */
 async function lastCaptureTile() {
-  let rec = await loadLastCapture();
-  // Android's files directory is a second durable source of truth. If the
-  // IndexedDB capture slot vanished (quota eviction, failed write, app/WebView
-  // upgrade), rebuild it silently so the scan is visible on Home again.
-  if (!rec || !rec.files || rec.files.length < 2) {
-    const b = globalThis.AndroidARBridge;
-    if (b && typeof b.exportDataset === 'function') {
-      try {
-        const capture = await importNativeCapture(b);
-        const files = [...capture.files];
-        rec = {
-          kind: 'photos', created: Date.now(),
-          files: files.map((f) => ({ name: f.name, blob: f })),
-          ...storedCapture({ ...capture, files }),
-        };
-        await saveLastCapture(rec).catch(() => {});
-      } catch { /* no completed native scan in the Android folder */ }
-    }
-  }
-  if (!rec || !rec.files || rec.files.length < 2) return null;
+  const rec = await loadLastCapture();
+  // Native scans are listed from their immutable Android archives below; do
+  // not duplicate their JPEGs (or their tile) in IndexedDB.
+  if (!rec || rec.nativeCaptureId || !rec.files || rec.files.length < 2) return null;
   const b = document.createElement('div');
   b.className = 'galtile';
   b.style.cursor = 'pointer';
   b.title = `${rec.files.length} frames, saved on this device`;
-  // the badge keeps it apart from the shares — a capture OF a known scene
-  // makes the thumbnails near-identical
   const capWhen = rec.created
     ? new Date(rec.created).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
     : null;
@@ -1115,30 +1107,69 @@ async function lastCaptureTile() {
     <button class="run-menu" title="Options">⋯</button>
     <span class="galname">${rec.files.length} photos</span>
     <span class="galmeta">${capWhen ? `${capWhen} · ` : ''}local</span>`;
-  const img = Object.assign(new Image(), { src: URL.createObjectURL(rec.files[0].blob), alt: '' });
-  b.prepend(img);
-  tileMenu(b.querySelector('.run-menu'), [
-    { label: 'Train', act: async () => {
-      const set = await openCaptureSet(rec);
-      if (!set) return;
-      open(set);
-      if (!WALL_FIRST) showDetail(set);
-    } },
-    { label: 'Delete', danger: true, act: async () => {
-      const { deleteLastCapture } = await import('./store.js');
-      await deleteLastCapture();
-      b.remove();
-    } },
-  ]);
-  b.addEventListener('click', async () => {
-    if (S.picking) { S.pending = await openCaptureSet(rec); paintCard(S.pending); return; }
+  b.prepend(Object.assign(new Image(), { src: URL.createObjectURL(rec.files[0].blob), alt: '' }));
+  const train = async () => {
     const set = await openCaptureSet(rec);
     if (!set) return;
     open(set);
     if (!WALL_FIRST) showDetail(set);
+  };
+  tileMenu(b.querySelector('.run-menu'), [
+    { label: 'Train', act: train },
+    { label: 'Delete', danger: true, act: async () => {
+      const { deleteLastCapture } = await import('./store.js');
+      await deleteLastCapture(); b.remove();
+    } },
+  ]);
+  b.addEventListener('click', async () => {
+    if (S.picking) { S.pending = await openCaptureSet(rec); paintCard(S.pending); return; }
+    await train();
   });
   return b;
 }
+
+/** Every native ARCore archive is a ground-truth scan tile. Only references
+ * cross into JS; opening one fetches its files from the stable native folder. */
+async function nativeCaptureTiles() {
+  const b = globalThis.AndroidARBridge;
+  if (!b || typeof b.listCaptureArchives !== 'function') return [];
+  let rows = [];
+  try { rows = JSON.parse(b.listCaptureArchives()); } catch { return []; }
+  if (!Array.isArray(rows)) return [];
+  return rows.map((row) => {
+    const tile = document.createElement('div');
+    tile.className = 'galtile'; tile.style.cursor = 'pointer';
+    const when = row.created ? new Date(row.created).toLocaleString([],
+      { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
+    tile.innerHTML = `<button class="run-menu" title="Options">⋯</button>
+      <span class="galname">${fmt(row.frameCount || 0)} ARCore photos</span>
+      <span class="galmeta">${when ? `${when} · ` : ''}native scan</span>`;
+    if (row.previewUri) tile.prepend(Object.assign(new Image(), { src: row.previewUri, alt: '' }));
+    tileMenu(tile.querySelector('.run-menu'), [
+      { label: 'Delete', danger: true, act: async () => {
+        let answer = { deleted: false, reason: 'unsupported' };
+        try { answer = JSON.parse(b.deleteCaptureArchive(row.captureId)); } catch { /* report below */ }
+        if (answer.deleted) tile.remove();
+        else if (answer.reason === 'referenced') flash('Delete its trained models first; this scan is still their source.', 7000);
+        else flash('This scan could not be deleted.', 6000);
+      } },
+    ]);
+    tile.addEventListener('click', async () => {
+      try {
+        const capture = await importNativeCapture(b, row.captureId);
+        const rec = { kind: 'photos', created: row.created || Date.now(),
+          nativeCaptureId: row.captureId,
+          files: capture.files.map((f) => ({ name: f.name, blob: f, url: f.url })),
+          ...storedCapture(capture) };
+        const set = await openCaptureSet(rec);
+        if (!set) return;
+        open(set); if (!WALL_FIRST) showDetail(set);
+      } catch (e) { flash(`Could not open native scan: ${e.message}`, 8000); }
+    });
+    return tile;
+  });
+}
+
 
 /** tiles for the local runs library — every training run this device has
  *  started. Finished runs reopen in the viewer straight from their stored
@@ -1195,12 +1226,6 @@ async function localRunTiles() {
     const src = r.recon && r.recon.source;
     const urlSrc = !!(src && Array.isArray(src.urls) && src.urls.length && src.urls.every(Boolean));
     const retrainable = !!(r.ownSrc || urlSrc);
-    if (r.status !== 'finished' && !r.sog && !(r.state && r.recon) && !retrainable && !live) {
-      // a dead tombstone: nothing to view, resume or retrain — the only
-      // possible action was Delete, so do that instead of listing it
-      deleteRun(r.id).catch(() => {});
-      continue;
-    }
     const b = document.createElement('div');
     b.className = 'galtile';
     b.style.cursor = (r.sog || (r.state && r.recon) || retrainable) ? 'pointer' : 'default';
@@ -1267,7 +1292,13 @@ async function localRunTiles() {
       (r.sog || retrainable || (r.state && r.recon)) && { label: 'Train', act: () => { S._localRun = r; trainLocalChoice(); } },
       { label: 'Rename', act: renameLocalModel },
       r.spaceId && { label: 'Copy link', act: async () => { try { await navigator.clipboard.writeText(shareLinkOf(r.spaceId)); flash('Link copied.', 2500); } catch { flash(shareLinkOf(r.spaceId), 8000); } } },
-      { label: 'Delete', danger: true, act: async () => { await deleteRun(r.id); b.remove(); } },
+      { label: 'Delete', danger: true, act: async () => {
+        const bridge = headlessBridge();
+        if (bridge && typeof bridge.deleteRunArchive === 'function' && bridge.deleteRunArchive(r.id) === false) {
+          flash('A running model cannot be deleted.', 6000); return;
+        }
+        await deleteRun(r.id); b.remove();
+      } },
     ]);
     b.addEventListener('click', () => {
       if (r.sog && r.recon) {
@@ -1561,10 +1592,14 @@ async function useOwnPhotosInner(list, capture = null) {
   if (S.ownUrls) S.ownUrls.forEach(URL.revokeObjectURL);
   S.ownUrls = files.map((f) => URL.createObjectURL(f));
   // survive a refresh: the capture is kept on-device and offered back
+  const nativeCaptureId = capture?.metadata?.nativeCaptureId || null;
   persistCapture({
     kind: 'photos', created: Date.now(),
-    files: files.map((f) => ({ name: f.name, blob: f })),
-    ...(capture ? storedCapture({ ...capture, files }) : {}),
+    ...(capture ? storedCapture({ ...capture, files: nativeCaptureId ? [] : files }) : {}),
+    ...(nativeCaptureId ? { nativeCaptureId } : {}),
+    files: files.map((f) => nativeCaptureId
+      ? { name: f.name, url: f.url }
+      : { name: f.name, blob: f }),
   });
   const set = ownSet(files, S.ownUrls);
   if (capture?.transforms) {
@@ -2903,8 +2938,11 @@ function startTraining() {
     const capKind = S._capRec && S._capRec.kind;
     const capFiles = (S.preset && S.preset.files) || [];
     const { saveRun, patchRun, listRuns, captureSrcKey } = await import('./store.js');
-    const srcKey = (pid === '__own' || pid === '__last') && capKind && capFiles.length
-      ? captureSrcKey(capKind + (S.preset.capture?.transforms ? '+poses' : ''), capFiles) : null;
+    const nativeCaptureId = S.preset?.capture?.metadata?.nativeCaptureId || null;
+    const srcKey = nativeCaptureId
+      ? `native:${nativeCaptureId}`
+      : (pid === '__own' || pid === '__last') && capKind && capFiles.length
+        ? captureSrcKey(capKind + (S.preset.capture?.transforms ? '+poses' : ''), capFiles) : null;
     // marking a record live moves only the training head (status, horizon,
     // diagnostics) — name, thumb, poses and source photos stay untouched
     const livePatch = () => ({
@@ -5652,11 +5690,12 @@ async function mountWall() {
     // Rebuild missing IndexedDB library entries from Android files before the
     // wall decides there is nothing to show.
     await mirrorAndroidRunDirs();
-    const [capTile, runTiles] = await Promise.all([
+    const [nativeTiles, capTile, runTiles] = await Promise.all([
+      nativeCaptureTiles().catch(() => []),
       lastCaptureTile().catch(() => null),
       localRunTiles().catch(() => []),
     ]);
-    const tiles = [...(capTile ? [capTile] : []), ...runTiles];
+    const tiles = [...nativeTiles, ...(capTile ? [capTile] : []), ...runTiles];
     host.replaceChildren();
     if (!tiles.length) { host.hidden = true; return; }
     const heading = document.createElement('p');
@@ -6258,10 +6297,15 @@ function stageHeadlessRun() {
       if (files.length < 3) throw new Error('no photos in hand');
       const names = files.map((f) => f.name);
       if (!names.every(Headless.validName)) throw new Error('photo names outside the handoff set');
+      const cap = S.preset && S.preset.capture;
+      const native = !!(cap && cap.metadata && cap.metadata.nativeARCore &&
+        cap.metadata.nativeCaptureId && files.every((f) => f.url));
+      const photoSource = native ? 'urls' : 'files';
       b.writeRunJson(runId, 'manifest.json', JSON.stringify(Headless.buildManifest({
         runId, name: (S._localRun && S._localRun.name) || (S.preset && S.preset.name) || 'model',
-        maxIters: S.maxIters, gpu: S.settings.gpu, srcKey: null,
-        photos: names, photoSource: 'files', settings: S.settings,
+        maxIters: S.maxIters, gpu: S.settings.gpu, srcKey: cap?.metadata?.nativeCaptureId || null,
+        photos: names, photoSource,
+        ...(native ? { photoUrls: files.map((f) => f.url) } : {}), settings: S.settings,
       })));
       b.writeRunJson(runId, 'status.json', JSON.stringify(
         { status: 'staging', owner: 'activity', iter: 0, at: Date.now() }));
@@ -6269,23 +6313,14 @@ function stageHeadlessRun() {
       // Never delete older run directories here. Their state.bin, recon and
       // retained photos are durable recovery sources backing Home tiles; only
       // an explicit user deletion may remove them.
-      const cap = S.preset && S.preset.capture;
-      const native = !!(cap && cap.metadata && cap.metadata.nativeARCore) && typeof b.retainCapture === 'function';
       if (native) {
-        // zero-copy path: the AR frames still sit in captures/current (the
-        // post-import reset is skipped on headless-capable bridges) — the
-        // native side copies them into the run dir, no bytes cross the bridge
-        try {
-          b.retainCapture(runId);
-          await pollRetain(runId, names);
-          // Keep captures/current as an independent recovery source. It is
-          // intentionally redundant with both IndexedDB and the run directory;
-          // the next native capture replaces it, never a training handoff.
-        } catch (e) {
-          console.warn('[headless] retain fell back to upload', e);
-          await stagePhotoBlobs(runId, files);
-        }
+        // ARCore archives are the ground truth. The run stores references only;
+        // both WebViews read the same immutable native JPEGs.
+        b.writeRunJson(runId, 'photos.json', JSON.stringify(
+          { names, source: 'urls', complete: true, at: Date.now() }));
       } else {
+        // Browser/file-picker blobs have no native archive, so only those need
+        // a service-readable copy in the run directory.
         await stagePhotoBlobs(runId, files);
       }
       if (S.gen !== gen || S.runId !== runId) return;   // the run moved on without us
@@ -6297,23 +6332,6 @@ function stageHeadlessRun() {
       console.warn('[headless] staging failed — local training unaffected', e);
     }
   })().catch(() => {});
-}
-/** Wait for the native retain (polls the status the bridge thread writes). */
-async function pollRetain(runId, names) {
-  const b = headlessBridge();
-  for (let i = 0; i < 120; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    let st = null;
-    try { st = JSON.parse(b.retainStatus(runId)); } catch { throw new Error('retain unreadable'); }
-    if (st && st.error) throw new Error(st.error);
-    if (st && (st.complete || st.done)) {
-      const kept = new Set(st.names || []);
-      const missing = names.filter((n) => !kept.has(n));
-      if (missing.length) throw new Error(`${missing.length} photos not retained`);
-      return;
-    }
-  }
-  throw new Error('retain timed out');
 }
 /** Upload photo bytes into the run dir (uploads, picker shots, video frames —
  *  everything without disk files). Chunked base64, sequential, throttled past
@@ -6462,7 +6480,9 @@ async function mirrorHeadlessRun(runId, status) {
   const parsed = parseState(stateBytes);
   recon.source = {
     preset: null, names: [...manifest.photos],
-    urls: manifest.photos.map((n) => Headless.photoUrl(runId, n)),
+    urls: manifest.photoSource === 'urls'
+      ? [...manifest.photoUrls]
+      : manifest.photos.map((n) => Headless.photoUrl(runId, n)),
   };
   let thumb = null;
   try {
@@ -6801,7 +6821,9 @@ async function adoptHeadlessRun(runId, mode) {
     recon.source = {
       preset: null,
       names: [...manifest.photos],
-      urls: manifest.photos.map((n) => Headless.photoUrl(runId, n)),
+      urls: manifest.photoSource === 'urls'
+      ? [...manifest.photoUrls]
+      : manifest.photos.map((n) => Headless.photoUrl(runId, n)),
     };
     const rec = {
       id: runId, name: manifest.name, status: 'finished',

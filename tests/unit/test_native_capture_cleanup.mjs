@@ -5,18 +5,28 @@ const xr = readFileSync(new URL('../../app/js/xr-ui.js', import.meta.url), 'utf8
 const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
 const nativeCap = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/NativeCaptureActivity.java', import.meta.url), 'utf8');
 
-// Browser-only imports can clean their native copies after IndexedDB accepts
-// them. Headless-capable Android keeps captures/current as an independent
-// recovery source, and can rehydrate it when IndexedDB is absent.
-assert.match(xr, /if \(!reviewed\) return;\s*await onCapture\(reviewed\);\s*\/\/[\s\S]*?try \{ nativeBridge\.resetCaptureSession\(\); \} catch/,
-  'non-headless imports may wipe their redundant on-disk capture');
-assert.match(xr, /export async function importNativeCapture\(nativeBridge[\s\S]*exportDataset\(\)[\s\S]*payload\.frames\.map/,
-  'a completed scan should be rehydratable from the Android data folder');
-assert.match(main, /@JavascriptInterface public void resetCaptureSession\(\) \{[\s\S]*?NativeCaptureActivity\.resetCaptureSession\(MainActivity\.this\);/,
-  'the bridge should expose the native capture wipe');
-assert.match(nativeCap, /static void resetCaptureSession\(Context context\) \{[\s\S]*?deleteTree\(new File\(context\.getFilesDir\(\), "captures\/current"\)\);/,
-  'the wipe should delete the capture directory when no capture is live');
-assert.match(nativeCap, /if \(active == this\) active = null;/,
-  'finishing the capture activity should release it so the wipe takes the delete path');
+// A completed native scan is an immutable, ID-addressed archive. New scans
+// and training handoffs must reference it rather than wiping or copying it.
+assert.match(nativeCap, /captureId = "capture_" \+ System\.currentTimeMillis\(\);[\s\S]*new File\(new File\(getFilesDir\(\), "captures"\), captureId\)/,
+  'each capture should get a stable native archive directory');
+const onCreate = nativeCap.slice(nativeCap.indexOf('onCreate(Bundle'), nativeCap.indexOf('private void applySafeAreaInsets'));
+assert.doesNotMatch(onCreate, /deleteTree\(/,
+  'opening a new capture must not delete an older scan archive');
+assert.match(nativeCap, /if \(!captureFinished && outputDir != null\) deleteTree\(outputDir\)/,
+  'only an incomplete capture should be cleaned up automatically');
+assert.match(nativeCap, /putExtra\("captureId", captureId\)/,
+  'the completed archive identity should be returned to the WebView');
+assert.match(main, /splatxr-native-capture[\s\S]*detail:\{captureId:/,
+  'the native result event should carry the archive identity');
+assert.match(xr, /export async function importNativeCapture\(nativeBridge[\s\S]*captureId = null[\s\S]*exportDataset\(captureId \|\| ''\)[\s\S]*nativeCaptureId: payload\.captureId/,
+  'native import should preserve its archive reference');
+assert.match(main, /public String listCaptureArchives\(\)[\s\S]*previewUri/,
+  'Home should be able to enumerate all valid native scan archives');
+assert.match(main, /Native scan archives are the image ground truth[\s\S]*public String exportDataset\(String requestedId\)/,
+  'the bridge should export references for a requested archive');
+assert.match(main, /public String deleteCaptureArchive\(String captureId\)[\s\S]*manifest\.json[\s\S]*\"referenced\"/,
+  'explicit scan deletion should refuse archives referenced by durable runs');
+assert.match(main, /public boolean deleteRunArchive\(String runId\)[\s\S]*readActive/,
+  'explicit model deletion should protect a live run and remove its durable directory');
 
-console.log('native capture cleanup after import: passed');
+console.log('native capture archive lifecycle: passed');

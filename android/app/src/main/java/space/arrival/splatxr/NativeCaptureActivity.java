@@ -3,6 +3,7 @@ package space.arrival.splatxr;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.content.res.ColorStateList;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
@@ -98,6 +99,8 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     private final AtomicBoolean captureRequested = new AtomicBoolean(false);
     private final CoverageRenderer cloudRenderer = new CoverageRenderer();
     private File outputDir;
+    private String captureId;
+    private boolean captureFinished;
     private volatile int capturedFrameCount;
     private volatile int capturedSeedCount;
     private boolean trackingUiInitialized;
@@ -106,15 +109,6 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     static void requestKeyframe() {
         NativeCaptureActivity value = active;
         if (value != null) value.captureRequested.set(true);
-    }
-
-    static void resetCaptureSession(Context context) {
-        NativeCaptureActivity value = active;
-        if (value != null) {
-            value.glView.queueEvent(value.cloudRenderer::resetData);
-            return;
-        }
-        deleteTree(new File(context.getFilesDir(), "captures/current"));
     }
 
     static int frameCount(File dir) {
@@ -134,8 +128,10 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         active = this;
         captureSpacingCm = Math.max(2, Math.min(200, getPreferences(MODE_PRIVATE).getInt("capture_spacing_cm", 10)));
         cloudRenderer.setSpacingCm(captureSpacingCm);
-        outputDir = new File(getFilesDir(), "captures/current");
-        deleteTree(outputDir);
+        // Every scan is an immutable native archive. Trainings reference this
+        // directory directly; a later scan must never overwrite its photos.
+        captureId = "capture_" + System.currentTimeMillis();
+        outputDir = new File(new File(getFilesDir(), "captures"), captureId);
         outputDir.mkdirs();
 
         getWindow().setStatusBarColor(Color.rgb(7, 9, 9));
@@ -546,6 +542,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     @Override protected void onDestroy() {
         if (active == this) active = null;
         if (session != null) { session.close(); session = null; }
+        if (!captureFinished && outputDir != null) deleteTree(outputDir);
         super.onDestroy();
     }
 
@@ -567,7 +564,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             try {
                 cloudRenderer.writeDataset(outputDir);
                 main.post(() -> {
-                    setResult(RESULT_OK);
+                    captureFinished = true;
+                    Intent result = new Intent().putExtra("captureId", captureId);
+                    setResult(RESULT_OK, result);
                     finish();
                 });
             } catch (Exception e) {

@@ -206,8 +206,10 @@ public final class MainActivity extends Activity {
                 dispatchFileSaveEvent("error", e.getMessage());
             }
         } else if (requestCode == REQUEST_CAPTURE && resultCode == RESULT_OK && webView != null) {
-            webView.post(() -> webView.evaluateJavascript(
-                    "window.dispatchEvent(new CustomEvent('splatxr-native-capture'))", null));
+            String captureId = data == null ? "" : data.getStringExtra("captureId");
+            String script = "window.dispatchEvent(new CustomEvent('splatxr-native-capture',{detail:{captureId:" +
+                    JSONObject.quote(captureId == null ? "" : captureId) + "}}))";
+            webView.post(() -> webView.evaluateJavascript(script, null));
         }
     }
 
@@ -428,10 +430,6 @@ public final class MainActivity extends Activity {
             NativeCaptureActivity.requestKeyframe();
         }
 
-        @JavascriptInterface public void resetCaptureSession() {
-            NativeCaptureActivity.resetCaptureSession(MainActivity.this);
-        }
-
         @JavascriptInterface public void beginFileSave(String name, String mimeType) {
             runOnUiThread(() -> startFileSave(name, mimeType));
         }
@@ -516,36 +514,6 @@ public final class MainActivity extends Activity {
             });
         }
 
-        @JavascriptInterface public String retainStatus(String runId) {
-            String done = RunFiles.readJson(MainActivity.this, runId, "photos.json");
-            return done != null ? done : "{\"pending\":true}";
-        }
-
-        /** Copy the native capture's frames into the run dir (background
-         *  thread; the page polls retainStatus). Zero bytes cross the bridge. */
-        @JavascriptInterface public void retainCapture(final String runId) {
-            new Thread(() -> {
-                try {
-                    java.util.List<String> kept = RunFiles.retainCaptureFrames(MainActivity.this, runId);
-                    JSONObject status = new JSONObject();
-                    if (kept.isEmpty()) {
-                        status.put("error", "no capture frames left to retain");
-                    } else {
-                        status.put("names", new JSONArray(kept));
-                        status.put("complete", true);
-                    }
-                    status.put("at", System.currentTimeMillis());
-                    RunFiles.writeJson(MainActivity.this, runId, "photos.json", status.toString());
-                } catch (Exception e) {
-                    try {
-                        JSONObject status = new JSONObject();
-                        status.put("error", e.getMessage() == null ? "retain failed" : e.getMessage());
-                        RunFiles.writeJson(MainActivity.this, runId, "photos.json", status.toString());
-                    } catch (Exception ignored) { /* status is best-effort */ }
-                }
-            }).start();
-        }
-
         /** The handoff verdict: the page secured the run to files (or failed
          *  to) — the service boots the headless twin off it, or settles. */
         @JavascriptInterface public void handoffDone(String runId, boolean ok) {
@@ -573,25 +541,48 @@ public final class MainActivity extends Activity {
             } catch (Exception ignored) { /* the twin is gone; the files say so */ }
         }
 
-        @JavascriptInterface public String exportDataset() {
+        private File captureArchive(String requested) {
+            File root = new File(getFilesDir(), "captures");
+            if (requested != null && requested.matches("[A-Za-z0-9_-]{1,80}")) {
+                File exact = new File(root, requested);
+                if (exact.isDirectory()) return exact;
+            }
+            File[] dirs = root.listFiles(File::isDirectory);
+            if (dirs == null || dirs.length == 0) return null;
+            java.util.Arrays.sort(dirs, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+            for (File dir : dirs) {
+                if (new File(dir, "transforms.json").isFile() && NativeCaptureActivity.frameCount(dir) >= 3) return dir;
+            }
+            return null;
+        }
+
+        /** Native scan archives are the image ground truth. Return references,
+         *  never image bytes; WebViews and service trainers fetch these URLs. */
+        @JavascriptInterface public String exportDataset(String requestedId) {
             try {
-                File current = new File(getFilesDir(), "captures/current");
+                File current = captureArchive(requestedId);
+                if (current == null) return "{\"ready\":false}";
                 File transformFile = new File(current, "transforms.json");
                 File pointsFile = new File(current, "seed_points.json");
+                String captureId = current.getName();
+                String base = "https://appassets.androidplatform.net/captures/" + captureId + "/";
                 JSONObject result = new JSONObject();
+                result.put("captureId", captureId);
+                result.put("created", current.lastModified());
                 result.put("frameCount", NativeCaptureActivity.frameCount(current));
                 result.put("pointCount", NativeCaptureActivity.pointCount(current));
-                result.put("transformsUri", "https://appassets.androidplatform.net/captures/current/transforms.json");
-                result.put("pointsUri", "https://appassets.androidplatform.net/captures/current/seed_points.json");
-                result.put("seedPlyUri", "https://appassets.androidplatform.net/captures/current/seed.ply");
+                result.put("transformsUri", base + "transforms.json");
+                result.put("pointsUri", base + "seed_points.json");
+                result.put("metadataUri", base + "capture.json");
+                result.put("seedPlyUri", base + "seed.ply");
                 JSONArray frames = new JSONArray();
-                File[] files = current.listFiles((dir, name) -> name.matches("frame_[0-9]{4}\\.jpg"));
+                File[] files = current.listFiles((dir, name) -> name.matches("frame_[0-9]{4}\.jpg"));
                 if (files != null) {
                     java.util.Arrays.sort(files, java.util.Comparator.comparing(File::getName));
                     for (File file : files) {
                         JSONObject item = new JSONObject();
                         item.put("name", file.getName());
-                        item.put("uri", "https://appassets.androidplatform.net/captures/current/" + file.getName());
+                        item.put("uri", base + file.getName());
                         frames.put(item);
                     }
                 }
@@ -601,6 +592,68 @@ public final class MainActivity extends Activity {
             } catch (Exception e) {
                 return "{\"ready\":false,\"error\":" + JSONObject.quote(e.getMessage() == null ? "export unavailable" : e.getMessage()) + "}";
             }
+        }
+
+        /** Explicitly delete a durable run. Live runs are protected. */
+        @JavascriptInterface public boolean deleteRunArchive(String runId) {
+            if (!RunFiles.validRunId(runId)) return false;
+            if (runId.equals(RunFiles.readActive(MainActivity.this))) return false;
+            return deleteArchiveTree(RunFiles.runDir(MainActivity.this, runId));
+        }
+
+        /** Explicit scan deletion is reference-safe: any durable run manifest
+         * naming this capture keeps the canonical photos alive. */
+        @JavascriptInterface public String deleteCaptureArchive(String captureId) {
+            JSONObject result = new JSONObject();
+            try {
+                if (captureId == null || !captureId.matches("[A-Za-z0-9_-]{1,80}")) {
+                    result.put("deleted", false); result.put("reason", "invalid"); return result.toString();
+                }
+                File[] runs = RunFiles.runsDir(MainActivity.this).listFiles(File::isDirectory);
+                if (runs != null) for (File run : runs) {
+                    String raw = RunFiles.readJson(MainActivity.this, run.getName(), "manifest.json");
+                    if (raw != null && captureId.equals(new JSONObject(raw).optString("srcKey"))) {
+                        result.put("deleted", false); result.put("reason", "referenced");
+                        result.put("runId", run.getName()); return result.toString();
+                    }
+                }
+                File archive = new File(new File(getFilesDir(), "captures"), captureId);
+                result.put("deleted", archive.isDirectory() && deleteArchiveTree(archive));
+                if (!result.optBoolean("deleted")) result.put("reason", "missing");
+            } catch (Exception e) {
+                try { result.put("deleted", false); result.put("reason", "error"); } catch (Exception ignored) { }
+            }
+            return result.toString();
+        }
+
+        private boolean deleteArchiveTree(File file) {
+            if (file == null || !file.exists()) return true;
+            File[] children = file.listFiles();
+            if (children != null) for (File child : children) if (!deleteArchiveTree(child)) return false;
+            return file.delete();
+        }
+
+        @JavascriptInterface public String listCaptureArchives() {
+            JSONArray out = new JSONArray();
+            try {
+                File root = new File(getFilesDir(), "captures");
+                File[] dirs = root.listFiles(File::isDirectory);
+                if (dirs == null) return out.toString();
+                java.util.Arrays.sort(dirs, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+                for (File dir : dirs) {
+                    if (!dir.getName().matches("[A-Za-z0-9_-]{1,80}")) continue;
+                    int count = NativeCaptureActivity.frameCount(dir);
+                    if (count < 3 || !new File(dir, "transforms.json").isFile()) continue;
+                    JSONObject item = new JSONObject();
+                    item.put("captureId", dir.getName());
+                    item.put("created", dir.lastModified());
+                    item.put("frameCount", count);
+                    item.put("previewUri", "https://appassets.androidplatform.net/captures/" +
+                            dir.getName() + "/frame_0000.jpg");
+                    out.put(item);
+                }
+            } catch (Exception ignored) { }
+            return out.toString();
         }
     }
 }

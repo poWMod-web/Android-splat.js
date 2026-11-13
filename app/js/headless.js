@@ -12,9 +12,9 @@
 // storage. Commands ride startService intents, bulk bytes ride files:
 //
 //   runs/active.json          { runId } — a run exists that outlived / may outlive the Activity
-//   runs/<runId>/manifest.json  run parameters (photos, horizon, settings)
+//   runs/<runId>/manifest.json  run parameters and canonical scan references
 //   runs/<runId>/photos.json    { names, complete } — photo handoff state
-//   runs/<runId>/photos/<name>  the training photos, byte-identical
+//   runs/<runId>/photos/<name>  picker photos only; native scans remain in captures/<id>/
 //   runs/<runId>/state.bin      the raw trainer state (packState format)
 //   runs/<runId>/recon.json     cameras/frames/recipe/cloud (buildReconJson format)
 //   runs/<runId>/progress.json  { iter, maxIters, splats, psnr, ips, training, at }
@@ -49,11 +49,12 @@ export function validName(name) {
 }
 
 /** The manifest the Activity stages at Start (versioned for forward tolerance). */
-export function buildManifest({ runId, name, maxIters, gpu, srcKey, photos, photoSource, settings }) {
+export function buildManifest({ runId, name, maxIters, gpu, srcKey, photos, photoSource, photoUrls, settings }) {
   return {
     version: 1, runId, name: name || 'model', maxIters: maxIters | 0,
     gpu: Math.min(100, Math.max(10, Math.round(gpu ?? 100))),
     srcKey: srcKey || null, photos: [...photos], photoSource,
+    ...(photoSource === 'urls' ? { photoUrls: [...(photoUrls || [])] } : {}),
     settings: settings ? { ...settings } : null,
     stagedAt: Date.now(),
   };
@@ -67,7 +68,16 @@ export function validateManifest(m) {
   if (!Array.isArray(m.photos) || m.photos.length < 3 || !m.photos.every(validName)) {
     throw new Error('manifest has a bad photo list');
   }
-  if (m.photoSource !== 'files') throw new Error('manifest photoSource is not files');
+  if (m.photoSource !== 'files' && m.photoSource !== 'urls') throw new Error('manifest has a bad photoSource');
+  if (m.photoSource === 'urls') {
+    if (!Array.isArray(m.photoUrls) || m.photoUrls.length !== m.photos.length ||
+        !m.photoUrls.every((raw) => {
+          try {
+            const u = new URL(raw);
+            return u.origin === ASSET_HOST && /^\/captures\/[A-Za-z0-9_-]{1,80}\/[A-Za-z0-9_.-]{1,120}$/.test(u.pathname);
+          } catch { return false; }
+        })) throw new Error('manifest has bad native photo references');
+  }
   return m;
 }
 

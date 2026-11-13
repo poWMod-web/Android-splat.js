@@ -317,61 +317,6 @@ public final class RunFiles {
         }
     }
 
-    // ── retain + cleanup (Activity side) ────────────────────────────────────
-    /** Copy the native capture's frames into the run dir (zero bridge bytes).
-     *  Returns the copied names; the web side matches them against the run's
-     *  own photo list and falls back to uploading anything missing. */
-    public static List<String> retainCaptureFrames(Context ctx, String runId) {
-        List<String> kept = new ArrayList<>();
-        File current = new File(new File(ctx.getFilesDir(), "captures"), "current");
-        File[] frames = current.listFiles((dir, name) -> name.matches("frame_[0-9]{4}\\.jpg"));
-        if (frames == null) return kept;
-        java.util.Arrays.sort(frames, java.util.Comparator.comparing(File::getName));
-        File photos = new File(runDir(ctx, runId), "photos");
-        if (!photos.exists()) photos.mkdirs();
-        byte[] buf = new byte[65536];
-        for (File src : frames) {
-            try {
-                InputStream in = new FileInputStream(src);
-                try {
-                    OutputStream out = new FileOutputStream(new File(photos, src.getName()));
-                    try {
-                        int n;
-                        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-                    } finally {
-                        out.close();
-                    }
-                } finally {
-                    in.close();
-                }
-                kept.add(src.getName());
-            } catch (Exception ignored) {
-                // per-frame best-effort; the manifest check names the missing
-            }
-        }
-        return kept;
-    }
-
-    /** Delete every run dir except keepId (staged runs clean predecessors). */
-    public static void cleanRunDirs(Context ctx, String keepId) {
-        File runs = runsDir(ctx);
-        File[] dirs = runs.listFiles();
-        if (dirs == null) return;
-        for (File d : dirs) {
-            if (!d.isDirectory()) continue;
-            if (keepId != null && d.getName().equals(keepId)) continue;
-            deleteRecursive(d);
-        }
-    }
-
-    public static void deleteRecursive(File f) {
-        if (f.isDirectory()) {
-            File[] kids = f.listFiles();
-            if (kids != null) for (File k : kids) deleteRecursive(k);
-        }
-        try { f.delete(); } catch (Exception ignored) { }
-    }
-
     private static byte[] readAll(File f) throws Exception {
         long len = f.length();
         if (len > MAX_JSON_BYTES) throw new IllegalArgumentException("file too large");

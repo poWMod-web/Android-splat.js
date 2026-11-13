@@ -55,7 +55,7 @@ assert.equal((xr.match(/setBusy\?\.\(false\)/g) || []).length, 2,
   'both capture paths should lower the counter in a finally');
 assert.match(xr, /setBusy\?\.\(true\);\n      let dataset = null;\n      try \{ dataset = await captureXR\(\); \}/,
   'browser capture should hold the counter across its pre-modal await');
-assert.match(xr, /splatxr-native-capture', async \(\) => \{\n      \/\/[\s\S]{0,300}?setBusy\?\.\(true\);/,
+assert.match(xr, /splatxr-native-capture', async \(event\) => \{\n      \/\/[\s\S]{0,300}?setBusy\?\.\(true\);/,
   'the native import should hold the counter from the event');
 
 // --- zombie bypass: a service-owned live marker with no live service releases ---

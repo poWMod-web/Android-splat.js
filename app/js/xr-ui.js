@@ -9,11 +9,11 @@ const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&
 /** Rehydrate a completed native ARCore scan directly from Android app
  * storage. Used both by the capture-return event and by home boot recovery
  * when IndexedDB was cleared or its original write failed. */
-export async function importNativeCapture(nativeBridge = globalThis.AndroidARBridge) {
+export async function importNativeCapture(nativeBridge = globalThis.AndroidARBridge, captureId = null) {
   if (!nativeBridge || typeof nativeBridge.exportDataset !== 'function') throw new Error('Native capture storage is unavailable.');
-  const payload = JSON.parse(nativeBridge.exportDataset());
+  const payload = JSON.parse(nativeBridge.exportDataset(captureId || ''));
   if (!payload.ready || payload.frameCount < 3) throw new Error(payload.error || 'Capture at least three frames before importing.');
-  const metadataUri = 'https://appassets.androidplatform.net/captures/current/capture.json';
+  const metadataUri = payload.metadataUri;
   const responses = await Promise.all([
     fetch(payload.transformsUri), fetch(payload.pointsUri), fetch(metadataUri),
   ]);
@@ -22,11 +22,13 @@ export async function importNativeCapture(nativeBridge = globalThis.AndroidARBri
   const files = await Promise.all(payload.frames.map(async (frame) => {
     const response = await fetch(frame.uri);
     if (!response.ok) throw new Error(`Could not read ${frame.name} from the native capture.`);
-    return new File([await response.blob()], frame.name, { type: 'image/jpeg' });
+    return Object.assign(new File([await response.blob()], frame.name, { type: 'image/jpeg' }),
+      { url: frame.uri, nativeCaptureId: payload.captureId });
   }));
   return validateDataset({ kind: 'ar', files, transforms, points: pointDocument.points || [],
     pointsByFrame: pointDocument.pointsByFrame || null,
-    metadata: { ...metadata, ...pointDocument.metadata, nativeARCore: true } });
+    metadata: { ...metadata, ...pointDocument.metadata, nativeARCore: true,
+      nativeCaptureId: payload.captureId } });
 }
 
 function modal(html, className = '') {
@@ -192,24 +194,17 @@ export function initXRUI({ onCapture, flash, setBusy }) {
     $('xr-ar-state').dataset.ready = '1';
     button.querySelector('span').textContent = 'Capture with ARCore';
     $('xr-capability-note').textContent = 'Native ARCore capture pairs camera images with tracked poses and an RGB seed cloud.';
-    window.addEventListener('splatxr-native-capture', async () => {
+    window.addEventListener('splatxr-native-capture', async (event) => {
       // the import (and the review after it) land through open(): Start
       // queues behind the counter (the app's setBusy)
       setBusy?.(true);
       try {
-        const dataset = await importNativeCapture(nativeBridge);
+        const dataset = await importNativeCapture(nativeBridge, event.detail?.captureId || null);
         const reviewed = await reviewCapture(dataset);
         if (!reviewed) return;
         await onCapture(reviewed);
-        // the frames now live in the app as Blobs (IndexedDB) — the native
-        // copies are redundant, so drop them instead of leaving up to 200
-        // JPEGs in app storage until the next capture. Except on
-        // headless-capable bridges: the migrate-on-swipe retain copies them
-        // into the run dir at Start (zero bytes over the bridge) and the
-        // staging path resets the session once the copy matches.
-        if (typeof nativeBridge.writeRunJson !== 'function') {
-          try { nativeBridge.resetCaptureSession(); } catch { /* best-effort */ }
-        }
+        // The native archive remains the canonical source. IndexedDB and
+        // training runs retain only its stable identity and URLs.
       } catch (e) {
         console.error('[SplatXR] Native capture import failed:', e);
         showXRHelp(e.message || 'Native ARCore capture could not be imported.');

@@ -86,11 +86,14 @@ async function boot() {
     // app's continue path — re-sorting against imgIdx would mis-train)
     const staged = new Set(manifest.photos);
     files = [];
+    const urlByName = new Map(manifest.photos.map((name, i) =>
+      [name, manifest.photoSource === 'urls' ? manifest.photoUrls[i] : H.photoUrl(runId, name)]));
     for (const fr of recon.frames || []) {
       if (!staged.has(fr.name)) throw new Error(`photo ${fr.name} was not staged`);
-      const r = await fetch(H.photoUrl(runId, fr.name));
+      const sourceUrl = urlByName.get(fr.name);
+      const r = await fetch(sourceUrl);
       if (!r.ok) throw new Error(`photo ${fr.name} unreadable (${r.status})`);
-      files.push(new File([await r.blob()], fr.name, { type: 'image/jpeg' }));
+      files.push(Object.assign(new File([await r.blob()], fr.name, { type: 'image/jpeg' }), { url: sourceUrl }));
     }
     if (!files.length) throw new Error('no photos staged');
     log(`resuming ${files.length} photos at iter ${st.iter}`);

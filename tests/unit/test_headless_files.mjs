@@ -162,8 +162,8 @@ assert.ok(continueBranch > adopt.indexOf('headlessClear(runId)') &&
   'a continuing handback must never delete its recovery marker before rebuild');
 assert.match(adopt, /Transaction rollback:[\s\S]*showRecovery\(runId/,
   'a failed local rebuild should retain files and show recovery instead of Home');
-assert.match(app, /st && \(st\.complete \|\| st\.done\)/,
-  "native AR retention should accept Java's photos.json complete flag");
+assert.match(app, /source: 'urls', complete: true/,
+  'native AR handoff should mark archive references complete without copying images');
 assert.match(main, /public String recoverActiveRun\(\)[\s\S]*RunFiles\.recoverActive/,
   'the Activity bridge should expose orphaned handback recovery');
 assert.match(runFiles, /String recoverActive\(Context ctx\)[\s\S]*state\.length\(\) < 16[\s\S]*photos\.optBoolean\("complete"/,
@@ -197,15 +197,24 @@ assert.match(fileCheckpoint, /writeRunJson\(S\.runId, 'recon\.json'[\s\S]*patchR
   'every Android-file handoff checkpoint should be mirrored into IndexedDB with its graph');
 assert.match(app, /async function mirrorHeadlessRun\(runId, status\)[\s\S]*state\.bin[\s\S]*saveRun\(rec\)/,
   'boot should rediscover an Android run directory as a Home library record');
-assert.match(app, /async function lastCaptureTile\(\)[\s\S]*importNativeCapture\(b\)[\s\S]*saveLastCapture\(rec\)/,
-  'Home should recover a native Android scan when the IndexedDB capture slot is missing');
+assert.match(app, /async function nativeCaptureTiles\(\)[\s\S]*listCaptureArchives\(\)[\s\S]*importNativeCapture\(b, row\.captureId\)/,
+  'Home should enumerate native Android scan archives independently of IndexedDB');
 assert.match(main, /public String listRecoverableRuns\(\)[\s\S]*RunFiles\.listDurableRuns/,
   'the bridge should expose complete Android run directories to Home');
 assert.match(runFiles, /List<String> listDurableRuns\(Context ctx\)[\s\S]*state\.bin[\s\S]*photos\.optBoolean\("complete"/,
   'Android discovery should require a checkpoint and complete retained images');
 assert.match(app, /async function mirrorAndroidRunDirs\(\)[\s\S]*listRecoverableRuns\(\)[\s\S]*mirrorHeadlessRun/,
   'Home should rebuild missing IndexedDB run records from Android files');
-const stage = app.slice(app.indexOf('function stageHeadlessRun()'), app.indexOf('/** Wait for the native retain'));
+const stage = app.slice(app.indexOf('function stageHeadlessRun()'), app.indexOf('/** Upload photo bytes'));
 assert.doesNotMatch(stage, /cleanRunDirs|resetCaptureSession/,
-  'handoff must not delete old run directories or the independent native scan copy');
+  'handoff must not delete old run directories or native scan archives');
+assert.match(stage, /photoSource = native \? 'urls' : 'files'[\s\S]*photoUrls: files\.map/,
+  'native handoff manifests should reference canonical archive URLs');
+assert.doesNotMatch(stage, /retainCapture/,
+  'native handoff must not copy canonical photos into each run');
+const store = readFileSync(new URL('../../app/js/store.js', import.meta.url), 'utf8');
+assert.doesNotMatch(store, /KEEP\s*=|pruneRuns|slice\(KEEP\)/,
+  'training history must not be implicitly evicted after a fixed count');
+assert.doesNotMatch(app, /a dead tombstone:[\s\S]*deleteRun\(r\.id\)/,
+  'Home must not silently delete incomplete training records');
 console.log('test_headless_files: OK');
