@@ -576,7 +576,7 @@ public final class MainActivity extends Activity {
                 result.put("metadataUri", base + "capture.json");
                 result.put("seedPlyUri", base + "seed.ply");
                 JSONArray frames = new JSONArray();
-                File[] files = current.listFiles((dir, name) -> name.matches("frame_[0-9]{4}\.jpg"));
+                File[] files = current.listFiles((dir, name) -> name.matches("frame_[0-9]{4}\\.jpg"));
                 if (files != null) {
                     java.util.Arrays.sort(files, java.util.Comparator.comparing(File::getName));
                     for (File file : files) {

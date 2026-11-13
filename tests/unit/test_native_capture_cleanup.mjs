@@ -22,6 +22,8 @@ assert.match(xr, /export async function importNativeCapture\(nativeBridge[\s\S]*
   'native import should preserve its archive reference');
 assert.match(main, /public String listCaptureArchives\(\)[\s\S]*previewUri/,
   'Home should be able to enumerate all valid native scan archives');
+assert.ok(main.includes('name.matches(\"frame_[0-9]{4}\\\\.jpg\")'),
+  'Java frame matching must escape the regex dot with a valid Java string escape');
 assert.match(main, /Native scan archives are the image ground truth[\s\S]*public String exportDataset\(String requestedId\)/,
   'the bridge should export references for a requested archive');
 assert.match(main, /public String deleteCaptureArchive\(String captureId\)[\s\S]*manifest\.json[\s\S]*\"referenced\"/,
