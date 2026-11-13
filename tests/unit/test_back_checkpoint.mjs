@@ -19,13 +19,21 @@ assert.ok(app.includes("if (reason === 'back') flash('Progress saved on this dev
 assert.ok(app.includes("await checkpointRun('back')"), 'the header Back awaits the checkpoint');
 assert.ok(app.includes("location.href = (S.state === 'train' || S.state === 'prep') ? 'index.html?back=1' : 'index.html';"),
   'leaving a live run boots the deliberate-leave home');
-assert.ok(app.includes("checkpointRun('back').catch(() => {})\n      .then(() => { location.href = 'index.html?back=1'; });"),
-  'popstate secures the IDB checkpoint before leaving too');
+assert.ok(app.includes("checkpointRun('back').catch(() => {})\n      .then(() => { S._leaving = true; location.href = 'index.html?back=1'; });"),
+  'popstate secures the IDB checkpoint and waves through before leaving too');
 // Back is IDB-only: the Yours resume is the way back, no file copy.
 const back = app.slice(app.indexOf('async function goBack()'), app.indexOf('function backToSetup()'));
 assert.ok(!back.includes('secureFileCheckpoint'), 'goBack secures IDB only, never files');
 const pop = app.slice(app.indexOf("addEventListener('popstate'"), app.indexOf('function detailClose()'));
 assert.ok(!pop.includes('secureFileCheckpoint'), 'system Back secures IDB only, never files');
+// A Back-leave waves past beforeunload with no confirm — the checkpoint is
+// the save. Refresh/close still ask (nothing secured them).
+assert.ok(app.includes('if (S._leaving) return;   // Back already saved — wave it through'),
+  'beforeunload waves a Back-leave through with no confirm');
+assert.ok(app.includes("if (S.state === 'train' || S.state === 'prep') { e.preventDefault(); e.returnValue = ''; }"),
+  'refresh/close still confirm away from a live run');
+assert.ok(back.includes('S._leaving = true;'), 'goBack waves its navigation through');
+assert.ok(pop.includes('S._leaving = true;'), 'system Back waves its navigation through');
 assert.ok(app.includes("history.pushState({ sj: 'run' }, '')"),
   'training owns a history entry so Back pops into the checkpoint-leave');
 assert.ok(app.includes("else if (mp.get('back')) headlessClearMarker().finally(() => mountWall());"),

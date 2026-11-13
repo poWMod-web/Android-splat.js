@@ -904,9 +904,11 @@ function boot() {
 
   checkGpu();
   if (new URLSearchParams(location.search).get('about')) { S._aboutFromUrl = true; openAbout(true); }
-  // a refresh mid-run would throw away the model (and, before storage
-  // landed, the capture) — ask first
+  // a refresh or tab-close mid-run would throw away the model (and, before
+  // storage landed, the capture) — ask first. A Back-leave never asks: it
+  // secured the run first, so there is nothing left to warn about.
   addEventListener('beforeunload', (e) => {
+    if (S._leaving) return;   // Back already saved — wave it through
     if (S.state === 'train' || S.state === 'prep') { e.preventDefault(); e.returnValue = ''; }
   });
   window.__splat = S;          // console access
@@ -2481,11 +2483,11 @@ async function goBack() {
     return;
   }
   // Back out of a live run secures it first (the checkpoint lives here
-  // now — pausing is free). ?back=1 tells the fresh boot this was a
-  // deliberate leave: the handoff marker stands down instead of hijacking
-  // the boot into recovery, and the Yours tile is the way back. Cancelling
-  // the beforeunload confirm keeps training AND the armed handoff: nothing
-  // below runs until the navigation commits.
+  // now — pausing is free), then waves the navigation through with no
+  // confirm: there is nothing left to warn about. ?back=1 tells the fresh
+  // boot this was a deliberate leave: the handoff marker stands down
+  // instead of hijacking the boot into recovery, and the Yours tile is
+  // the way back.
   // IDB only, deliberately: the Yours resume is the way back, and the ?back
   // boot stands the marker down anyway. A swipe landing mid-reload
   // (killed before the boot clears the marker) settles from no files and
@@ -2494,8 +2496,9 @@ async function goBack() {
     await checkpointRun('back').catch(() => {});
   }
   // Back from a run leaves the same way the logo does: a page navigation
-  // home. The wall is never rendered OVER a live scene — the beforeunload
-  // confirm guards a training in progress.
+  // home. The wall is never rendered OVER a live scene. The flag waves the
+  // navigation past beforeunload — the run above is already secured.
+  S._leaving = true;
   location.href = (S.state === 'train' || S.state === 'prep') ? 'index.html?back=1' : 'index.html';
 }
 /** After a failed solve: back to the setup card the run started from — with
@@ -5400,11 +5403,11 @@ addEventListener('popstate', () => {
   if (viewerOpen) { closeViewerToHome(); return; }
   if (detailOpen) { closeDetailCard(); return; }
   // back during a running solve/training: leave the same way the header
-  // Back does — a page navigation home (the wall is never rendered OVER a
-  // live scene; beforeunload asks before a training is thrown away)
+  // Back does — secure it, then a page navigation home (the wall is never
+  // rendered OVER a live scene). No confirm: the checkpoint is the save.
   if ((S.state === 'prep' || S.state === 'train') && $('start').hidden) {
     checkpointRun('back').catch(() => {})
-      .then(() => { location.href = 'index.html?back=1'; });
+      .then(() => { S._leaving = true; location.href = 'index.html?back=1'; });
   }
 });
 
