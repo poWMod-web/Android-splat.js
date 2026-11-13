@@ -102,10 +102,15 @@ public final class TrainingService extends Service {
     private int handoffGen;   // the pass timers only settle the pass that armed them
     private boolean backgroundRequested;
     private boolean handoffFromBackground;
+    private boolean returnToActivity;
     private String backgroundRunId;
     private final Runnable backgroundHandoff = () -> {
         if (!backgroundRequested || backgroundRunId == null || headlessActive) return;
         beginHandoff(backgroundRunId, true);
+    };
+    private final Runnable returnHandoff = () -> {
+        if (returnToActivity && headlessActive)
+            headlessEval("window.__headlessStop&&window.__headlessStop()");
     };
     private final Runnable bootWatchdog = () -> {
         if (!headlessActive || headlessRunId == null) return;
@@ -192,16 +197,25 @@ public final class TrainingService extends Service {
                 }
                 break;
             }
-            case "activity-foreground":
-                // Debounce cancellation only. If beginHandoff already sent the
-                // request, its exact checkpoint must complete and own the run.
-                if (handoffRunId == null) {
-                    backgroundRequested = false;
-                    backgroundRunId = null;
-                    main.removeCallbacks(backgroundHandoff);
+            case "activity-foreground": {
+                String runId = intent.getStringExtra("runId");
+                backgroundRequested = false;
+                backgroundRunId = null;
+                main.removeCallbacks(backgroundHandoff);
+                // Once the Activity comes back it must own the model again.
+                // Latch across a handoff/boot race; postProgress retries the
+                // guarded hook after the headless session is actually ready.
+                boolean returning = runId != null && runId.equals(RunFiles.readActive(this)) &&
+                        (headlessActive || (handoffRunId != null && runId.equals(handoffRunId)) ||
+                                "service".equals(ownerOf(runId)));
+                if (returning) {
+                    returnToActivity = true;
+                    if (headlessActive) headlessEval("window.__headlessStop&&window.__headlessStop()");
+                } else if (!foreground && !headlessActive) {
+                    stopSelf();
                 }
-                if (!foreground && !headlessActive) stopSelf();
                 break;
+            }
             case "headless-pause":
                 headlessCommand(intent, "window.__headlessPause&&window.__headlessPause()");
                 break;
@@ -641,6 +655,10 @@ public final class TrainingService extends Service {
                     if (lastPaused) releaseWakeLock(); else acquireWakeLock();
                 }
                 showOngoing(lastTitle, lastText, lastDone, lastTotal, false);
+                if (returnToActivity && headlessActive) {
+                    main.removeCallbacks(returnHandoff);
+                    main.postDelayed(returnHandoff, 1500);
+                }
             } catch (Exception ignored) { /* progress display must never crash training */ }
         }
 
@@ -659,20 +677,29 @@ public final class TrainingService extends Service {
         // The three orderly ends: the driver secured the status file first, so
         // the service only posts the summary and stands down.
         @JavascriptInterface public void finishRun(String runId, String title, String text) {
-            endRun(title, text);
+            endRun(runId, title, text, true);
         }
 
         @JavascriptInterface public void stopRun(String runId, String title, String text) {
-            endRun(title, text);
+            // Ownership is moving back into the visible Activity, not ending.
+            endRun(runId, title, text, false);
         }
 
         @JavascriptInterface public void abortRun(String runId, String title, String text) {
-            endRun(title, text);
+            endRun(runId, title, text, true);
         }
 
-        private void endRun(String title, String text) {
-            showDone(title, text);
-            main.post(() -> teardown());
+        private void endRun(String runId, String title, String text, boolean summary) {
+            if (summary) showDone(title, text);
+            main.post(() -> {
+                teardown();   // destroy the service WebView/GPU FIRST
+                try {
+                    JSONObject beat = new JSONObject();
+                    beat.put("alive", false);
+                    beat.put("at", System.currentTimeMillis());
+                    RunFiles.writeJson(TrainingService.this, runId, "service.json", beat.toString());
+                } catch (Exception ignored) { /* stale heartbeat expires as fallback */ }
+            });
         }
     }
 
@@ -721,9 +748,14 @@ public final class TrainingService extends Service {
 
     private void teardown() {
         handoffSettled = true;
+        handoffRunId = null;
         backgroundRequested = false;
+        returnToActivity = false;
         backgroundRunId = null;
-        if (main != null) main.removeCallbacks(backgroundHandoff);
+        if (main != null) {
+            main.removeCallbacks(backgroundHandoff);
+            main.removeCallbacks(returnHandoff);
+        }
         destroyHeadless();
         try { notifications().cancel(NOTIF_ID); } catch (Exception ignored) { /* already gone */ }
         try { stopForeground(true); } catch (Exception ignored) { /* never foregrounded */ }
@@ -749,8 +781,8 @@ public final class TrainingService extends Service {
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
         Intent open = new Intent(this, MainActivity.class)
-                .setAction(Intent.ACTION_MAIN)
-                .addCategory(Intent.CATEGORY_LAUNCHER);
+                .setAction(MainActivity.ACTION_RETURN_TRAINING)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent tap = PendingIntent.getActivity(this, 0, open,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         builder.setSmallIcon(R.mipmap.icon180)

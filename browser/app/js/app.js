@@ -6332,6 +6332,10 @@ async function headlessBootCheck() {
   } catch { status = null; }
   if (!status || typeof status.status !== 'string') { headlessDiscard(runId); return false; }
   if (status.status === 'finished') { await adoptHeadlessRun(runId, 'finished'); return true; }
+  if (status.status === 'interrupted' && status.stopped) {
+    await returnHeadlessRun(runId);
+    return true;
+  }
   if (!Headless.isLiveStatus(status)) { showRecovery(runId, status); return true; }
   let service = null;
   try {
@@ -6390,14 +6394,12 @@ function wireMonitorOnce() {
     if (!S._monRun) return;
     $('mon-stop').disabled = true;
     flash('Stopping the background run …', 60000);
-    if (await headlessTakeover(S._monRun)) adoptHeadlessRun(S._monRun, 'continue');
-    else { $('mon-stop').disabled = false; flash('The background run is still taking over — try again in half a minute.', 8000); }
+    if (!(await returnHeadlessRun(S._monRun))) $('mon-stop').disabled = false;
   });
   $('mon-continue').addEventListener('click', async () => {
     if (!S._monRun) return;
     $('mon-continue').disabled = true;
-    if (await headlessTakeover(S._monRun)) adoptHeadlessRun(S._monRun, 'continue');
-    else { $('mon-continue').disabled = false; flash('The background run is still taking over — try again in half a minute.', 8000); }
+    if (!(await returnHeadlessRun(S._monRun))) $('mon-continue').disabled = false;
   });
   $('mon-discard').addEventListener('click', () => {
     if (S._monRun) headlessDiscard(S._monRun);
@@ -6442,6 +6444,10 @@ async function monitorPoll(now, force = false) {
     const status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json().catch(() => null);
     if (!status) return;   // transient read failure — retry next poll
     if (status.status === 'finished') { adoptHeadlessRun(runId, 'finished'); return; }
+    if (status.status === 'interrupted' && status.stopped) {
+      returnHeadlessRun(runId);
+      return;
+    }
     if (!Headless.isLiveStatus(status)) { showRecovery(runId, status); return; }
     let service = null, progress = null;
     try { service = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json(); } catch { /* quiet */ }
@@ -6495,15 +6501,40 @@ async function monitorSnapshot(runId) {
 async function headlessTakeover(runId) {
   const b = headlessBridge();
   try { b && b.headlessCommand('headless-stop', runId); } catch { /* best-effort */ }
-  for (let i = 0; i < 12; i++) {
+  // A non-live status is written before Java destroys the service WebView.
+  // Wait for service.json alive:false (written AFTER teardown), or a stale
+  // heartbeat, so the Activity never creates a second WebGPU owner.
+  for (let i = 0; i < 90; i++) {
     await new Promise((r) => setTimeout(r, 1000));
-    let s = null;
-    try { s = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json(); }
-    catch { return true; }   // unreadable: nothing live left to fight
-    if (!s || !Headless.isLiveStatus(s) || s.owner === 'activity') return true;
-    if (Date.now() - (s.at || 0) > 60000) return true;   // stale twin: dead
+    let status = null, service = null;
+    try { status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json(); }
+    catch { /* a torn/transition read is not proof the GPU is gone */ }
+    try { service = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json(); }
+    catch { service = null; }
+    const stateReleased = !status || !Headless.isLiveStatus(status) || status.owner === 'activity';
+    const serviceReleased = !!service &&
+      (service.alive === false || !Headless.heartbeatFresh(service));
+    if (stateReleased && serviceReleased) return true;
   }
   return false;
+}
+
+/** The one automatic service→Activity handback used by notification return,
+ *  normal foregrounding, and the monitor button. */
+async function returnHeadlessRun(runId) {
+  if (!runId) return false;
+  if (S._handbackRun === runId) return false;
+  S._handbackRun = runId;
+  flash('Returning training to the app …', 90000);
+  try {
+    if (!(await headlessTakeover(runId))) {
+      flash('The background trainer has not released the GPU yet. It is still safe in the service; try again shortly.', 9000);
+      return false;
+    }
+    return await adoptHeadlessRun(runId, 'continue');
+  } finally {
+    if (S._handbackRun === runId) S._handbackRun = null;
+  }
 }
 /** Adopt a background run into this Activity: finished opens view-only in the
  *  done viewer, continue resumes training locally under the same run id (the
@@ -6560,9 +6591,11 @@ async function adoptHeadlessRun(runId, mode) {
       }
       await continueLocalRun(false);
     }
+    return true;
   } catch (e) {
     console.error(e);
     flash(`Could not open the background run (${e.message}) — it stays stored for another try.`, 9000);
+    return false;
   }
 }
 /** The run died out of reach (pressure kill, crash, pre-handoff swipe): offer

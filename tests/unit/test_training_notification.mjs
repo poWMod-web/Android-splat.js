@@ -62,6 +62,8 @@ assert.match(service, /builder\.addAction\(lastPaused \? android\.R\.drawable\.i
   'the ongoing notification should carry a Pause/Resume action');
 assert.match(service, /PendingIntent\.getBroadcast\(this, 1, toggle,/,
   'the shade button should fire a broadcast instead of opening the app');
+assert.match(service, /setAction\(MainActivity\.ACTION_RETURN_TRAINING\)[\s\S]*FLAG_ACTIVITY_CLEAR_TOP \| Intent\.FLAG_ACTIVITY_SINGLE_TOP/,
+  'tapping the notification should target the existing Activity and request training ownership');
 assert.match(service, /if \(lastPaused\) releaseWakeLock\(\); else acquireWakeLock\(\);/,
   'a shade pause should free the CPU while keeping the notification up');
 

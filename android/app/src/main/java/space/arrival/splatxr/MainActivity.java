@@ -38,6 +38,8 @@ public final class MainActivity extends Activity {
     /** The training notification's Pause/Resume button: the service fires it,
      *  the activity turns it into a WebView toggle call. */
     public static final String ACTION_TOGGLE_TRAINING = "space.arrival.splatxr.TOGGLE_TRAINING";
+    /** Notification/app foreground: return service-owned training to this Activity. */
+    public static final String ACTION_RETURN_TRAINING = "space.arrival.splatxr.RETURN_TRAINING";
     /** The background handoff: the foreground service fires it when this Activity
      *  stops (or its task is removed), the activity acks and checkpoints — the
      *  verdict follows as headless-ready (or the service times out). */
@@ -361,13 +363,26 @@ public final class MainActivity extends Activity {
      *  monitor and the service remains the sole GPU owner. */
     @Override protected void onStart() {
         super.onStart();
+        requestTrainingReturn();
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (intent != null && ACTION_RETURN_TRAINING.equals(intent.getAction())) requestTrainingReturn();
+    }
+
+    /** Foregrounding means the Activity should own its live model again, not
+     *  merely display the service monitor. The service checkpoints first and
+     *  acknowledges GPU teardown through service.json. */
+    private void requestTrainingReturn() {
         String active = RunFiles.readActive(this);
         if (active == null) return;
         try {
             startService(new Intent(this, TrainingService.class)
                     .putExtra("action", "activity-foreground")
                     .putExtra("runId", active));
-        } catch (Exception ignored) { /* no service means there was nothing pending */ }
+        } catch (Exception ignored) { /* no service means boot recovery owns the files */ }
     }
 
     @Override protected void onDestroy() {

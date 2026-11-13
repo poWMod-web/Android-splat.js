@@ -1,7 +1,7 @@
 // train-headless.js — the foreground-service driver. Runs ONLY in the :training
-// service's headless WebView (booted from onTaskRemoved), never in the app.
+// service's headless WebView (booted when the Activity backgrounds), never in the app.
 //
-// It resumes the swiped-away run from the last file checkpoint — photos,
+// It resumes the backgrounded run from the exact handoff checkpoint — photos,
 // state.bin and recon.json from files/runs/<runId>/ — and keeps training with
 // no UI: progress goes to the service notification, checkpoints back to files,
 // and snapshots serve the reopened app's monitor view. The service drives it
@@ -279,15 +279,25 @@ globalThis.__headlessResume = () => {
  *  reopened app offers Continue-here from it. */
 globalThis.__headlessStop = async () => {
   if (!ses || ending) return;
+  const wasTraining = !!ses.training;
   ending = true;
   try {
     try { ses.pause(); } catch { /* already down */ }
-    await secureFileCheckpoint();
+    const secured = await secureFileCheckpoint();
+    if (!secured) {
+      // Never hand stale state back as if it were current. Keep service
+      // ownership and retry on the next foreground-return progress request.
+      ending = false;
+      if (wasTraining) ses.start();
+      postStatus({ status: ses.training ? 'active' : 'paused', handbackError: 'checkpoint failed' });
+      postProgress(true);
+      return;
+    }
     await snapshot();
     const iter = ses.trainer ? ses.trainer.iter | 0 : 0;
     postStatus({ status: 'interrupted', iter, stopped: true });
-    bridge.stopRun(runId, 'Training stopped',
-      `State kept at cycle ${iter.toLocaleString('en-US')} — continue any time.`);
+    bridge.stopRun(runId, 'Training returned to app',
+      `State kept at cycle ${iter.toLocaleString('en-US')} — resuming in the app.`);
   } catch (e) {
     await fail(e);
   }

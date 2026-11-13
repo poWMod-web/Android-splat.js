@@ -120,4 +120,18 @@ for (const s of ['setDataDirectorySuffix("training")', 'AndroidHeadless', 'headl
     'ORPHAN_TAKEOVER_DELAY_MS', 'beginHandoff']) {
   assert.ok(svc.includes(s), `service implements ${s}`);
 }
+
+// Foreground/notification return is a real ownership transfer, not a monitor-only reopen.
+assert.match(main, /void onNewIntent\(Intent intent\)[\s\S]*ACTION_RETURN_TRAINING[\s\S]*requestTrainingReturn\(\)/,
+  'a notification tap on an existing Activity should explicitly request the model back');
+assert.match(svc, /case "activity-foreground":[\s\S]*returnToActivity = true[\s\S]*__headlessStop/,
+  'foregrounding should latch a stop/checkpoint request into the service trainer');
+assert.match(svc, /beat\.put\("alive", false\)[\s\S]*RunFiles\.writeJson[\s\S]*service\.json/,
+  'Java should acknowledge service GPU teardown before Activity adoption');
+assert.match(driver, /const secured = await secureFileCheckpoint\(\);[\s\S]*if \(!secured\)[\s\S]*ses\.start\(\)/,
+  'a failed handback checkpoint should keep service training instead of returning stale state');
+assert.match(app, /status\.status === 'interrupted' && status\.stopped[\s\S]*returnHeadlessRun\(runId\)/,
+  'a stopped service checkpoint should automatically resume in the Activity');
+assert.match(app, /service\.alive === false[\s\S]*Headless\.heartbeatFresh\(service\)/,
+  'Activity adoption should wait for the post-teardown service acknowledgment');
 console.log('test_headless_files: OK');
