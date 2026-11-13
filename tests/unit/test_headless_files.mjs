@@ -143,6 +143,12 @@ assert.match(app, /'mon-continue'\)\.addEventListener\('click'[\s\S]*returnHeadl
   'only the Continue here button should request service ownership');
 assert.match(app, /service\.alive === false[\s\S]*Headless\.heartbeatFresh\(service\)/,
   'Activity adoption should wait for the post-teardown service acknowledgment');
+const monitorPollStart = app.indexOf('async function monitorPoll(now, force = false)');
+const monitorPoll = app.slice(monitorPollStart, app.indexOf('function paintMonitorProgress', monitorPollStart));
+assert.ok((monitorPoll.match(/S\._handbackRun === (?:S\._monRun|runId)/g) || []).length >= 3,
+  'monitor polling must ignore the intentional stopped checkpoint throughout ownership transfer');
+assert.match(svc, /public void stopRun\([\s\S]*endRun\(runId, title, text, false\)/,
+  'an ownership transfer must not post an interruption summary notification');
 
 const adoptStart = app.indexOf('async function adoptHeadlessRun(runId, mode)');
 const adopt = app.slice(adoptStart, app.indexOf('/** The run died out of reach', adoptStart));

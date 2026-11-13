@@ -6778,7 +6778,7 @@ function wireMonitorOnce() {
   $('mon-stop').addEventListener('click', async () => {
     if (!S._monRun) return;
     $('mon-stop').disabled = true;
-    flash('Stopping the background run …', 60000);
+    flash('Securing the background checkpoint and transferring training here …', 60000);
     if (!(await returnHeadlessRun(S._monRun))) $('mon-stop').disabled = false;
   });
   $('mon-continue').addEventListener('click', async () => {
@@ -6822,12 +6822,19 @@ function paintMonitorHead(runId) {
  *  on, and the transitions — finished adopts, dead/interrupted recovers. */
 async function monitorPoll(now, force = false) {
   if (S.state !== 'monitor' || !S._monRun || S._monRecovery) return;
+  // Stop & continue intentionally makes the service publish a final
+  // interrupted/stopped checkpoint before releasing its GPU. That is a
+  // transfer protocol state, not a failure modal.
+  if (S._handbackRun === S._monRun) return;
   if (!force && now - S._monAt < 5000) return;
   S._monAt = now;
   const runId = S._monRun;
   try {
     const status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json().catch(() => null);
     if (!status) return;   // transient read failure — retry next poll
+    // A poll can have started just before the button set _handbackRun. Do not
+    // reinterpret the service's orderly stop acknowledgment as a crash.
+    if (S._handbackRun === runId) return;
     if (status.status === 'finished') { adoptHeadlessRun(runId, 'finished'); return; }
     if (status.status === 'interrupted' && status.stopped) {
       showRecovery(runId, status);
@@ -6837,6 +6844,7 @@ async function monitorPoll(now, force = false) {
     let service = null, progress = null;
     try { service = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json(); } catch { /* quiet */ }
     try { progress = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'progress.json')))).json(); } catch { /* quiet */ }
+    if (S._handbackRun === runId) return;
     if (status.owner === 'service' && !Headless.heartbeatFresh(service)) { showRecovery(runId, status); return; }
     S._monPaused = status.status === 'paused';
     paintMonitorProgress(status, progress);
