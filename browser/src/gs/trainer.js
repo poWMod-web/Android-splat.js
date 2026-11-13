@@ -35,6 +35,20 @@ export const MERGE_BUDGET_MS = 250;
 /** Steps per merged submit before the first timer measurement lands. */
 export const UNMEASURED_MERGE = 8;
 
+/** Shuffled-epoch camera deck (INRIA dealing): a Fisher–Yates permutation
+ *  of [0, n), drawn with pop(). Every camera trains exactly once per pass,
+ *  then the deck reshuffles — even coverage instead of the with-replacement
+ *  lottery, which leaves ~37% of cameras unseen after N steps. Uses the
+ *  trainer's own RNG, so seeded runs reproduce the dealing order too. */
+export function shuffledCamDeck(n, rand) {
+  const deck = Array.from({ length: Math.max(0, n | 0) }, (_, i) => i);
+  for (let i = deck.length - 1; i > 0; i--) {
+    const j = (rand() * (i + 1)) | 0;
+    const t = deck[i]; deck[i] = deck[j]; deck[j] = t;
+  }
+  return deck;
+}
+
 /** Partition camera target images (whole cameras, in order) into chunks of
  *  at most `limitBytes` each, so packed training targets fit adapters whose
  *  single-binding ceiling the full set exceeds. sizesPx: pixels per camera.
@@ -882,6 +896,7 @@ export class GSTrainer {
     // Atomic float order in the kernels stays nondeterministic, so this
     // narrows the spread, it does not zero it.
     this.rand = Number.isFinite(this.opts.seed) ? makeRng(this.opts.seed) : () => Math.random();
+    this._camDeck = [];   // shuffled-epoch deck (stepOnce refills per pass)
 
     // gradcheck metadata
     this.hBySlot = [
@@ -1116,6 +1131,7 @@ export class GSTrainer {
     const sum = new Float64Array(names.length);
     let steps = 0;
     for (let s = 0; s < k; s++) {
+      // deliberately NOT the epoch deck: a timing probe must not deal training's hand
       let ci = (this.rand() * this.camMeta.length) | 0;
       for (let tries = 0; tries < 16 && (ci === this.holdout || (this.excluded && this.excluded.has(ci))); tries++) ci = (ci + 1) % this.camMeta.length;
       const meta = this.camMeta[ci];
@@ -1230,7 +1246,11 @@ export class GSTrainer {
       this._mEnc = d.createCommandEncoder();
       this._ringUsed = 0;
     }
-    let ci = (this.rand() * this.camMeta.length) | 0;
+    // shuffled epochs: deal the pass, reshuffle when spent. The skip loop
+    // below still advances past holdout/excluded (a re-dealt collision
+    // just trains one camera twice in a pass — harmless).
+    if (!this._camDeck.length) this._camDeck = shuffledCamDeck(this.camMeta.length, this.rand);
+    let ci = this._camDeck.pop();
     // skip the holdout and any excluded (e.g. motion-blurred) cameras
     for (let tries = 0; tries < 16; tries++) {
       const bad = ci === this.holdout || (this.excluded && this.excluded.has(ci));
