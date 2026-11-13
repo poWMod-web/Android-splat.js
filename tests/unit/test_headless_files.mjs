@@ -76,96 +76,35 @@ assert.ok(Math.abs(cam.cx - 256) < 1e-9 && Math.abs(cam.cy - 144) < 1e-9);
 assert.equal(snapshotCam({ cams: [], frames: [] }), null);
 assert.equal(snapshotCam(null), null);
 
-// ── wiring pins: the driver + app implement the vocabulary this module defines
-const driver = readFileSync(new URL('../../app/js/train-headless.js', import.meta.url), 'utf8');
-for (const hook of ['__headlessToggle', '__headlessPause', '__headlessResume', '__headlessStop', '__headlessSnapshot']) {
-  assert.ok(driver.includes(hook), `driver exposes ${hook}`);
-}
-for (const call of ['postProgress', 'writeRunJson', 'writeRunChunk', 'writeSnapshotChunk', 'finishRun', 'stopRun', 'abortRun']) {
-  assert.ok(driver.includes(call), `driver calls bridge.${call}`);
-}
+// ── retired service handoff ────────────────────────────────────────────────
+// Keep the parser/validator covered above for compatibility with files left by
+// older APKs, but never activate cross-WebView WebGPU ownership again.
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
-for (const fn of ['stageHeadlessRun', 'secureFileCheckpoint', 'enterMonitor', 'adoptHeadlessRun']) {
-  assert.ok(app.includes(`function ${fn}`), `app implements ${fn}`);
-}
-// transitions only: no periodic file checkpoints anywhere on either side
-for (const [src, name] of [[app, 'app'], [driver, 'driver']]) {
-  assert.ok(!src.includes('maybeFileCheckpoint') && !src.includes('maybeCheckpoint'),
-    `${name} writes file checkpoints on transitions only, never periodically`);
-}
-assert.ok(!readFileSync(new URL('../../app/js/headless.js', import.meta.url), 'utf8').includes('checkpointDue'),
-  'the cadence gate is gone with the periodics');
-// foreground-service handoff: Activity background/task removal asks, the page secures + relinquishes GPU
-assert.ok(app.includes('globalThis.__splatxrHandoff'), 'app exposes the handoff hook');
-assert.ok(app.includes('b.handoffDone(runId, ok)'), 'the handoff verdict rides handoffDone');
-const hook = app.slice(app.indexOf('globalThis.__splatxrHandoff'), app.indexOf('const trainBridge'));
-assert.ok(hook.includes('secureFileCheckpoint'), 'the handoff hook is the app side that still secures files');
-assert.match(hook, /if \(ok[\s\S]*S\.session\.pause\(\); S\.session\.dispose\(\)[\s\S]*enterMonitor\(runId\)/,
-  'a successful handoff should dispose the Activity GPU before becoming a monitor');
-assert.match(hook, /activity\.json[^]*alive: false/,
-  'the successful handoff should retire the Activity heartbeat before service boot');
 const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
-assert.ok(main.includes('ACTION_HANDOFF_TRAINING'), 'the handoff broadcast exists');
-assert.ok(main.includes('public void handoffDone(String runId, boolean ok)'), 'the bridge carries the verdict');
-assert.match(main, /void onStop\(\)[^]*activity-background/,
-  'normal Activity backgrounding should ask the foreground service to own training');
-assert.match(main, /void onStart\(\)[^]*activity-foreground/,
-  'a quick foreground return should cancel the debounced handoff');
-assert.ok(app.includes("localStorage.getItem('splatjs_monitor_visuals') === '1'"),
-  'the monitor visuals toggle defaults off, like the in-app training visuals');
 const svc = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
-const runFiles = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/RunFiles.java', import.meta.url), 'utf8');
-for (const s of ['setDataDirectorySuffix("training")', 'AndroidHeadless', 'headless-snapshot', 'onTaskRemoved',
-    'headless-ack', 'headless-ready', 'settleHandoff', 'HANDOFF_ACK_MS', 'handoffGen',
-    'activity-background', 'BACKGROUND_HANDOFF_DELAY_MS', 'SUCCESS_TAKEOVER_DELAY_MS',
-    'ORPHAN_TAKEOVER_DELAY_MS', 'beginHandoff']) {
-  assert.ok(svc.includes(s), `service implements ${s}`);
-}
-
-// Foreground/notification return is a real ownership transfer, not a monitor-only reopen.
-assert.match(main, /void onNewIntent\(Intent intent\)[\s\S]*ACTION_RETURN_TRAINING[\s\S]*requestTrainingReturn\(\)/,
-  'a notification tap on an existing Activity should explicitly request the model back');
-assert.match(svc, /case "activity-foreground":[\s\S]*returnToActivity = true[\s\S]*__headlessStop/,
-  'foregrounding should latch a stop/checkpoint request into the service trainer');
-assert.match(svc, /beat\.put\("alive", false\)[\s\S]*RunFiles\.writeJson[\s\S]*service\.json/,
-  'Java should acknowledge service GPU teardown before Activity adoption');
-assert.match(driver, /const secured = await secureFileCheckpoint\(\);[\s\S]*if \(!secured\)[\s\S]*ses\.start\(\)/,
-  'a failed handback checkpoint should keep service training instead of returning stale state');
-assert.match(app, /status\.status === 'interrupted' && status\.stopped[\s\S]*returnHeadlessRun\(runId\)/,
-  'a stopped service checkpoint should automatically resume in the Activity');
-assert.match(app, /service\.alive === false[\s\S]*Headless\.heartbeatFresh\(service\)/,
-  'Activity adoption should wait for the post-teardown service acknowledgment');
-
-const adoptStart = app.indexOf('async function adoptHeadlessRun(runId, mode)');
-const adopt = app.slice(adoptStart, app.indexOf('/** The run died out of reach', adoptStart));
-assert.match(adopt, /if \(mode === 'finished'\) \{[\s\S]*await continueLocalRun\(true\);[\s\S]*headlessClear\(runId\);/,
-  'a finished handback should clear its marker only after the viewer rebuilds');
-assert.match(adopt, /await continueLocalRun\(false\);[\s\S]*S\.state !== 'train'[\s\S]*owner: 'activity'/,
-  'a continuing handback should publish Activity ownership only after a live trainer exists');
-const continueBranch = adopt.indexOf('await continueLocalRun(false)');
-assert.ok(continueBranch > adopt.indexOf('headlessClear(runId)') &&
-    !adopt.slice(adopt.lastIndexOf('} else {', continueBranch), continueBranch).includes('headlessClear(runId)'),
-  'a continuing handback must never delete its recovery marker before rebuild');
-assert.match(adopt, /Transaction rollback:[\s\S]*showRecovery\(runId/,
-  'a failed local rebuild should retain files and show recovery instead of Home');
-assert.match(app, /st && \(st\.complete \|\| st\.done\)/,
-  "native AR retention should accept Java's photos.json complete flag");
-assert.match(main, /public String recoverActiveRun\(\)[\s\S]*RunFiles\.recoverActive/,
-  'the Activity bridge should expose orphaned handback recovery');
-assert.match(runFiles, /String recoverActive\(Context ctx\)[\s\S]*state\.length\(\) < 16[\s\S]*photos\.optBoolean\("complete"/,
-  'orphan recovery should require exact state and retained AR photos');
-assert.match(runFiles, /"finished"\.equals\(value\)[\s\S]*"discarded"\.equals\(value\)[\s\S]*"dismissed"\.equals\(value\)/,
-  'orphan recovery must not resurrect completed or deliberately abandoned runs');
-assert.match(app, /typeof b\.recoverActiveRun === 'function' \? b\.recoverActiveRun\(\) : null/,
-  'boot should recover a durable run directory when old code deleted active.json');
-assert.match(app, /status: 'discarded'[\s\S]*headlessClear\(runId\)/,
-  'Discard should mark its directory so orphan recovery respects the choice');
-assert.match(app, /A file-backed service handback cannot use Session\.recover[\s\S]*restartForGpuRecovery[\s\S]*showRecovery\(runId/,
-  'a handback device loss should rebuild in a fresh Android renderer or remain on file-backed recovery');
-assert.match(main, /public void restartForGpuRecovery\(String runId\)[\s\S]*gpuRendererRestart = true;[\s\S]*recreate\(\)/,
-  'Android should replace the poisoned visible WebView for one handback retry');
-assert.match(main, /WebView oldWebView = webView;[\s\S]*oldWebView\.destroy\(\)/,
-  'Activity teardown should explicitly destroy the old WebView renderer');
-assert.match(app, /service\.alive === false[\s\S]*return true;[\s\S]*headlessCommand\('headless-stop'/,
-  'a dead service should not be restarted and allowed to overwrite GPU-retry metadata');
-console.log('test_headless_files: OK');
+const manifest = readFileSync(new URL('../../android/app/src/main/AndroidManifest.xml', import.meta.url), 'utf8');
+assert.match(app, /const headlessBridge = \(\) => null;/,
+  'service-owned WebGPU handoff must stay disabled');
+const boot = app.slice(app.indexOf('function boot()'), app.indexOf('// WebGPU probe'));
+assert.doesNotMatch(boot, /headlessBootCheck|headlessClearMarker/,
+  'app boot must ignore stale service-run markers and open the local wall');
+const start = app.slice(app.indexOf('function startTraining()'), app.indexOf('function buildSceneFromSession'));
+assert.doesNotMatch(start, /stageHeadlessRun/,
+  'starting a run must not stage a second-process trainer');
+const preflightAt = app.indexOf('async function startPrep()');
+const preflight = app.slice(preflightAt, preflightAt + 3000);
+assert.doesNotMatch(preflight, /headlessMarkerLive|headlessBootCheck/,
+  'stale service files must never block a new local Start');
+assert.doesNotMatch(main, /ACTION_HANDOFF_TRAINING|activity-background|handoffDone|headlessCommand/,
+  'the Activity must never transfer a live trainer to the service');
+assert.doesNotMatch(main, /writeRunJson|writeRunChunk|setActiveRun|recoverActiveRun/,
+  'the disabled bridge must not stage or adopt headless run files');
+assert.doesNotMatch(svc, /import android\.webkit|new WebView|AndroidHeadless|headless-|RunFiles|activity-foreground/,
+  'the notification service must not own a WebView, GPU, or run files');
+assert.doesNotMatch(manifest, /android:process=":training"/,
+  'the notification-only service should not create a second app process');
+assert.match(svc, /onTaskRemoved\(Intent rootIntent\)[\s\S]*teardown\(\);/,
+  'swiping away the Activity should stop the notification, not start a trainer');
+assert.match(main, /onDestroy\(\)[\s\S]*stopTrainingService\(\);/,
+  'destroying the Activity should always stop its notification service');
+console.log('test_headless_files: retired handoff compatibility OK');

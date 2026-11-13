@@ -58,56 +58,22 @@ assert.match(xr, /setBusy\?\.\(true\);\n      let dataset = null;\n      try \{ 
 assert.match(xr, /splatxr-native-capture', async \(\) => \{\n      \/\/[\s\S]{0,300}?setBusy\?\.\(true\);/,
   'the native import should hold the counter from the event');
 
-// --- zombie bypass: a service-owned live marker with no live service releases ---
-const guard = app.slice(app.indexOf('async function headlessMarkerLive()'),
-  app.indexOf('/** Liveness of a service-owned run'));
-assert.match(guard, /status\.owner === 'service' && !\(await headlessServiceAlive\(runId\)\)/,
-  'service-owned live markers should get a liveness check');
-assert.match(guard, /status: 'interrupted', at: Date\.now\(\),/,
-  'a dead service should release its run to recovery');
-assert.match(guard, /status\.owner === 'activity' && S\.state === 'ready'/,
-  'an activity-owned marker cannot brick Start when this Activity is in setup');
-assert.match(guard, /headlessBridge\(\)\.clearActiveRun\(runId\)/,
-  'the stale local marker should be released before the new run stages');
-assert.match(app, /async function headlessFetch\(url, timeoutMs = 2500\)[\s\S]*ctl\.abort\(\)/,
-  'a wedged Android files-dir read must not own Start indefinitely');
-assert.match(guard, /headlessFetch\(Headless\.activeUrl\(\)\)/,
-  'the Start preflight should use the bounded local-file read');
-assert.match(app, /if \(!\(await headlessBootCheck\(\)\)\)/,
-  'a genuinely live background run should open its monitor, not leave a dead Start card');
+// --- service handoff retired: Start can never be blocked by a stale marker ---
+assert.match(app, /const headlessBridge = \(\) => null;/,
+  'the unreliable cross-renderer training handoff should remain disabled');
+assert.doesNotMatch(mainAct, /headlessCommand|handoffDone|ACTION_HANDOFF_TRAINING/,
+  'the Activity bridge should expose no service trainer controls');
+assert.doesNotMatch(service, /new WebView|AndroidHeadless|headless-ping|RunFiles/,
+  'the notification service should never create a second trainer');
 
-const aliveStart = app.indexOf('async function headlessServiceAlive(runId)');
-const alive = app.slice(aliveStart, aliveStart + 1200);
-assert.match(alive, /Headless\.heartbeatFresh\(s\)\) return true/,
-  'a fresh heartbeat should prove liveness outright');
-assert.match(alive, /b\.headlessCommand\('headless-ping', runId\)/,
-  'a quiet run should get a ping round-trip');
-assert.match(alive, /setTimeout\(r, 1200\)/,
-  'the ping should allow a round-trip beat before re-reading');
-
-assert.match(mainAct, /!action\.equals\("headless-ping"\)\) return;/,
-  'the bridge should whitelist the ping command');
-const pingCase = service.slice(service.indexOf('case "headless-ping"'), service.indexOf('case "headless-stop"'));
-assert.match(pingCase, /headlessActive && runId\.equals\(headlessRunId\)/,
-  'the ping should answer for the live twin');
-assert.match(pingCase, /!handoffSettled && runId\.equals\(handoffRunId\)/,
-  'the ping should answer while a handoff settles');
-assert.match(pingCase, /RunFiles\.writeJson\(this, runId, "service\.json", beat\.toString\(\)\)/,
-  'the ping should answer with a heartbeat');
-assert.match(pingCase, /stopSelf\(\); \/\/ delivered to a dead service: linger nothing/,
-  'an unowned ping should linger nothing');
-
-// --- background training: channel-pumped frames, metrics-driven progress ---
+// The Activity WebView may still make progress while Android leaves it alive;
+// unlike the retired service twin this uses the one original session and no
+// state migration.
 assert.match(session, /if \(isHidden\(\) && this\._sched\.pump\) this\._sched\.pump\(\);/,
-  'hidden pages should pump frames through the channel');
+  'a hidden Activity page should pump frames through the channel when allowed');
 assert.match(session, /ch\.port1\.onmessage = \(\) => runFrame\(\);/,
   'the pump should deliver frames, not just ticks');
 assert.match(session, /ch\.port1\.unref\?\.\(\); ch\.port2\.unref\?\.\(\);/,
   'the pump must not hold a Node event loop open by itself');
-assert.doesNotMatch(driver, /setInterval/,
-  'the headless page should own no throttlable timers');
-assert.match(driver, /ses\.on\('metrics', \(\) => postProgress\(\)\);/,
-  'headless progress should ride the metrics beat');
-assert.doesNotMatch(driver, /function tick\(\)/, 'the interval tick should be gone');
 
-console.log('intake guard, zombie bypass, background pump + metrics progress pinned');
+console.log('intake guard + single-Activity background fallback pinned');

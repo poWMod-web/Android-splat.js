@@ -38,43 +38,18 @@ public final class MainActivity extends Activity {
     /** The training notification's Pause/Resume button: the service fires it,
      *  the activity turns it into a WebView toggle call. */
     public static final String ACTION_TOGGLE_TRAINING = "space.arrival.splatxr.TOGGLE_TRAINING";
-    /** Notification/app foreground: return service-owned training to this Activity. */
-    public static final String ACTION_RETURN_TRAINING = "space.arrival.splatxr.RETURN_TRAINING";
-    /** The background handoff: the foreground service fires it when this Activity
-     *  stops (or its task is removed), the activity acks and checkpoints — the
-     *  verdict follows as headless-ready (or the service times out). */
-    public static final String ACTION_HANDOFF_TRAINING = "space.arrival.splatxr.HANDOFF_TRAINING";
     private ValueCallback<Uri[]> fileChooserCallback;
     private WebView webView;
     private WebViewAssetLoader assetLoader;
     private final Object fileSaveLock = new Object();
     private OutputStream fileSaveStream;
     private boolean fileSavePickerPending;
-    /** Suppress onStop's normal Activity→service handoff while replacing a
-     *  renderer whose WebGPU process was lost during service return. */
-    private boolean gpuRendererRestart;
     private final BroadcastReceiver toggleTrainingReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context ctx, Intent intent) {
             if (webView == null) return;
             webView.post(() -> {
                 try { webView.evaluateJavascript("window.__splatxrNotifToggle&&window.__splatxrNotifToggle()", null); }
                 catch (Exception ignored) { /* the shade toggle must never crash the app */ }
-            });
-        }
-    };
-    private final BroadcastReceiver handoffReceiver = new BroadcastReceiver() {
-        @Override public void onReceive(Context ctx, Intent intent) {
-            // ack FIRST (the service stops its absence timer), then run the
-            // page's handoff — the verdict follows as headless-ready
-            try {
-                startService(new Intent(MainActivity.this, TrainingService.class)
-                        .putExtra("action", "headless-ack")
-                        .putExtra("runId", intent.getStringExtra("runId")));
-            } catch (Exception ignored) { /* the service times out instead */ }
-            if (webView == null) return;
-            webView.post(() -> {
-                try { webView.evaluateJavascript("window.__splatxrHandoff&&window.__splatxrHandoff()", null); }
-                catch (Exception ignored) { /* the service times out instead */ }
             });
         }
     };
@@ -87,11 +62,9 @@ public final class MainActivity extends Activity {
 
         File captureRoot = new File(getFilesDir(), "captures");
         if (!captureRoot.exists()) captureRoot.mkdirs();
-        File runsRoot = RunFiles.runsDir(this);
         assetLoader = new WebViewAssetLoader.Builder()
                 .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
                 .addPathHandler("/captures/", new WebViewAssetLoader.InternalStoragePathHandler(this, captureRoot))
-                .addPathHandler("/runs/", new WebViewAssetLoader.InternalStoragePathHandler(this, runsRoot))
                 .build();
 
         webView = new WebView(this);
@@ -141,11 +114,6 @@ public final class MainActivity extends Activity {
             ContextCompat.registerReceiver(this, toggleTrainingReceiver, toggleFilter,
                     ContextCompat.RECEIVER_NOT_EXPORTED);
         } catch (Exception ignored) { /* shade control is best-effort */ }
-        try {
-            IntentFilter handoffFilter = new IntentFilter(ACTION_HANDOFF_TRAINING);
-            ContextCompat.registerReceiver(this, handoffReceiver, handoffFilter,
-                    ContextCompat.RECEIVER_NOT_EXPORTED);
-        } catch (Exception ignored) { /* the handoff falls back to the files on disk */ }
     }
 
     private void applySafeAreaInsets(FrameLayout content) {
@@ -328,10 +296,8 @@ public final class MainActivity extends Activity {
         catch (Exception ignored) { /* the service was never started */ }
     }
 
-    /** System Back goes through the page's history first: Back closes pushed UI
-     *  layers and checkpoints out of a live run (the page's popstate leave —
-     *  same effect as the header Back) instead of killing the app. Only with
-     *  no history left does Back finish the activity as before. */
+    /** Route Android Back through page history so a live Activity run gets
+     *  the same IDB checkpoint as the in-page Back button. */
     @SuppressWarnings("deprecation")
     @Override public void onBackPressed() {
         if (webView != null) {
@@ -345,68 +311,13 @@ public final class MainActivity extends Activity {
         super.onBackPressed();
     }
 
-    /** Move a live run into the foreground service whenever this Activity is
-     *  genuinely backgrounded. Previously the service owned only the ongoing
-     *  notification until onTaskRemoved; Home/app-switch therefore left the
-     *  actual GPU loop in a killable background WebView. */
-    @Override protected void onStop() {
-        super.onStop();
-        if (isChangingConfigurations() || gpuRendererRestart) return;
-        String active = RunFiles.readActive(this);
-        if (active == null) return;
-        try {
-            startService(new Intent(this, TrainingService.class)
-                    .putExtra("action", "activity-background")
-                    .putExtra("runId", active));
-        } catch (Exception ignored) { /* the already-foreground service still has swipe fallback */ }
-    }
-
-    /** Cancel only a handoff which is still in its debounce window. Once the
-     *  checkpoint request has been sent, the page deliberately becomes the
-     *  monitor and the service remains the sole GPU owner. */
-    @Override protected void onStart() {
-        super.onStart();
-        requestTrainingReturn();
-    }
-
-    @Override protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        setIntent(intent);
-        if (intent != null && ACTION_RETURN_TRAINING.equals(intent.getAction())) requestTrainingReturn();
-    }
-
-    /** Foregrounding means the Activity should own its live model again, not
-     *  merely display the service monitor. The service checkpoints first and
-     *  acknowledges GPU teardown through service.json. */
-    private void requestTrainingReturn() {
-        String active = RunFiles.readActive(this);
-        if (active == null) return;
-        try {
-            startService(new Intent(this, TrainingService.class)
-                    .putExtra("action", "activity-foreground")
-                    .putExtra("runId", active));
-        } catch (Exception ignored) { /* no service means boot recovery owns the files */ }
-    }
-
     @Override protected void onDestroy() {
         try { unregisterReceiver(toggleTrainingReceiver); } catch (Exception ignored) { /* never registered */ }
-        try { unregisterReceiver(handoffReceiver); } catch (Exception ignored) { /* never registered */ }
-        if (RunFiles.readActive(this) == null) stopTrainingService();
+        stopTrainingService();
         cancelFileSave();
         if (fileChooserCallback != null) {
             fileChooserCallback.onReceiveValue(null);
             fileChooserCallback = null;
-        }
-        // Explicitly kill the renderer: Activity recreation alone can leave a
-        // lost WebGPU WebView attached until GC, and the replacement then
-        // inherits the same poisoned graphics process.
-        WebView oldWebView = webView;
-        webView = null;
-        if (oldWebView != null) {
-            try { oldWebView.stopLoading(); } catch (Exception ignored) { }
-            try { oldWebView.removeJavascriptInterface("AndroidARBridge"); } catch (Exception ignored) { }
-            try { oldWebView.loadUrl("about:blank"); } catch (Exception ignored) { }
-            try { oldWebView.destroy(); } catch (Exception ignored) { }
         }
         super.onDestroy();
     }
@@ -466,104 +377,6 @@ public final class MainActivity extends Activity {
 
         @JavascriptInterface public void setTrainingPaused(boolean paused) {
             sendTrainingPaused(paused);
-        }
-
-        // ── migrate-on-swipe: the files-dir bus (RunFiles). Small atomic
-        // JSON writes, chunked large writes, the active marker, the native
-        // photo retain, and commands to the headless twin. Reads go through
-        // the /runs/ path handler as plain fetches, not through here.
-        @JavascriptInterface public boolean writeRunJson(String runId, String name, String json) {
-            return RunFiles.writeJson(MainActivity.this, runId, name, json);
-        }
-
-        @JavascriptInterface public boolean writeRunChunk(String runId, String name, String base64, boolean last) {
-            return RunFiles.writeChunk(MainActivity.this, runId, name, base64, last);
-        }
-
-        @JavascriptInterface public boolean setActiveRun(String runId) {
-            return RunFiles.writeActive(MainActivity.this, runId);
-        }
-
-        @JavascriptInterface public boolean clearActiveRun(String runId) {
-            return RunFiles.clearActive(MainActivity.this, runId);
-        }
-
-        /** Restore a transaction marker lost by an older handback build. */
-        @JavascriptInterface public String recoverActiveRun() {
-            String runId = RunFiles.recoverActive(MainActivity.this);
-            return runId == null ? "" : runId;
-        }
-
-        /** Replace the visible WebView after a handback device loss. The run's
-         *  durable marker must still match, and onStop must not bounce it back
-         *  into the service while this renderer-only restart is in flight. */
-        @JavascriptInterface public void restartForGpuRecovery(String runId) {
-            if (!RunFiles.validRunId(runId) || !runId.equals(RunFiles.readActive(MainActivity.this))) return;
-            runOnUiThread(() -> {
-                gpuRendererRestart = true;
-                recreate();
-            });
-        }
-
-        @JavascriptInterface public void cleanRunDirs(String keepId) {
-            RunFiles.cleanRunDirs(MainActivity.this, keepId);
-        }
-
-        @JavascriptInterface public String retainStatus(String runId) {
-            String done = RunFiles.readJson(MainActivity.this, runId, "photos.json");
-            return done != null ? done : "{\"pending\":true}";
-        }
-
-        /** Copy the native capture's frames into the run dir (background
-         *  thread; the page polls retainStatus). Zero bytes cross the bridge. */
-        @JavascriptInterface public void retainCapture(final String runId) {
-            new Thread(() -> {
-                try {
-                    java.util.List<String> kept = RunFiles.retainCaptureFrames(MainActivity.this, runId);
-                    JSONObject status = new JSONObject();
-                    if (kept.isEmpty()) {
-                        status.put("error", "no capture frames left to retain");
-                    } else {
-                        status.put("names", new JSONArray(kept));
-                        status.put("complete", true);
-                    }
-                    status.put("at", System.currentTimeMillis());
-                    RunFiles.writeJson(MainActivity.this, runId, "photos.json", status.toString());
-                } catch (Exception e) {
-                    try {
-                        JSONObject status = new JSONObject();
-                        status.put("error", e.getMessage() == null ? "retain failed" : e.getMessage());
-                        RunFiles.writeJson(MainActivity.this, runId, "photos.json", status.toString());
-                    } catch (Exception ignored) { /* status is best-effort */ }
-                }
-            }).start();
-        }
-
-        /** The handoff verdict: the page secured the run to files (or failed
-         *  to) — the service boots the headless twin off it, or settles. */
-        @JavascriptInterface public void handoffDone(String runId, boolean ok) {
-            if (runId == null || !RunFiles.validRunId(runId)) return;
-            try {
-                startService(new Intent(MainActivity.this, TrainingService.class)
-                        .putExtra("action", "headless-ready")
-                        .putExtra("runId", runId)
-                        .putExtra("ok", ok));
-            } catch (Exception ignored) { /* the service times out instead */ }
-        }
-
-        /** A command to the headless twin (pause/resume/stop/snapshot/ping). Plain
-         *  start: the service is already foreground while a run lives. */
-        @JavascriptInterface public void headlessCommand(String action, String runId) {
-            if (action == null || runId == null) return;
-            if (!action.equals("headless-pause") && !action.equals("headless-resume") &&
-                    !action.equals("headless-stop") && !action.equals("headless-snapshot") &&
-                    !action.equals("headless-ping")) return;
-            if (!RunFiles.validRunId(runId)) return;
-            try {
-                startService(new Intent(MainActivity.this, TrainingService.class)
-                        .putExtra("action", action)
-                        .putExtra("runId", runId));
-            } catch (Exception ignored) { /* the twin is gone; the files say so */ }
         }
 
         @JavascriptInterface public String exportDataset() {
