@@ -26,6 +26,10 @@ assert.match(service, /new NotificationChannel\(\s*CHANNEL_ID, "Training progres
   'the service should post progress on a low-importance channel');
 assert.match(service, /startForeground\(NOTIF_ID, notification, ServiceInfo\.FOREGROUND_SERVICE_TYPE_SPECIAL_USE\)/,
   'the service should start foreground as special-use on Android 14+');
+assert.match(service, /setOngoing\(ongoing\)/,
+  'training should keep a persistent, non-dismissible ongoing notification');
+assert.match(service, /setForegroundServiceBehavior\(Notification\.FOREGROUND_SERVICE_IMMEDIATE\)/,
+  'Android 12+ should expose the foreground-service notification immediately');
 assert.match(service, /PARTIAL_WAKE_LOCK, "SplatXR:training"/,
   'the service should hold a partial wake lock while training');
 assert.match(service, /case "start":[\s\S]*case "update":[\s\S]*case "finish":[\s\S]*default:/,

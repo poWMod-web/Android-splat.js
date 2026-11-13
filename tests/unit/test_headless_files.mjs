@@ -95,19 +95,29 @@ for (const [src, name] of [[app, 'app'], [driver, 'driver']]) {
 }
 assert.ok(!readFileSync(new URL('../../app/js/headless.js', import.meta.url), 'utf8').includes('checkpointDue'),
   'the cadence gate is gone with the periodics');
-// the swipe-away handoff: the service asks, the page secures + reports back
+// foreground-service handoff: Activity background/task removal asks, the page secures + relinquishes GPU
 assert.ok(app.includes('globalThis.__splatxrHandoff'), 'app exposes the handoff hook');
 assert.ok(app.includes('b.handoffDone(runId, ok)'), 'the handoff verdict rides handoffDone');
 const hook = app.slice(app.indexOf('globalThis.__splatxrHandoff'), app.indexOf('const trainBridge'));
 assert.ok(hook.includes('secureFileCheckpoint'), 'the handoff hook is the app side that still secures files');
+assert.match(hook, /if \(ok[\s\S]*S\.session\.pause\(\); S\.session\.dispose\(\)[\s\S]*enterMonitor\(runId\)/,
+  'a successful handoff should dispose the Activity GPU before becoming a monitor');
+assert.match(hook, /activity\.json[^]*alive: false/,
+  'the successful handoff should retire the Activity heartbeat before service boot');
 const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
 assert.ok(main.includes('ACTION_HANDOFF_TRAINING'), 'the handoff broadcast exists');
 assert.ok(main.includes('public void handoffDone(String runId, boolean ok)'), 'the bridge carries the verdict');
+assert.match(main, /void onStop\(\)[^]*activity-background/,
+  'normal Activity backgrounding should ask the foreground service to own training');
+assert.match(main, /void onStart\(\)[^]*activity-foreground/,
+  'a quick foreground return should cancel the debounced handoff');
 assert.ok(app.includes("localStorage.getItem('splatjs_monitor_visuals') === '1'"),
   'the monitor visuals toggle defaults off, like the in-app training visuals');
 const svc = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
 for (const s of ['setDataDirectorySuffix("training")', 'AndroidHeadless', 'headless-snapshot', 'onTaskRemoved',
-    'headless-ack', 'headless-ready', 'settleHandoff', 'HANDOFF_ACK_MS', 'handoffGen']) {
+    'headless-ack', 'headless-ready', 'settleHandoff', 'HANDOFF_ACK_MS', 'handoffGen',
+    'activity-background', 'BACKGROUND_HANDOFF_DELAY_MS', 'SUCCESS_TAKEOVER_DELAY_MS',
+    'ORPHAN_TAKEOVER_DELAY_MS', 'beginHandoff']) {
   assert.ok(svc.includes(s), `service implements ${s}`);
 }
 console.log('test_headless_files: OK');

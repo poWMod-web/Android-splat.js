@@ -6035,11 +6035,12 @@ function renderHud() {
   hud.replaceChildren(row);
 }
 
-// ── migrate-on-swipe (Android headless handoff) ─────────────────────────────
-// Design B: this Activity trains locally (live session, live viewer) and stages
+// ── Android foreground-service handoff ──────────────────────────────────────
+// This Activity trains locally (live session, live viewer) and stages
 // a run directory under files/runs/<runId>/ from the first cycle — manifest,
-// photos, periodic state checkpoints. On swipe-away the :training service
-// resumes from the last file checkpoint in its headless WebView; the reopened
+// photos and an exact transition checkpoint. When the Activity backgrounds (or
+// is swiped away), the :training foreground service resumes that checkpoint in
+// its headless WebView; the reopened
 // app monitors (snapshot viewer + progress when Show-visuals is on), adopts
 // the finish, or recovers. File shapes + cadence live in ./headless.js (shared
 // with the driver, unit-pinned); this side only stages, checkpoints, watches.
@@ -6526,14 +6527,28 @@ function showRecovery(runId, status) {
 function headlessDiscard(runId) {
   headlessClear(runId);
 }
-/** The swipe-away handoff: the service asked for the run — secure it to files
- *  and report back (headless-ready carries the verdict; silence times out). */
+/** Foreground-service handoff: secure one exact checkpoint, then relinquish
+ *  the Activity's GPU before the service creates its WebView. A failed save
+ *  leaves the local trainer untouched; Java retries while the Activity stays
+ *  backgrounded. Once successful this page becomes the file-backed monitor. */
 globalThis.__splatxrHandoff = async () => {
   const b = headlessBridge();
   const runId = S.runId;
   let ok = false;
   try { ok = await secureFileCheckpoint(); } catch { ok = false; }
-  try { b && b.handoffDone(runId, ok); } catch { /* the service times out instead */ }
+  if (ok && runId && S.runId === runId && S.state === 'train' && S.session) {
+    try { S.session.pause(); S.session.dispose(); } catch { /* checkpoint is already safe */ }
+    S.session = null;
+    S.scene = null;
+    document.getElementById('cv-model')?.remove();
+    gpuCanvas = null;
+    // bootHeadlessNow refuses a fresh Activity heartbeat. Retire it only after
+    // the checkpoint and GPU disposal have both succeeded.
+    try { b && b.writeRunJson(runId, 'activity.json', JSON.stringify({ alive: false, at: Date.now() })); }
+    catch { /* the service also waits out stale beats */ }
+    enterMonitor(runId);
+  }
+  try { b && b.handoffDone(runId, ok); } catch { /* the service's absence timer settles from the saved files */ }
 };
 
 // ── training notification (Android) ─────────────────────────────────────────

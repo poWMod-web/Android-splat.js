@@ -38,8 +38,8 @@ public final class MainActivity extends Activity {
     /** The training notification's Pause/Resume button: the service fires it,
      *  the activity turns it into a WebView toggle call. */
     public static final String ACTION_TOGGLE_TRAINING = "space.arrival.splatxr.TOGGLE_TRAINING";
-    /** The swipe-away handoff: the service fires it from onTaskRemoved, the
-     *  activity acks at once and runs the page's file checkpoint — the
+    /** The background handoff: the foreground service fires it when this Activity
+     *  stops (or its task is removed), the activity acks and checkpoints — the
      *  verdict follows as headless-ready (or the service times out). */
     public static final String ACTION_HANDOFF_TRAINING = "space.arrival.splatxr.HANDOFF_TRAINING";
     private ValueCallback<Uri[]> fileChooserCallback;
@@ -338,6 +338,36 @@ public final class MainActivity extends Activity {
             } catch (Exception ignored) { /* fall through to the default */ }
         }
         super.onBackPressed();
+    }
+
+    /** Move a live run into the foreground service whenever this Activity is
+     *  genuinely backgrounded. Previously the service owned only the ongoing
+     *  notification until onTaskRemoved; Home/app-switch therefore left the
+     *  actual GPU loop in a killable background WebView. */
+    @Override protected void onStop() {
+        super.onStop();
+        if (isChangingConfigurations()) return;
+        String active = RunFiles.readActive(this);
+        if (active == null) return;
+        try {
+            startService(new Intent(this, TrainingService.class)
+                    .putExtra("action", "activity-background")
+                    .putExtra("runId", active));
+        } catch (Exception ignored) { /* the already-foreground service still has swipe fallback */ }
+    }
+
+    /** Cancel only a handoff which is still in its debounce window. Once the
+     *  checkpoint request has been sent, the page deliberately becomes the
+     *  monitor and the service remains the sole GPU owner. */
+    @Override protected void onStart() {
+        super.onStart();
+        String active = RunFiles.readActive(this);
+        if (active == null) return;
+        try {
+            startService(new Intent(this, TrainingService.class)
+                    .putExtra("action", "activity-foreground")
+                    .putExtra("runId", active));
+        } catch (Exception ignored) { /* no service means there was nothing pending */ }
     }
 
     @Override protected void onDestroy() {

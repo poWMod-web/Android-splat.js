@@ -1,4 +1,4 @@
-// train-headless.js — the migrate-on-swipe driver. Runs ONLY in the :training
+// train-headless.js — the foreground-service driver. Runs ONLY in the :training
 // service's headless WebView (booted from onTaskRemoved), never in the app.
 //
 // It resumes the swiped-away run from the last file checkpoint — photos,

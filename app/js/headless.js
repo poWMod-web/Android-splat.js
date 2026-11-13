@@ -1,7 +1,7 @@
-// headless.js — the migrate-on-swipe handoff, shared by the app and the headless driver.
+// headless.js — the Android foreground-service handoff, shared by the app and headless driver.
 //
 // Design B: the Activity trains locally (live session, live viewer) and stages
-// a run directory under the app's files/runs/<runId>/. On swipe-away the main
+// a run directory under the app's files/runs/<runId>/. When the Activity backgrounds, the main
 // process dies and the :training foreground service boots the headless driver
 // (train-headless.js), which resumes from the last file checkpoint and keeps
 // training. The reopened app monitors (snapshot viewer + progress), adopts the

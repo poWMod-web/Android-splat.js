@@ -57,9 +57,15 @@ public final class TrainingService extends Service {
     private static final String CHANNEL_ID = "splatxr-training";
     private static final int NOTIF_ID = 101;
     private static final int DONE_ID = 102;
-    /** Swipe-away to headless boot: let the dying Activity process release
-     *  the GPU first (two live WebGPU devices briefly would OOM small phones). */
-    private static final long TAKEOVER_DELAY_MS = 8000;
+    /** A successful pass explicitly disposes the Activity GPU, so resume with
+     *  only a small process handoff gap. An orphan recovery still waits for a
+     *  dying Activity process to release its GPU (two devices can OOM phones). */
+    private static final long SUCCESS_TAKEOVER_DELAY_MS = 750;
+    private static final long ORPHAN_TAKEOVER_DELAY_MS = 8000;
+    /** Ignore momentary Activity stops (permission/file UI). Home and app
+     *  switches remain stopped and transfer shortly afterwards. */
+    private static final long BACKGROUND_HANDOFF_DELAY_MS = 1500;
+    private static final long BACKGROUND_RETRY_MS = 5000;
     /** The handoff handshake: acked in 5 s (alive and working — the verdict
      *  then gets 90 s for a large checkpoint) or never (gone — settle from
      *  whatever the handoff files hold). */
@@ -94,6 +100,13 @@ public final class TrainingService extends Service {
     private boolean handoffAcked;
     private boolean handoffSettled;
     private int handoffGen;   // the pass timers only settle the pass that armed them
+    private boolean backgroundRequested;
+    private boolean handoffFromBackground;
+    private String backgroundRunId;
+    private final Runnable backgroundHandoff = () -> {
+        if (!backgroundRequested || backgroundRunId == null || headlessActive) return;
+        beginHandoff(backgroundRunId, true);
+    };
     private final Runnable bootWatchdog = () -> {
         if (!headlessActive || headlessRunId == null) return;
         if ("booting".equals(statusOf(headlessRunId))) {
@@ -169,6 +182,26 @@ public final class TrainingService extends Service {
                 showDone(intent.getStringExtra("title"), intent.getStringExtra("text"));
                 teardown();
                 break;
+            case "activity-background": {
+                String runId = intent.getStringExtra("runId");
+                if (foreground && runId != null && runId.equals(RunFiles.readActive(this))) {
+                    backgroundRequested = true;
+                    backgroundRunId = runId;
+                    main.removeCallbacks(backgroundHandoff);
+                    main.postDelayed(backgroundHandoff, BACKGROUND_HANDOFF_DELAY_MS);
+                }
+                break;
+            }
+            case "activity-foreground":
+                // Debounce cancellation only. If beginHandoff already sent the
+                // request, its exact checkpoint must complete and own the run.
+                if (handoffRunId == null) {
+                    backgroundRequested = false;
+                    backgroundRunId = null;
+                    main.removeCallbacks(backgroundHandoff);
+                }
+                if (!foreground && !headlessActive) stopSelf();
+                break;
             case "headless-pause":
                 headlessCommand(intent, "window.__headlessPause&&window.__headlessPause()");
                 break;
@@ -199,7 +232,16 @@ public final class TrainingService extends Service {
                         // heartbeat before touching anything)
                         handoffSettled = true;
                         final String id = runId;
-                        main.postDelayed(() -> bootHeadlessNow(id), TAKEOVER_DELAY_MS);
+                        main.postDelayed(() -> bootHeadlessNow(id), SUCCESS_TAKEOVER_DELAY_MS);
+                    } else if (handoffFromBackground && backgroundRequested) {
+                        // Staging photos may still be landing. The Activity has
+                        // not disposed its trainer on a failed checkpoint, so
+                        // leave it intact and retry while it remains hidden.
+                        handoffRunId = null;
+                        handoffAcked = false;
+                        handoffSettled = true;
+                        main.removeCallbacks(backgroundHandoff);
+                        main.postDelayed(backgroundHandoff, BACKGROUND_RETRY_MS);
                     } else {
                         settleHandoff(runId, "the handoff checkpoint failed");
                     }
@@ -263,19 +305,7 @@ public final class TrainingService extends Service {
         // a fresh file checkpoint it writes before it goes. Acked in 5 s or
         // never (settled from the files on disk either way: the Back-leave
         // copy arms exactly the swipe-during-reload case).
-        handoffRunId = active;
-        handoffAcked = false;
-        handoffSettled = false;
-        handoffGen++;
-        Intent handoff = new Intent(MainActivity.ACTION_HANDOFF_TRAINING);
-        handoff.setPackage(getPackageName());
-        handoff.putExtra("runId", active);
-        try { sendBroadcast(handoff); } catch (Exception ignored) { /* nobody home: the timer settles */ }
-        final String runId = active;
-        final int gen = handoffGen;
-        main.postDelayed(() -> {
-            if (gen == handoffGen && !handoffAcked) settleHandoff(runId, "the app was gone before the pass");
-        }, HANDOFF_ACK_MS);
+        beginHandoff(active, false);
         super.onTaskRemoved(rootIntent);
     }
 
@@ -294,7 +324,29 @@ public final class TrainingService extends Service {
         super.onDestroy();
     }
 
-    // ── migrate-on-swipe: the headless trainer ──────────────────────────────
+    // ── foreground-service-owned headless trainer ───────────────────────────
+
+    /** Ask the Activity page for one exact checkpoint. Normal backgrounding
+     *  and task removal share this path; only a background request retries a
+     *  not-yet-staged checkpoint (the local trainer is still intact then). */
+    private void beginHandoff(String runId, boolean fromBackground) {
+        if (headlessActive || runId == null || !runId.equals(RunFiles.readActive(this))) return;
+        if (handoffRunId != null && !handoffSettled) return;
+        handoffRunId = runId;
+        handoffFromBackground = fromBackground;
+        handoffAcked = false;
+        handoffSettled = false;
+        handoffGen++;
+        Intent handoff = new Intent(MainActivity.ACTION_HANDOFF_TRAINING);
+        handoff.setPackage(getPackageName());
+        handoff.putExtra("runId", runId);
+        try { sendBroadcast(handoff); } catch (Exception ignored) { /* absence timer settles */ }
+        final int gen = handoffGen;
+        main.postDelayed(() -> {
+            if (gen == handoffGen && !handoffAcked)
+                settleHandoff(runId, "the app was gone before the pass");
+        }, HANDOFF_ACK_MS);
+    }
 
     /** A monitor command for the headless twin: evaluate now when live, else
      *  boot for a live marker and retry the (guarded, no-op-safe) call while
@@ -347,7 +399,7 @@ public final class TrainingService extends Service {
         if (!isLive(statusOf(runId))) return;
         if (activityFresh(runId)) return;   // the Activity owns it — stand down
         if (!handoffReady(runId)) {
-            markInterrupted(runId, "the swipe-away handoff was incomplete");
+            markInterrupted(runId, "the background handoff was incomplete");
             teardown();
             return;
         }
@@ -452,7 +504,7 @@ public final class TrainingService extends Service {
         if (activityFresh(runId)) return;   // the Activity owns it — stand down
         if (handoffReady(runId)) {
             final String id = runId;
-            main.postDelayed(() -> bootHeadlessNow(id), TAKEOVER_DELAY_MS);
+            main.postDelayed(() -> bootHeadlessNow(id), ORPHAN_TAKEOVER_DELAY_MS);
             return;
         }
         markInterrupted(runId, why);
@@ -669,6 +721,9 @@ public final class TrainingService extends Service {
 
     private void teardown() {
         handoffSettled = true;
+        backgroundRequested = false;
+        backgroundRunId = null;
+        if (main != null) main.removeCallbacks(backgroundHandoff);
         destroyHeadless();
         try { notifications().cancel(NOTIF_ID); } catch (Exception ignored) { /* already gone */ }
         try { stopForeground(true); } catch (Exception ignored) { /* never foregrounded */ }
@@ -702,10 +757,15 @@ public final class TrainingService extends Service {
                 .setContentTitle(title == null || title.isEmpty() ? "Training model" : title)
                 .setContentText(text == null ? "" : text)
                 .setContentIntent(tap)
+                .setCategory(Notification.CATEGORY_SERVICE)
                 .setOngoing(ongoing)
                 .setAutoCancel(!ongoing)
                 .setOnlyAlertOnce(true);
         if (Build.VERSION.SDK_INT < 26) builder.setPriority(Notification.PRIORITY_LOW);
+        // Android 12 may otherwise defer showing an FGS notification. Training
+        // is continuous and user-visible: expose its ongoing notification now.
+        if (ongoing && Build.VERSION.SDK_INT >= 31)
+            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
         if (ongoing && total > 0 && done >= 0) builder.setProgress(total, Math.min(done, total), false);
         if (ongoing) {
             // Pause / Resume without opening the app: a broadcast the
