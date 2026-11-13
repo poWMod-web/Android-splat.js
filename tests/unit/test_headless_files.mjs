@@ -98,6 +98,8 @@ assert.ok(!readFileSync(new URL('../../app/js/headless.js', import.meta.url), 'u
 // the swipe-away handoff: the service asks, the page secures + reports back
 assert.ok(app.includes('globalThis.__splatxrHandoff'), 'app exposes the handoff hook');
 assert.ok(app.includes('b.handoffDone(runId, ok)'), 'the handoff verdict rides handoffDone');
+const hook = app.slice(app.indexOf('globalThis.__splatxrHandoff'), app.indexOf('const trainBridge'));
+assert.ok(hook.includes('secureFileCheckpoint'), 'the handoff hook is the app side that still secures files');
 const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
 assert.ok(main.includes('ACTION_HANDOFF_TRAINING'), 'the handoff broadcast exists');
 assert.ok(main.includes('public void handoffDone(String runId, boolean ok)'), 'the bridge carries the verdict');

@@ -2461,8 +2461,8 @@ function trainDeadEnd() {
 
 /** Back — one routine for every door that means it (the header Back, the
  *  brand title off the home tile, the phone's own Back through popstate's
- *  sibling path): a live run is secured first (IDB for Yours, files for the
- *  handoff), then home. */
+ *  sibling path): a live run is secured first (IDB only — the Yours resume;
+ *  no file copy), then home. */
 async function goBack() {
   const runId = S.runId || (S._localRun && S._localRun.id);
   if (runId) await persistRunDetails(runId, { full: true }).catch(() => {});
@@ -2486,13 +2486,12 @@ async function goBack() {
   // the boot into recovery, and the Yours tile is the way back. Cancelling
   // the beforeunload confirm keeps training AND the armed handoff: nothing
   // below runs until the navigation commits.
+  // IDB only, deliberately: the Yours resume is the way back, and the ?back
+  // boot stands the marker down anyway. A swipe landing mid-reload
+  // (killed before the boot clears the marker) settles from no files and
+  // interrupts — the IDB checkpoint still resumes from Yours.
   if ((S.state === 'train' || S.state === 'prep') && S.runId) {
     await checkpointRun('back').catch(() => {});
-    // the handoff-format copy alongside: strictly, the ?back boot stands the
-    // marker down and orphans these files — but a swipe landing mid-reload
-    // (killed before the boot clears the marker) settles the handoff from
-    // exactly this copy instead of interrupting
-    await secureFileCheckpoint().catch(() => {});
   }
   // Back from a run leaves the same way the logo does: a page navigation
   // home. The wall is never rendered OVER a live scene — the beforeunload
@@ -5404,7 +5403,6 @@ addEventListener('popstate', () => {
   // live scene; beforeunload asks before a training is thrown away)
   if ((S.state === 'prep' || S.state === 'train') && $('start').hidden) {
     checkpointRun('back').catch(() => {})
-      .then(() => secureFileCheckpoint().catch(() => {}))
       .then(() => { location.href = 'index.html?back=1'; });
   }
 });
@@ -6130,8 +6128,9 @@ async function stagePhotoBlobs(runId, files) {
   b.writeRunJson(runId, 'photos.json', JSON.stringify({ names, complete: true, at: Date.now() }));
 }
 /** One-shot file checkpoint: the handoff-format copy (state.bin + recon +
- *  status iter). Written ONLY on transitions — leaving (Back) and the
- *  swipe-away handoff — never periodically. Awaits; true when it landed. */
+ *  status iter). Written ONLY on the swipe-away handoff — Back is IDB-only
+ *  (the Yours resume), and nothing writes periodically. Awaits; true when
+ *  it landed. */
 async function secureFileCheckpoint() {
   const b = headlessBridge();
   if (!b || !S._hlStaged || S.runId !== S._hlStaged || !S._hlPhotos) return false;

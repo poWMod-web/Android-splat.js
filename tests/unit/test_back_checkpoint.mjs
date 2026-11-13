@@ -19,8 +19,13 @@ assert.ok(app.includes("if (reason === 'back') flash('Progress saved on this dev
 assert.ok(app.includes("await checkpointRun('back')"), 'the header Back awaits the checkpoint');
 assert.ok(app.includes("location.href = (S.state === 'train' || S.state === 'prep') ? 'index.html?back=1' : 'index.html';"),
   'leaving a live run boots the deliberate-leave home');
-assert.ok(app.includes("checkpointRun('back').catch(() => {})\n      .then(() => secureFileCheckpoint().catch(() => {}))\n      .then(() => { location.href = 'index.html?back=1'; });"),
-  'popstate secures both formats before leaving too');
+assert.ok(app.includes("checkpointRun('back').catch(() => {})\n      .then(() => { location.href = 'index.html?back=1'; });"),
+  'popstate secures the IDB checkpoint before leaving too');
+// Back is IDB-only: the Yours resume is the way back, no file copy.
+const back = app.slice(app.indexOf('async function goBack()'), app.indexOf('function backToSetup()'));
+assert.ok(!back.includes('secureFileCheckpoint'), 'goBack secures IDB only, never files');
+const pop = app.slice(app.indexOf("addEventListener('popstate'"), app.indexOf('function detailClose()'));
+assert.ok(!pop.includes('secureFileCheckpoint'), 'system Back secures IDB only, never files');
 assert.ok(app.includes("history.pushState({ sj: 'run' }, '')"),
   'training owns a history entry so Back pops into the checkpoint-leave');
 assert.ok(app.includes("else if (mp.get('back')) headlessClearMarker().finally(() => mountWall());"),
