@@ -147,6 +147,58 @@ export function planSoftPrune(masses, n, ratio,
 }
 
 /**
+ * Plan one dead-splat cull for soft-prune-off runs: no ratio, no ratchet,
+ * no floors negotiated — only rows with ZERO rendered mass (obstructed or
+ * transparent for the whole window) are candidates, and only after
+ * `votesNeeded` consecutive windows (the same hysteresis as planSoftPrune:
+ * one noisy window never kills a useful splat).
+ *
+ * masses: Float32Array(n) of rendered mass per splat (gather slot 2).
+ * votes: Uint16Array(n), REQUIRED — hysteresis is the point; rows that
+ *   show mass reset to 0, zero-mass rows vote up, `votesNeeded` dies.
+ * minCull: confirmed kills below this don't pay for a compaction (votes
+ *   persist — they ARE the window's product).
+ * floor: fail-safe survivor count — a cull that would leave fewer rows
+ *   than this refuses instead of trusting pathological stats.
+ * Refuses (null) on short masses, non-finite masses, or all-zero mass
+ * (stats never accumulated — indistinguishable from broken stats, exactly
+ * the case planSoftPrune refuses). Else { rank, kept, culled, candidates }:
+ * rank[i] is the survivor's compacted row or CULLED; candidates counts the
+ * zero-mass rows this window. Deterministic: same inputs, same plan.
+ */
+export function planDeadCull(masses, n, { votes = null, votesNeeded = 2, minCull = 1024, floor = 8192 } = {}) {
+  if (!masses || masses.length < n) throw new Error(`planDeadCull: masses holds ${masses ? masses.length : 0} rows for n=${n}`);
+  if (!votes) throw new Error('planDeadCull: votes required (hysteresis is the point)');
+  if (votes.length < n) throw new Error(`planDeadCull: votes holds ${votes.length} rows for n=${n}`);
+  let max = 0;
+  let candidates = 0;
+  for (let i = 0; i < n; i++) {
+    const m = masses[i];
+    if (!Number.isFinite(m)) return null;                 // fail safe on broken stats
+    if (m > max) max = m;
+    if (m <= 0) candidates++;
+  }
+  // all-zero mass means the stats never accumulated (or a fully occluded
+  // model): culling would eat ARBITRARY rows — refuse, like planSoftPrune
+  if (max <= 0) return null;
+  const kill = new Uint8Array(n);
+  let final = 0;
+  for (let i = 0; i < n; i++) {
+    if (masses[i] <= 0) {
+      votes[i]++;
+      if (votes[i] >= votesNeeded) { kill[i] = 1; final++; }
+    } else votes[i] = 0;
+  }
+  // votes persist through a no-cull window (they ARE the window's product)
+  if (final < minCull) return { rank: null, kept: n, culled: 0, candidates };
+  if (n - final < Math.min(n, floor)) return { rank: null, kept: n, culled: 0, candidates };
+  const rank = new Uint32Array(n).fill(CULLED);
+  let kept = 0;
+  for (let i = 0; i < n; i++) if (!kill[i]) rank[i] = kept++;
+  return { rank, kept, culled: final, candidates };
+}
+
+/**
  * Split the compaction into temp-sized chunks: [{ srcBase, count,
  * dstBase, survivors }]. Chunks partition the SOURCE rows; dstBase is the
  * running survivor count, so the caller's tmp→dst copies land

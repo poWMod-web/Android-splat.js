@@ -1619,6 +1619,15 @@ export class Session {
               (pruned.floorBound === 'ratchet' ? ' (growth ratchet held the floor)' : ''));
             this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
           }
+        } else if (!sp && trainer.iter <= 0.85 * this._maxIters()) {
+          // soft-prune off: no ratio trims, but vote-confirmed dead splats
+          // (zero rendered mass two windows running) still go — obstructed
+          // rows are pure overhead, never signal
+          const dead = await trainer.pruneDead();
+          if (dead.culled) {
+            this._log(`dead cull @${trainer.iter}: culled ${dead.culled} -> ${dead.n} splats`);
+            this._em.emit('event', { kind: 'dead-cull', iter: trainer.iter, ...dead });
+          }
         }
         const r0 = performance.now();
         // awaited: refine reads six buffers and writes them all back — steps
@@ -1639,34 +1648,6 @@ export class Session {
         }
       }
 
-      // early milestones (opt-in, ahead of the tandem above): a gentle
-      // 10% trim every 1000 iterations through 6000 — keep 0.9 each.
-      // Pure culls: no bonus regrow (the scheduled refines grow on their
-      // own cadence) and no ratchet (neither held nor set). The old
-      // aggressive ladder (keep 1/4 @500, 1/2 @1000, 3/4 @2000) culled
-      // before the model carried any signal and wedged training
-      // irrecoverably. Past `until` of the run (short test runs) the
-      // marks stay unfired.
-      const spm = trainer.opts ? trainer.opts.softPrune : null;
-      if (spm && trainer.iter <= (spm.until ?? 0.85) * this._maxIters()) {
-        this._pruneFired ??= [];
-        const marks = spm.milestones ?? [[1000, 0.9], [2000, 0.9], [3000, 0.9], [4000, 0.9], [5000, 0.9], [6000, 0.9]];
-        // a continued run starts past every mark — only fire within one
-        // window of it, so old milestones never replay back-to-back
-        const due = marks.find(([at]) => trainer.iter >= at &&
-          trainer.iter - at < (spm.every ?? 3000) && !this._pruneFired.includes(at));
-        if (due) {
-          this._pruneFired.push(due[0]);
-          const pruned = await trainer.softPrune(1 - due[1], { skipRatchet: true });
-          if (!pruned.culled) {
-            this._log(`early prune @${trainer.iter}: kept all ${pruned.n}` +
-              (pruned.candidates ? ` (${pruned.candidates} voted — confirmation pending)` : ' (too few rows or no signal yet)'));
-          } else {
-            this._log(`early prune @${trainer.iter}: culled ${pruned.culled} -> ${pruned.n} splats`);
-            this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
-          }
-        }
-      }
       // the ceiling's own prompt: a refine reporting growth-still-scheduled
       // against a full TRUE cap pauses and asks — keep training at the cap,
       // or prune to half and grow on. The UI answers via start() (growth

@@ -10,7 +10,7 @@ import {
 import { rodrigues, m3mul, makeRng } from '../sfm/geometry.js';
 import { createGpu } from '../gpu/context.js';
 import { ssimIndexRgb } from './ssim.js';
-import { planSoftPrune, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES, CULLED } from './softprune.js';
+import { planSoftPrune, planDeadCull, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES, CULLED } from './softprune.js';
 
 // plan item (6): one event-loop turn between the stages of multi-second
 // queue drains (refine readbacks, refined-eval passes) — input and the
@@ -2558,7 +2558,7 @@ export class GSTrainer {
   }
 
   /** Periodic importance culling (Speedy-Splat method, opt-in via
-   *  opts.softPrune { ratio, every, until, milestones }): drop the
+   *  opts.softPrune { ratio, every, until }): drop the
    *  lowest-rendered-mass
    *  fraction of splats and compact every per-splat buffer GPU-side.
    *  Survivors keep their Adam moments — unlike relocation and reseed, a
@@ -2566,25 +2566,18 @@ export class GSTrainer {
    *  windows WITHOUT draining them (gather mode 2), so refine planning
    *  never notices. Skips while a protected seed range is active (rows
    *  permute) and whenever the plan refuses (too few rows, no signal).
-   *  ratioOverride (the session's early milestones) culls that fraction
-   *  instead of cfg.ratio. Every refine culls until `until` of the run;
-   *  milestones fire ahead of the schedule. Candidates vote per window and
+   *  ratioOverride culls that fraction instead of cfg.ratio
+   *  (programmatic use). Every refine culls until `until` of the run.
+   *  Candidates vote per window and
    *  only consecutive offenders die (cfg.votes ?? 2); skipRatchet frees a
    *  cull from the floor entirely (neither held nor set). Returns
    *  { culled, n, floorBound, candidates }. */
-  async softPrune(ratioOverride = null, { skipRatchet = false } = {}) {
-    const cfg = this.opts.softPrune;
-    if (!cfg) return { culled: 0, n: this.n };
-    const ratio = ratioOverride ?? cfg.ratio ?? 0.1;
-    if (!(ratio > 0 && ratio < 1)) return { culled: 0, n: this.n };
-    if (this.protect && this.iter < this.protect.until) return { culled: 0, n: this.n };
-    // an LOD level hold is a polish window at a fixed count — culling
-    // would eat the level out from under its snapshot
-    if (this.growLimit && this.growLimit < this.cap && this.n >= this.growLimit) {
-      return { culled: 0, n: this.n };
-    }
+  /** Vote-sheet resize + rendered-mass gather (mode 2: the windows are
+   *  read WITHOUT draining, so refine planning never notices). One scoring
+   *  pass serves both the ratio trim and the dead cull. */
+  async _gatherMasses() {
     // votes ride the rows: growth appends (new tail starts clean), the
-    // compaction below permutes survivors, a reseed births a fresh trainer.
+    // compaction permutes survivors, a reseed births a fresh trainer.
     // Relocated rows inherit their index's votes — one good window resets
     // them, so only the still-bad die.
     if (this._pruneVotes.length !== this.n) {
@@ -2613,12 +2606,14 @@ export class GSTrainer {
     const logitOp = new Float32Array(this.n);
     const meanLogS = new Float32Array(this.n);
     for (let i = 0; i < this.n; i++) { masses[i] = g[i * 4 + 2]; logitOp[i] = g[i * 4]; meanLogS[i] = g[i * 4 + 3]; }
-    const plan = planSoftPrune(masses, this.n, ratio, {
-      minCull: cfg.minCull ?? 1024, floor: cfg.floor ?? 8192,
-      last: this._softPruneFloor || 0, cap: this.cap, logitOp, meanLogS,
-      votes: this._pruneVotes, votesNeeded: cfg.votes ?? 2, skipRatchet,
-    });
-    if (!plan || !plan.culled) return { culled: 0, n: this.n, candidates: plan ? plan.candidates : 0 };
+    return { masses, logitOp, meanLogS };
+  }
+
+  /** Compact every per-splat buffer to a cull plan (GPU-side ranked
+   *  scatter into temp, then plain copies home). Survivors carry their
+   *  vote history to their new rows; row-indexed CPU state dies with the
+   *  permutation. */
+  _compactToPlan(plan) {
     // survivors keep their vote history through the compaction
     const nvotes = new Uint16Array(plan.kept);
     for (let i = 0; i < this.n; i++) {
@@ -2626,6 +2621,7 @@ export class GSTrainer {
       if (r !== CULLED) nvotes[r] = this._pruneVotes[i];
     }
     this._pruneVotes = nvotes;
+    const d = this.device;
     this._ensureCompact();
     d.queue.writeBuffer(this.bufCompactRank, 0, plan.rank);
     const bufs = [
@@ -2663,10 +2659,51 @@ export class GSTrainer {
     this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
     // row-indexed CPU state dies with the permutation: the census baseline
     this._lastReloc = null;
+  }
+
+  async softPrune(ratioOverride = null, { skipRatchet = false } = {}) {
+    const cfg = this.opts.softPrune;
+    if (!cfg) return { culled: 0, n: this.n };
+    const ratio = ratioOverride ?? cfg.ratio ?? 0.1;
+    if (!(ratio > 0 && ratio < 1)) return { culled: 0, n: this.n };
+    if (this.protect && this.iter < this.protect.until) return { culled: 0, n: this.n };
+    // an LOD level hold is a polish window at a fixed count — culling
+    // would eat the level out from under its snapshot
+    if (this.growLimit && this.growLimit < this.cap && this.n >= this.growLimit) {
+      return { culled: 0, n: this.n };
+    }
+    const { masses, logitOp, meanLogS } = await this._gatherMasses();
+    const plan = planSoftPrune(masses, this.n, ratio, {
+      minCull: cfg.minCull ?? 1024, floor: cfg.floor ?? 8192,
+      last: this._softPruneFloor || 0, cap: this.cap, logitOp, meanLogS,
+      votes: this._pruneVotes, votesNeeded: cfg.votes ?? 2, skipRatchet,
+    });
+    if (!plan || !plan.culled) return { culled: 0, n: this.n, candidates: plan ? plan.candidates : 0 };
+    this._compactToPlan(plan);
     // the growth ratchet: the next prune (below the cap) holds this floor —
-    // unless bypassed (early milestones neither hold nor set it)
+    // unless bypassed (neither held nor set)
     if (!skipRatchet) this._softPruneFloor = plan.kept;
     return { culled: plan.culled, n: this.n, floorBound: plan.floorBound, candidates: plan.candidates };
+  }
+
+  /** Dead-splat culling for soft-prune-off runs: no ratio trim, no floor,
+   *  no ratchet — only rows with zero rendered mass `votesNeeded` windows
+   *  running (the same hysteresis as the soft path) are compacted out.
+   *  Obstructed rows are pure overhead, never signal. Yields entirely when
+   *  the tandem owns culling. Returns { culled, n, candidates }. */
+  async pruneDead({ votesNeeded = 2, minCull = 1024 } = {}) {
+    if (this.opts.softPrune) return { culled: 0, n: this.n };
+    if (this.protect && this.iter < this.protect.until) return { culled: 0, n: this.n };
+    // an LOD level hold is a polish window at a fixed count — culling
+    // would eat the level out from under its snapshot
+    if (this.growLimit && this.growLimit < this.cap && this.n >= this.growLimit) {
+      return { culled: 0, n: this.n };
+    }
+    const { masses } = await this._gatherMasses();
+    const plan = planDeadCull(masses, this.n, { votes: this._pruneVotes, votesNeeded, minCull });
+    if (!plan || !plan.culled) return { culled: 0, n: this.n, candidates: plan ? plan.candidates : 0 };
+    this._compactToPlan(plan);
+    return { culled: plan.culled, n: this.n, candidates: plan.candidates };
   }
 
   /** Lazily built compaction kit: no buffers, no pipelines until the first

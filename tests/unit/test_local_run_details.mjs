@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { trimProgressToIter } from '../../app/js/session_io.js';
 
 const root = resolve(new URL('../..', import.meta.url).pathname);
 const app = readFileSync(resolve(root, 'app/js/app.js'), 'utf8');
@@ -27,8 +28,14 @@ assert.match(app, /function restoreRunDetails\([\s\S]*session\.setLossHistory\(h
   'reopening a local model should hydrate its score history and timing samples');
 assert.match(app, /restoreRunDetails\(S\._localRun, ses\)/,
   'the local Details payload should be restored when the saved model opens');
-assert.match(app, /restoreRunDetails\(lr, ses\)[\s\S]*S\._carryTrainElapsed = true/,
-  'continuing a local run should carry forward its history and cumulative elapsed time');
+assert.match(app, /restoreRunDetails\(lr, ses, viewOnly \? \{\} : \{ trimToIter: baseIter \}\)[\s\S]*S\._carryTrainElapsed = true/,
+  'continuing a local run should trim its history to the resume point and carry forward cumulative elapsed time');
+assert.match(app, /continuedBuf, trimProgressToIter \} from '\.\/session_io\.js';/,
+  'the app should source the resume trimmer from the session IO module');
+assert.match(app, /function restoreRunDetails\(run, session = S\.session, opts = \{\}\)/,
+  'restoring run details should accept options');
+assert.match(app, /trimProgressToIter\(run\.detailProgress \|\| \{\}, opts\.trimToIter\)/,
+  'restoring run details should trim ahead-of-checkpoint histories on request');
 const continueStart = app.indexOf('async function continueLocalRun(');
 const continueEnd = app.indexOf('\nasync function ', continueStart + 1);
 assert.ok(continueStart >= 0 && continueEnd > continueStart, 'the local-run continuation function should exist');
@@ -74,5 +81,33 @@ assert.match(sessionIo, /capture-time snapshot[\s\S]*potentially-mutated optimiz
   'saved model details should preserve the frozen camera-view point cloud');
 assert.match(sessionIo, /if \(S\.scene\?\.xyz\?\.length\)/,
   'the saved scene cloud should be the source for model Details after training');
+
+// ---- resume trimming: histories ahead of the checkpoint are cut --------------
+// A Details persist lands checkpoint-free, so a killed run's record can hold
+// chart points past its state's iteration — without the trim, the continued
+// run plots over the already-plotted stretch.
+{
+  const progress = {
+    chart: [[100, 20], [200, 21], [300, 22]],
+    holds: [[200, 19], [300, 20]],
+    events: [{ iter: 200, kind: 'prune' }, { iter: 300, kind: 'grow' }, { kind: 'note' }],
+    metrics: [[111, 100, 50], [222, 200, 55], [333, 300, 60]],
+    minutes: 9,
+  };
+  const trimmed = trimProgressToIter(progress, 200);
+  assert.deepEqual(trimmed.chart, [[100, 20], [200, 21]], 'chart rows past the resume point go');
+  assert.deepEqual(trimmed.holds, [[200, 19]], 'hold rows past the resume point go');
+  assert.deepEqual(trimmed.events, [{ iter: 200, kind: 'prune' }, { kind: 'note' }],
+    'events past the resume point go, iter-less events stay');
+  assert.deepEqual(trimmed.metrics, [[111, 100, 50], [222, 200, 55]],
+    'metric rows key on their iteration, not their timestamp');
+  assert.equal(trimmed.minutes, 9, 'non-history fields ride along');
+  assert.equal(progress.chart.length, 3, 'the record itself is never mutated');
+  assert.notEqual(trimmed, progress, 'the trim returns a fresh object');
+  assert.deepEqual(trimProgressToIter(progress, null).chart.length, 3,
+    'viewing (no resume point) keeps the full record');
+  assert.deepEqual(trimProgressToIter(null, 200), {},
+    'a missing record trims to an empty object');
+}
 
 console.log('Local model Details persistence, continuation, and training visualization gate: passed');

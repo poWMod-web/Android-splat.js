@@ -270,6 +270,11 @@ export function createTrainWorkerHandler(deps = {}) {
         const r = await tr.softPrune(params.ratio ?? null, { skipRatchet: !!params.skipRatchet });
         return { value: { ...r, iter: tr.iter, n: tr.n } };
       }
+      case 'pruneDead': {
+        const tr = need();
+        const r = await tr.pruneDead();
+        return { value: { ...r, iter: tr.iter, n: tr.n } };
+      }
       case 'readLoss': {
         const tr = need();
         return { value: { mse: await tr.readLoss(), entryOverflowTiles: tr.entryOverflowTiles || 0 } };

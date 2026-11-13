@@ -174,9 +174,9 @@
           <option value="">On</option>
           <option value="0">Off</option>
         </select></div>
-      <div class="setrow" title="Off by default. When enabled, training periodically culls the lowest-contributing fraction of splats (by accumulated render weight) and keeps going — the model holds more detail under the same splat budget."><label for="set-softprune">Soft prune</label>
+      <div class="setrow" title="Off by default — Off still removes vote-confirmed dead splats (zero render contribution two checks running). When enabled, training also periodically culls the lowest-contributing fraction of splats (by accumulated render weight) and keeps going — the model holds more detail under the same splat budget."><label for="set-softprune">Soft prune</label>
         <select id="set-softprune">
-          <option value="">Off</option>
+          <option value="">Off (dead only)</option>
           <option value="0.01">Trim 1%</option>
           <option value="0.02">Trim 2%</option>
           <option value="0.05">Trim 5%</option>

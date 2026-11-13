@@ -17,7 +17,7 @@ import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture, un
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from '../../src/training-settings.js';
 import { zipStore } from './zip.js';
 import { saveBlob } from './download.js';
-import { buildSessionZip, fetchModel, gravityUpForKnownRun, continuedInputDim, continuedBuf } from './session_io.js';
+import { buildSessionZip, fetchModel, gravityUpForKnownRun, continuedInputDim, continuedBuf, trimProgressToIter } from './session_io.js';
 import { buildDisplayCloud } from './scene-cloud.js';
 import { REPO, DISCORD, DATA, ownSet } from './data.js';
 
@@ -3141,7 +3141,7 @@ async function persistRunDetails(id = S.runId, { full = false } = {}) {
   return updated;
 }
 
-function restoreRunDetails(run, session = S.session) {
+function restoreRunDetails(run, session = S.session, opts = {}) {
   if (!run) return;
   const solve = run.detailSolve || {};
   S.solveStats = solve.solveStats
@@ -3158,7 +3158,13 @@ function restoreRunDetails(run, session = S.session) {
   const frameCount = session && session.frames ? session.frames.length : 0;
   if (frameCount) S.sel = Math.max(0, Math.min(frameCount - 1, S.sel | 0));
   S._savedGpuFacts = run.detailGpu || null;
-  const progress = run.detailProgress || {};
+  // a continued run restarts at its state checkpoint, but the record's
+  // histories can run ahead of it (a Details persist lands checkpoint-free)
+  // — trim them to the resume point so the curve continues instead of
+  // plotting over itself. Viewing keeps the full record (no trim).
+  const progress = opts.trimToIter != null
+    ? trimProgressToIter(run.detailProgress || {}, opts.trimToIter)
+    : (run.detailProgress || {});
   S._savedDetailSettings = progress.settings || null;
   S.chartEvents = Array.isArray(progress.events) ? progress.events.map((e) => ({ ...e })) : [];
   S.holdHist = Array.isArray(progress.holds) ? progress.holds.map((r) => Array.from(r || [])) : [];
@@ -3392,6 +3398,10 @@ function onTrainEvent(e) {
   if (e.kind === 'soft-prune') {
     S.chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned −${fmt(e.culled)}` });
     S.growNote = { text: `−${fmt(e.culled)} splats`, until: performance.now() + 2200 };
+  }
+  if (e.kind === 'dead-cull') {
+    S.chartEvents.push({ iter: e.iter, kind: 'prune', label: `Dead −${fmt(e.culled)}` });
+    S.growNote = { text: `−${fmt(e.culled)} dead splats`, until: performance.now() + 2200 };
   }
   if (e.kind === 'grow-now') {
     S.chartEvents.push({ iter: e.iter, kind: 'grow', label: `Grew +${fmt(e.grown || 0)}` });
@@ -4767,7 +4777,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     S.iter = baseIter;
     S.psnrTrain = null; S.psnrHold = null;
     S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
-    restoreRunDetails(lr, ses);
+    restoreRunDetails(lr, ses, viewOnly ? {} : { trimToIter: baseIter });
     buildSceneFromSession();
     mountModelCanvas();
     if (viewOnly) {

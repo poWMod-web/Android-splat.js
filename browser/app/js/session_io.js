@@ -477,3 +477,29 @@ export async function decodeModel(bytes, reconUrl) {
 
 const headTextIs = (bytes, tag) =>
   new TextDecoder().decode(bytes.subarray(0, tag.length)) === tag;
+
+// ---------------------------------------------------------------------------
+// resume trimming
+// ---------------------------------------------------------------------------
+
+/** Trim a saved detailProgress to a resume point: the record's per-iteration
+ *  histories (chart, holds, events, metrics) can run AHEAD of its state
+ *  checkpoint — a Details persist lands checkpoint-free — so a continued
+ *  run would plot new points over the already-plotted stretch. Keeps rows
+ *  at or before `iter` (metrics key on [1], events on .iter); rows without
+ *  a readable iteration are kept, never destroy what we can't place.
+ *  Returns a FRESH object — the record keeps its full history for viewing. */
+export function trimProgressToIter(progress, iter) {
+  const src = progress && typeof progress === 'object' ? progress : {};
+  if (!Number.isFinite(iter)) return { ...src };
+  const rowBefore = (r) => !Array.isArray(r) || !Number.isFinite(r[0]) || r[0] <= iter;
+  const evBefore = (e) => !e || typeof e !== 'object' || !Number.isFinite(e.iter) || e.iter <= iter;
+  const metBefore = (m) => !Array.isArray(m) || !Number.isFinite(m[1]) || m[1] <= iter;
+  return {
+    ...src,
+    ...(Array.isArray(src.chart) ? { chart: src.chart.filter(rowBefore) } : {}),
+    ...(Array.isArray(src.holds) ? { holds: src.holds.filter(rowBefore) } : {}),
+    ...(Array.isArray(src.events) ? { events: src.events.filter(evBefore) } : {}),
+    ...(Array.isArray(src.metrics) ? { metrics: src.metrics.filter(metBefore) } : {}),
+  };
+}
