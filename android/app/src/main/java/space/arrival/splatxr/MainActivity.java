@@ -50,6 +50,9 @@ public final class MainActivity extends Activity {
     private final Object fileSaveLock = new Object();
     private OutputStream fileSaveStream;
     private boolean fileSavePickerPending;
+    /** Suppress onStop's normal Activity→service handoff while replacing a
+     *  renderer whose WebGPU process was lost during service return. */
+    private boolean gpuRendererRestart;
     private final BroadcastReceiver toggleTrainingReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context ctx, Intent intent) {
             if (webView == null) return;
@@ -348,7 +351,7 @@ public final class MainActivity extends Activity {
      *  actual GPU loop in a killable background WebView. */
     @Override protected void onStop() {
         super.onStop();
-        if (isChangingConfigurations()) return;
+        if (isChangingConfigurations() || gpuRendererRestart) return;
         String active = RunFiles.readActive(this);
         if (active == null) return;
         try {
@@ -393,6 +396,17 @@ public final class MainActivity extends Activity {
         if (fileChooserCallback != null) {
             fileChooserCallback.onReceiveValue(null);
             fileChooserCallback = null;
+        }
+        // Explicitly kill the renderer: Activity recreation alone can leave a
+        // lost WebGPU WebView attached until GC, and the replacement then
+        // inherits the same poisoned graphics process.
+        WebView oldWebView = webView;
+        webView = null;
+        if (oldWebView != null) {
+            try { oldWebView.stopLoading(); } catch (Exception ignored) { }
+            try { oldWebView.removeJavascriptInterface("AndroidARBridge"); } catch (Exception ignored) { }
+            try { oldWebView.loadUrl("about:blank"); } catch (Exception ignored) { }
+            try { oldWebView.destroy(); } catch (Exception ignored) { }
         }
         super.onDestroy();
     }
@@ -478,6 +492,17 @@ public final class MainActivity extends Activity {
         @JavascriptInterface public String recoverActiveRun() {
             String runId = RunFiles.recoverActive(MainActivity.this);
             return runId == null ? "" : runId;
+        }
+
+        /** Replace the visible WebView after a handback device loss. The run's
+         *  durable marker must still match, and onStop must not bounce it back
+         *  into the service while this renderer-only restart is in flight. */
+        @JavascriptInterface public void restartForGpuRecovery(String runId) {
+            if (!RunFiles.validRunId(runId) || !runId.equals(RunFiles.readActive(MainActivity.this))) return;
+            runOnUiThread(() -> {
+                gpuRendererRestart = true;
+                recreate();
+            });
         }
 
         @JavascriptInterface public void cleanRunDirs(String keepId) {

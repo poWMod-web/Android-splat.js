@@ -3607,6 +3607,32 @@ async function deviceLostRecovery(msg) {
       });
     }
     if (S.gen !== gen) return;
+    // A file-backed service handback cannot use Session.recover(): Android's
+    // low-memory worker owns (and has now lost) its transferred seed pixels.
+    // Restart the visible WebView once, then reconstruct from state.bin.
+    if (S._hlStaged) {
+      const runId = S._hlStaged;
+      const restarts = S._hlGpuRestarts | 0;
+      const b = headlessBridge();
+      if (b && typeof b.restartForGpuRecovery === 'function' && restarts < 1) {
+        b.writeRunJson(runId, 'status.json', JSON.stringify({
+          status: 'interrupted', stopped: true, owner: 'activity', iter: S.iter | 0,
+          at: Date.now(), gpuRestarts: restarts + 1,
+          error: 'the Activity GPU was reset while returning; reopening from the saved checkpoint',
+        }));
+        S._hlGpuRestarts = restarts + 1;
+        b.restartForGpuRecovery(runId);
+        return;
+      }
+      try { S.session && S.session.dispose(); } catch { /* already lost */ }
+      S.session = null;
+      showRecovery(runId, {
+        status: 'interrupted', stopped: true, iter: S.iter | 0,
+        error: 'the Activity graphics process could not reopen the saved checkpoint; no run data was deleted',
+      });
+      flash('The graphics process could not restart. The checkpoint and original AR frames are still stored; Continue here can retry.', 12000);
+      return;
+    }
     await S.session.recover();
     if (S.gen !== gen) return;
     S.iter = 0; S.psnrTrain = null; S.psnrHold = null;
@@ -3619,10 +3645,42 @@ async function deviceLostRecovery(msg) {
   } catch (err) {
     console.error(err);
     if (S.gen === gen) {
-      solveFailed('The graphics device was lost and could not be brought back — ' +
-        'you are back at the setup screen. Your photos are kept; a lower Training resolution ' +
-        '(the gear) or fewer photos usually train fine.');
-      trainDeadEnd();
+      // A service handback is different from an ordinary tab loss: its exact
+      // checkpoint and photos are still on disk. lowMem moved the continuation
+      // seed into the failed worker, so Session.recover() cannot repair it in
+      // place. Recreate Android's visible WebView once to get a genuinely new
+      // renderer/GPU process, then boot again from the durable transaction.
+      const runId = S._hlStaged;
+      const restarts = S._hlGpuRestarts | 0;
+      const b = headlessBridge();
+      if (runId && b && typeof b.restartForGpuRecovery === 'function' && restarts < 1) {
+        try {
+          b.writeRunJson(runId, 'status.json', JSON.stringify({
+            status: 'interrupted', stopped: true, owner: 'activity', iter: S.iter | 0,
+            at: Date.now(), gpuRestarts: restarts + 1,
+            error: 'the Activity GPU was reset while returning; reopening from the saved checkpoint',
+          }));
+          S._hlGpuRestarts = restarts + 1;
+          b.restartForGpuRecovery(runId);
+          return;
+        } catch (restartErr) { console.error(restartErr); }
+      }
+      if (runId) {
+        // Never let a failed handback fall through trainDeadEnd() to Home. The
+        // marker, checkpoint, reconstruction and AR photos remain retryable.
+        try { S.session && S.session.dispose(); } catch { /* already lost */ }
+        S.session = null;
+        showRecovery(runId, {
+          status: 'interrupted', stopped: true, iter: S.iter | 0,
+          error: 'the Activity graphics process could not reopen the saved checkpoint; no run data was deleted',
+        });
+        flash('The graphics process could not restart. The checkpoint and original AR frames are still stored; Continue here can retry.', 12000);
+      } else {
+        solveFailed('The graphics device was lost and could not be brought back — ' +
+          'you are back at the setup screen. Your photos are kept; a lower Training resolution ' +
+          '(the gear) or fewer photos usually train fine.');
+        trainDeadEnd();
+      }
     }
   } finally {
     S._recovering = false;
@@ -6514,6 +6572,16 @@ async function monitorSnapshot(runId) {
  *  False = a takeover is still in flight, retry shortly. */
 async function headlessTakeover(runId) {
   const b = headlessBridge();
+  // Do not start a dead service merely to tell it to stop: that path rewrites
+  // status.json and used to erase the renderer-restart transaction metadata.
+  try {
+    const [status, service] = await Promise.all([
+      fetch(Headless.fresh(Headless.runUrl(runId, 'status.json'))).then((r) => r.ok ? r.json() : null),
+      fetch(Headless.fresh(Headless.runUrl(runId, 'service.json'))).then((r) => r.ok ? r.json() : null),
+    ]);
+    if (status && !Headless.isLiveStatus(status) && service &&
+        (service.alive === false || !Headless.heartbeatFresh(service))) return true;
+  } catch { /* command + acknowledgment loop below remains authoritative */ }
   try { b && b.headlessCommand('headless-stop', runId); } catch { /* best-effort */ }
   // A non-live status is written before Java destroys the service WebView.
   // Wait for service.json alive:false (written AFTER teardown), or a stale
@@ -6564,6 +6632,7 @@ async function adoptHeadlessRun(runId, mode) {
       await (await fetch(Headless.fresh(Headless.runUrl(runId, 'state.bin')))).arrayBuffer());
     const status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json().catch(() => ({}));
     handbackStatus = status;
+    S._hlGpuRestarts = status.gpuRestarts | 0;
     const { parseState } = await import('./session_io.js');
     parseState(stateBytes);   // torn writes refuse HERE, not mid-rebuild
     let thumb = null;
@@ -6609,15 +6678,19 @@ async function adoptHeadlessRun(runId, mode) {
       // turn to retire its device before allocating the Activity's replacement.
       await new Promise((resolve) => setTimeout(resolve, 300));
       await continueLocalRun(false);
-      if (S.state !== 'train' || !S.session || !S.session.trainer) {
-        throw new Error('the local trainer did not rebuild');
+      // Worker setup can resolve just before device.lost is delivered. Give
+      // that event a turn and reject a trainer whose GPU is already dead.
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      if (S.state !== 'train' || !S.session || !S.session.trainer || S.session.deviceLost) {
+        throw new Error('the local trainer did not rebuild on a live graphics device');
       }
       const b = headlessBridge();
       if (b) {
         try {
           b.setActiveRun(runId);
           b.writeRunJson(runId, 'status.json', JSON.stringify(
-            { status: 'active', owner: 'activity', iter: S.session.trainer.iter | 0, at: Date.now() }));
+            { status: 'active', owner: 'activity', iter: S.session.trainer.iter | 0,
+              at: Date.now(), gpuRestarts: S._hlGpuRestarts | 0 }));
           b.writeRunJson(runId, 'activity.json', JSON.stringify({ alive: true, at: Date.now() }));
         } catch { /* the next activity beat retries ownership evidence */ }
       }
@@ -6627,10 +6700,27 @@ async function adoptHeadlessRun(runId, mode) {
     console.error(e);
     // Transaction rollback: files, state and active.json were never cleared.
     // Put recovery in front of the user instead of trainDeadEnd's Home screen.
-    S._hlStaged = null; S._hlPhotos = false; S._hlCkptBusy = false;
+    S._hlStaged = runId; S._hlPhotos = true; S._hlCkptBusy = false;
+    const reason = String((e && e.message) || e);
+    const restarts = handbackStatus.gpuRestarts | 0;
+    const b = headlessBridge();
+    if (mode !== 'finished' && restarts < 1 &&
+        /device|GPU|graphics|WebGPU|worker/i.test(reason) && b &&
+        typeof b.restartForGpuRecovery === 'function') {
+      try {
+        b.writeRunJson(runId, 'status.json', JSON.stringify({
+          ...handbackStatus, status: 'interrupted', stopped: true, owner: 'activity',
+          at: Date.now(), gpuRestarts: restarts + 1,
+          error: `reopening the Activity graphics process after handback failure: ${reason}`,
+        }));
+        S._hlGpuRestarts = restarts + 1;
+        b.restartForGpuRecovery(runId);
+        return false;
+      } catch (restartErr) { console.error(restartErr); }
+    }
     showRecovery(runId, { ...handbackStatus, status: 'interrupted', stopped: true,
-      error: `return to app failed: ${e.message || e}` });
-    flash(`Could not resume in the app (${e.message}) — the checkpoint and AR frames are still available here.`, 12000);
+      error: `return to app failed: ${reason}` });
+    flash(`Could not resume in the app (${reason}) — the checkpoint and AR frames are still available here.`, 12000);
     return false;
   }
 }

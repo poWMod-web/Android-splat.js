@@ -160,4 +160,12 @@ assert.match(app, /typeof b\.recoverActiveRun === 'function' \? b\.recoverActive
   'boot should recover a durable run directory when old code deleted active.json');
 assert.match(app, /status: 'discarded'[\s\S]*headlessClear\(runId\)/,
   'Discard should mark its directory so orphan recovery respects the choice');
+assert.match(app, /A file-backed service handback cannot use Session\.recover[\s\S]*restartForGpuRecovery[\s\S]*showRecovery\(runId/,
+  'a handback device loss should rebuild in a fresh Android renderer or remain on file-backed recovery');
+assert.match(main, /public void restartForGpuRecovery\(String runId\)[\s\S]*gpuRendererRestart = true;[\s\S]*recreate\(\)/,
+  'Android should replace the poisoned visible WebView for one handback retry');
+assert.match(main, /WebView oldWebView = webView;[\s\S]*oldWebView\.destroy\(\)/,
+  'Activity teardown should explicitly destroy the old WebView renderer');
+assert.match(app, /service\.alive === false[\s\S]*return true;[\s\S]*headlessCommand\('headless-stop'/,
+  'a dead service should not be restarted and allowed to overwrite GPU-retry metadata');
 console.log('test_headless_files: OK');
