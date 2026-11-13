@@ -114,6 +114,7 @@ assert.match(main, /void onStart\(\)[^]*activity-foreground/,
 assert.ok(app.includes("localStorage.getItem('splatjs_monitor_visuals') === '1'"),
   'the monitor visuals toggle defaults off, like the in-app training visuals');
 const svc = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
+const runFiles = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/RunFiles.java', import.meta.url), 'utf8');
 for (const s of ['setDataDirectorySuffix("training")', 'AndroidHeadless', 'headless-snapshot', 'onTaskRemoved',
     'headless-ack', 'headless-ready', 'settleHandoff', 'HANDOFF_ACK_MS', 'handoffGen',
     'activity-background', 'BACKGROUND_HANDOFF_DELAY_MS', 'SUCCESS_TAKEOVER_DELAY_MS',
@@ -134,4 +135,29 @@ assert.match(app, /status\.status === 'interrupted' && status\.stopped[\s\S]*ret
   'a stopped service checkpoint should automatically resume in the Activity');
 assert.match(app, /service\.alive === false[\s\S]*Headless\.heartbeatFresh\(service\)/,
   'Activity adoption should wait for the post-teardown service acknowledgment');
+
+const adoptStart = app.indexOf('async function adoptHeadlessRun(runId, mode)');
+const adopt = app.slice(adoptStart, app.indexOf('/** The run died out of reach', adoptStart));
+assert.match(adopt, /if \(mode === 'finished'\) \{[\s\S]*await continueLocalRun\(true\);[\s\S]*headlessClear\(runId\);/,
+  'a finished handback should clear its marker only after the viewer rebuilds');
+assert.match(adopt, /await continueLocalRun\(false\);[\s\S]*S\.state !== 'train'[\s\S]*owner: 'activity'/,
+  'a continuing handback should publish Activity ownership only after a live trainer exists');
+const continueBranch = adopt.indexOf('await continueLocalRun(false)');
+assert.ok(continueBranch > adopt.indexOf('headlessClear(runId)') &&
+    !adopt.slice(adopt.lastIndexOf('} else {', continueBranch), continueBranch).includes('headlessClear(runId)'),
+  'a continuing handback must never delete its recovery marker before rebuild');
+assert.match(adopt, /Transaction rollback:[\s\S]*showRecovery\(runId/,
+  'a failed local rebuild should retain files and show recovery instead of Home');
+assert.match(app, /st && \(st\.complete \|\| st\.done\)/,
+  "native AR retention should accept Java's photos.json complete flag");
+assert.match(main, /public String recoverActiveRun\(\)[\s\S]*RunFiles\.recoverActive/,
+  'the Activity bridge should expose orphaned handback recovery');
+assert.match(runFiles, /String recoverActive\(Context ctx\)[\s\S]*state\.length\(\) < 16[\s\S]*photos\.optBoolean\("complete"/,
+  'orphan recovery should require exact state and retained AR photos');
+assert.match(runFiles, /"finished"\.equals\(value\)[\s\S]*"discarded"\.equals\(value\)[\s\S]*"dismissed"\.equals\(value\)/,
+  'orphan recovery must not resurrect completed or deliberately abandoned runs');
+assert.match(app, /typeof b\.recoverActiveRun === 'function' \? b\.recoverActiveRun\(\) : null/,
+  'boot should recover a durable run directory when old code deleted active.json');
+assert.match(app, /status: 'discarded'[\s\S]*headlessClear\(runId\)/,
+  'Discard should mark its directory so orphan recovery respects the choice');
 console.log('test_headless_files: OK');

@@ -474,6 +474,12 @@ public final class MainActivity extends Activity {
             return RunFiles.clearActive(MainActivity.this, runId);
         }
 
+        /** Restore a transaction marker lost by an older handback build. */
+        @JavascriptInterface public String recoverActiveRun() {
+            String runId = RunFiles.recoverActive(MainActivity.this);
+            return runId == null ? "" : runId;
+        }
+
         @JavascriptInterface public void cleanRunDirs(String keepId) {
             RunFiles.cleanRunDirs(MainActivity.this, keepId);
         }

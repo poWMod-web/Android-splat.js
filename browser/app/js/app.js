@@ -6122,8 +6122,8 @@ async function headlessMarkerLive() {
     if (status.owner === 'activity' && S.state === 'ready') {
       try {
         headlessBridge().writeRunJson(runId, 'status.json', JSON.stringify({
-          ...status, status: 'interrupted', at: Date.now(),
-          error: 'the previous local trainer was no longer running',
+          ...status, status: 'dismissed', at: Date.now(),
+          error: 'the previous local trainer was deliberately replaced',
         }));
         headlessBridge().clearActiveRun(runId);
       } catch { /* the new staging pass will replace an un-clearable marker */ }
@@ -6225,7 +6225,7 @@ async function pollRetain(runId, names) {
     let st = null;
     try { st = JSON.parse(b.retainStatus(runId)); } catch { throw new Error('retain unreadable'); }
     if (st && st.error) throw new Error(st.error);
-    if (st && st.done) {
+    if (st && (st.complete || st.done)) {
       const kept = new Set(st.names || []);
       const missing = names.filter((n) => !kept.has(n));
       if (missing.length) throw new Error(`${missing.length} photos not retained`);
@@ -6308,7 +6308,13 @@ async function headlessClearMarker() {
     const r = await fetch(Headless.activeUrl());
     if (!r.ok) return;
     const { runId } = await r.json();
-    if (Headless.validRunId(runId)) { try { b.clearActiveRun(runId); } catch { /* best-effort */ } }
+    if (Headless.validRunId(runId)) {
+      try {
+        b.writeRunJson(runId, 'status.json', JSON.stringify(
+          { status: 'dismissed', owner: 'activity', iter: S.iter || 0, at: Date.now() }));
+        b.clearActiveRun(runId);
+      } catch { /* best-effort */ }
+    }
   } catch { /* best-effort */ }
 }
 /** Release the marker (local finish, adopt, discard). Only clears when the
@@ -6326,10 +6332,14 @@ async function headlessBootCheck() {
   let runId = null;
   try {
     const r = await fetch(Headless.activeUrl());
-    if (!r.ok) return false;
-    runId = (await r.json()).runId;
-    if (!Headless.validRunId(runId)) return false;
-  } catch { return false; }
+    if (r.ok) runId = (await r.json()).runId;
+  } catch { /* an older broken handback may have removed only active.json */ }
+  if (!Headless.validRunId(runId)) {
+    const b = headlessBridge();
+    try { runId = typeof b.recoverActiveRun === 'function' ? b.recoverActiveRun() : null; }
+    catch { runId = null; }
+  }
+  if (!Headless.validRunId(runId)) return false;
   let status = null;
   try {
     status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json();
@@ -6545,6 +6555,7 @@ async function returnHeadlessRun(runId) {
  *  photos are already staged, so the handoff re-arms without re-uploading). */
 async function adoptHeadlessRun(runId, mode) {
   flash(mode === 'finished' ? 'Opening the finished model …' : 'Resuming training here …', 60000);
+  let handbackStatus = {};
   try {
     const manifest = Headless.validateManifest(
       await (await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')))).json());
@@ -6552,6 +6563,7 @@ async function adoptHeadlessRun(runId, mode) {
     const stateBytes = new Uint8Array(
       await (await fetch(Headless.fresh(Headless.runUrl(runId, 'state.bin')))).arrayBuffer());
     const status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json().catch(() => ({}));
+    handbackStatus = status;
     const { parseState } = await import('./session_io.js');
     parseState(stateBytes);   // torn writes refuse HERE, not mid-rebuild
     let thumb = null;
@@ -6578,27 +6590,47 @@ async function adoptHeadlessRun(runId, mode) {
     // same id as the run's own record: adopting patches it, never duplicates it
     if (!(await patchRun(runId, rec))) await saveRun(rec);
     S._localRun = { ...rec };
-    headlessClear(runId);
     $('monitor').hidden = true;
     document.getElementById('cv-monitor')?.remove();
-    if (mode === 'finished') await continueLocalRun(true);
-    else {
-      // the handoff re-arms around the already-staged photos (no re-upload)
+    if (mode === 'finished') {
+      await continueLocalRun(true);
+      if (S.state !== 'done' || !S.session || !S.session.trainer) {
+        throw new Error('the finished model did not rebuild');
+      }
+      // Finished/view-only has no live owner. Clear only AFTER its viewer is
+      // proven live; until then active.json is the recovery transaction log.
+      headlessClear(runId);
+    } else {
+      // The staged AR photos + active marker remain authoritative throughout
+      // rebuild. Never publish owner=activity before that Activity has a live
+      // trainer, and never clear the marker for a continuing run.
       S._hlStaged = runId; S._hlPhotos = true; S._hlCkptBusy = false;
+      // WebView.destroy() ran before alive:false, but give the GPU process one
+      // turn to retire its device before allocating the Activity's replacement.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await continueLocalRun(false);
+      if (S.state !== 'train' || !S.session || !S.session.trainer) {
+        throw new Error('the local trainer did not rebuild');
+      }
       const b = headlessBridge();
       if (b) {
         try {
           b.setActiveRun(runId);
           b.writeRunJson(runId, 'status.json', JSON.stringify(
-            { status: 'active', owner: 'activity', iter: rec.iter, at: Date.now() }));
-        } catch { /* best-effort */ }
+            { status: 'active', owner: 'activity', iter: S.session.trainer.iter | 0, at: Date.now() }));
+          b.writeRunJson(runId, 'activity.json', JSON.stringify({ alive: true, at: Date.now() }));
+        } catch { /* the next activity beat retries ownership evidence */ }
       }
-      await continueLocalRun(false);
     }
     return true;
   } catch (e) {
     console.error(e);
-    flash(`Could not open the background run (${e.message}) — it stays stored for another try.`, 9000);
+    // Transaction rollback: files, state and active.json were never cleared.
+    // Put recovery in front of the user instead of trainDeadEnd's Home screen.
+    S._hlStaged = null; S._hlPhotos = false; S._hlCkptBusy = false;
+    showRecovery(runId, { ...handbackStatus, status: 'interrupted', stopped: true,
+      error: `return to app failed: ${e.message || e}` });
+    flash(`Could not resume in the app (${e.message}) — the checkpoint and AR frames are still available here.`, 12000);
     return false;
   }
 }
@@ -6622,6 +6654,11 @@ function showRecovery(runId, status) {
  *  next staged run cleans them — a discard must never strand a booting twin
  *  by deleting the bytes under it. */
 function headlessDiscard(runId) {
+  const b = headlessBridge();
+  try {
+    b && b.writeRunJson(runId, 'status.json', JSON.stringify(
+      { status: 'discarded', owner: 'activity', iter: 0, at: Date.now() }));
+  } catch { /* clearing the marker still hides it for this boot */ }
   headlessClear(runId);
 }
 /** Foreground-service handoff: secure one exact checkpoint, then relinquish

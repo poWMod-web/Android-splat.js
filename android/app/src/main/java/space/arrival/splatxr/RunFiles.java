@@ -236,6 +236,42 @@ public final class RunFiles {
         }
     }
 
+    /** Recover a marker cleared by an interrupted Activity handback. The run
+     *  directory is the durable transaction: require its exact state, recon,
+     *  manifest and retained photos. Deliberately dismissed/finished runs are
+     *  excluded, so normal Back and Discard never resurrect. */
+    public static String recoverActive(Context ctx) {
+        String active = readActive(ctx);
+        if (active != null) return active;
+        File[] dirs = runsDir(ctx).listFiles(File::isDirectory);
+        if (dirs == null) return null;
+        String best = null;
+        long bestAt = 0;
+        for (File dir : dirs) {
+            String id = dir.getName();
+            if (!validRunId(id)) continue;
+            File state = new File(dir, "state.bin");
+            File recon = new File(dir, "recon.json");
+            File manifest = new File(dir, "manifest.json");
+            if (!state.isFile() || state.length() < 16 || !recon.isFile() || !manifest.isFile()) continue;
+            try {
+                String photosRaw = readJson(ctx, id, "photos.json");
+                String statusRaw = readJson(ctx, id, "status.json");
+                if (photosRaw == null || statusRaw == null) continue;
+                JSONObject photos = new JSONObject(photosRaw);
+                if (!photos.optBoolean("complete", photos.optBoolean("done", false))) continue;
+                JSONObject status = new JSONObject(statusRaw);
+                String value = status.optString("status", "");
+                if ("finished".equals(value) || "discarded".equals(value) || "dismissed".equals(value)) continue;
+                if (!("staging".equals(value) || "booting".equals(value) || "active".equals(value) ||
+                        "paused".equals(value) || "interrupted".equals(value))) continue;
+                long at = Math.max(status.optLong("at", 0), state.lastModified());
+                if (best == null || at > bestAt) { best = id; bestAt = at; }
+            } catch (Exception ignored) { /* malformed dirs are not recovery candidates */ }
+        }
+        return best != null && writeActive(ctx, best) ? best : null;
+    }
+
     /** Clear only when the marker still names runId — a newer run's claim is
      *  never touched. */
     public static boolean clearActive(Context ctx, String runId) {
