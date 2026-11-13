@@ -39,6 +39,15 @@ assert.ok(app.includes("else if (mp.get('back')) headlessClearMarker().finally((
   'the deliberate-leave boot stands the handoff down instead of recovering');
 assert.ok(app.includes('async function headlessClearMarker()'), 'the marker stand-down exists');
 
+// Stop & keep shows the orbit viewer before its asynchronous GPU readback is
+// durable. Every route from that viewer to Home must await the save barrier.
+assert.match(app, /async function goBack\(\)[\s\S]*S\.state === 'done' && S\._securing[\s\S]*await S\._securing/,
+  'header Back must await the finished-model checkpoint before leaving orbit view');
+assert.match(app, /async function closeViewerToHome\(\)[\s\S]*S\.state === 'done' && S\._securing[\s\S]*await S\._securing/,
+  'SPA and system-Back viewer exits must await the same save barrier');
+assert.match(app, /try \{ ckpt = await checkpointRun\('finish'\)[\s\S]*if \(!ckpt\)[\s\S]*return false;[\s\S]*headlessClear\(\)/,
+  'a failed final checkpoint must keep its recovery marker instead of pretending to save');
+
 // The brand title IS Back off the home tile: one shared routine, same effect.
 // (On the home tile it still opens About.)
 assert.ok(app.includes('async function goBack()'), 'Back lives in one shared routine');

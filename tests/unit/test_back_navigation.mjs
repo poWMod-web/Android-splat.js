@@ -41,8 +41,8 @@ assert.match(trainShare, /closeOverlays\(\);/, 'leaving the viewer for setup sho
 const calls = (app.match(/\n\s*closeOverlays\(\);/g) || []).length;
 assert.equal(calls, 11, `all eleven transition sites, including monitor/recovery/adopt, should call the closer (found ${calls})`);
 for (const [name, from, to] of [
-  ['closeDetailCard', 'function closeDetailCard()', 'function closeViewerToHome()'],
-  ['closeViewerToHome', 'function closeViewerToHome()', 'async function fetchShareRecon('],
+  ['closeDetailCard', 'function closeDetailCard()', 'async function closeViewerToHome()'],
+  ['closeViewerToHome', 'async function closeViewerToHome()', 'async function fetchShareRecon('],
   ['restoreShared', 'async function restoreShared(', 'function setStartStyle('],
 ]) {
   const slice = app.slice(app.indexOf(from), app.indexOf(to));

@@ -2644,6 +2644,13 @@ function trainDeadEnd() {
  *  sibling path): a live run is secured in IndexedDB and Android app data,
  *  then home. */
 async function goBack() {
+  // The orbit viewer appears immediately after Stop & keep, while its state
+  // readback is asynchronous. Back must be a save barrier, not a teardown race.
+  if (S.state === 'done' && S._securing) {
+    flash('Saving the finished model …', 60000);
+    const saved = await S._securing.catch(() => false);
+    if (!saved) return;
+  }
   const runId = S.runId || (S._localRun && S._localRun.id);
   if (runId) await persistRunDetails(runId, { full: true }).catch(() => {});
   // a shared creation holds nothing precious — Back is simply the way
@@ -4060,11 +4067,15 @@ async function finish() {
   S._securing = (async () => {
     while (S._ckptBusy) await new Promise((r) => setTimeout(r, 200));   // a 'hidden' write in flight
     let ckpt = null;
-    try { ckpt = await checkpointRun('finish'); } catch { /* best-effort */ }
-    // The final checkpoint is now in Android files as well as IndexedDB; only
-    // then release the live marker so Home can rediscover the finished model.
+    try { ckpt = await checkpointRun('finish'); } catch (e) { console.warn('finish checkpoint failed', e); }
+    if (!ckpt) {
+      flash('The finished model is still open, but it could not be saved. Free storage before leaving.', 12000);
+      return false;
+    }
+    // The final checkpoint is now in Android files and/or IndexedDB; only then
+    // release the live marker so Home can rediscover the finished model.
     headlessClear();
-    if (S.gen !== gen) return;
+    if (S.gen !== gen) return true;
     if (S.runId && S.gen === gen) {
       try {
         const thumb = await renderShareThumb();
@@ -4104,6 +4115,7 @@ async function finish() {
       };
       if (S.state === 'done') renderControls();   // swap the quick Train for the run's own
     }
+    return true;
   })();
   try { await S._securing; } catch { /* best-effort */ }
   if (PERF.on) perfCard();
@@ -5704,7 +5716,15 @@ function closeDetailCard() {
 
 /** Tear the restored viewer down and land on the wall — the SPA counterpart
  *  of the old full-page navigation home. */
-function closeViewerToHome() {
+async function closeViewerToHome() {
+  // Stop & keep enters the orbit viewer before the GPU readback has finished.
+  // Never tear down that session (or bump S.gen) until the model checkpoint is
+  // actually durable; this was the race that produced an empty Home.
+  if (S.state === 'done' && S._securing) {
+    flash('Saving the finished model …', 60000);
+    const saved = await S._securing.catch(() => false);
+    if (!saved) return;
+  }
   stopTour();
   try { S.session && S.session.dispose(); } catch (e) { /* view-only facade */ }
   document.getElementById('cv-model')?.remove();
