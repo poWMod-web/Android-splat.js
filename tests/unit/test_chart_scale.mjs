@@ -145,4 +145,26 @@ assert.match(appSource, /formatTrainingScore\(shownScore\('train'\)\)/,
 assert.match(appSource, /const gap = \(shownScore\('train'\) != null && shownScore\('hold'\) != null\)/,
   'the details gap should compare filtered scores');
 
+
+// cold-start warmup: a steep initial rise tracks instead of clamping
+assert.match(zlemaSource, /minStd = 0\.25/,
+  'the noise floor defaults to the dB scale (~50% of expected readout sigma)');
+assert.match(zlemaSource, /this\.warmup = 4;/,
+  'the first updates after the latch track unclamped while the variance seeds');
+const zramp = new FastRobustZLEMA();
+const rampEnd = [10, 14, 18, 22, 26, 28, 29, 30, 30.5, 30.7, 30.8]
+  .reduce((_, v) => zramp.update(v), 0);
+assert.ok(Math.abs(rampEnd - 30.8) < 2,
+  `a steep early rise should track within 2 dB by readout 11 (got ${rampEnd.toFixed(2)})`);
+const zwarm = new FastRobustZLEMA();
+zwarm.update(10); zwarm.update(14);
+assert.ok(zwarm.variance > 1,
+  'the warmup seeds the variance from the observed steps, opening the gate at the signal scale');
+const zflat2 = new FastRobustZLEMA();
+for (let i = 0; i < 40; i++) zflat2.update(20);
+let zslow = 20;
+for (let i = 0; i < 20; i++) zslow = zflat2.update(20 + (i + 1) * 0.3);
+assert.ok(Math.abs(zslow - 26) < 1,
+  `a gradual mid-run rise should track within 1 dB (got ${zslow.toFixed(2)})`);
+
 console.log('PSNR and approximate SSIM graph scales: passed');

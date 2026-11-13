@@ -3015,7 +3015,9 @@ async function runPruneAndContinue(ratio = 0.5) {
   } catch (err) {
     card.remove();
     console.error(err);
-    flash(`Prune failed: ${err.message} — press play to resume.`, 8000);
+    // a failed prune resumes a training run onto the unpruned model (the
+    // session owns the loop now); an already-paused run stays paused
+    flash(`Prune failed: ${err.message} — ${ses.training ? 'training on with the unpruned model.' : 'press play to resume.'}`, 8000);
   } finally {
     S._pruning = false;
     syncTrainButtons();

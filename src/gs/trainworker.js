@@ -214,28 +214,33 @@ export function createTrainWorkerHandler(deps = {}) {
           });
         };
         fenceDepth = trainerOpts.fenceRing ?? 4;
-        trainer = await createTrainerImpl({ ...trainerOpts, gpu });
-        trainer.setup(gaussians, cams, images, maxViewW, maxViewH, radius);
+        // boot into a local and swap on success: a setup throw used to
+        // leave the half-built trainer published (bufParams undefined while
+        // camMeta exists), so every later call failed cryptically AND a
+        // retry init hit 'already initialized' instead of rebooting (2026-11)
+        const next = await createTrainerImpl({ ...trainerOpts, gpu });
+        next.setup(gaussians, cams, images, maxViewW, maxViewH, radius);
         // resume-with-SH: setup zero-fills SH, a restored model brings its own
         // (clamped to the cap — a checkpoint past it truncated the params
         // but pasted all n rows into a cap-sized SH buffer)
-        if (gaussians.sh && trainer.bufSH) {
-          const shRows = Math.min(gaussians.n, trainer.cap);
+        if (gaussians.sh && next.bufSH) {
+          const shRows = Math.min(gaussians.n, next.cap);
           if (shRows < gaussians.n) {
             emit('log', `SH restore truncated to ${shRows} of ${gaussians.n} rows (splat cap)`);
           }
-          trainer.device.queue.writeBuffer(trainer.bufSH, 0,
+          next.device.queue.writeBuffer(next.bufSH, 0,
             gaussians.sh.buffer, gaussians.sh.byteOffset,
-            shRows * trainer.shK * 3 * 4);
+            shRows * next.shK * 3 * 4);
         }
         if (params.hull) {
-          trainer.hullKill = makeSplatTestImpl(params.hull, params.hullOpts || {});
+          next.hullKill = makeSplatTestImpl(params.hull, params.hullOpts || {});
         }
-        if (params.protect) trainer.protect = { ...params.protect };
-        if (params.freezePos) trainer.setFreezePos(params.freezePos.from, params.freezePos.to);
-        trainer.holdout = params.holdout ?? -1;
-        trainer.excluded = new Set(params.excluded || []);
-        if (params.iter != null) { trainer.iter = params.iter; trainer.adamT0 = params.iter; }
+        if (params.protect) next.protect = { ...params.protect };
+        if (params.freezePos) next.setFreezePos(params.freezePos.from, params.freezePos.to);
+        next.holdout = params.holdout ?? -1;
+        next.excluded = new Set(params.excluded || []);
+        if (params.iter != null) { next.iter = params.iter; next.adamT0 = params.iter; }
+        trainer = next;
         return { value: mirror() };
       }
       case 'runBatch': {

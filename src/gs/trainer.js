@@ -98,6 +98,11 @@ export class GSTrainer {
     // 4.18 -> 3.65 ms (~85 % of an object-centric scene is in view); parity exact.
     this.compact = opts.compact ?? true;
     this.iter = 0;
+    // setup() flips this once every buffer, bind group and CPU deck exists —
+    // until then the entry points below fail LOUD instead of throwing the
+    // GPU's cryptic TypeErrors (copyBufferToBuffer on an undefined buffer,
+    // .length on a missing deck) from a half-booted trainer (2026-11)
+    this.ready = false;
     this._mEnc = null;      // (1) open merged-batch encoder (null outside a batch)
     this._ringUsed = 0;     // (1) ring slots consumed by the open encoder
     this._tsSteps = 0;      // (1) steps encoded in the open batch (timer scaling)
@@ -908,6 +913,7 @@ export class GSTrainer {
       'pos.x', 'pos.y', 'pos.z', 'logSx', 'logSy', 'logSz',
       'q.w', 'q.x', 'q.y', 'q.z', 'c.r', 'c.g', 'c.b', 'opa', 'pad', 'pad',
     ];
+    this.ready = true;
   }
 
   _camUniform({ R, t, f, fy, cx, cy, w, h, g = 0, b = 0, bg = null }, trainMode, offset, camIdx = 0) {
@@ -1232,6 +1238,7 @@ export class GSTrainer {
    *  Set trainer.holdout = <camIdx> to exclude a camera from training
    *  (evaluate it with evalCamPsnr for an honest novel-view metric). */
   stepOnce() {
+    if (!this.ready) throw new Error('GSTrainer.stepOnce: setup() did not complete');
     const d = this.device;
     // (1) merged-submit bracketing: inside a batch every step encodes into
     // the shared encoder (one submit per batch); unbracketed callers get the
@@ -1731,6 +1738,7 @@ export class GSTrainer {
 
   /** Read and reset accumulated squared-error stats -> mean L2 per pixel-channel. */
   async readLoss() {
+    if (!this.ready) throw new Error('GSTrainer.readLoss: setup() did not complete');
     const d = this.device;
     const enc = d.createCommandEncoder();
     enc.copyBufferToBuffer(this.bufStats, 0, this.bufStatsRead, 0, 16);
@@ -2025,6 +2033,7 @@ export class GSTrainer {
   }
 
   async refine(rng = this.rand) {
+    if (!this.ready) throw new Error('GSTrainer.refine: setup() did not complete');
     // (1) the cost basis may move under the merge cap — re-measure (one
     // conservative batch) rather than overshoot on a stale estimate
     this._msStepEst = null;
@@ -2576,6 +2585,7 @@ export class GSTrainer {
    *  read WITHOUT draining, so refine planning never notices). One scoring
    *  pass serves both the ratio trim and the dead cull. */
   async _gatherMasses() {
+    if (!this.ready) throw new Error('GSTrainer._gatherMasses: setup() did not complete');
     // votes ride the rows: growth appends (new tail starts clean), the
     // compaction permutes survivors, a reseed births a fresh trainer.
     // Relocated rows inherit their index's votes — one good window resets
@@ -2769,6 +2779,7 @@ export class GSTrainer {
 
   /** Read back current Gaussian parameters (+ SH coeffs when enabled). */
   async readGaussians() {
+    if (!this.ready) throw new Error('GSTrainer.readGaussians: setup() did not complete');
     const d = this.device;
     const enc = d.createCommandEncoder();
     enc.copyBufferToBuffer(this.bufParams, 0, this.bufParamsRead, 0, this.n * STRIDE * 4);

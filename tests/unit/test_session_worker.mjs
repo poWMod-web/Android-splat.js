@@ -594,8 +594,8 @@ assert.match(sessionSource, /if \(!this\.gpu && !this\._shouldOffload\(\)\) \{/,
   'solve skips the session device when the worker will own one');
 assert.match(sessionSource, /const dilate = trainerOpts\.dilate \?\? 0\.1;/,
   'unbake derives dilate from opts (no trainer needed pre-boot)');
-assert.match(sessionSource, /if \(boot\.hullKillFn\) this\.trainer\.hullKill = boot\.hullKillFn;/,
-  'local boot keeps the prebuilt hull test (no behaviour change)');
+assert.match(sessionSource, /if \(boot\.hullKillFn\) next\.hullKill = boot\.hullKillFn;/,
+  'local boot keeps the prebuilt hull test (configured pre-swap, published after)');
 assert.match(sessionSource, /training on the main thread \(trainWorker disabled\)/,
   'an explicitly local session says so in the log (which path ran is diagnosable)');
 assert.match(sessionSource, /this\._chain = p\.catch\(\(\) => \{\}\);/,

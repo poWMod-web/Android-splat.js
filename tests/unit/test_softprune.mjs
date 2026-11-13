@@ -243,4 +243,22 @@ assert.equal(COMPACT_TEMP_BYTES, 16 * 1024 * 1024);
   assert.equal(p.culled, 2000, '2000 confirmed dead clear the default minCull');
 }
 
+
+// ---- dead cull: zero means EXACT zero of the quantized mass counter ------
+{
+  // the gather divides an i32 counter (round(alpha*T*8) per pixel touch) by
+  // WFIX=8: any positive reading, however small, is a rendered splat —
+  // near-zero mass is alive, only exact zero dies
+  const n = 5000;
+  const votes = new Uint16Array(n);
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i < 2000 ? 1e-9 : i + 1;
+  planDeadCull(masses, n, { votes, minCull: 1, floor: 1 });
+  const p = planDeadCull(masses, n, { votes, minCull: 1, floor: 1 });
+  assert.ok(p, 'sub-quantum mass is not an all-zero window');
+  assert.equal(p.culled, 0, 'sub-quantum-but-nonzero mass is alive, not dead');
+  assert.equal(votes[0], 0, 'any positive mass resets the vote sheet');
+  assert.equal(p.candidates, 0, 'nothing counts as a zero-mass candidate');
+}
+
 console.log('soft-prune + dead-cull planning (rank + chunk): passed');

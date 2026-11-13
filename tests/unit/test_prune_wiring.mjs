@@ -99,11 +99,17 @@ assert.match(session, /async pruneAndContinue\(ratio = 0\.5,/,
   'prune-and-continue defaults to half');
 assert.match(session, /async pruneAndContinue\(ratio = 0\.5, \{ onStatus = null, onProgress = null \}/,
   'a pure prune takes no horizon extension');
-assert.match(session, /this\.training = wasTraining;/,
-  'a pure prune restores the run state instead of resuming');
+assert.match(session, /const resume = \(\) => \{ if \(wasTraining\) \{ this\.training = false; this\.start\(\); \} \};/,
+  'a pure prune restores the run state through start() (a paused run stays paused, a training one reschedules)');
 assert.match(session, /resumed: wasTraining/,
   'the outcome reports whether training resumed');
 const pruneBody = session.slice(session.indexOf('async pruneAndContinue'), session.indexOf('async growNow()'));
+assert.match(pruneBody, /resume\(\);\n        this\._capAsked = false;/,
+  'the success path resumes the loop it paused');
+assert.match(pruneBody, /try \{ resume\(\); \} catch/,
+  'a failed prune resumes onto the intact previous trainer instead of wedging paused');
+assert.match(pruneBody, /the unpruned model is intact/,
+  'a moved-seed reseed failure says the previous model survived (not "reload")');
 assert.ok(!pruneBody.includes('continueFor') && !pruneBody.includes('trainer.refine('),
   'a pure prune neither extends the horizon nor grows');
 assert.match(session, /kind: 'prune-continue', iter, \.\.\.out/,
@@ -188,5 +194,38 @@ assert.match(app, /async function runGrowNow\(\) \{/,
 const growBody = session.slice(session.indexOf('async growNow()'), session.indexOf('async finish()'));
 assert.ok(!growBody.includes('softPrune'),
   'a manual growth pass never culls, even with soft prune on');
+
+
+// ---- failed boots publish nothing (the prune-failure cascade, 2026-11) ----
+assert.match(session, /const next = await GSTrainer\.create\(\{ \.\.\.trainerOpts, gpu: this\.gpu \}\);/,
+  'local boots build into a local, not onto the live trainer');
+assert.match(session, /this\._setupTrainer\(next, boot\.cams, boot\.frames, boot\.maxW, boot\.maxH, boot\.radius\);/,
+  'setup runs pre-swap against the local');
+assert.match(session, /if \(this\._worker\) this\._terminateWorker\(\);   \/\/ the replacement is in: retire the previous core/,
+  'only a fully booted replacement retires the previous core');
+assert.match(session, /this\.trainer = next;/,
+  'the live trainer swaps once, after setup completes');
+assert.match(session, /terminate ONLY the replacement/,
+  'a failed remote boot terminates only its own worker (the previous trainer stays live)');
+assert.match(worker, /const next = await createTrainerImpl\(\{ \.\.\.trainerOpts, gpu \}\);/,
+  'worker init builds into a local, not onto the published trainer');
+assert.match(worker, /trainer = next;/,
+  'worker init publishes only after setup (a retry reboots instead of hitting already-initialized)');
+assert.match(trainer, /this\.ready = false;/,
+  'a fresh trainer opens unready');
+assert.match(trainer, /this\.ready = true;/,
+  'setup completion flips the ready flag');
+assert.match(trainer, /if \(!this\.ready\) throw new Error\('GSTrainer\.readGaussians: setup\(\) did not complete'\);/,
+  'readback on a half-booted trainer fails loud, not as a GPU TypeError');
+assert.match(trainer, /if \(!this\.ready\) throw new Error\('GSTrainer\.stepOnce: setup\(\) did not complete'\);/,
+  'steps on a half-booted trainer fail loud, not as .length on a missing deck');
+assert.match(session, /if \(trainer\.ready === false\) \{/,
+  'the frame loop refuses a half-booted trainer loudly');
+assert.match(session, /seed data was released after the first boot \(lowMem\) — reload to train again/,
+  'a lowMem reseed says plainly its pixels are gone (prune and checkpoint resume alike)');
+assert.match(session, /trainerOpts = \{ \.\.\.trainerOpts, useStats: true \};/,
+  'soft-prune-off boots accumulate the mass window the dead cull scores');
+assert.match(app, /training on with the unpruned model\./,
+  'a failed prune tells a resumed run it kept training');
 
 console.log('prune-and-continue + soft-prune wiring: passed');

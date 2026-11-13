@@ -26,7 +26,7 @@ export class FastRobustZLEMA {
    * @param {number} zThresh  - Gaussian tail cutoff in std devs (e.g., 2.2 to 2.5)
    * @param {number} minStd   - Minimum noise floor (~50% of expected Gaussian sigma)
    */
-  constructor(period = 20, zThresh = 2.3, minStd = 0.0) {
+  constructor(period = 20, zThresh = 2.3, minStd = 0.25) {
     const p = Math.max(2, period | 0);
     this.lag = (p - 1) >> 1;
     // Standard EMA alpha for period N: 2 / (N + 1)
@@ -41,6 +41,13 @@ export class FastRobustZLEMA {
     this.minVariance = minStd * minStd;
     this.gamma = 0.05;
     this.oneMinusGamma = 0.95;
+    // Cold start: the first updates after the latch track UNCLAMPED while
+    // the variance seeds from the observed steps (a steep initial rise is
+    // signal, not a spike — clamping it against the 1e-3 birth variance
+    // pinned the curve while raw climbed 20 dB, 2026-11). After the warmup
+    // the gate opens at the signal's own scale and the clamp takes over.
+    this.warmup = 4;
+    this.count = 0;
     this.writeIdx = 0;
     this.initialized = false;
     this.zlema = 0.0;
@@ -53,20 +60,31 @@ export class FastRobustZLEMA {
       this.zlema = x;
       this.variance = this.minVariance > 1e-3 ? this.minVariance : 1e-3;
       this.initialized = true;
+      this.count = 1;
       return x;
     }
+    this.count++;
     // 1. Clamp extreme Gaussian tail spikes against the current ZLEMA center
     let cleanX = x;
     const err = x - this.zlema;
-    let errSq = err * err;
-    const maxErrSq = this.zThreshSq * this.variance;
-    if (errSq > maxErrSq) {
-      const limit = Math.sqrt(maxErrSq);
-      cleanX = this.zlema + (err > 0 ? limit : -limit);
-      errSq = maxErrSq;
+    if (this.count <= this.warmup) {
+      // still learning the signal's scale: track the sample and seed the
+      // variance from the largest step seen (monotone — one steep step
+      // opens the gate for the rise that follows it)
+      const stepSq = err * err;
+      if (stepSq > this.variance) this.variance = stepSq;
+      if (this.minVariance > this.variance) this.variance = this.minVariance;
+    } else {
+      let errSq = err * err;
+      const maxErrSq = this.zThreshSq * this.variance;
+      if (errSq > maxErrSq) {
+        const limit = Math.sqrt(maxErrSq);
+        cleanX = this.zlema + (err > 0 ? limit : -limit);
+        errSq = maxErrSq;
+      }
+      const nextVar = this.oneMinusGamma * this.variance + this.gamma * errSq;
+      this.variance = nextVar > this.minVariance ? nextVar : this.minVariance;
     }
-    const nextVar = this.oneMinusGamma * this.variance + this.gamma * errSq;
-    this.variance = nextVar > this.minVariance ? nextVar : this.minVariance;
     // 2. Read lagged clean sample from power-of-2 ring buffer
     const laggedIdx = (this.writeIdx - this.lag) & this.mask;
     const laggedX = this.buf[laggedIdx];
@@ -82,10 +100,10 @@ export class FastRobustZLEMA {
   reset() {
     this.initialized = false;
     this.writeIdx = 0;
+    this.count = 0;
   }
   series(pts) {
     this.reset();
     return pts.map(([iter, v]) => [iter, this.update(v)]);
   }
 }
-

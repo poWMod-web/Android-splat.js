@@ -691,11 +691,11 @@ export class Session {
 
   /** trainer.setup with the frame alphas hidden when the session trains unmasked
    *  (opts.maskTraining === false): the packed targets then carry alpha 255. */
-  _setupTrainer(cams, frames, maxW, maxH, radius) {
+  _setupTrainer(trainer, cams, frames, maxW, maxH, radius) {
     const hide = this.opts.maskTraining === false && frames && frames.some((f) => f.alpha);
     const saved = hide ? frames.map((f) => f.alpha) : null;
     if (hide) for (const f of frames) f.alpha = null;
-    try { this.trainer.setup(this.model, cams, frames, maxW, maxH, radius); }
+    try { trainer.setup(this.model, cams, frames, maxW, maxH, radius); }
     finally { if (hide) frames.forEach((f, i) => { f.alpha = saved[i]; }); }
   }
 
@@ -749,6 +749,12 @@ export class Session {
 
   async _bootTrainer(trainerOpts, boot) {
     trainerOpts = this._withTandemBoost(trainerOpts);
+    if (!trainerOpts.softPrune && trainerOpts.useStats === undefined) {
+      // soft-prune-off runs still cull vote-confirmed dead splats, scored
+      // off the same rendered-mass window — without the accumulation the
+      // gather reads all-zero and the dead cull silently never fires
+      trainerOpts = { ...trainerOpts, useStats: true };
+    }
     if (this._shouldOffload()) {
       try {
         await this._bootRemoteTrainer(trainerOpts, boot);
@@ -757,36 +763,43 @@ export class Session {
         if ((this.opts.trainWorker ?? 'auto') === true) throw e;
         if (e && e.workerOwned) throw e;   // the seed moved — fallback would boot from detached buffers
         this._log(`worker training unavailable (${(e && e.message) || e}) — training on the main thread`);
-        this._terminateWorker();
-        this.trainer = null;
+        // the failed boot published nothing: the previous core (a reseed's)
+        // stays live until the fallback below swaps its own in (2026-11)
       }
     }
     const twMode = this.opts.trainWorker ?? 'auto';
     if (twMode === false || twMode === 'never') this._log('training on the main thread (trainWorker disabled)');
     if (!this.gpu) this.gpu = await createGpu({ device: this.opts.device });
     this.gpu.onLost = (info) => this._deviceLost(info);
-    this.trainer = await GSTrainer.create({ ...trainerOpts, gpu: this.gpu });
+    // boot into a local and swap on success: publishing this.trainer BEFORE
+    // setup() meant any setup throw left a half-booted trainer (camMeta set,
+    // buffers missing) that passed the frame guard and then failed every
+    // call cryptically — the prune-failure cascade (2026-11)
+    const next = await GSTrainer.create({ ...trainerOpts, gpu: this.gpu });
     const gi = this.gpu.info || {};
     this._log(`GPU: ${gi.vendor || 'unknown'} ${gi.architecture || ''} — ` +
-      `${this.trainer.tileGrad ? 'tile-shared' : 'direct'} gradient accumulation`);
-    this._setupTrainer(boot.cams, boot.frames, boot.maxW, boot.maxH, boot.radius);
-    if (boot.hullKillFn) this.trainer.hullKill = boot.hullKillFn;
-    if (boot.protect) this.trainer.protect = { ...boot.protect };
-    if (boot.freezePos) this.trainer.setFreezePos(boot.freezePos.from, boot.freezePos.to);
-    if (boot.sh && this.trainer.bufSH) {
+      `${next.tileGrad ? 'tile-shared' : 'direct'} gradient accumulation`);
+    this._setupTrainer(next, boot.cams, boot.frames, boot.maxW, boot.maxH, boot.radius);
+    if (boot.hullKillFn) next.hullKill = boot.hullKillFn;
+    if (boot.protect) next.protect = { ...boot.protect };
+    if (boot.freezePos) next.setFreezePos(boot.freezePos.from, boot.freezePos.to);
+    if (boot.sh && next.bufSH) {
       // a checkpoint with more splats than the cap truncated the params
       // but pasted all shN rows into a cap-sized SH buffer — an upload
       // larger than its buffer. Clamp to the same rows the params kept.
-      const shRows = Math.min(boot.shN ?? this.trainer.cap, this.trainer.cap);
+      const shRows = Math.min(boot.shN ?? next.cap, next.cap);
       if (shRows < boot.shN) {
         this._log(`SH restore truncated to ${shRows} of ${boot.shN} rows (splat cap)`);
       }
-      this.trainer.device.queue.writeBuffer(this.trainer.bufSH, 0,
-        boot.sh.buffer, boot.sh.byteOffset, shRows * this.trainer.shK * 3 * 4);
+      next.device.queue.writeBuffer(next.bufSH, 0,
+        boot.sh.buffer, boot.sh.byteOffset, shRows * next.shK * 3 * 4);
     }
-    this.trainer.excluded = new Set(boot.excluded || []);
-    this.trainer.holdout = boot.holdout ?? -1;
-    if (boot.iter != null) { this.trainer.iter = boot.iter; this.trainer.adamT0 = boot.iter; }
+    next.excluded = new Set(boot.excluded || []);
+    next.holdout = boot.holdout ?? -1;
+    if (boot.iter != null) { next.iter = boot.iter; next.adamT0 = boot.iter; }
+    if (this._worker) this._terminateWorker();   // the replacement is in: retire the previous core
+    this.trainer = next;
+    this._remote = false;
   }
 
   /** Spawn the training worker and upload the seed + targets through the
@@ -801,10 +814,7 @@ export class Session {
     } catch (e) {
       throw new Error(`training worker did not start (${(e && e.message) || e})`);
     }
-    this._worker = worker;
     const remote = new RemoteTrainer(worker, trainerOpts);
-    remote.onEvent('device-lost', (info) => this._deviceLost(info));
-    remote.onEvent('worker-error', (err) => this._workerFailed(err));
     remote.onEvent('log', (m) => this._log(m));
     // lowMem moves (transfers) the seed and targets instead of copying: from
     // the setup postMessage on, the main-side buffers are detached. A worker
@@ -833,6 +843,14 @@ export class Session {
         try { this.gpu.dispose(); } catch { /* already gone */ }
         this.gpu = null;
       }
+      // the replacement is fully booted: retire the previous core (a reseed
+      // that orphaned it carried two live GPU devices) and publish. Fault
+      // events wire up HERE, so a dying replacement never reports against
+      // the previous core it failed to replace (2026-11).
+      if (this._worker) this._terminateWorker();
+      remote.onEvent('device-lost', (info) => this._deviceLost(info));
+      remote.onEvent('worker-error', (err) => this._workerFailed(err));
+      this._worker = worker;
       this.trainer = remote;
       this._remote = true;
       this._workerGen++;
@@ -841,7 +859,12 @@ export class Session {
       this._log(`GPU: ${gi.vendor || 'unknown'} ${gi.architecture || ''} — ` +
         `${mirror.tileGrad ? 'tile-shared' : 'direct'} gradient accumulation (worker)`);
     } catch (e) {
-      this._terminateWorker();
+      // the failed boot published nothing: terminate ONLY the replacement
+      // and fail its RPCs — the previous trainer stays live (a failed prune
+      // reseed keeps training on the unpruned model) and the view stays
+      // attached to it (2026-11)
+      try { remote.abort(e instanceof Error ? e : new Error(String((e && e.message) || e))); } catch { /* gone */ }
+      try { if (typeof worker.terminate === 'function') worker.terminate(); } catch { /* gone */ }
       if (moved) {
         const fatal = new Error(`training worker failed (${(e && e.message) || e}) — ` +
           `the seed already moved to the worker, so training cannot fall back to the main thread; reload to retry`);
@@ -1048,6 +1071,12 @@ export class Session {
       this.model.data = unbakeOpacityCompensation(this.model.data, this.model.n, f0, pos, dilate);
       this._log(`unbaked the export's opacity compensation (f ${f0.toFixed(1)}, ${this.recon.cams.length} cams, dilate ${dilate})`);
     }
+    // lowMem released the frame pixels after the first boot — a reseed
+    // (prune-and-continue, checkpoint resume) has nothing to re-upload.
+    // Say so plainly instead of crashing inside setup on null rgb.
+    if (!opts.viewOnly && this.frames && this.frames.some((f) => !f.rgb)) {
+      throw new Error('seed data was released after the first boot (lowMem) — reload to train again');
+    }
     await this._bootTrainer(trainerOpts, {
       gaussians: {
         data: this.model.data, n: gaussians.n, dc: gaussians.dc,
@@ -1111,7 +1140,9 @@ export class Session {
    *  model where the schedules stopped, stretch the horizon, and resume.
    *  The holdout is probed before and after (skipped without one); a drop
    *  past 0.5 dB warns but never blocks — training recovers it. Resets
-   *  the cap prompt, so the next ceiling hit asks again. */
+   *  the cap prompt, so the next ceiling hit asks again. A failed reseed
+   *  leaves the previous trainer live (atomic swap) and a run that was
+   *  training resumes onto it — a failed prune never bricks the run. */
   async pruneAndContinue(ratio = 0.5, { onStatus = null, onProgress = null } = {}) {
     const trainer = this.trainer;
     if (!trainer) throw new Error('seed() first');
@@ -1122,6 +1153,11 @@ export class Session {
       const wasTraining = this.training;
       this.training = false;
       const say = (m) => { this._log(m); if (onStatus) onStatus(m); };
+      // the loop restarts through start(), not the bare flag: the in-flight
+      // frame already exited without rescheduling, and start() no-ops while
+      // training — so the flag drops first to force the reschedule. A paused
+      // run stays paused (the cap-hit card's prune included).
+      const resume = () => { if (wasTraining) { this.training = false; this.start(); } };
       try {
         const before = this.holdout >= 0 ? await trainer.evalCamPsnr(this.holdout) : null;
         const raw = await trainer.readGaussians();
@@ -1138,7 +1174,7 @@ export class Session {
           after = await this.trainer.evalCamPsnr(this.holdout);
           delta = after - before;
         }
-        this.training = wasTraining;
+        resume();
         this._capAsked = false;
         if (delta != null && delta < -0.5) {
           this._log(`WARNING: prune cost ${(-delta).toFixed(2)} dB ` +
@@ -1153,8 +1189,19 @@ export class Session {
         return out;
       } catch (e) {
         // a failed prune must not swallow the prompt — the ceiling is
-        // still full and the user can retry (or keep training at the cap)
+        // still full and the user can retry (or keep training at the cap).
+        // The reseed swaps atomically, so the previous trainer is intact:
+        // a run that was training resumes onto the unpruned model instead
+        // of wedging paused on a half-booted core (2026-11).
         this._capAsked = false;
+        try { resume(); } catch (re) { this._log(`prune cleanup: resume failed (${(re && re.message) || re})`); }
+        if (e && e.workerOwned) {
+          // the replacement's seed moved, but the previous core is intact
+          // (and training again, above) — say that instead of "reload"
+          const f = new Error(`prune reseed failed (${(e.cause && e.cause.message) || 'worker boot failed'}) — the unpruned model is intact`);
+          f.cause = e;
+          throw f;
+        }
         throw e;
       }
     });
@@ -1503,6 +1550,13 @@ export class Session {
   async _frameLoop() {
     const trainer = this.trainer;
     if (!trainer || !trainer.camMeta || this._lost) return;
+    // ready === false is a half-booted trainer (setup threw after camMeta,
+    // before the buffers): fail LOUD here instead of throwing the GPU's
+    // cryptic TypeErrors mid-frame (2026-11). Proxies and mocks leave ready
+    // undefined, which passes.
+    if (trainer.ready === false) {
+      throw new Error('trainer setup did not complete — the seed/reseed failed partway; reload or recover to reboot cleanly');
+    }
     this._frameCount++;
 
     if (this.training && trainer.iter >= this._maxIters()) {
