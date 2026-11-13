@@ -2997,7 +2997,7 @@ async function runPruneAndContinue(ratio = 0.5) {
     card.remove();
     const d = out.delta == null ? 'no holdout to score against'
       : `${out.delta >= 0 ? '+' : ''}${out.delta.toFixed(2)} dB holdout`;
-    flash(`Pruned ${fmt(out.from)} → ${fmt(out.to)} splats (${d}) — training on with room to grow.`, 7000);
+    flash(`Pruned ${fmt(out.from)} → ${fmt(out.to)} splats (${d}) — ${out.resumed ? 'training on with room to grow.' : 'press play to grow on.'}`, 7000);
   } catch (err) {
     card.remove();
     console.error(err);
@@ -3379,7 +3379,7 @@ function onTrainEvent(e) {
     S.chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned −${fmt(e.culled)}` });
     S.growNote = { text: `−${fmt(e.culled)} splats`, until: performance.now() + 2200 };
   }
-  if (e.kind === 'tandem-regrow' || e.kind === 'grow-now') {
+  if (e.kind === 'grow-now') {
     S.chartEvents.push({ iter: e.iter, kind: 'grow', label: `Grew +${fmt(e.grown || 0)}` });
     S.growNote = { text: `+${fmt(e.grown || 0)} splats`, until: performance.now() + 2200 };
   }

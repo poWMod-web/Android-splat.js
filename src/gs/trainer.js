@@ -10,7 +10,7 @@ import {
 import { rodrigues, m3mul, makeRng } from '../sfm/geometry.js';
 import { createGpu } from '../gpu/context.js';
 import { ssimIndexRgb } from './ssim.js';
-import { planSoftPrune, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES } from './softprune.js';
+import { planSoftPrune, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES, CULLED } from './softprune.js';
 
 // plan item (6): one event-loop turn between the stages of multi-second
 // queue drains (refine readbacks, refined-eval passes) — input and the
@@ -896,6 +896,7 @@ export class GSTrainer {
     // Atomic float order in the kernels stays nondeterministic, so this
     // narrows the spread, it does not zero it.
     this.rand = Number.isFinite(this.opts.seed) ? makeRng(this.opts.seed) : () => Math.random();
+    this._pruneVotes = new Uint16Array(0);   // consecutive low-mass windows per row (soft-prune hysteresis)
     this._camDeck = [];   // shuffled-epoch deck (stepOnce refills per pass)
 
     // gradcheck metadata
@@ -2567,8 +2568,11 @@ export class GSTrainer {
    *  permute) and whenever the plan refuses (too few rows, no signal).
    *  ratioOverride (the session's early milestones) culls that fraction
    *  instead of cfg.ratio. Every refine culls until `until` of the run;
-   *  milestones fire ahead of the schedule. Returns { culled, n, floorBound }. */
-  async softPrune(ratioOverride = null) {
+   *  milestones fire ahead of the schedule. Candidates vote per window and
+   *  only consecutive offenders die (cfg.votes ?? 2); skipRatchet frees a
+   *  cull from the floor entirely (neither held nor set). Returns
+   *  { culled, n, floorBound, candidates }. */
+  async softPrune(ratioOverride = null, { skipRatchet = false } = {}) {
     const cfg = this.opts.softPrune;
     if (!cfg) return { culled: 0, n: this.n };
     const ratio = ratioOverride ?? cfg.ratio ?? 0.1;
@@ -2578,6 +2582,15 @@ export class GSTrainer {
     // would eat the level out from under its snapshot
     if (this.growLimit && this.growLimit < this.cap && this.n >= this.growLimit) {
       return { culled: 0, n: this.n };
+    }
+    // votes ride the rows: growth appends (new tail starts clean), the
+    // compaction below permutes survivors, a reseed births a fresh trainer.
+    // Relocated rows inherit their index's votes — one good window resets
+    // them, so only the still-bad die.
+    if (this._pruneVotes.length !== this.n) {
+      const nv = new Uint16Array(this.n);
+      nv.set(this._pruneVotes.subarray(0, Math.min(this._pruneVotes.length, this.n)));
+      this._pruneVotes = nv;
     }
     const d = this.device;
     d.queue.writeBuffer(this.uniGather, 0, new Uint32Array([this.n, 2, 0, 0]));
@@ -2603,8 +2616,16 @@ export class GSTrainer {
     const plan = planSoftPrune(masses, this.n, ratio, {
       minCull: cfg.minCull ?? 1024, floor: cfg.floor ?? 8192,
       last: this._softPruneFloor || 0, cap: this.cap, logitOp, meanLogS,
+      votes: this._pruneVotes, votesNeeded: cfg.votes ?? 2, skipRatchet,
     });
-    if (!plan) return { culled: 0, n: this.n };
+    if (!plan || !plan.culled) return { culled: 0, n: this.n, candidates: plan ? plan.candidates : 0 };
+    // survivors keep their vote history through the compaction
+    const nvotes = new Uint16Array(plan.kept);
+    for (let i = 0; i < this.n; i++) {
+      const r = plan.rank[i];
+      if (r !== CULLED) nvotes[r] = this._pruneVotes[i];
+    }
+    this._pruneVotes = nvotes;
     this._ensureCompact();
     d.queue.writeBuffer(this.bufCompactRank, 0, plan.rank);
     const bufs = [
@@ -2642,9 +2663,10 @@ export class GSTrainer {
     this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
     // row-indexed CPU state dies with the permutation: the census baseline
     this._lastReloc = null;
-    // the growth ratchet: the next prune (below the cap) holds this floor
-    this._softPruneFloor = plan.kept;
-    return { culled: plan.culled, n: this.n, floorBound: plan.floorBound };
+    // the growth ratchet: the next prune (below the cap) holds this floor —
+    // unless bypassed (early milestones neither hold nor set it)
+    if (!skipRatchet) this._softPruneFloor = plan.kept;
+    return { culled: plan.culled, n: this.n, floorBound: plan.floorBound, candidates: plan.candidates };
   }
 
   /** Lazily built compaction kit: no buffers, no pipelines until the first

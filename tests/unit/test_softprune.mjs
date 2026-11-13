@@ -109,4 +109,56 @@ assert.match(COMPACT_SRC, /tmp\[di \+ k\] = src\[si \+ k\]/, 'a ranked scatter i
 assert.match(COMPACT_SRC, /workgroup_size\(256\)/, 'matches the gather dispatch shape');
 assert.equal(COMPACT_TEMP_BYTES, 16 * 1024 * 1024);
 
+// ---- hysteresis: candidates vote, only consecutive offenders die ------------
+{
+  const n = 20000;
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i;
+  const votes = new Uint16Array(n);
+  const w1 = planSoftPrune(masses, n, 0.2, { votes });
+  assert.equal(w1.culled, 0, 'one bad window votes but culls nothing');
+  assert.equal(w1.kept, n);
+  assert.equal(w1.rank, null, 'no cull means no compaction rank');
+  assert.equal(w1.candidates, 4000, 'the bottom fraction still counts as candidates');
+  assert.ok(votes.slice(0, 4000).every((v) => v === 1), 'candidates vote once');
+  assert.ok(votes.slice(4000).every((v) => v === 0), 'the kept reset');
+  const w2 = planSoftPrune(masses, n, 0.2, { votes });
+  assert.equal(w2.culled, 4000, 'a second bad window confirms the cull');
+  assert.equal(w2.kept, 16000);
+  for (let i = 0; i < 4000; i++) assert.equal(w2.rank[i], CULLED, `row ${i} culled`);
+  for (let i = 4000; i < n; i++) assert.equal(w2.rank[i], i - 4000, `row ${i} ranks ${i - 4000}`);
+  // the window turns: yesterday's candidates recover, today's vote fresh
+  const flipped = new Float32Array(n);
+  for (let i = 0; i < n; i++) flipped[i] = n - 1 - i;
+  const w3 = planSoftPrune(flipped, n, 0.2, { votes });
+  assert.equal(w3.culled, 0, 'recovered rows are spared — votes are consecutive, not lifetime');
+  assert.equal(votes[0], 0, 'a good window clears the count');
+  assert.equal(votes[n - 1], 1, 'the new bottom starts at one');
+}
+// ---- deeper confirmation asks more windows ----------------------------------
+{
+  const n = 5000;
+  const votes = new Uint16Array(n);
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i;
+  assert.equal(planSoftPrune(masses, n, 0.5, { votes, votesNeeded: 3, minCull: 1, floor: 1 }).culled, 0);
+  assert.equal(planSoftPrune(masses, n, 0.5, { votes, votesNeeded: 3, minCull: 1, floor: 1 }).culled, 0);
+  assert.equal(planSoftPrune(masses, n, 0.5, { votes, votesNeeded: 3, minCull: 1, floor: 1 }).culled, 2500,
+    'three strikes with votesNeeded 3');
+}
+// ---- the ratchet can be bypassed (pure milestone culls) ---------------------
+{
+  const n = 20000;
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i;
+  const p = planSoftPrune(masses, n, 0.2, { last: 19000, cap: 1000000, minCull: 1, skipRatchet: true });
+  assert.equal(p.kept, 16000, 'a bypassed ratchet holds nothing back');
+  assert.equal(p.culled, 4000);
+  assert.equal(p.floorBound, null);
+  assert.equal(p.candidates, 4000, 'candidates equal the cull without votes');
+  const short = new Uint16Array(10);
+  assert.throws(() => planSoftPrune(masses, n, 0.2, { votes: short }), /holds 10 rows/,
+    'a short vote array refuses instead of misvoting');
+}
+
 console.log('soft-prune planning (rank + chunk): passed');

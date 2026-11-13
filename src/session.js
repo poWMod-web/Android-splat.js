@@ -1112,10 +1112,14 @@ export class Session {
    *  The holdout is probed before and after (skipped without one); a drop
    *  past 0.5 dB warns but never blocks — training recovers it. Resets
    *  the cap prompt, so the next ceiling hit asks again. */
-  async pruneAndContinue(ratio = 0.5, { extendIters = null, onStatus = null, onProgress = null } = {}) {
+  async pruneAndContinue(ratio = 0.5, { onStatus = null, onProgress = null } = {}) {
     const trainer = this.trainer;
     if (!trainer) throw new Error('seed() first');
     return this._locked(async () => {
+      // pure prune: cull and reseed only — the run's state and horizon are
+      // the visitor's, not the button's, so a paused run stays paused and
+      // the horizon never stretches behind their back
+      const wasTraining = this.training;
       this.training = false;
       const say = (m) => { this._log(m); if (onStatus) onStatus(m); };
       try {
@@ -1134,8 +1138,7 @@ export class Session {
           after = await this.trainer.evalCamPsnr(this.holdout);
           delta = after - before;
         }
-        const ext = extendIters ?? Math.round((this.opts.maxIters ?? 60000) * 0.25);
-        await this.continueFor(ext);
+        this.training = wasTraining;
         this._capAsked = false;
         if (delta != null && delta < -0.5) {
           this._log(`WARNING: prune cost ${(-delta).toFixed(2)} dB ` +
@@ -1145,7 +1148,7 @@ export class Session {
         } else {
           say(`pruned ${raw.n.toLocaleString()} → ${simp.n.toLocaleString()} splats (no holdout — flying blind)`);
         }
-        const out = { from: raw.n, to: simp.n, before, after, delta, maxIters: this.opts.maxIters };
+        const out = { from: raw.n, to: simp.n, before, after, delta, maxIters: this.opts.maxIters, resumed: wasTraining };
         this._em.emit('event', { kind: 'prune-continue', iter, ...out });
         return out;
       } catch (e) {
@@ -1159,7 +1162,7 @@ export class Session {
 
   /** Manual growth pass, any time: one immediate refine (relocate the dead
    *  + grow into the highest-error donors) outside the schedule — the
-   *  Prune/Grow button's other half. A bonus pass like the tandem regrow:
+   *  Prune/Grow button's other half. Pure growth: one refine, no cull —
    *  lastRefine untouched. At a full cap it asks the ceiling question
    *  instead of growing into nothing. */
   async growNow() {
@@ -1637,12 +1640,13 @@ export class Session {
       }
 
       // early milestones (opt-in, ahead of the tandem above): a gentle
-      // 10% trim every 1000 iterations through 6000 — keep 0.9 each —
-      // each followed by its own bonus regrow, since no scheduled
-      // refine follows this early. The old aggressive ladder (keep 1/4
-      // @500, 1/2 @1000, 3/4 @2000) culled before the model carried
-      // any signal and wedged training irrecoverably. Past `until` of
-      // the run (short test runs) the marks stay unfired.
+      // 10% trim every 1000 iterations through 6000 — keep 0.9 each.
+      // Pure culls: no bonus regrow (the scheduled refines grow on their
+      // own cadence) and no ratchet (neither held nor set). The old
+      // aggressive ladder (keep 1/4 @500, 1/2 @1000, 3/4 @2000) culled
+      // before the model carried any signal and wedged training
+      // irrecoverably. Past `until` of the run (short test runs) the
+      // marks stay unfired.
       const spm = trainer.opts ? trainer.opts.softPrune : null;
       if (spm && trainer.iter <= (spm.until ?? 0.85) * this._maxIters()) {
         this._pruneFired ??= [];
@@ -1653,18 +1657,13 @@ export class Session {
           trainer.iter - at < (spm.every ?? 3000) && !this._pruneFired.includes(at));
         if (due) {
           this._pruneFired.push(due[0]);
-          const pruned = await trainer.softPrune(1 - due[1]);
+          const pruned = await trainer.softPrune(1 - due[1], { skipRatchet: true });
           if (!pruned.culled) {
-            this._log(`early prune @${trainer.iter}: kept all ${pruned.n} (too few rows or no signal yet)`);
+            this._log(`early prune @${trainer.iter}: kept all ${pruned.n}` +
+              (pruned.candidates ? ` (${pruned.candidates} voted — confirmation pending)` : ' (too few rows or no signal yet)'));
           } else {
             this._log(`early prune @${trainer.iter}: culled ${pruned.culled} -> ${pruned.n} splats`);
             this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
-            const b = await trainer.refine();
-            if (!refineResult || b.capped) refineResult = b;
-            if (b.grown) {
-              this._log(`tandem regrow @${trainer.iter}: +${b.grown} -> ${b.n} splats`);
-              this._em.emit('event', { kind: 'tandem-regrow', iter: trainer.iter, ...b });
-            }
           }
         }
       }

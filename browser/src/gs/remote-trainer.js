@@ -85,8 +85,8 @@ export class RemoteTrainer {
     return r;
   }
 
-  async softPrune(ratio = null) {
-    const r = await this._rpc.call('softPrune', { ratio });
+  async softPrune(ratio = null, opts = null) {
+    const r = await this._rpc.call('softPrune', { ratio, skipRatchet: !!(opts && opts.skipRatchet) });
     this.iter = r.iter; this.n = r.n;
     return r;
   }

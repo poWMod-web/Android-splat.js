@@ -73,12 +73,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
  * 'absolute', null). Deterministic: same inputs, same plan.
  */
 export function planSoftPrune(masses, n, ratio,
-    { minCull = 1024, floor = 8192, last = 0, cap = Infinity, logitOp = null, meanLogS = null } = {}) {
+    { minCull = 1024, floor = 8192, last = 0, cap = Infinity, logitOp = null, meanLogS = null,
+      votes = null, votesNeeded = 2, skipRatchet = false } = {}) {
   if (!(ratio > 0 && ratio < 1)) throw new Error(`planSoftPrune: ratio must be in (0, 1), got ${ratio}`);
   if (!masses || masses.length < n) throw new Error(`planSoftPrune: masses holds ${masses ? masses.length : 0} rows for n=${n}`);
   let target = n - Math.floor(n * ratio);
   let floorBound = null;
-  if (n < cap && last > 0 && target < Math.min(last, n)) {
+  if (!skipRatchet && n < cap && last > 0 && target < Math.min(last, n)) {
     target = Math.min(last, n);   // the cull eats regrowth, not the curve
     floorBound = 'ratchet';
   }
@@ -122,7 +123,27 @@ export function planSoftPrune(masses, n, ratio,
     if (kept >= target) break;
     rank[i] = kept++;
   }
-  return { rank, kept, culled: n - kept, threshold, floorBound };
+  const candidates = n - kept;
+  if (!votes) return { rank, kept, culled: candidates, threshold, floorBound, candidates };
+  if (votes.length < n) throw new Error(`planSoftPrune: votes holds ${votes.length} rows for n=${n}`);
+  // hysteresis (Mobile-GS votes, on our measured-mass signal): candidates
+  // vote, the merely unlucky reset — only consecutive offenders die, so one
+  // noisy window can never kill a useful splat. Floors computed above still
+  // hold: the final cull is a subset of the candidates.
+  const kill = new Uint8Array(n);
+  let final = 0;
+  for (let i = 0; i < n; i++) {
+    if (rank[i] === CULLED) {
+      votes[i]++;
+      if (votes[i] >= votesNeeded) { kill[i] = 1; final++; }
+    } else votes[i] = 0;
+  }
+  // votes persist through a no-cull window (they ARE the window's product)
+  if (final < minCull) return { rank: null, kept: n, culled: 0, threshold, floorBound, candidates };
+  rank.fill(CULLED);
+  kept = 0;
+  for (let i = 0; i < n; i++) if (!kill[i]) rank[i] = kept++;
+  return { rank, kept, culled: final, threshold, floorBound, candidates };
 }
 
 /**

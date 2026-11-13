@@ -267,7 +267,7 @@ export function createTrainWorkerHandler(deps = {}) {
       }
       case 'softPrune': {
         const tr = need();
-        const r = await tr.softPrune(params.ratio ?? null);
+        const r = await tr.softPrune(params.ratio ?? null, { skipRatchet: !!params.skipRatchet });
         return { value: { ...r, iter: tr.iter, n: tr.n } };
       }
       case 'readLoss': {

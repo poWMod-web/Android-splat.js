@@ -11,8 +11,16 @@ const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8'
 const appHtml = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 
 // ---- the trainer culls by rendered mass, on demand -------------------------
-assert.match(trainer, /async softPrune\(ratioOverride = null\) \{/,
-  'the trainer serves a soft-prune call, with a milestone override');
+assert.match(trainer, /async softPrune\(ratioOverride = null, \{ skipRatchet = false \} = \{\}\) \{/,
+  'the trainer serves a soft-prune call, with a milestone override and a ratchet bypass');
+assert.match(trainer, /this\._pruneVotes = new Uint16Array\(0\);/,
+  'each trainer opens with a clean vote sheet');
+assert.match(trainer, /votes: this\._pruneVotes, votesNeeded: cfg\.votes \?\? 2,/,
+  'every cull votes its candidates, two consecutive windows to die');
+assert.match(trainer, /nvotes\[r\] = this\._pruneVotes\[i\];/,
+  'survivors keep their vote history through the compaction');
+assert.match(trainer, /if \(!skipRatchet\) this\._softPruneFloor = plan\.kept;/,
+  'a bypassed cull neither holds nor sets the ratchet');
 assert.match(trainer, /const ratio = ratioOverride \?\? cfg\.ratio \?\? 0\.1;/,
   'a milestone override culls its own fraction instead of the configured trim');
 assert.match(trainer, /planSoftPrune\(masses, this\.n, ratio, \{/,
@@ -43,10 +51,10 @@ assert.match(protocol, /'softPrune',    \/\/ importance-cull barrier/,
   'the RPC contract lists the call');
 assert.match(worker, /case 'softPrune': \{/,
   'the worker serves it');
-assert.match(remote, /async softPrune\(ratio = null\) \{/,
-  'the remote proxy mirrors n/iter like refine does');
-assert.match(worker, /const r = await tr\.softPrune\(params\.ratio \?\? null\);/,
-  'the worker forwards a milestone override to its trainer');
+assert.match(remote, /async softPrune\(ratio = null, opts = null\) \{/,
+  'the remote proxy forwards the ratchet bypass with n/iter like refine does');
+assert.match(worker, /const r = await tr\.softPrune\(params\.ratio \?\? null, \{ skipRatchet: !!params\.skipRatchet \}\);/,
+  'the worker forwards a milestone override and bypass to its trainer');
 
 // ---- the session drives cadence, prompt, and prune-and-continue ------------
 assert.match(session, /const pruned = await trainer\.softPrune\(\);/,
@@ -55,8 +63,8 @@ assert.match(session, /tandem prune @/,
   'the cull rides inside the scheduled refine');
 assert.match(session, /\[tandem: culled /,
   'the refine log names the cull it regrew');
-assert.match(session, /pruned = await trainer\.softPrune\(1 - due\[1\]\);/,
-  'early milestones cull their own keep-fraction');
+assert.match(session, /pruned = await trainer\.softPrune\(1 - due\[1\], \{ skipRatchet: true \}\);/,
+  'early milestones cull their own keep-fraction, ratchet bypassed');
 assert.match(session, /kind: 'soft-prune', iter: trainer\.iter/,
   'culls surface as events');
 assert.match(session, /if \(refineResult && refineResult\.capped && !this\._capAsked\) \{/,
@@ -65,8 +73,15 @@ assert.match(session, /kind: 'cap-hit', iter: trainer\.iter, splats: trainer\.n/
   'the question reaches the UI as an event');
 assert.match(session, /async pruneAndContinue\(ratio = 0\.5,/,
   'prune-and-continue defaults to half');
-assert.match(session, /await this\.continueFor\(ext\);/,
-  'the reseed stretches the horizon and resumes');
+assert.match(session, /async pruneAndContinue\(ratio = 0\.5, \{ onStatus = null, onProgress = null \}/,
+  'a pure prune takes no horizon extension');
+assert.match(session, /this\.training = wasTraining;/,
+  'a pure prune restores the run state instead of resuming');
+assert.match(session, /resumed: wasTraining/,
+  'the outcome reports whether training resumed');
+const pruneBody = session.slice(session.indexOf('async pruneAndContinue'), session.indexOf('async growNow()'));
+assert.ok(!pruneBody.includes('continueFor') && !pruneBody.includes('trainer.refine('),
+  'a pure prune neither extends the horizon nor grows');
 assert.match(session, /kind: 'prune-continue', iter, \.\.\.out/,
   'the outcome (counts, probe delta, horizon) reaches the UI');
 
@@ -135,8 +150,9 @@ assert.match(session, /trainerOpts = this\._withTandemBoost\(trainerOpts\);/,
   'every boot (local, remote, worker) recomputes the tandem boost');
 assert.match(session, /const g1 = \(1 \+ g0\) \/ \(1 - sp\.ratio\) - 1;/,
   'the per-refine boost holds the no-prune trajectory against the cull');
-assert.match(session, /kind: 'tandem-regrow', iter: trainer\.iter/,
-  'the bonus growth pass surfaces as an event');
+const mileBody = session.slice(session.indexOf('early milestones (opt-in'), session.indexOf("the ceiling's own prompt"));
+assert.ok(!mileBody.includes('trainer.refine(') && !mileBody.includes('tandem-regrow'),
+  'milestones cull pure: no regrow, no ratchet');
 assert.match(session, /async growNow\(\) \{/,
   'the session serves a manual growth pass');
 assert.match(app, />Prune\/Grow<\/button>/,
