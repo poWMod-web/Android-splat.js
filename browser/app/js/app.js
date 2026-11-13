@@ -627,6 +627,9 @@ function boot() {
   initXRUI({
     flash,
     onCapture: (capture) => useOwnPhotos(capture.files, capture),
+    // the native import runs before any review modal exists: Start refuses
+    // while the counter stands (see startPrep)
+    setBusy: (on) => { S._intakeN = Math.max(0, (S._intakeN || 0) + (on ? 1 : -1)); },
   });
   $('xr-review-set').addEventListener('click', async () => {
     const dataset = S.preset?.capture || { kind: 'photos', files: S.preset?.files || [], points: [] };
@@ -1476,7 +1479,15 @@ function persistCapture(rec) {
   });
 }
 
+// Async intake funnels through here (file picker, drops, captures, zips):
+// the landing set's open() bumps S.gen, which silently kills a startPrep in
+// flight — Start refuses while the counter stands (see startPrep).
 async function useOwnPhotos(list, capture = null) {
+  S._intakeN = (S._intakeN || 0) + 1;
+  try { return await useOwnPhotosInner(list, capture); }
+  finally { S._intakeN--; }
+}
+async function useOwnPhotosInner(list, capture = null) {
   // capture zips (exported photos + camera JSON) unpack to files and join
   // the flow below; a session zip restores instead of training
   const all = [];
@@ -1549,7 +1560,13 @@ async function useOwnPhotos(list, capture = null) {
 /** A video: every frame is scored (sharpness, motion, cuts), the picks are
  *  shown on a timeline the user can trim, then the winners are captured and
  *  continue exactly like a photo set. */
+// video intake lands through open() too — same guard as photo sets above
 async function useOwnVideo(file) {
+  S._intakeN = (S._intakeN || 0) + 1;
+  try { return await useOwnVideoInner(file); }
+  finally { S._intakeN--; }
+}
+async function useOwnVideoInner(file) {
   const card = document.createElement('div');
   card.className = 'upcard';
   card.id = 'vidcard';
@@ -1866,8 +1883,10 @@ function videoReview(card, ctx) {
 async function open(preset, autostart = false) {
   document.getElementById('failcard')?.remove();
   if (preset.list && !preset.names) {
+    S._intakeN = (S._intakeN || 0) + 1;
     try { await loadPresetList(preset); }
     catch { flash('Could not load that set\'s file list.', 5000); return; }
+    finally { S._intakeN--; }
   }
   S.gen++;
   if (S.session) { S.session.pause(); S.session.dispose(); }
@@ -2043,6 +2062,9 @@ async function avatarPrep(gen) {
 }
 
 async function startPrep() {
+  // a photo/capture/video set still landing (its open() would bump the
+  // generation and silently kill this start below): say so, don't just die
+  if ((S._intakeN || 0) > 0) { flash('The frames are still landing — Start again in a moment.', 4000); return; }
   document.getElementById('failcard')?.remove();
   if (S.commitSettings && !S.commitSettings()) return;
   // migrate-on-swipe: one GPU — a live headless run owns it until adopted,
@@ -6040,7 +6062,40 @@ async function headlessMarkerLive() {
     if (!Headless.validRunId(runId)) return false;
     const st = await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
     if (!st.ok) return false;
-    return Headless.isLiveStatus(await st.json());
+    const status = await st.json();
+    if (!Headless.isLiveStatus(status)) return false;
+    // a live run owned by a service that answers no ping died with its
+    // process (killed, crashed, updated): release it to recovery instead of
+    // blocking every new start behind a run that will never finish
+    if (status.owner === 'service' && !(await headlessServiceAlive(runId))) {
+      try {
+        headlessBridge().writeRunJson(runId, 'status.json', JSON.stringify({
+          ...status, status: 'interrupted', at: Date.now(),
+          error: 'the background trainer was gone when a new run started',
+        }));
+      } catch { /* best-effort: the new run's own staging overwrites the marker */ }
+      return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
+/** Liveness of a service-owned run: a fresh heartbeat proves it outright; a
+ *  quiet one gets a ping round-trip (answered from Java, which no page
+ *  throttle can silence) before it is declared dead. Conservative throughout:
+ *  any doubt blocks the new start, as before. */
+async function headlessServiceAlive(runId) {
+  const b = headlessBridge();
+  try {
+    const s = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json().catch(() => null);
+    if (Headless.heartbeatFresh(s)) return true;
+  } catch { /* fall through to the ping */ }
+  if (!b || typeof b.headlessCommand !== 'function') return true;
+  try { b.headlessCommand('headless-ping', runId); } catch { return true; }
+  await new Promise((r) => setTimeout(r, 1200));
+  try {
+    const s = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json();
+    return Headless.heartbeatFresh(s);
   } catch { return false; }
 }
 /** Stage the handoff for this run: manifest + marker now, photos in the

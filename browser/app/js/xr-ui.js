@@ -130,7 +130,7 @@ export function reviewCapture(dataset) {
   });
 }
 
-export function initXRUI({ onCapture, flash }) {
+export function initXRUI({ onCapture, flash, setBusy }) {
   const button = $('btn-ar');
   const nativeBridge = globalThis.AndroidARBridge;
   const nativeAvailable = !!(nativeBridge && typeof nativeBridge.isAvailable === 'function' && nativeBridge.isAvailable());
@@ -168,7 +168,12 @@ export function initXRUI({ onCapture, flash }) {
     button.disabled = true;
     try {
       if (nativeAvailable) { nativeBridge.startCapture(); return; }
-      const dataset = await captureXR();
+      // the browser capture resolves before any review modal exists: Start
+      // refuses while the counter stands (the app's setBusy)
+      setBusy?.(true);
+      let dataset = null;
+      try { dataset = await captureXR(); }
+      finally { setBusy?.(false); }
       if (!dataset) return;
       const reviewed = await reviewCapture(dataset);
       if (reviewed) await onCapture(reviewed);
@@ -184,6 +189,9 @@ export function initXRUI({ onCapture, flash }) {
     button.querySelector('span').textContent = 'Capture with ARCore';
     $('xr-capability-note').textContent = 'Native ARCore capture pairs camera images with tracked poses and an RGB seed cloud.';
     window.addEventListener('splatxr-native-capture', async () => {
+      // the import (and the review after it) land through open(): Start
+      // refuses while the counter stands (the app's setBusy)
+      setBusy?.(true);
       try {
         const dataset = await importNativeCapture();
         const reviewed = await reviewCapture(dataset);
@@ -201,7 +209,7 @@ export function initXRUI({ onCapture, flash }) {
       } catch (e) {
         console.error('[SplatXR] Native capture import failed:', e);
         showXRHelp(e.message || 'Native ARCore capture could not be imported.');
-      }
+      } finally { setBusy?.(false); }
     });
   }
 

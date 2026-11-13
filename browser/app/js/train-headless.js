@@ -28,7 +28,7 @@ let manifest = null;
 let recon = null;          // the checkpoint's recon (cloud + leveling carry over)
 let snapCam = null;
 let files = [];
-let ending = false;        // finalize/abort in flight — the tick stands down
+let ending = false;        // finalize/abort in flight — the metrics beat stands down
 let ckptBusy = false;
 let lastProgAt = 0, lastProgIter = -1;
 let ips = 0, ipsAt = 0, ipsIter = 0;
@@ -139,7 +139,10 @@ async function boot() {
     postProgress(true);
     if (!wasPaused) ses.start();
     else log('resumed paused (the run was paused when swiped away)');
-    setInterval(tick, 2500);
+    // progress rides the metrics beat (every readout while frames run), not a
+    // timer: this page is hidden from birth, so its intervals throttle to a
+    // crawl and the notification would freeze behind a healthy run
+    ses.on('metrics', () => postProgress());
   } catch (e) {
     await fail(e);
   }
@@ -176,11 +179,6 @@ function postProgress(force = false) {
       training: !!ses.training, at: now,
     }));
   } catch (e) { log('progress post failed', e); }
-}
-
-async function tick() {
-  if (ending || !ses || !ses.trainer) return;
-  postProgress();   // progress only — file checkpoints are transition-driven (finish/stop)
 }
 
 /** One-shot file checkpoint: the raw state plus a recon that carries the

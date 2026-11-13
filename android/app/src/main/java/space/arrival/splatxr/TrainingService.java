@@ -206,6 +206,28 @@ public final class TrainingService extends Service {
                 }
                 break;
             }
+            case "headless-ping": {
+                // liveness probe for a service-owned live marker (the Start
+                // guard): answered from Java, which no page throttle silences —
+                // a frozen-but-alive twin still owns its run and must block.
+                // Owned = the live twin, or a handoff still settling for this
+                // run; anything else lingers nothing.
+                String runId = intent.getStringExtra("runId");
+                boolean owned = runId != null &&
+                        ((headlessActive && runId.equals(headlessRunId)) ||
+                                (!handoffSettled && runId.equals(handoffRunId)));
+                if (owned) {
+                    try {
+                        JSONObject beat = new JSONObject();
+                        beat.put("alive", true);
+                        beat.put("at", System.currentTimeMillis());
+                        RunFiles.writeJson(this, runId, "service.json", beat.toString());
+                    } catch (Exception ignored) { /* the guard treats silence as dead */ }
+                } else {
+                    stopSelf(); // delivered to a dead service: linger nothing
+                }
+                break;
+            }
             case "headless-stop":
                 // never boots a trainer just to stop it: with no live twin the
                 // status file is the whole story

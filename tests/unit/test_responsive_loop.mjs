@@ -614,4 +614,55 @@ async function smallTrainer(trainerOpts = {}) {
   assert.ok(timed._tsSet, 'the feature present means the timer builds by default');
 }
 
+// ---- (7b) hidden pages pump frames through a MessageChannel, not rAF/timers ----
+// rAF never fires hidden and worker timers throttle to 1/s, then 1/min —
+// without the pump a swiped-away run crawls, then freezes, then resumes on
+// return. Node has MessageChannel, so the pump runs here too.
+{
+  const s = createSession({});
+  let steps = 0;
+  s.trainer = {
+    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50,
+    stepOnce() { steps++; this.iter++; },
+    device: { queue: { async onSubmittedWorkDone() {} } },
+  };
+  s.view._tick = () => {};
+  s._ensureScheduler();
+  assert.equal(typeof s._sched.pump, 'function', 'the scheduler builds a channel pump');
+  globalThis.document = { hidden: true };
+  try {
+    s.training = true;
+    s._frameCount = 0;
+    s._lastStats = performance.now();
+    s._scheduleFrame();
+    await new Promise((r) => setTimeout(r, 60));
+    assert.ok(s._frameCount >= 2, `hidden frames chain through the pump (ran ${s._frameCount})`);
+    assert.ok(steps > 0, 'hidden frames run steps');
+    s.training = false;
+    const parked = s._frameCount;
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(s._frameCount, parked, 'pausing parks the pumped loop');
+  } finally {
+    s.training = false;
+    delete globalThis.document;
+  }
+  // visible pages keep the rAF path: the pump sits idle
+  const v = createSession({});
+  v.trainer = {
+    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50,
+    stepOnce() {}, device: { queue: { async onSubmittedWorkDone() {} } },
+  };
+  v.view._tick = () => {};
+  v._ensureScheduler();
+  assert.equal(typeof v._sched.pump, 'function', 'the pump exists even when unused');
+  const origPump = v._sched.pump, origRaf = v._sched.raf;
+  let pumped = 0, rafd = 0;
+  v._sched.pump = () => { pumped++; origPump(); };
+  v._sched.raf = (fn) => { rafd++; origRaf(fn); };
+  v._scheduleFrame();
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(pumped, 0, 'visible pages never touch the pump');
+  assert.equal(rafd, 1, 'visible pages schedule through rAF');
+}
+
 console.log('responsive loop (yields, hidden skips, pooled step scratch, duty governor) verified');

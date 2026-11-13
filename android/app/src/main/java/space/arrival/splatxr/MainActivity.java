@@ -475,12 +475,13 @@ public final class MainActivity extends Activity {
             } catch (Exception ignored) { /* the service times out instead */ }
         }
 
-        /** A command to the headless twin (pause/resume/stop/snapshot). Plain
+        /** A command to the headless twin (pause/resume/stop/snapshot/ping). Plain
          *  start: the service is already foreground while a run lives. */
         @JavascriptInterface public void headlessCommand(String action, String runId) {
             if (action == null || runId == null) return;
             if (!action.equals("headless-pause") && !action.equals("headless-resume") &&
-                    !action.equals("headless-stop") && !action.equals("headless-snapshot")) return;
+                    !action.equals("headless-stop") && !action.equals("headless-snapshot") &&
+                    !action.equals("headless-ping")) return;
             if (!RunFiles.validRunId(runId)) return;
             try {
                 startService(new Intent(MainActivity.this, TrainingService.class)

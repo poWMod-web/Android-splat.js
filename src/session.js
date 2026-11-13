@@ -1385,8 +1385,24 @@ export class Session {
             performance.now() - this._frameScheduledAt > 150) runFrame();
       };
     }
+    // Background driver: a hidden page loses rAF entirely and its worker
+    // timers throttle (1/s hidden, 1/min after five minutes) — the loop
+    // would crawl, then freeze, on swipe-away. Message tasks are NOT
+    // timer-throttled, so a hidden page pumps its frames through a channel
+    // instead; the tick worker stays as the backstop for visible pages.
+    let pump = null;
+    if (typeof MessageChannel === 'function') {
+      try {
+        const ch = new MessageChannel();
+        ch.port1.onmessage = () => runFrame();
+        // Node-only: a listening port holds the event loop open — the pump
+        // must never keep a process (or a test) alive by itself
+        try { ch.port1.unref?.(); ch.port2.unref?.(); } catch { /* browsers have no unref */ }
+        pump = () => ch.port2.postMessage(0);
+      } catch { /* no channel: rAF plus the worker backstop, as before */ }
+    }
     this._sched = {
-      runFrame, tickWorker,
+      runFrame, tickWorker, pump,
       raf: typeof requestAnimationFrame === 'function'
         ? (fn) => requestAnimationFrame(fn) : (fn) => setTimeout(fn, 16),
     };
@@ -1399,7 +1415,11 @@ export class Session {
   _scheduleFrame() {
     this._framePending = true;
     this._frameScheduledAt = performance.now();
-    this._sched.raf(this._sched.runFrame);
+    // hidden (swiped-away, background tab, screen off): rAF never fires and
+    // the worker tick throttles — pump through the channel instead. Decided
+    // per frame, so hiding or showing mid-run just switches drivers.
+    if (isHidden() && this._sched.pump) this._sched.pump();
+    else this._sched.raf(this._sched.runFrame);
   }
 
   /** Effective GPU usage: the governor's auto duty capped by the slider.
