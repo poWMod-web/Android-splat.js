@@ -3285,7 +3285,7 @@ async function checkpointRun(reason) {
   S._ckptBusy = true;
   const gen = S.gen;
   try {
-    const { packState, buildReconJson } = await import('./session_io.js');
+    const { packState, buildReconJson, trainBudget } = await import('./session_io.js');
     const state = new Blob([await packState(S.session)]);
     if (S.gen !== gen) return null;
     const recon = buildReconJson(S);
@@ -3294,7 +3294,7 @@ async function checkpointRun(reason) {
     await patchRun(S.runId, {
       iter: it, splats: S.splats || S.session.trainer.n,
       psnr: S.psnrHold ?? S.psnrTrain ?? null,
-      cap: S.session.trainer.cap || 0,   // growth headroom carries over
+      cap: trainBudget(S.session),   // the configured budget carries over, not the allocation (seed x capMult under-allocates — the continue card must see the limit training runs under)
       state, recon, ckptAt: Date.now(), minutes: detailProgress.minutes,
       detailSolve: captureRunSolveDetails(),
       detailProgress,

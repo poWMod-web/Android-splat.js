@@ -42,6 +42,18 @@ export function trainRecipe(ses) {
   return t;
 }
 
+/** The splat budget training was CONFIGURED with (the session trainer opts'
+ *  maxSplats), falling back to the live allocation ceiling, then the model
+ *  size. trainer.cap alone lies low whenever seed x capMult under-allocates
+ *  (the default for explicit sub-1M budgets): the continue card's "Original
+ *  budget" and every ceiling that inherits it must see the configured limit,
+ *  not the allocation. */
+export function trainBudget(ses) {
+  const t = (ses && ses.opts && ses.opts.trainer) || {};
+  const tr = (ses && ses.trainer) || {};
+  return Math.max(t.maxSplats || 0, tr.cap || 0, tr.n || 0);
+}
+
 /** Capture-world gravity in the DATA frame, from a capture.json leveling
  *  report (row-major rotation R): leveling rotates the world by R, so the
  *  capture world's +Y — gravity, ARCore sessions are gravity-aligned — sits
@@ -140,7 +152,9 @@ export function buildReconJson(S) {
     })) } : {}),
     iter: ses.trainer.iter,
     splats: ses.trainer.n,
-    maxSplats: ses.trainer.cap || 0,
+    // the CONFIGURED budget (records old enough to hold the allocation read
+    // low here, exactly as before — new saves carry the real limit)
+    maxSplats: trainBudget(ses),
     shK: ses.trainer.shK,
     sceneRadius: ses.model.radius,
     center: ses.model.center ? r6(ses.model.center) : null,

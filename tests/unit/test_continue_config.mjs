@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { convertSHDegree, continuedInputDim, continuedBuf } from '../../app/js/session_io.js';
+import { convertSHDegree, continuedInputDim, continuedBuf, trainBudget } from '../../app/js/session_io.js';
 import { adaptiveTrainCap } from '../../src/io/frames.js';
 
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
@@ -78,8 +78,10 @@ assert.match(cont, /Math\.max\(fr0\.nw \|\| fr0\.fw \|\| 0, fr0\.nh \|\| fr0\.fh
   'Full size should use the file’s own pixel size, not the feature-capped dims');
 assert.match(sessionIo, /\.\.\.\(Number\.isFinite\(f\.srcW\) \? \{ nw: f\.srcW, nh: f\.srcH \} : \{\}\)/,
   'the recon JSON should persist each frame’s native pixel size');
-assert.match(sessionIo, /maxSplats: ses\.trainer\.cap \|\| 0,/,
+assert.match(sessionIo, /maxSplats: trainBudget\(ses\),/,
   'the recon JSON should record the budget continuations replay');
+assert.match(app, /cap: trainBudget\(S\.session\),/,
+  'checkpoints should record the configured budget, not the allocation');
 assert.match(cont, /const cap = Math\.max\(g\.n, lr\.splats \|\| 0, lr\.cap \|\| 0,/,
   'the continuation should carry the run’s own budget, finished runs included');
 assert.match(cont, /Math\.max\(g\.n, lr\.splats \|\| 0,[\s\S]*opts\.splats \|\| 0\)/,
@@ -173,6 +175,17 @@ assert.match(cont, /ses\.trainer\.growLimit = S\.lodPlan\.levels\[S\.lodPlan\.id
   assert.equal(continuedBuf(undefined, {}, 480), 1);
   assert.equal(continuedBuf(undefined, { res: 960, buf: 0.5 }, 0), 0.5);
   assert.equal(continuedBuf(NaN, { res: 960, buf: 0.5 }, 480), 0.5);
+}
+
+// The recorded budget is the CONFIGURED limit, not the allocation: a small
+// seed x capMult under-allocates (explicit sub-1M budgets default to x4),
+// and the continue card must show the limit training runs under.
+{
+  assert.equal(trainBudget({ opts: { trainer: { maxSplats: 600000 } }, trainer: { cap: 124000, n: 124000 } }), 600000);
+  assert.equal(trainBudget({ opts: { trainer: { maxSplats: 300000 } }, trainer: { cap: 300000, n: 290000 } }), 300000);
+  assert.equal(trainBudget({ opts: {}, trainer: { cap: 200000, n: 180000 } }), 200000);
+  assert.equal(trainBudget({ opts: {}, trainer: { n: 50000 } }), 50000);
+  assert.equal(trainBudget(null), 0);
 }
 
 // A fresh run's done screen must reach the same finished-run path: finish()
