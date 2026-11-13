@@ -261,11 +261,13 @@ function readKeepCustom(id) {
   const pct = Math.round(parseFloat($(id).value) || 0);
   return (pct >= 5 ? Math.min(95, pct) : 50) / 100;
 }
-/** Custom PRUNE percentage from a picker input (clamped 5–95%, 50% when the
- *  input is empty or garbage): returns the KEEP fraction the flow wants. */
+/** Custom PRUNE percentage from a picker input (clamped 1–95%, 50% only
+ *  when the input is empty or garbage): returns the KEEP fraction the flow
+ *  wants. A valid low value such as 3 must remain 3, never fall back to 50. */
 function readPruneCustom(id) {
-  const pct = Math.round(parseFloat($(id).value) || 0);
-  return 1 - (pct >= 5 ? Math.min(95, pct) : 50) / 100;
+  const raw = parseFloat($(id).value);
+  const pct = Number.isFinite(raw) ? Math.min(95, Math.max(1, Math.round(raw))) : 50;
+  return 1 - pct / 100;
 }
 
 // quality macros: the one-knob row that drives the individual rows below it.
@@ -3170,7 +3172,7 @@ function showPrunePicker() {
       <button class="btn" data-ratio="0.75">Prune ¼</button>
       <button class="btn" data-ratio="0.5">Prune ½</button>
       <button class="btn" data-grow="1">Grow now</button>
-      <input id="prunepick-custom" type="number" min="5" max="95" step="1" value="50" style="width:4.5em" title="Custom prune percentage (5–95)">
+      <input id="prunepick-custom" type="number" min="1" max="95" step="1" value="50" style="width:4.5em" title="Custom prune percentage (1–95)">
       <button class="btn" data-custom="1">Prune %</button>
       <button class="btn linkish" data-ratio="">Cancel</button>
     </div>`;
