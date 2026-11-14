@@ -1146,16 +1146,14 @@ a.cbtn { text-decoration: none; }
 
 /* Service monitor: snapshots and score live inside the card, never behind its
    frosted backdrop. The service remains the sole WebGPU owner. */
-#monitor { width: min(920px, calc(100% - 24px)); }
+#monitor { width: 100%; max-width: none; height: calc(100dvh - 52px); box-sizing: border-box; }
+#monitor > .monitor-live-grid { width: min(920px, 100%); }
 .monitor-live-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin: 14px auto 2px; width: 100%; }
 .monitor-preview, .monitor-chartwrap { min-height: 190px; border: 1px solid var(--line); background: rgba(7,9,9,.72); border-radius: 10px; overflow: hidden; position: relative; }
 .monitor-preview canvas, .monitor-chartwrap canvas { display: block; width: 100%; height: 190px; }
 .monitor-preview canvas { object-fit: contain; }
 .monitor-preview small { position: absolute; left: 8px; bottom: 6px; color: var(--dim); font: 10px var(--mono); background: rgba(7,9,9,.72); padding: 2px 4px; }
 @media (max-width: 700px) { .monitor-live-grid { grid-template-columns: 1fr; } }
-.strip { position: relative; }
-.strip-align { position: absolute; right: 10px; top: -42px; z-index: 8; backdrop-filter: blur(8px); }
-
 .monitor-preview[hidden] + .monitor-chartwrap { grid-column: 1 / -1; }
 .monitor-gpu { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 10px auto 0; color: var(--dim); font: 11px var(--mono); }
 .monitor-gpu input { width: min(260px, 48vw); }

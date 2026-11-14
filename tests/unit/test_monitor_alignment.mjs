@@ -7,6 +7,7 @@ const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival
 const service = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
 const session = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
 const align = readFileSync(new URL('../../app/js/align.js', import.meta.url), 'utf8');
+const css = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
 
 assert.match(headless, /scoreHistory: \(ses\.lossHistory \|\| \[\]\)\.slice\(-400\)/);
 assert.match(app, /new Chart\(\$\('mon-chart'\)/);
@@ -32,12 +33,25 @@ for (const cmd of ['headless-prune', 'headless-grow']) {
 }
 assert.match(headless, /globalThis\.__headlessGrow/);
 assert.match(headless, /globalThis\.__headlessPrune/);
+assert.match(headless, /resume = await ses\.pauseAndDrain\(\);[\s\S]*const state = await packState\(ses\)/,
+  'service checkpoints wait for the active GPU frame before mapping buffers');
+assert.match(session, /async pauseAndDrain\(\)/);
+assert.match(session, /const wasTraining = await this\.pauseAndDrain\(\);[\s\S]*return this\._locked/,
+  'manual prune drains its frame before taking the readback lock');
+assert.match(session, /const work = this\._frameLoop\(\);[\s\S]*this\._frameWork = work/,
+  'the pause barrier tracks the complete in-flight frame');
 
 assert.match(app, /adjacentPoseCandidates\(S\.photos, S\.scene\.cams, i\)/);
 assert.match(align, /ransacE\(/);
 assert.match(align, /selectPose\(/);
 assert.match(app, /Automatic alignment found/);
 assert.match(app, /Manual frame alignment/);
+assert.match(app, /align\.id = 'c-align'/,
+  'Align belongs to the selected-frame controls');
+assert.doesNotMatch(app, /strip-align|Align selected/,
+  'the filmstrip must not show Align before an image is selected');
+assert.match(css, /#monitor \{ width: 100%; max-width: none; height: calc\(100dvh - 52px\); box-sizing: border-box; \}/,
+  'the background monitor covers the full viewport below the app bar');
 assert.match(app, /checkpointRun\('align'\)/);
 assert.match(session, /async updateCameraPose\(ci, R, t\)/);
 assert.match(session, /this\.recon\?\.cams\?\.find/);

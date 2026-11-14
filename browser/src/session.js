@@ -1135,6 +1135,24 @@ export class Session {
 
   pause() { this.training = false; }
 
+  /** Stop scheduling and wait for the currently submitted frame/readbacks to
+   * settle. GPU buffer mapping is exclusive: prune, checkpoint, snapshot and
+   * grow must cross this barrier before they start their own readback. Returns
+   * whether training was running so callers can restore that state. */
+  async pauseAndDrain() {
+    const wasTraining = !!this.training;
+    this.training = false;
+    this._framePending = false;
+    const active = this._frameWork;
+    if (active) await active;
+    // The finishing frame may have requested a view-only follow-up.
+    this._framePending = false;
+    if (!this._remote && this.trainer?.device?.queue) {
+      await this.trainer.device.queue.onSubmittedWorkDone();
+    }
+    return wasTraining;
+  }
+
   /** Raise the training horizon by `moreIters` and resume. The trainer's
    *  schedules (pos-lr decay, growth stop) are horizon-relative and stretch
    *  with it — this is a real continued run, not idling at floor lr. */
@@ -1159,12 +1177,14 @@ export class Session {
   async pruneAndContinue(ratio = 0.5, { onStatus = null, onProgress = null } = {}) {
     const trainer = this.trainer;
     if (!trainer) throw new Error('seed() first');
+    // Pause OUTSIDE the readback lock. An active frame can itself be waiting
+    // for that lock; taking it first would deadlock, while skipping this
+    // barrier caused GPUBuffer "outstanding map pending" in the service.
+    const wasTraining = await this.pauseAndDrain();
     return this._locked(async () => {
       // pure prune: cull and reseed only — the run's state and horizon are
       // the visitor's, not the button's, so a paused run stays paused and
       // the horizon never stretches behind their back
-      const wasTraining = this.training;
-      this.training = false;
       const say = (m) => { this._log(m); if (onStatus) onStatus(m); };
       // the loop restarts through start(), not the bare flag: the in-flight
       // frame already exited without rescheduling, and start() no-ops while
@@ -1258,8 +1278,9 @@ export class Session {
   async growNow() {
     const trainer = this.trainer;
     if (!trainer) throw new Error('seed() first');
-    return this._locked(async () => {
-      const r = await trainer.refine();
+    const wasTraining = await this.pauseAndDrain();
+    try {
+      const r = await this._locked(() => trainer.refine());
       this._log(`grow-now @${trainer.iter}: relocated ${r.moved || 0}, grew +${r.grown || 0} -> ${r.n} splats`);
       this._em.emit('event', { kind: 'grow-now', iter: trainer.iter, ...r });
       if (r.capped && !this._capAsked) {
@@ -1267,9 +1288,12 @@ export class Session {
         this.training = false;
         this._log(`splat cap reached at ${trainer.n} — paused: keep training at the cap, or prune and continue`);
         this._em.emit('event', { kind: 'cap-hit', iter: trainer.iter, splats: trainer.n });
-      }
+      } else if (wasTraining) this.start();
       return r;
-    });
+    } catch (e) {
+      if (wasTraining) this.start();
+      throw e;
+    }
   }
 
   /** End the run early with the model as it stands: final metrics, then the
@@ -1397,9 +1421,12 @@ export class Session {
       arm();
       // a readback rejecting mid-flight (device loss) must not become an
       // unhandled rejection — _frameFailed stops the loop and explains it
-      this._frameLoop().then(
+      const work = this._frameLoop();
+      this._frameWork = work;
+      work.then(
         () => { if (this._frameSeq === id) clearTimeout(this._stallT); },
-        (e) => { if (this._frameSeq === id) clearTimeout(this._stallT); this._frameFailed(e); });
+        (e) => { if (this._frameSeq === id) clearTimeout(this._stallT); this._frameFailed(e); })
+        .finally(() => { if (this._frameWork === work) this._frameWork = null; });
     };
     if (tickWorker) {
       tickWorker.onmessage = () => {

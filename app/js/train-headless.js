@@ -225,9 +225,11 @@ function postProgress(force = false) {
  *  recon holds no points and no capture metadata). Transitions only. */
 async function secureFileCheckpoint() {
   if (ckptBusy || !ses || !ses.trainer) return false;
-  const iter = ses.trainer.iter | 0;
+  let resume = false;
   ckptBusy = true;
   try {
+    resume = await ses.pauseAndDrain();
+    const iter = ses.trainer.iter | 0;
     const state = await packState(ses);
     const chunks = b64(state);
     for (let i = 0; i < chunks.length; i++) {
@@ -249,7 +251,10 @@ async function secureFileCheckpoint() {
   } catch (e) {
     log('checkpoint failed', e);   // best-effort: never disturb the run
     return false;
-  } finally { ckptBusy = false; }
+  } finally {
+    ckptBusy = false;
+    if (resume && !ending && ses && !ses.training) ses.start();
+  }
 }
 
 const filesWithUrls = () => files.map((f, i) => Object.assign(f, {
@@ -345,7 +350,14 @@ globalThis.__headlessStop = async () => {
     await fail(e);
   }
 };
-globalThis.__headlessSnapshot = () => snapshot();
+globalThis.__headlessSnapshot = async () => {
+  if (!ses || ending) return;
+  let resume = false;
+  try {
+    resume = await ses.pauseAndDrain();
+    await snapshot();
+  } finally { if (resume && !ending && ses && !ses.training) ses.start(); }
+};
 let manualEdit = false;
 async function manualModelEdit(kind, keep = 0.75) {
   if (!ses || !ses.trainer || ending || manualEdit) return;

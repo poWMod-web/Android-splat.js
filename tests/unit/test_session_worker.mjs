@@ -606,8 +606,8 @@ assert.match(sessionSource, /async capture\(\) \{\n    if \(!this\.camera\) thro
   'the view offers canvas-free capture in both modes');
 assert.match(sessionSource, /await this\._commitSplit\(excluded\);/,
   'the training split commits once (single remote round trip)');
-assert.match(sessionSource, /this\._frameLoop\(\)\.then\(\n        \(\) => \{ if \(this\._frameSeq === id\) clearTimeout\(this\._stallT\); \},\n        \(e\) => \{ if \(this\._frameSeq === id\) clearTimeout\(this\._stallT\); this\._frameFailed\(e\); \}\);\n/,
-  'frame failures stop the loop loudly instead of wedging training=true (and land the stall watchdog)');
+assert.match(sessionSource, /const work = this\._frameLoop\(\);\n      this\._frameWork = work;\n      work\.then\([\s\S]*this\._frameFailed\(e\); \}\)[\s\S]*this\._frameWork = null/,
+  'frame failures stop loudly while the pause barrier tracks the full frame');
 assert.match(sessionSource, /kind: 'train-error'/,
   'a throwing frame emits train-error (the app offers resume)');
 assert.match(sessionSource, /kind: 'worker-error'/,

@@ -4774,6 +4774,11 @@ function renderControls() {
         renderControls();
         syncFrameUrl();
       }));
+    const align = document.createElement('button');
+    align.className = 'cbtn'; align.id = 'c-align'; align.textContent = 'Align';
+    align.title = 'Correct this selected image’s camera pose';
+    align.addEventListener('click', alignSelectedFrame);
+    c.appendChild(align);
   }
 
   if (S.state !== 'done') return;
@@ -6318,7 +6323,7 @@ async function alignSelectedFrame() {
   const i = S.sel, cam = S.scene?.cams?.[i];
   if (!cam?.R || S._aligning) return;
   if (!confirm(`Align frame ${i + 1}? Training pauses at a safe boundary. Automatic alignment uses feature matches to the previous and next placed images; nothing changes until you confirm.`)) return;
-  S._aligning = true; $('strip-align').disabled = true;
+  S._aligning = true; if ($('c-align')) $('c-align').disabled = true;
   try {
     flash('Matching adjacent images …', 10000);
     const cs = await adjacentPoseCandidates(S.photos, S.scene.cams, i);
@@ -6341,7 +6346,7 @@ async function alignSelectedFrame() {
   } catch (err) {
     console.warn('[align]', err);
     if (confirm(`Automatic alignment could not be validated (${err.message}). Open manual alignment?`)) manualAlignSelected(i);
-  } finally { S._aligning = false; if ($('strip-align')) $('strip-align').disabled = false; }
+  } finally { S._aligning = false; if ($('c-align')) $('c-align').disabled = false; }
 }
 
 function wireStage() {
@@ -6411,8 +6416,7 @@ function wireStage() {
 // ── filmstrip ───────────────────────────────────────────────────────────────
 function buildStrip(deferPhotos = false) {
   const strip = $('strip');
-  strip.innerHTML = '<div class="strip-scroll" id="strip-scroll"></div><button class="btn btn-outline strip-align" id="strip-align" hidden>Align selected</button>';
-  $('strip-align').addEventListener('click', alignSelectedFrame);
+  strip.innerHTML = '<div class="strip-scroll" id="strip-scroll"></div>';
   const sc = $('strip-scroll');
   dragScroll(sc);
   const fill = async (el) => {
@@ -6480,8 +6484,6 @@ async function thumbBmp(i) {
 
 function paintStrip() {
   const sc = $('strip-scroll');
-  const ab = $('strip-align');
-  if (ab) ab.hidden = !(S.scene?.cams?.[S.sel]?.R && (S.state === 'train' || S.state === 'done'));
   if (!sc) return;
   const active = (S.state === 'train' && S.session && S.session.training && S.scene)
     ? (S.scene.cams.find((c) => c.ci === S.session.activeCam) || {}).i : -1;
