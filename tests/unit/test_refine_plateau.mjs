@@ -19,8 +19,8 @@ assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 1.0), NOW, { window: W }),
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.0), NOW, { window: W }), true,
   'a flat score plateaus');
 const noisyFlat = line(9, NOW - W, 150, 20, 0.0).map((r, i) => [r[0], r[1] + (i % 2 ? 0.35 : -0.35)]);
-assert.equal(scorePlateaued(noisyFlat, NOW, { window: W }), false,
-  'a flat trend with high score variance is not converged yet');
+assert.equal(scorePlateaued(noisyFlat, NOW, { window: W }), true,
+  'a noisy under-capacity ceiling is still a plateau');
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.05), NOW, { window: W }), true,
   'a crawl (+0.05 dB/kiter) plateaus');
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.2), NOW, { window: W }), false,
@@ -47,12 +47,12 @@ assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.11), NOW, { window: W })
 // ---- wiring pins: growth follows fresh low-variance plateaus ---------------
 assert.match(sessionSource, /export function scorePlateaued\(history, nowIter/,
   'the detector is exported for tests and reuse');
-assert.match(sessionSource, /stdDev <= maxStdDev/,
-  'a low slope alone is insufficient while score variance is still high');
+assert.doesNotMatch(sessionSource, /stdDev <= maxStdDev/,
+  'noise is diagnostic, not a hard veto on under-capacity plateaus');
 assert.match(sessionSource, /sinceRefine >= convergenceGap/,
   'a full convergence gap must elapse after the prior growth');
-assert.match(sessionSource, /plateau = scorePlateaued\(this\.zlemaHistory, trainer\.iter, \{[\s\S]*maxStdDev: this\.opts\.plateauStdDev \?\? 0\.15,[\s\S]*after: trainer\.lastRefine \|\| 0/,
-  'the next plateau must use fresh, low-variance evidence after the prior growth');
+assert.match(sessionSource, /const recovered = this\._refineRecoveryTarget == null[\s\S]*after: trainer\.lastRefine \|\| 0/,
+  'the next plateau needs recovery to its reference and fresh evidence');
 assert.match(sessionSource, /if \(trainer\.iter > 1500 && plateau\) \{/,
   'automatic growth should run only on a measured score plateau');
 assert.doesNotMatch(sessionSource, /sinceRefine >= refineEvery \|\| plateau|_plateauGap \* 2/,
@@ -107,8 +107,8 @@ const triggerHist = [];
 spiky.forEach(([i, v], k) => { if (k >= SKIP_FIRST) triggerHist.push([i, incrFeed.update(v)]); });
 assert.deepEqual(triggerHist, new EngineZLEMA().series(spiky.slice(SKIP_FIRST)),
   'incremental per-push updates should equal the graph fresh pass');
-assert.equal(scorePlateaued(spiky, NOW, { window: W }), false,
-  'the variance guard rejects a noisy apparent stall on raw readouts');
+assert.equal(scorePlateaued(spiky, NOW, { window: W }), true,
+  'raw transient noise may resemble an under-capacity plateau');
 assert.equal(scorePlateaued(triggerHist, NOW, { window: W }), false,
   'the filtered slope should see through them to the healthy climb');
 

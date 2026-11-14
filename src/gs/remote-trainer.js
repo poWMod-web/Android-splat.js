@@ -111,6 +111,11 @@ export class RemoteTrainer {
   camDrift() { return this._rpc.call('camDrift', {}); }
   capture(cam) { return this._rpc.call('capture', { cam }); }
   sync() { return this._rpc.call('sync', {}); }
+  async updateCameraPose(i, R, t) {
+    const meta = await this._rpc.call('updateCameraPose', { i, R, t });
+    if (this.camMeta[i]) Object.assign(this.camMeta[i], meta);
+    return meta;
+  }
 
   /** Push an allow-listed live set (see trainworker CONFIG_KEYS); known keys
    *  also update the main-side mirror. */

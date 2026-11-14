@@ -1143,3 +1143,15 @@ a.cbtn { text-decoration: none; }
    rescan without making the user reload the whole WebView. */
 .wall-refresh { display: block; margin: 0 auto 8px; padding: 8px 10px; border-radius: 8px; }
 .wall-refresh:hover, .wall-refresh:focus-visible { color: var(--paper); background: rgba(255,255,255,.05); }
+
+/* Service monitor: snapshots and score live inside the card, never behind its
+   frosted backdrop. The service remains the sole WebGPU owner. */
+#monitor { width: min(920px, calc(100% - 24px)); }
+.monitor-live-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin: 14px auto 2px; width: 100%; }
+.monitor-preview, .monitor-chartwrap { min-height: 190px; border: 1px solid var(--line); background: rgba(7,9,9,.72); border-radius: 10px; overflow: hidden; position: relative; }
+.monitor-preview canvas, .monitor-chartwrap canvas { display: block; width: 100%; height: 190px; }
+.monitor-preview canvas { object-fit: contain; }
+.monitor-preview small { position: absolute; left: 8px; bottom: 6px; color: var(--dim); font: 10px var(--mono); background: rgba(7,9,9,.72); padding: 2px 4px; }
+@media (max-width: 700px) { .monitor-live-grid { grid-template-columns: 1fr; } }
+.strip { position: relative; }
+.strip-align { position: absolute; right: 10px; top: -42px; z-index: 8; backdrop-filter: blur(8px); }

@@ -26,6 +26,7 @@ import { Developer, fitRect } from './develop.js';
 import { Chart, psnrToApproxSsimPercent } from './chart.js';
 import { bmp, readyBmp, sizedUrl } from './img.js';
 import * as Headless from './headless.js';
+import { adjacentPoseCandidates } from './align.js';
 
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => Math.round(n).toLocaleString('en-US');
@@ -3635,7 +3636,7 @@ async function checkpointRun(reason) {
   if (!S.runId || !S.session || !S.session.trainer) return null;
   // 'finish' runs in the done state, BEFORE the export chain: the result is
   // secured even if sog compression or the device dies right after training
-  if (reason === 'finish' ? S.state !== 'done' : S.state !== 'train') return null;
+  if (reason === 'finish' ? S.state !== 'done' : reason === 'align' ? !['train', 'done'].includes(S.state) : S.state !== 'train') return null;
   const it = S.session.trainer.iter | 0;
   if (S._ckptBusy || (reason === 'hidden' && it < 200)) return null;
   // hidden fires on every tab switch — only rewrite after real progress
@@ -6264,6 +6265,66 @@ function select(i) {
   if (!$('details').hidden) renderDetails();
 }
 
+async function commitAlignedPose(i, R, centre, source) {
+  const cam = S.scene.cams[i];
+  const t = [-(R[0]*centre[0]+R[1]*centre[1]+R[2]*centre[2]),
+    -(R[3]*centre[0]+R[4]*centre[1]+R[5]*centre[2]),
+    -(R[6]*centre[0]+R[7]*centre[1]+R[8]*centre[2])];
+  await S.session.updateCameraPose(cam.ci, R, t);
+  cam.R = Array.from(R); cam.t = t;
+  // Make durability immediate; normal checkpoints and background staging then
+  // carry the same recon/trainer pose without a second pose catalogue.
+  await checkpointRun('align').catch((e) => console.warn('[align] checkpoint', e));
+  goToFrame(i); paintStrip();
+  flash(`Frame ${i + 1} aligned (${source}) and checkpointed.`, 6000);
+}
+
+function manualAlignSelected(i) {
+  const cam = S.scene.cams[i], old = { R: [...cam.R], t: [...cam.t] };
+  leaveFrame();
+  const card = document.createElement('div'); card.className = 'upcard'; card.id = 'align-manual';
+  card.innerHTML = `<b>Manual frame alignment</b><span class="sog-status">Orbit to the photograph’s correct viewpoint, then save. The old pose remains available until you confirm.</span><div class="row"><button class="btn" data-save="1">Save this view</button><button class="btn linkish">Cancel</button></div>`;
+  $('stage').appendChild(card);
+  card.addEventListener('click', async (e) => {
+    if (e.target.tagName !== 'BUTTON') return;
+    const save = e.target.dataset.save; card.remove();
+    if (!save) { cam.R = old.R; cam.t = old.t; goToFrame(i); return; }
+    const p = vp.freePose(), C = camCentre(p);
+    if (!confirm(`Replace frame ${i + 1}'s pose with this manual alignment?`)) { goToFrame(i); return; }
+    try { await commitAlignedPose(i, p.R, C, 'manual'); } catch (err) { flash(`Alignment failed: ${err.message}`, 8000); }
+  });
+}
+
+async function alignSelectedFrame() {
+  const i = S.sel, cam = S.scene?.cams?.[i];
+  if (!cam?.R || S._aligning) return;
+  if (!confirm(`Align frame ${i + 1}? Training pauses at a safe boundary. Automatic alignment uses feature matches to the previous and next placed images; nothing changes until you confirm.`)) return;
+  S._aligning = true; $('strip-align').disabled = true;
+  try {
+    flash('Matching adjacent images …', 10000);
+    const cs = await adjacentPoseCandidates(S.photos, S.scene.cams, i);
+    let reliable = cs.length >= 1;
+    let R = cs[0]?.Rworld;
+    if (cs.length >= 2) {
+      const qa = quatFromR(cs[0].Rworld), qb0 = quatFromR(cs[1].Rworld);
+      const dot = Math.abs(qa.reduce((n, x, k) => n + x * qb0[k], 0));
+      const disagreement = 2 * Math.acos(clamp(dot, -1, 1)) * 180 / Math.PI;
+      reliable = disagreement <= 8;
+      if (reliable) R = quatToR(qslerp(qa, cs[1].Rworld ? quatFromR(cs[1].Rworld) : qa, .5));
+    }
+    const neighbours = [S.scene.cams[i - 1], S.scene.cams[i + 1]].filter((c) => c?.R);
+    const centres = neighbours.map(camCentre);
+    const C = centres.length === 2 ? centres[0].map((v, k) => (v + centres[1][k]) / 2) : camCentre(cam);
+    const evidence = cs.map((c) => `${c.side}: ${c.inliers}/${c.matches} inliers`).join(', ');
+    if (reliable && confirm(`Automatic alignment found ${evidence}. Apply the feature-derived rotation and neighbour-anchored position?`)) {
+      await commitAlignedPose(i, R, C, 'automatic');
+    } else if (confirm(`${evidence || 'Adjacent features were insufficient or inconsistent.'}\n\nOpen manual alignment instead?`)) manualAlignSelected(i);
+  } catch (err) {
+    console.warn('[align]', err);
+    if (confirm(`Automatic alignment could not be validated (${err.message}). Open manual alignment?`)) manualAlignSelected(i);
+  } finally { S._aligning = false; if ($('strip-align')) $('strip-align').disabled = false; }
+}
+
 function wireStage() {
   const st = $('stage');
   // Touch-hold with a quiet window: while visuals show, the GPU belongs to
@@ -6331,7 +6392,8 @@ function wireStage() {
 // ── filmstrip ───────────────────────────────────────────────────────────────
 function buildStrip(deferPhotos = false) {
   const strip = $('strip');
-  strip.innerHTML = '<div class="strip-scroll" id="strip-scroll"></div>';
+  strip.innerHTML = '<div class="strip-scroll" id="strip-scroll"></div><button class="btn btn-outline strip-align" id="strip-align" hidden>Align selected</button>';
+  $('strip-align').addEventListener('click', alignSelectedFrame);
   const sc = $('strip-scroll');
   dragScroll(sc);
   const fill = async (el) => {
@@ -6399,6 +6461,8 @@ async function thumbBmp(i) {
 
 function paintStrip() {
   const sc = $('strip-scroll');
+  const ab = $('strip-align');
+  if (ab) ab.hidden = !(S.scene?.cams?.[S.sel]?.R && (S.state === 'train' || S.state === 'done'));
   if (!sc) return;
   const active = (S.state === 'train' && S.session && S.session.training && S.scene)
     ? (S.scene.cams.find((c) => c.ci === S.session.activeCam) || {}).i : -1;
@@ -7056,6 +7120,17 @@ function enterMonitor(runId) {
   window.scrollTo(0, 0);
   S.state = 'monitor';
   S._monRun = runId; S._monAt = 0;
+  S._monChartRows = 0;
+  if (!S._monChart) {
+    S._monChart = new Chart($('mon-chart'), { onHover: (h) => {
+      const tip = $('mon-chart-tip');
+      if (!h) { tip.hidden = true; return; }
+      tip.hidden = false;
+      tip.textContent = `${fmt(h.iter)} cycles${h.splats != null ? ` · ${fmt(h.splats)} splats` : ''} · ${h.train.toFixed(1)} ${h.unit}`;
+      tip.style.left = `${clamp(h.xPct, 18, 75)}%`; tip.style.top = `${clamp(h.yPct, 10, 70)}%`;
+    } });
+  }
+  S._monChart.reset();
   $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
   if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
   // This is a status screen, not a viewer. A snapshot behind the card's
@@ -7076,6 +7151,28 @@ function wireMonitorOnce() {
     try { b.headlessCommand(S._monPaused ? 'headless-resume' : 'headless-pause', S._monRun); } catch { /* best-effort */ }
     S._monPaused = !S._monPaused;
     syncMonitorButtons();
+  });
+  $('mon-prune').addEventListener('click', () => {
+    if (!S._monRun || document.getElementById('mon-edit-pick')) return;
+    const card = document.createElement('div');
+    card.className = 'upcard'; card.id = 'mon-edit-pick';
+    const title = document.createElement('b'); title.textContent = 'Change the live model?';
+    const note = document.createElement('span'); note.className = 'sog-status';
+    note.textContent = 'The background trainer pauses at a safe model boundary. Pruning removes the lowest-mass 25%; growth adds capacity in high-error areas. A checkpoint and preview follow automatically.';
+    const row = document.createElement('div'); row.className = 'row';
+    for (const [label, cmd] of [['Prune 25%', 'headless-prune'], ['Grow now', 'headless-grow'], ['Cancel', '']]) {
+      const button = document.createElement('button'); button.className = cmd ? 'btn' : 'btn linkish';
+      button.textContent = label; if (cmd) button.dataset.cmd = cmd; row.appendChild(button);
+    }
+    card.append(title, note, row);
+    $('monitor').appendChild(card);
+    card.addEventListener('click', (e) => {
+      if (e.target.tagName !== 'BUTTON') return;
+      const cmd = e.target.dataset.cmd; card.remove();
+      if (!cmd) return;
+      try { headlessBridge()?.headlessCommand(cmd, S._monRun); } catch { /* next poll remains authoritative */ }
+      flash(cmd.endsWith('grow') ? 'Growing the background model …' : 'Pruning the background model …', 5000);
+    });
   });
   $('mon-stop').addEventListener('click', async () => {
     if (!S._monRun) return;
@@ -7163,9 +7260,41 @@ async function monitorPoll(now, force = false) {
     if (status.owner === 'service' && !Headless.heartbeatFresh(service)) { showRecovery(runId, status); return; }
     S._monPaused = status.status === 'paused';
     paintMonitorProgress(status, progress);
+    paintMonitorLive(runId, progress);
     syncMonitorButtons();
   } catch (e) { console.warn('[headless] monitor poll failed', e); }
 }
+function paintMonitorLive(runId, progress) {
+  const c = S._monChart;
+  if (c && progress) {
+    const rows = Array.isArray(progress.scoreHistory) ? progress.scoreHistory : [];
+    const splats = Array.isArray(progress.splatHistory) ? progress.splatHistory : [];
+    c.reset();
+    const nearSplats = (iter) => {
+      let out = progress.splats;
+      for (const row of splats) { if (row[0] <= iter) out = row[1]; else break; }
+      return out;
+    };
+    for (const row of rows) if (Number.isFinite(row[0]) && Number.isFinite(row[1])) c.push(row[0], row[1], null, nearSplats(row[0]));
+    c.scale = progress.scoreScale === 'similarity' ? 'similarity' : 'db';
+    c.maxIter = progress.maxIters || Math.max(1, progress.iter || 1);
+    c.resize(); c.draw();
+  }
+  // Service-rendered PNG: near-live visuals with no competing WebGPU owner.
+  const cv = $('mon-model'), ctx = cv && cv.getContext('2d');
+  if (!ctx) return;
+  const img = new Image();
+  img.onload = () => {
+    const dpr = devicePixelRatio || 1, r = cv.getBoundingClientRect();
+    cv.width = Math.max(1, Math.round(r.width * dpr)); cv.height = Math.max(1, Math.round(r.height * dpr));
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    const f = fitRect(img.width, img.height, cv.width, cv.height, 0);
+    ctx.drawImage(img, f.x, f.y, f.w, f.h);
+  };
+  img.src = Headless.fresh(Headless.runUrl(runId, 'snapshot.png'));
+  try { headlessBridge()?.headlessCommand('headless-snapshot', runId); } catch { /* current snapshot is still valid */ }
+}
+
 function paintMonitorProgress(status, progress) {
   const p = progress || {};
   const iter = p.iter ?? status.iter ?? 0, max = p.maxIters || 0;

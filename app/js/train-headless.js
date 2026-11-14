@@ -212,6 +212,10 @@ function postProgress(force = false) {
       iter, maxIters: manifest ? manifest.maxIters : 0,
       splats: ses.trainer.n | 0, psnr, scoreScale: manifest?.scoreScale || 'db', ips: +ips.toFixed(1),
       training: !!ses.training, at: now,
+      // A bounded durable tail powers the foreground monitor without creating
+      // a second trainer/WebGPU device. Values are measured, never inferred.
+      scoreHistory: (ses.lossHistory || []).slice(-400),
+      splatHistory: splatHist.slice(-400),
     }));
   } catch (e) { log('progress post failed', e); }
 }
@@ -342,5 +346,22 @@ globalThis.__headlessStop = async () => {
   }
 };
 globalThis.__headlessSnapshot = () => snapshot();
+let manualEdit = false;
+async function manualModelEdit(kind) {
+  if (!ses || !ses.trainer || ending || manualEdit) return;
+  manualEdit = true;
+  try {
+    if (kind === 'grow') await ses.growNow();
+    else await ses.pruneAndContinue(0.75); // safe monitor default: prune 25%
+    await secureFileCheckpoint();
+    await snapshot();
+    postProgress(true);
+  } catch (e) {
+    log(`manual ${kind} failed`, e);
+    postStatus({ status: ses.training ? 'active' : 'paused', commandError: String(e.message || e) });
+  } finally { manualEdit = false; }
+}
+globalThis.__headlessGrow = () => manualModelEdit('grow');
+globalThis.__headlessPrune = () => manualModelEdit('prune');
 
 boot();

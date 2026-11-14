@@ -151,6 +151,14 @@ export function createTrainWorkerHandler(deps = {}) {
         view.dirty = true;
         return true;
       }
+      case 'updateCameraPose': {
+        const meta = tr.camMeta[p.i];
+        if (!meta) throw new Error(`trainworker: no camera ${p.i}`);
+        meta.R = Array.from(p.R); meta.t = Array.from(p.t);
+        tr.camUniforms[p.i] = tr._camUniform(meta, 1, meta.offset, p.i);
+        view.dirty = true;
+        return { ...meta };
+      }
       case 'setEnabled':
         view.enabled = !!p.enabled;
         view.dirty = true;

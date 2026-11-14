@@ -210,6 +210,12 @@ public final class TrainingService extends Service {
             case "headless-snapshot":
                 headlessCommand(intent, "window.__headlessSnapshot&&window.__headlessSnapshot()");
                 break;
+            case "headless-prune":
+                headlessCommand(intent, "window.__headlessPrune&&window.__headlessPrune()");
+                break;
+            case "headless-grow":
+                headlessCommand(intent, "window.__headlessGrow&&window.__headlessGrow()");
+                break;
             case "headless-ack": {
                 String runId = intent.getStringExtra("runId");
                 if (runId != null && runId.equals(handoffRunId) && !handoffSettled) {

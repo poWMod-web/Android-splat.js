@@ -537,6 +537,7 @@ public final class MainActivity extends Activity {
             if (action == null || runId == null) return;
             if (!action.equals("headless-pause") && !action.equals("headless-resume") &&
                     !action.equals("headless-stop") && !action.equals("headless-snapshot") &&
+                    !action.equals("headless-prune") && !action.equals("headless-grow") &&
                     !action.equals("headless-ping")) return;
             if (!RunFiles.validRunId(runId)) return;
             try {

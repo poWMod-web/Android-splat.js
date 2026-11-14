@@ -232,33 +232,25 @@ class Emitter {
   }
 }
 
-/** Plateau test for score-driven refine cadence: least-squares slope of
- *  ZLEMA-filtered train PSNR over the trailing `window` iters stays under
- *  `slope` — the graph's curve, not the raw readouts, so one spiky sample
- *  can't fake a stall (or mask one) and pull a refine forward early
- *  dB/kiter. Needs minPoints finite samples spanning most of the window —
- *  anything less is "still warming up", never a plateau. Flat OR falling
- *  trips it: a stalled score wants fresh capacity, a falling one triage. */
-export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, minPoints = 4, after = -Infinity, maxStdDev = 0.15 } = {}) {
+/** Robust plateau test for score-driven refinement. A capacity-starved model can
+ * oscillate around a flat ceiling, so raw residual standard deviation is
+ * diagnostic rather than a veto. We compare medians of the first and last
+ * thirds (robust to spikes) and require a full fresh window. Recovery from an
+ * intervention is gated separately by the Session state machine below. */
+export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, minPoints = 4, after = -Infinity } = {}) {
   if (!Array.isArray(history) || !history.length) return false;
-  const pts = [];
-  for (const [i, p] of history) {
-    if (Number.isFinite(i) && Number.isFinite(p) && i >= Math.max(nowIter - window, after) && i <= nowIter) pts.push([i, p]);
-  }
-  if (pts.length < minPoints) return false;
-  if (pts[pts.length - 1][0] - pts[0][0] < window * 0.75) return false;
-  let sx = 0, sy = 0, sxx = 0, sxy = 0;
-  for (const [i, p] of pts) { sx += i; sy += p; sxx += i * i; sxy += i * p; }
-  const n = pts.length;
-  const denom = n * sxx - sx * sx;
-  if (!(denom > 0)) return false;
-  const m = (n * sxy - sx * sy) / denom;
-  const b = (sy - m * sx) / n;
-  let residual2 = 0;
-  for (const [i, p] of pts) residual2 += (p - (m * i + b)) ** 2;
-  const stdDev = Math.sqrt(residual2 / n);
-  return m * 1000 < slope && stdDev <= maxStdDev;
+  const pts = history.filter(([i, p]) => Number.isFinite(i) && Number.isFinite(p) &&
+    i >= Math.max(nowIter - window, after) && i <= nowIter).sort((a, b) => a[0] - b[0]);
+  if (pts.length < minPoints || pts.at(-1)[0] - pts[0][0] < window * 0.75) return false;
+  const q = Math.max(2, Math.floor(pts.length / 3));
+  const median = (a) => { const v = a.map((p) => p[1]).sort((x, y) => x - y); return v[v.length >> 1]; };
+  const early = pts.slice(0, q), late = pts.slice(-q);
+  const dt = late.reduce((n, p) => n + p[0], 0) / q - early.reduce((n, p) => n + p[0], 0) / q;
+  if (!(dt > 0)) return false;
+  const robustSlope = (median(late) - median(early)) * 1000 / dt;
+  return robustSlope < slope;
 }
+
 
 export class Session {
   /** @param {SessionOptions} [opts] */
@@ -281,8 +273,10 @@ export class Session {
     // below reads THIS, so the trigger trips on the line the user sees
     this.zlemaHistory = [];   // [iter, filteredPsnrTrain]
     this._zlema = new FastRobustZLEMA();
-    // Automatic growth is plateau-only. After each growth, a fresh full
-    // convergence window must accumulate before the next plateau can qualify.
+    // Intervention cycle: plateau -> expected score drop -> recovery to the
+    // pre-intervention reference -> a fresh plateau. This blocks repeated
+    // growth while the model is still rebuilding quality.
+    this._refineRecoveryTarget = null;
     this._fences = [];      // in-flight batch fences (see _frameLoop)
     this._govAuto = 1;      // duty governor: auto duty, min()'d with the slider
     this._govLag = 0;       // event-loop lag EWMA (ms)
@@ -1235,6 +1229,27 @@ export class Session {
     });
   }
 
+  /** Replace one training pose at a paused model boundary. Recon, trainer
+   * metadata and camera uniforms move together so checkpoints reopen exactly. */
+  async updateCameraPose(ci, R, t) {
+    const trainer = this.trainer;
+    if (!trainer || !trainer.camMeta?.[ci]) throw new Error('camera is not trainable');
+    const wasTraining = this.training;
+    if (wasTraining) this.pause();
+    try {
+      await this._locked(async () => {
+        if (this._remote) await trainer.updateCameraPose(ci, R, t);
+        else {
+          const meta = trainer.camMeta[ci]; meta.R = Array.from(R); meta.t = Array.from(t);
+          trainer.camUniforms[ci] = trainer._camUniform(meta, 1, meta.offset, ci);
+        }
+        const imgIdx = trainer.camMeta[ci].imgIdx;
+        const rc = this.recon?.cams?.find((c) => c.imgIdx === imgIdx);
+        if (rc) { rc.R = Array.from(R); rc.t = Array.from(t); }
+      });
+    } finally { if (wasTraining) this.start(); }
+  }
+
   /** Manual growth pass, any time: one immediate refine (relocate the dead
    *  + grow into the highest-error donors) outside the schedule — the
    *  Prune/Grow button's other half. Pure growth: one refine, no cull —
@@ -1694,18 +1709,24 @@ export class Session {
       const sinceRefine = trainer.iter - (trainer.lastRefine || 0);
       const plateauWindow = this.opts.plateauWindow ?? 1200;
       const convergenceGap = this.opts.plateauMinGap ?? plateauWindow;
+      const currentScore = this.zlemaHistory.length ? this.zlemaHistory.at(-1)[1] : null;
+      const recovered = this._refineRecoveryTarget == null ||
+        (Number.isFinite(currentScore) && currentScore >= this._refineRecoveryTarget - (this.opts.plateauRecoverySlack ?? 0.05));
+      if (recovered && this._refineRecoveryTarget != null) this._refineRecoveryTarget = null;
       let plateau = false;
-      if (this.opts.refinePlateau !== false && trainer.iter > 1500 &&
+      if (this.opts.refinePlateau !== false && trainer.iter > 1500 && recovered &&
           sinceRefine >= convergenceGap) {
         plateau = scorePlateaued(this.zlemaHistory, trainer.iter, {
           window: plateauWindow,
           slope: this.opts.plateauSlope ?? 0.1,
-          maxStdDev: this.opts.plateauStdDev ?? 0.15,
           after: trainer.lastRefine || 0,
         });
       }
       let refineResult = null;
       if (trainer.iter > 1500 && plateau) {
+        // Remember quality before mutation. The next refine cannot happen on
+        // the low post-grow plateau; quality must first recover to this mark.
+        this._refineRecoveryTarget = Number.isFinite(currentScore) ? currentScore : null;
         trainer.lastRefine = trainer.iter;
         // tandem prune: cull the lowest-mass fraction FIRST (until 85% of
         // the run), so this same refine regrows the freed capacity into
