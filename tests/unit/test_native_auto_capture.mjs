@@ -6,8 +6,12 @@ assert.match(source, /CheckBox autoToggle = new CheckBox\(this\);[\s\S]*autoTogg
 assert.match(source, /autoToggle\.setChecked\(false\)/, 'native capture must retain the WebXR manual-capture default');
 assert.match(source, /getInt\("capture_spacing_cm", 10\)/, 'native default spacing must be 10 cm');
 assert.match(source, /if \(value < 2 \|\| value > 200\)/, 'spacing must be editable from 2 to 200 cm');
-assert.match(source, /boolean autoDue = autoCaptureEnabled && autoCaptureRunning && cloudRenderer\.sampleTravel\(position\)/,
-  'automatic shots need the mode armed AND the run started');
+assert.match(source, /autoFirstCapturePending = running/,
+  'pressing Start should arm an immediate first tracked sample');
+assert.match(source, /boolean firstAutoDue = autoCaptureEnabled && autoCaptureRunning && autoFirstCapturePending;[\s\S]*\(firstAutoDue \|\| cloudRenderer\.sampleTravel\(position\)\)/,
+  'the first sample is due immediately; distance spacing governs later samples');
+assert.match(source, /if \(firstAutoDue && saved\) autoFirstCapturePending = false/,
+  'a transient unavailable camera image must not consume the first sample');
 assert.match(source, /if \(!autoCaptureEnabled \|\| !autoCaptureRunning\) cloudRenderer\.breakTravelContinuity\(\);/,
   'a stopped run must not accumulate travel');
 assert.match(source, /if \(autoCaptureEnabled\) \{\s*\/\/ auto mode: the center button starts\/stops the automatic run\s*setAutoCaptureRunning\(!autoCaptureRunning\);/,
@@ -20,7 +24,7 @@ assert.match(source, /else if \(autoCaptureRunning\) shutterView\.setLabel\("Sto
   'a running auto capture should offer Stop on the center button');
 assert.match(source, /else shutterView\.setLabel\("Start", "Start auto-capture"\);/,
   'an armed auto capture should offer Start on the center button');
-assert.match(source, /if \(manualDue \|\| autoDue\) capture\(frame\)/);
+assert.match(source, /if \(manualDue \|\| autoDue\) \{[\s\S]*boolean saved = capture\(frame\)/);
 assert.match(source, /distanceSinceCapture \+= distance[\s\S]*return distanceSinceCapture \+ 1e-6f >= spacingMeters/);
 assert.match(source, /void captured\(float\[\] position\)[\s\S]*distanceSinceCapture = 0f/);
 console.log('native ARCore distance auto-capture UI and 10 cm default: passed');

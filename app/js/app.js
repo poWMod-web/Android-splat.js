@@ -338,6 +338,7 @@ const S = {
   keys: new Set(),             // held WASD keys (camera-relative fly)
   maxIters: INITIAL_ITERS,     // grows when the user continues training
   settings: loadSettings(),    // training knobs from the start-card panel
+  earlyPrune: null,            // approved one-shot 75% removal at cycle 500
   gen: 0,                      // run generation — stale async work checks it
 };
 
@@ -2426,6 +2427,14 @@ async function startPrepInner() {
     catch (e) { flash(e.message, 8000); return; }
     S.avatarWanted = false;
   }
+  const earlyPruneApproved = confirm(
+    'Allow one automatic prune at 500 iterations to speed processing?\n\n' +
+    'It will remove 75% of the lowest-priority splats, keep 25%, and continue training automatically.'
+  );
+  S.earlyPrune = {
+    approved: earlyPruneApproved, iter: 500, ratio: 0.25,
+    done: !earlyPruneApproved, busy: false,
+  };
   // consume the detail-card history entry — Back during a run must not
   // resurrect a card that no longer applies
   if (history.state && history.state.sj) history.replaceState(null, '');
@@ -3766,8 +3775,45 @@ function queueMetricsPaint() {
   });
 }
 
+function publishEarlyPruneState() {
+  // Before staging there is no second process to race; stageHeadlessRun will
+  // serialize the current flag later. Once staged, refuse to prune unless the
+  // one-shot marker is durable — duplicate 75% removals are unacceptable.
+  if (!S._hlManifest || !S.runId || !S.earlyPrune) return true;
+  S._hlManifest.settings = {
+    ...(S._hlManifest.settings || {}),
+    earlyPrune: { ...S.earlyPrune, busy: false },
+  };
+  const b = headlessBridge();
+  try { return !!b && b.writeRunJson(S.runId, 'manifest.json', JSON.stringify(S._hlManifest)) !== false; }
+  catch (e) { console.warn('[early-prune] manifest update failed', e); return false; }
+}
+
+async function maybeEarlyPrune(iter) {
+  const cfg = S.earlyPrune;
+  if (!cfg?.approved || cfg.done || cfg.busy || iter < cfg.iter ||
+      S._pruning || S._growing || !S.session?.trainer) return;
+  // One approved attempt only. Mark it before crossing the async prune so a
+  // handoff/checkpoint cannot run the destructive milestone twice.
+  cfg.busy = true;
+  cfg.done = true;
+  if (!publishEarlyPruneState()) {
+    cfg.busy = false;
+    flash('Could not safely record the speed-prune milestone — training continues unpruned.', 7000);
+    return;
+  }
+  flash('Approved speed prune: removing 75% of splats and continuing …', 7000);
+  try {
+    await runPruneAndContinue(cfg.ratio);
+    await checkpointRun('early-prune').catch((e) => console.warn('[early-prune] checkpoint', e));
+  } finally { cfg.busy = false; publishEarlyPruneState(); }
+}
+
 function onMetrics(m) {
   S.iter = m.iter;
+  // Metrics emit inside the active frame promise. Cross a task boundary before
+  // pauseAndDrain(), otherwise the prune would wait on the frame calling it.
+  setTimeout(() => { void maybeEarlyPrune(m.iter); }, 0);
   S.splats = m.splats;
   S.itersPerSec = m.itersPerSec;
   androidNotifTick();
@@ -6874,7 +6920,8 @@ function stageHeadlessRun() {
         maxIters: S.maxIters, gpu: S.settings.gpu, scoreScale: S.scoreScale,
         srcKey: cap?.metadata?.nativeCaptureId || null,
         photos: names, photoSource,
-        ...(native ? { photoUrls: files.map((f) => f.url) } : {}), settings: S.settings,
+        ...(native ? { photoUrls: files.map((f) => f.url) } : {}),
+        settings: { ...S.settings, ...(S.earlyPrune ? { earlyPrune: { ...S.earlyPrune, busy: false } } : {}) },
       });
       S._hlManifest = manifest;
       b.writeRunJson(runId, 'manifest.json', JSON.stringify(manifest));

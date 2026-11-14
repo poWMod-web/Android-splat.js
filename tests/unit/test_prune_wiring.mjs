@@ -8,6 +8,7 @@ const worker = readFileSync(new URL('../../src/gs/trainworker.js', import.meta.u
 const remote = readFileSync(new URL('../../src/gs/remote-trainer.js', import.meta.url), 'utf8');
 const session = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
+const headless = readFileSync(new URL('../../app/js/train-headless.js', import.meta.url), 'utf8');
 const appHtml = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 
 // ---- the trainer culls by rendered mass, on demand -------------------------
@@ -269,5 +270,19 @@ assert.match(app, /custom\.value = String\(rememberedPrunePercent\(\)\)/,
   'the background picker reopens with the same remembered percentage');
 assert.match(app, /localStorage\.setItem\(PRUNE_CUSTOM_KEY, String\(pct\)\)/,
   'a valid whole percentage persists across app restarts');
+
+// ---- approved one-shot speed prune -----------------------------------------
+assert.match(app, /Allow one automatic prune at 500 iterations to speed processing[\s\S]*remove 75%[\s\S]*ratio: 0\.25/,
+  'fresh training asks permission before scheduling the destructive milestone');
+assert.match(app, /async function maybeEarlyPrune\(iter\)[\s\S]*iter < cfg\.iter[\s\S]*cfg\.done = true[\s\S]*runPruneAndContinue\(cfg\.ratio\)[\s\S]*checkpointRun\('early-prune'\)/,
+  'foreground training attempts the approved 75% removal once at cycle 500 and checkpoints it');
+assert.match(app, /settings: \{ \.\.\.S\.settings, \.\.\.\(S\.earlyPrune \? \{ earlyPrune:/,
+  'the approval rides the service handoff manifest');
+assert.match(headless, /approvedPrune\?\.approved[\s\S]*done: !!approvedPrune\.done/,
+  'background resume trusts the durable one-shot marker rather than iteration timing');
+assert.match(headless, /writeRunJson\(runId, 'manifest\.json'[\s\S]*early-prune marker failed; training continues unpruned/,
+  'background pruning must durably mark the milestone before removing splats');
+assert.match(headless, /async function maybeEarlyPrune\(iter\)[\s\S]*earlyPrune\.done = true[\s\S]*ses\.pruneAndContinue\(0\.25\)[\s\S]*secureFileCheckpoint\(\)/,
+  'the service performs and secures the same approved one-shot prune');
 
 console.log('prune-and-continue + soft-prune wiring: passed');

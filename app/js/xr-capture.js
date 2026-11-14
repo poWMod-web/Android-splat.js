@@ -251,6 +251,7 @@ async function runCapture({
       nextFileNumber: 1,
       auto: false,
       autoRunning: false,
+      autoFirstPending: false,
       manualRequests: 0,
       spacingCm,
       distanceTrigger: new DistanceCaptureTrigger(spacingCm / 100),
@@ -305,6 +306,7 @@ async function runCapture({
     autoInput?.addEventListener('change', () => {
       state.auto = !!autoInput.checked;
       state.autoRunning = false;   // checking arms the mode; the shutter starts it
+      state.autoFirstPending = false;
       state.distanceTrigger.reset();
       updateShutter();
       setStatus(state.auto ? `Auto-capture armed: press Start, then move slowly for one photo every ${state.spacingCm} cm.` : 'Manual capture enabled. Press Shutter to take a photo.');
@@ -330,10 +332,11 @@ async function runCapture({
       if (state.auto) {
         // auto mode: the shutter starts/stops the automatic run
         state.autoRunning = !state.autoRunning;
+        state.autoFirstPending = state.autoRunning;
         state.distanceTrigger.reset();
         updateShutter();
         setStatus(state.autoRunning
-          ? `Auto-capture started: one photo every ${state.spacingCm} cm traveled. Move slowly.`
+          ? `Auto-capture started: taking the first photo now, then one every ${state.spacingCm} cm traveled. Move slowly.`
           : 'Auto-capture stopped. Press Start to resume, or uncheck Auto-capture for manual shots.');
         return;
       }
@@ -421,7 +424,11 @@ async function runCapture({
         setPoseLabel(`active · ${position.map((value) => value.toFixed(2)).join(', ')} m`);
 
         const manual = state.manualRequests > 0;
-        const auto = state.auto && state.autoRunning && state.distanceTrigger.sample(position);
+        // Start captures the first synchronized tracked frame immediately;
+        // distance spacing begins only after that frame is actually queued.
+        const firstAuto = state.auto && state.autoRunning && state.autoFirstPending;
+        const auto = state.auto && state.autoRunning &&
+          (firstAuto || state.distanceTrigger.sample(position));
         if (!manual && !auto) return;
         // PNG encoding can lag a mobile GPU; do not accumulate full-size raw frames.
         if (state.pending.size >= 2) { setStatus('Saving photos… hold steady, then keep moving.'); return; }
@@ -448,7 +455,10 @@ async function runCapture({
           setStatus('This frame had no readable camera texture; it was not captured.');
           return;
         }
-        if (state.auto && state.autoRunning) state.distanceTrigger.captured(position);
+        if (state.auto && state.autoRunning) {
+          state.autoFirstPending = false;
+          state.distanceTrigger.captured(position);
+        }
         scheduleEncode(snapshot);
         updateUi();
         setStatus(manual ? 'Photo queued.' : 'Auto-captured a tracked frame. Keep moving slowly.');

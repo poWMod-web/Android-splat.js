@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 
 const source = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/NativeCaptureActivity.java', import.meta.url), 'utf8');
 const drawFrame = source.match(/        void onDrawFrame\(\) \{([\s\S]*?)\n        }\n\n        private void drawBackground/);
-const capture = source.match(/        private void capture\(Frame frame\) \{([\s\S]*?)\n        }\n\n        private void addColoredSeeds/);
+const capture = source.match(/        private boolean capture\(Frame frame\) \{([\s\S]*?)\n        }\n\n        private void addColoredSeeds/);
 assert.ok(drawFrame, 'CoverageRenderer frame loop should be present');
 assert.ok(capture, 'Native keyframe capture should be present');
 assert.doesNotMatch(drawFrame[1], /updateCoverage\s*\(/, 'preview frames must not add coverage observations');

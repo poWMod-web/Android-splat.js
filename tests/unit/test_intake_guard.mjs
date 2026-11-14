@@ -106,7 +106,7 @@ assert.match(session, /ch\.port1\.unref\?\.\(\); ch\.port2\.unref\?\.\(\);/,
   'the pump must not hold a Node event loop open by itself');
 assert.doesNotMatch(driver, /setInterval/,
   'the headless page should own no throttlable timers');
-assert.match(driver, /ses\.on\('metrics', \(\) => postProgress\(\)\);/,
+assert.match(driver, /ses\.on\('metrics', \(m\) => \{\s*postProgress\(\);/,
   'headless progress should ride the metrics beat');
 assert.doesNotMatch(driver, /function tick\(\)/, 'the interval tick should be gone');
 

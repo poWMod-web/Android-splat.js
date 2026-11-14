@@ -37,6 +37,7 @@ let shotBusy = false;
 let psnr = null;
 let splatHist = [];
 let chartEvents = [];
+let earlyPrune = null;       // approved in the Activity before training starts
 
 const b64 = (u8, size = 262144) => {
   const out = [];
@@ -81,6 +82,18 @@ async function boot() {
     manifest = H.validateManifest(await fetchJson('manifest.json'));
     if (manifest.runId !== runId) throw new Error('manifest names another run');
     const st = parseState(await fetchBytes('state.bin'));
+    const approvedPrune = manifest.settings?.earlyPrune;
+    if (approvedPrune?.approved) {
+      earlyPrune = {
+        iter: Number.isFinite(approvedPrune.iter) ? approvedPrune.iter : 500,
+        ratio: 0.25,   // approval is specifically for removing 75%
+        // The manifest marker is written before either process prunes. Iteration
+        // alone is not proof: the Activity can hand off just past cycle 500
+        // before its deferred prune task runs.
+        done: !!approvedPrune.done,
+        busy: false,
+      };
+    }
     recon = await fetchJson('recon.json');
     if (!recon || !Array.isArray(recon.cams) || !recon.cams.length) throw new Error('recon has no cameras');
     if (Number.isFinite(recon.iter) && recon.iter !== st.iter) {
@@ -160,7 +173,13 @@ async function boot() {
     // progress rides the metrics beat (every readout while frames run), not a
     // timer: this page is hidden from birth, so its intervals throttle to a
     // crawl and the notification would freeze behind a healthy run
-    ses.on('metrics', () => postProgress());
+    ses.on('metrics', (m) => {
+      postProgress();
+      // Metrics emit from the active frame promise; prune only after it exits,
+      // or pauseAndDrain would wait on the frame that called this handler.
+      const iter = m && Number.isFinite(m.iter) ? m.iter : ses.trainer.iter;
+      setTimeout(() => { void maybeEarlyPrune(iter); }, 0);
+    });
   } catch (e) {
     await fail(e);
   }
@@ -183,6 +202,41 @@ function onEvent(e) {
   if (e.kind === 'train-complete') finalize();
   else if (e.kind === 'device-lost' || e.kind === 'worker-error' || e.kind === 'train-error') {
     fail(`headless run faulted: ${e.message || e.kind} (last checkpoint kept)`);
+  }
+}
+
+async function maybeEarlyPrune(iter) {
+  if (!earlyPrune || earlyPrune.done || earlyPrune.busy || ending ||
+      iter < earlyPrune.iter || !ses?.trainer) return;
+  // The Activity obtained explicit approval. Publish the one-shot marker
+  // before touching the model so a process restart never removes 75% twice.
+  earlyPrune.busy = true;
+  earlyPrune.done = true;
+  manifest.settings = {
+    ...(manifest.settings || {}),
+    earlyPrune: { approved: true, iter: earlyPrune.iter, ratio: 0.25, done: true, busy: false },
+  };
+  try {
+    if (!bridge.writeRunJson(runId, 'manifest.json', JSON.stringify(manifest)))
+      throw new Error('native manifest write refused');
+  } catch (e) {
+    // Never perform a destructive one-shot operation without first making its
+    // completion marker durable across a service restart.
+    earlyPrune.busy = false;
+    log('early-prune marker failed; training continues unpruned', e);
+    return;
+  }
+  postProgress(true);
+  try {
+    log('approved speed prune at cycle 500: removing 75%');
+    await ses.pruneAndContinue(0.25);
+    await secureFileCheckpoint();
+    postProgress(true);
+  } catch (e) {
+    // pruneAndContinue restores the intact unpruned trainer on failure.
+    log('approved speed prune failed; training continues unpruned', e);
+  } finally {
+    earlyPrune.busy = false;
   }
 }
 

@@ -92,6 +92,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     private CaptureShutterView shutterView;
     private volatile boolean autoCaptureEnabled;
     private volatile boolean autoCaptureRunning;
+    // Start means "take the first tracked frame now", then apply spacing.
+    // Kept pending across transient CameraImage NotYetAvailable failures.
+    private volatile boolean autoFirstCapturePending;
     private volatile int captureSpacingCm = 10;
     private boolean installRequested;
     private boolean sessionResumed;
@@ -261,6 +264,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         autoToggle.setOnCheckedChangeListener((view, enabled) -> {
             autoCaptureEnabled = enabled;
             autoCaptureRunning = false;   // checking arms the mode; the center button starts it
+            autoFirstCapturePending = false;
             glView.queueEvent(cloudRenderer::resetDistanceBaseline);
             updateShutterLabel();
             showStatus(enabled
@@ -412,10 +416,14 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     /** The center button in auto mode: start/stop the automatic run. */
     private void setAutoCaptureRunning(boolean running) {
         autoCaptureRunning = running;
+        // Do not make the user move one spacing interval before photo one.
+        // The GL thread consumes this only after a synchronized tracked image
+        // is actually saved, so a temporarily unavailable CPU image retries.
+        autoFirstCapturePending = running;
         glView.queueEvent(cloudRenderer::resetDistanceBaseline);
         updateShutterLabel();
         showStatus(running
-                ? "Auto-capture started: one photo every " + captureSpacingCm + " cm traveled. Move slowly."
+                ? "Auto-capture started: taking the first photo now, then one every " + captureSpacingCm + " cm traveled. Move slowly."
                 : "Auto-capture stopped. Press Start to resume, or uncheck Auto-capture for manual shots.");
     }
 
@@ -671,10 +679,15 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 if (tracking) {
                     updateGroundPlane();
                     float[] position = frame.getCamera().getPose().getTranslation();
-                    boolean autoDue = autoCaptureEnabled && autoCaptureRunning && cloudRenderer.sampleTravel(position);
+                    boolean firstAutoDue = autoCaptureEnabled && autoCaptureRunning && autoFirstCapturePending;
+                    boolean autoDue = autoCaptureEnabled && autoCaptureRunning &&
+                            (firstAutoDue || cloudRenderer.sampleTravel(position));
                     if (!autoCaptureEnabled || !autoCaptureRunning) cloudRenderer.breakTravelContinuity();
                     boolean manualDue = captureRequested.getAndSet(false);
-                    if (manualDue || autoDue) capture(frame);
+                    if (manualDue || autoDue) {
+                        boolean saved = capture(frame);
+                        if (firstAutoDue && saved) autoFirstCapturePending = false;
+                    }
                     // Render accumulated capture samples each preview frame, but only
                     // successful keyframe capture may add coverage observations.
                     drawCoverage(frame);
@@ -889,10 +902,10 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             colors.put(red).put(green).put(0f);
         }
 
-        private void capture(Frame frame) {
+        private boolean capture(Frame frame) {
             Image image = null;
             try {
-                if (frames.size() >= 200) { showStatus("Maximum of 200 keyframes reached."); return; }
+                if (frames.size() >= 200) { showStatus("Maximum of 200 keyframes reached."); return false; }
                 image = frame.acquireCameraImage();
                 byte[] jpeg = jpegFromYuv(image);
                 Bitmap bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
@@ -929,10 +942,15 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 cloudRenderer.capturePosition(pose.getTranslation());
                 showStatus("Captured " + frames.size() + " / 200 · " + coverage.size() + " coverage points · " +
                         (autoCaptureEnabled ? "auto every " + captureSpacingCm + " cm" : "manual capture") + groundPlaneStatus());
+                return true;
             } catch (NotYetAvailableException e) {
-                showStatus("Camera image is not ready yet. Hold steady and capture again.");
+                showStatus(autoFirstCapturePending
+                        ? "Camera image is not ready yet. Holding the first auto-capture until it is available…"
+                        : "Camera image is not ready yet. Hold steady and capture again.");
+                return false;
             } catch (Exception e) {
                 showStatus("Capture failed: " + safeMessage(e));
+                return false;
             } finally {
                 if (image != null) image.close();
             }
