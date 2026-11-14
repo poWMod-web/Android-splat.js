@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   RUNS_BASE, runUrl, photoUrl, activeUrl, fresh,
-  validRunId, validName, buildManifest, validateManifest,
+  validRunId, validName, nativePhotoUrl, buildManifest, validateManifest,
   isLiveStatus, isOwnedBy,
   HEARTBEAT_STALE_MS, heartbeatFresh, encodeB64,
   snapshotSize, snapshotCam,
@@ -37,6 +37,17 @@ assert.throws(() => validateManifest({ ...m, maxIters: 500 }), /horizon/);
 assert.throws(() => validateManifest({ ...m, photos: ['a.jpg'] }), /photo list/);
 assert.throws(() => validateManifest({ ...m, photos: ['a.jpg', 'b.jpg', '../c'] }), /photo list/);
 assert.throws(() => validateManifest({ ...m, photoSource: 'blobs' }), /photoSource/);
+assert.equal(nativePhotoUrl('capture_7', 'frame_0001.jpg'),
+  'https://appassets.androidplatform.net/captures/capture_7/frame_0001.jpg');
+const nativeManifest = buildManifest({
+  runId: 'run_1_3', name: 'Native Scene', maxIters: 20000, gpu: 100,
+  srcKey: 'capture_7', photos: ['a.jpg', 'b.jpg', 'c.jpg'], photoSource: 'urls',
+  photoUrls: ['stale', 'or', 'mutated'], settings: {},
+});
+validateManifest(nativeManifest);
+assert.deepEqual(nativeManifest.photoUrls, ['a.jpg', 'b.jpg', 'c.jpg'].map((name) => nativePhotoUrl('capture_7', name)),
+  'native references should be rebuilt canonically from durable capture identity');
+assert.throws(() => validateManifest({ ...nativeManifest, srcKey: '../capture' }), /native photo references/);
 assert.throws(() => validateManifest(null), /object/);
 
 // ── status helpers ──────────────────────────────────────────────────────────
@@ -279,8 +290,8 @@ assert.match(main, /progress\.json[\s\S]*progressNewer = progress\.optLong\("at"
   'Home should merge service progress only when newer than lifecycle status');
 assert.match(app, /headlessStatusWrite\(status[\s\S]*splats:[\s\S]*psnr:/,
   'Activity lifecycle status should carry the same model numbers as its checkpoint');
-assert.match(stage, /photoSource = native \? 'urls' : 'files'[\s\S]*photoUrls: files\.map/,
-  'native handoff manifests should reference canonical archive URLs');
+assert.match(stage, /photoSource = native \? 'urls' : 'files'[\s\S]*photoUrls: names\.map\(\(name\) => Headless\.nativePhotoUrl\(nativeCaptureId, name\)\)/,
+  'native handoff manifests should derive canonical archive URLs from durable identity, not mutable File URLs');
 assert.match(app, /function updateHeadlessGpu\(value\)[\s\S]*gpu: v[\s\S]*writeRunJson\(S\.runId, 'manifest\.json'/,
   'the live GPU duty slider should update the recipe the background service boots');
 assert.match(app, /S\.session\.opts\.gpuUsage = v \/ 100;[\s\S]*updateHeadlessGpu\(v\)/,

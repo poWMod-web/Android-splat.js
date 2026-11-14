@@ -19,8 +19,10 @@ for (const [name, source] of [['Android', app], ['Browser', browser]]) {
   const removeStart = source.indexOf('async function removeTrainingImage(');
   const removeEnd = source.indexOf('function wireFrameLongPress(', removeStart);
   const remove = source.slice(removeStart, removeEnd);
-  assert.match(remove, /confirm\(`Remove frame \$\{i \+ 1\} from training\?[\s\S]*excludeCameraImage\(cam\.ci\)/,
-    `${name}: removal requires confirmation and uses stable camera exclusion`);
+  assert.match(remove, /inAppConfirm\('Remove image from training'[\s\S]*excludeCameraImage\(cam\.ci\)/,
+    `${name}: removal requires a titled in-app confirmation and uses stable camera exclusion`);
+  assert.doesNotMatch(remove, /\bconfirm\(/,
+    `${name}: image removal must not show the WebView origin as its title`);
   assert.match(remove, /cam\.state = 'removed'[\s\S]*checkpointRun\('remove-image'\)/,
     `${name}: removed state should be visible and durable`);
   assert.doesNotMatch(remove, /S\.photos\.splice|S\.scene\.cams\.splice/,

@@ -6518,7 +6518,7 @@ async function removeTrainingImage(i) {
     flash(`Frame ${i + 1} is already removed from training.`, 4000);
     return;
   }
-  if (!confirm(`Remove frame ${i + 1} from training? The original image will remain saved on this device.`)) return;
+  if (!(await inAppConfirm('Remove image from training', `Remove frame ${i + 1} from training? The original image will remain saved on this device.`, 'Remove image'))) return;
   S._removingImage = true;
   try {
     await S.session.excludeCameraImage(cam.ci);
@@ -6966,15 +6966,15 @@ function stageHeadlessRun() {
       const names = files.map((f) => f.name);
       if (!names.every(Headless.validName)) throw new Error('photo names outside the handoff set');
       const cap = S.preset && S.preset.capture;
-      const native = !!(cap && cap.metadata && cap.metadata.nativeARCore &&
-        cap.metadata.nativeCaptureId && files.every((f) => f.url));
+      const nativeCaptureId = cap?.metadata?.nativeCaptureId || '';
+      const native = !!(cap?.metadata?.nativeARCore && /^[A-Za-z0-9_-]{1,80}$/.test(nativeCaptureId));
       const photoSource = native ? 'urls' : 'files';
       const manifest = Headless.buildManifest({
         runId, name: (S._localRun && S._localRun.name) || (S.preset && S.preset.name) || 'model',
         maxIters: S.maxIters, gpu: S.settings.gpu, scoreScale: S.scoreScale,
         srcKey: cap?.metadata?.nativeCaptureId || null,
         photos: names, photoSource,
-        ...(native ? { photoUrls: files.map((f) => f.url) } : {}), settings: S.settings,
+        ...(native ? { photoUrls: names.map((name) => Headless.nativePhotoUrl(nativeCaptureId, name)) } : {}), settings: S.settings,
       });
       S._hlManifest = manifest;
       b.writeRunJson(runId, 'manifest.json', JSON.stringify(manifest));

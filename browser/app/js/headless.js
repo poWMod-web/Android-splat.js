@@ -48,6 +48,13 @@ export function validName(name) {
     name !== '.' && name !== '..' && !name.includes('..');
 }
 
+export function nativePhotoUrl(captureId, name) {
+  if (!/^[A-Za-z0-9_-]{1,80}$/.test(captureId || '') || !validName(name)) {
+    throw new Error('invalid native photo identity');
+  }
+  return `${ASSET_HOST}/captures/${captureId}/${name}`;
+}
+
 /** The manifest the Activity stages at Start (versioned for forward tolerance). */
 export function buildManifest({ runId, name, maxIters, gpu, scoreScale, srcKey, photos, photoSource, photoUrls, settings }) {
   return {
@@ -71,13 +78,13 @@ export function validateManifest(m) {
   }
   if (m.photoSource !== 'files' && m.photoSource !== 'urls') throw new Error('manifest has a bad photoSource');
   if (m.photoSource === 'urls') {
-    if (!Array.isArray(m.photoUrls) || m.photoUrls.length !== m.photos.length ||
-        !m.photoUrls.every((raw) => {
-          try {
-            const u = new URL(raw);
-            return u.origin === ASSET_HOST && /^\/captures\/[A-Za-z0-9_-]{1,80}\/[A-Za-z0-9_.-]{1,120}$/.test(u.pathname);
-          } catch { return false; }
-        })) throw new Error('manifest has bad native photo references');
+    // The capture id + validated filenames are the durable identity. Rebuild
+    // references instead of trusting serialized File.url values: those may
+    // gain encoding/query differences while a model is edited or restored.
+    // Canonicalization also repairs already-staged manifests safely because
+    // it can only target the app's own capture archive host.
+    try { m.photoUrls = m.photos.map((name) => nativePhotoUrl(m.srcKey, name)); }
+    catch { throw new Error('manifest has bad native photo references'); }
   }
   return m;
 }
