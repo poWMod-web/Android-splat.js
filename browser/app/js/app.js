@@ -4389,7 +4389,7 @@ async function restoreSession(src) {
     // SOG + recon: the lite viewer — the engine renders the compressed splat
     // directly (sorted, WebGL2), nothing decodes to float arrays, and phones
     // without WebGPU can still view. ?nopc forces the trainer view.
-    const liteOk = !src.bytes && src.url && /\.sog($|\?)/.test(src.url) && src.reconUrl &&
+    const liteOk = !src.bytes && src.url && (S._localRun?.sog || /\.sog($|\?)/.test(src.url)) && src.reconUrl &&
       !new URLSearchParams(location.search).has('nopc');
     if (liteOk) {
       try {
@@ -4405,7 +4405,7 @@ async function restoreSession(src) {
         }
         await hydrateLocalRunPhotos(reconJson, S._localRun);
         const { createSogView } = await import('./pcview.js');
-        const ses = await createSogView(src.url, { radius: reconJson.sceneRadius || 10, yUp: !!reconJson.knownCameras });
+        const ses = await createSogView(src.url, { radius: reconJson.sceneRadius || 10 });
         ses.frames = (reconJson.frames || []).map((f) => ({ ...f }));
         // the Details sheet reads session.recon (cams/points) — same shape
         // the old view-only path built via useReconstruction()
@@ -4430,7 +4430,10 @@ async function restoreSession(src) {
     const { gaussians, reconJson, state } = got;
     await hydrateLocalRunPhotos(reconJson, S._localRun);
     const iter = (state && state.iter) || (reconJson && reconJson.iter) || 0;
-    const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter), trainWorker: trainWorkerOpt() });
+    // Match arrival-space/main: a view-only fallback stays on the main thread.
+    // Moving it to the training worker made the browser viewer depend on an
+    // OffscreenCanvas/WebGPU path that can accept attach yet present no model.
+    const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter), trainWorker: false });
     if (reconJson) {
       ses.useReconstruction({
         known: !!reconJson.knownCameras,
@@ -6061,8 +6064,10 @@ async function mountWall() {
   const grid = document.createElement('div');
   grid.className = 'galgrid';
   const slots = { scans: [], files: [], capture: [], local: [] };
-  host.replaceChildren();
-  host.hidden = true;
+  // The refresh affordance is useful even before the first scan exists: it
+  // can discover a capture/service result created outside this WebView.
+  host.replaceChildren(heading, grid);
+  host.hidden = false;
 
   const paint = () => {
     if (token !== wallMountToken) return;
@@ -6073,8 +6078,7 @@ async function mountWall() {
     const recoveryFiles = slots.files.filter((tile) => !localIds.has(tile.dataset.runId));
     const tiles = [...slots.scans, ...slots.capture, ...slots.local, ...recoveryFiles];
     grid.replaceChildren(...tiles);
-    if (!tiles.length) { host.hidden = true; return; }
-    if (!heading.isConnected) host.append(heading, grid);
+    // Keep SAVED ON THIS DEVICE ↻ visible for an empty library too.
     host.hidden = false;
   };
   const load = (key, task, fallback = []) => {

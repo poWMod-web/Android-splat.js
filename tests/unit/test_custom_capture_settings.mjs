@@ -83,8 +83,10 @@ assert.match(controller, /const phoneClass = isPhoneClass\(\);/);
 assert.match(controller, /function trainWorkerOpt\(\) \{/);
 assert.match(controller, /get\('trainworker'\)/);
 assert.match(controller, /return isPhoneClass\(\) \? false : 'auto';/);
-assert.equal((controller.match(/trainWorker: trainWorkerOpt\(\),?/g) || []).length, 3,
-  'fresh, restore and continue sessions all take the worker/local decision');
+assert.equal((controller.match(/trainWorker: trainWorkerOpt\(\),?/g) || []).length, 2,
+  'fresh and continued training sessions take the worker/local decision');
+assert.match(controller, /const ses = createSession\(\{ holdout: -1, maxIters: Math\.max\(1, iter\), trainWorker: false \}\)/,
+  'the view-only fallback follows arrival-space/main and never depends on worker canvas presentation');
 // remote training rasterizes on the worker with the same compute kernel as
 // local — only the SOG-lite stand-in earns the cheap-viewer moving budget
 // (2026-11: the worker view rendered up to 2x main's pixels on one phone)

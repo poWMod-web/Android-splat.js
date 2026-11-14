@@ -23,6 +23,10 @@ assert.doesNotMatch(wall, /fetch\(|import\(['"]\.\/share\.js/,
   'mounting saved work must not issue network requests');
 assert.match(wall, /heading = document\.createElement\('button'\)[\s\S]*wall-refresh[\s\S]*heading\.addEventListener\('click', \(\) => mountWall\(\)\)/,
   'the saved-work heading should explicitly refresh the native and IndexedDB catalogs');
+assert.match(wall, /host\.replaceChildren\(heading, grid\);\s*host\.hidden = false/,
+  'SAVED ON THIS DEVICE refresh stays visible even when the catalog is empty');
+assert.doesNotMatch(wall, /if \(!tiles\.length\) \{ host\.hidden = true/,
+  'an empty scan/model list must not hide its refresh affordance');
 assert.match(app, /visibilitychange[\s\S]*S\.state === 'ready'[\s\S]*mountWall\(\)/,
   'returning to a visible Home screen should automatically refresh saved models');
 assert.match(app, /nativeNewer[\s\S]*Keep main's full model record[\s\S]*status: nativeRow\.status[\s\S]*splats: nativeRow\.splats/,
