@@ -261,5 +261,13 @@ assert.match(session, /trainerOpts = \{ \.\.\.trainerOpts, useStats: true \};/,
   'soft-prune-off boots accumulate the mass window the dead cull scores');
 assert.match(app, /training on with the unpruned model\./,
   'a failed prune tells a resumed run it kept training');
+assert.match(app, /const PRUNE_CUSTOM_KEY = 'splat\.pruneCustomPercent'/,
+  'foreground and background custom prune share a durable selected value');
+assert.match(app, /value="\$\{rememberedPrunePercent\(\)\}"/,
+  'the foreground picker reopens with the remembered percentage');
+assert.match(app, /custom\.value = String\(rememberedPrunePercent\(\)\)/,
+  'the background picker reopens with the same remembered percentage');
+assert.match(app, /localStorage\.setItem\(PRUNE_CUSTOM_KEY, String\(pct\)\)/,
+  'a valid whole percentage persists across app restarts');
 
 console.log('prune-and-continue + soft-prune wiring: passed');

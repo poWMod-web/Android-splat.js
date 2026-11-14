@@ -262,11 +262,28 @@ function readKeepCustom(id) {
   const pct = Math.round(parseFloat($(id).value) || 0);
   return (pct >= 5 ? Math.min(95, pct) : 50) / 100;
 }
-/** Custom PRUNE percentage from a picker input. Only whole values 1–99
- *  are accepted; invalid input returns null and must not execute a prune. */
+/** Custom PRUNE percentage is shared by foreground/background pickers and
+ * retained across picker closes and app restarts. */
+const PRUNE_CUSTOM_KEY = 'splat.pruneCustomPercent';
+function rememberedPrunePercent() {
+  try {
+    const raw = Number(localStorage.getItem(PRUNE_CUSTOM_KEY));
+    if (Number.isInteger(raw) && raw >= 1 && raw <= 99) return raw;
+  } catch { /* storage may be unavailable; the in-page default still works */ }
+  return 50;
+}
+function rememberPrunePercent(raw) {
+  const pct = Number(raw);
+  if (!Number.isInteger(pct) || pct < 1 || pct > 99) return null;
+  try { localStorage.setItem(PRUNE_CUSTOM_KEY, String(pct)); } catch { /* optional persistence */ }
+  return pct;
+}
+/** Only whole values 1–99 are accepted; invalid input returns null and must
+ * not execute a prune. Valid selections are remembered. */
 function readPruneCustom(id) {
   const raw = Number($(id).value);
   if (!Number.isInteger(raw) || raw < 1 || raw > 99) return null;
+  rememberPrunePercent(raw);
   return 1 - raw / 100;
 }
 
@@ -3354,11 +3371,12 @@ function showPrunePicker() {
       <button class="btn" data-ratio="0.75">Prune ¼</button>
       <button class="btn" data-ratio="0.5">Prune ½</button>
       <button class="btn" data-grow="1">Grow now</button>
-      <input id="prunepick-custom" type="number" min="1" max="99" step="1" value="50" style="width:4.5em" title="Custom prune percentage (1–99)">
+      <input id="prunepick-custom" type="number" min="1" max="99" step="1" value="${rememberedPrunePercent()}" style="width:4.5em" title="Custom prune percentage (1–99)">
       <button class="btn" data-custom="1">Prune %</button>
       <button class="btn linkish" data-ratio="">Cancel</button>
     </div>`;
   $('stage').appendChild(card);
+  $('prunepick-custom').addEventListener('change', (e) => rememberPrunePercent(e.target.value));
   card.querySelector('#prunepick-pick').addEventListener('click', (e) => {
     // the custom input lives in this row: only BUTTON clicks answer —
     // tapping the input to type must not dismiss the card
@@ -7170,8 +7188,10 @@ function wireMonitorOnce() {
       row.appendChild(button);
     }
     const custom = document.createElement('input'); custom.id = 'mon-prune-custom'; custom.type = 'number';
-    custom.min = '1'; custom.max = '99'; custom.step = '1'; custom.value = '50'; custom.style.width = '4.5em';
-    custom.title = 'Custom prune percentage (1–99)'; row.appendChild(custom);
+    custom.min = '1'; custom.max = '99'; custom.step = '1'; custom.value = String(rememberedPrunePercent()); custom.style.width = '4.5em';
+    custom.title = 'Custom prune percentage (1–99)';
+    custom.addEventListener('change', () => rememberPrunePercent(custom.value));
+    row.appendChild(custom);
     const customButton = document.createElement('button'); customButton.className = 'btn';
     customButton.textContent = 'Prune %'; customButton.dataset.custom = '1'; row.appendChild(customButton);
     const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel'; row.appendChild(cancel);
