@@ -207,7 +207,7 @@ function postProgress(force = false) {
       text: `${scoreText(psnr) ? `${scoreText(psnr)} · ` : ''}${ses.trainer.n.toLocaleString('en-US')} splats · ${iter.toLocaleString('en-US')} / ${(manifest ? manifest.maxIters : 0).toLocaleString('en-US')}`,
       done: iter, total: manifest ? manifest.maxIters : 0,
       iter, maxIters: manifest ? manifest.maxIters : 0,
-      splats: ses.trainer.n | 0, psnr, ips: +ips.toFixed(1),
+      splats: ses.trainer.n | 0, psnr, scoreScale: manifest?.scoreScale || 'db', ips: +ips.toFixed(1),
       training: !!ses.training, at: now,
     }));
   } catch (e) { log('progress post failed', e); }

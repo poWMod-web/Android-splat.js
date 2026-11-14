@@ -112,8 +112,12 @@ assert.match(main, /void onStop\(\)[^]*activity-background/,
   'normal Activity backgrounding should ask the foreground service to own training');
 assert.match(main, /void onStart\(\)[^]*notifyActivityVisible\(\)/,
   'a quick foreground return should cancel only the debounced handoff');
-assert.ok(app.includes("localStorage.getItem('splatjs_monitor_visuals') === '1'"),
-  'the monitor visuals toggle defaults off, like the in-app training visuals');
+assert.doesNotMatch(app, /mon-visuals|_monVisuals|monitorSnapshot/,
+  'the status card must not offer a snapshot that remains hidden behind its frosted backdrop');
+assert.doesNotMatch(readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8'), /id="mon-visuals"/,
+  'the background status screen should contain only meaningful controls');
+assert.match(app, /async function paintMonitorHead\(runId\)[\s\S]*manifest\.json[\s\S]*manifest\?\.name[\s\S]*mon-name/,
+  'the single BACKGROUND TRAINING heading should be followed by the model name, not a duplicate label or run ID');
 const svc = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
 assert.match(svc, /case "activity-visible":[\s\S]*removeCallbacks\(backgroundHandoff\)[\s\S]*break;/,
   'foreground visibility must not stop an already-running service trainer');

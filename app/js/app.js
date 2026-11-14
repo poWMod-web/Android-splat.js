@@ -6969,19 +6969,12 @@ function enterMonitor(runId) {
   gpuCanvas = null;
   window.scrollTo(0, 0);
   S.state = 'monitor';
-  S._monRun = runId; S._monAt = 0; S._monShotBusy = false; S._monShotAt = 0;
-  // off by default, like the in-app training visuals — snapshots render on demand
-  try { S._monVisuals = localStorage.getItem('splatjs_monitor_visuals') === '1'; }
-  catch { S._monVisuals = false; }
+  S._monRun = runId; S._monAt = 0;
   $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
   if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
-  let mc = document.getElementById('cv-monitor');
-  if (!mc) {
-    mc = document.createElement('canvas');
-    mc.id = 'cv-monitor';
-    $('stage').insertBefore(mc, $('cv'));
-  }
-  mc.style.display = S._monVisuals ? '' : 'none';
+  // This is a status screen, not a viewer. A snapshot behind the card's
+  // frosted backdrop was neither visible nor useful, so no canvas is mounted.
+  document.getElementById('cv-monitor')?.remove();
   paintMonitorHead(runId);
   wireMonitorOnce();
   $('monitor').hidden = false;
@@ -6991,14 +6984,6 @@ function enterMonitor(runId) {
 function wireMonitorOnce() {
   if (S._monWired) return;
   S._monWired = true;
-  $('mon-visuals').addEventListener('click', () => {
-    S._monVisuals = !S._monVisuals;
-    try { localStorage.setItem('splatjs_monitor_visuals', S._monVisuals ? '1' : '0'); } catch { /* private mode */ }
-    const mc = document.getElementById('cv-monitor');
-    if (mc) mc.style.display = S._monVisuals ? '' : 'none';
-    syncMonitorButtons();
-    if (S._monVisuals) monitorPoll(0, true);   // visuals on: a snapshot now, not next poll
-  });
   $('mon-pause').addEventListener('click', () => {
     const b = headlessBridge();
     if (!b || !S._monRun) return;
@@ -7035,8 +7020,7 @@ function wireMonitorOnce() {
   });
 }
 function syncMonitorButtons() {
-  const v = $('mon-visuals'), p = $('mon-pause');
-  if (v) v.textContent = S._monVisuals ? 'Hide visuals' : 'Show visuals';
+  const p = $('mon-pause');
   if (p) p.textContent = S._monPaused ? 'Resume' : 'Pause';
   // wireMonitorOnce persists across monitor visits. Reset the transfer buttons
   // from current state so a successful first handback cannot leave the second
@@ -7049,11 +7033,19 @@ function syncMonitorButtons() {
     if (el) el.hidden = (id === 'mon-live') === !!S._monRecovery;
   }
 }
-function paintMonitorHead(runId) {
+async function paintMonitorHead(runId) {
   S._monRecovery = false;
-  $('mon-name').textContent = 'Background training';
-  $('mon-sub').textContent = `run ${runId}`;
+  $('mon-name').textContent = 'Model';
+  $('mon-sub').hidden = true;
+  $('mon-sub').textContent = '';
   syncMonitorButtons();
+  try {
+    const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')));
+    const manifest = response.ok ? await response.json() : null;
+    if (S.state === 'monitor' && S._monRun === runId && manifest?.name) {
+      $('mon-name').textContent = manifest.name;
+    }
+  } catch { /* the neutral model title remains */ }
 }
 /** The monitor tick (5 s): status/progress paint, snapshot when visuals are
  *  on, and the transitions — finished adopts, dead/interrupted recovers. */
@@ -7086,7 +7078,6 @@ async function monitorPoll(now, force = false) {
     S._monPaused = status.status === 'paused';
     paintMonitorProgress(status, progress);
     syncMonitorButtons();
-    if (S._monVisuals) monitorSnapshot(runId);
   } catch (e) { console.warn('[headless] monitor poll failed', e); }
 }
 function paintMonitorProgress(status, progress) {
@@ -7097,33 +7088,14 @@ function paintMonitorProgress(status, progress) {
   $('mon-iter').textContent = max > 0
     ? `${fmt(iter)} / ${fmt(max)} cycles (${Math.min(99, Math.round(100 * iter / max))}%)`
     : `${fmt(iter)} cycles`;
-  $('mon-score').textContent = p.psnr != null ? `${(+p.psnr).toFixed(1)} dB` : '—';
+  $('mon-score').textContent = p.psnr != null
+    ? (p.scoreScale === 'similarity'
+        ? `${psnrToApproxSsimPercent(+p.psnr).toFixed(1)} %`
+        : `${(+p.psnr).toFixed(1)} dB`)
+    : '—';
   $('mon-splats').textContent = p.splats != null ? fmt(p.splats) : '—';
   const age = p.at ? Math.max(0, Math.round((Date.now() - p.at) / 1000)) : null;
   $('mon-updated').textContent = age == null ? '' : age < 8 ? 'live' : `updated ${age}s ago`;
-}
-/** Demand-driven snapshot: ask the headless twin for a fresh render, show the
- *  newest PNG on disk (it lands a poll or two after the request). */
-async function monitorSnapshot(runId) {
-  if (S._monShotBusy) return;
-  S._monShotBusy = true;
-  try {
-    const b = headlessBridge();
-    try { b && b.headlessCommand('headless-snapshot', runId); } catch { /* best-effort */ }
-    const meta = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.json')))).json().catch(() => null);
-    if (!meta || !(meta.at > S._monShotAt)) return;
-    const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.png')));
-    if (!r.ok) return;
-    const bmp = await createImageBitmap(await r.blob());
-    if (S._monRun !== runId || !S._monVisuals) { bmp.close(); return; }
-    const mc = document.getElementById('cv-monitor');
-    if (!mc) { bmp.close(); return; }
-    if (mc.width !== bmp.width || mc.height !== bmp.height) { mc.width = bmp.width; mc.height = bmp.height; }
-    mc.getContext('2d').drawImage(bmp, 0, 0);
-    bmp.close();
-    S._monShotAt = meta.at;
-  } catch (e) { console.warn('[headless] snapshot poll failed', e); }
-  finally { S._monShotBusy = false; }
 }
 /** Take the run back from the service: stop any live twin, then verify it
  *  stood down (or was already dead) before local training touches the GPU.
@@ -7314,6 +7286,7 @@ function showRecovery(runId, status) {
   $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
   document.getElementById('cv-monitor')?.remove();
   $('mon-name').textContent = 'Background training interrupted';
+  $('mon-sub').hidden = false;
   const iter = status && status.iter ? ` at cycle ${fmt(status.iter)}` : '';
   const why = status && status.error ? ` — ${status.error}` :
     ' — the system reclaimed it while the app was away.';
