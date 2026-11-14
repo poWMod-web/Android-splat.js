@@ -480,8 +480,13 @@ export class GSTrainer {
       ...this.camMeta.map((m) => Math.ceil(m.w / 2) * Math.ceil(m.h / 2)));
     // sizing for the lazy SSIM-metric buffers (see _ensureSsimMetric)
     this.ssimMetricBytes = Math.max(32, maxSsimPixels * 32);
-    this.bufStats = buf(16, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'stats');
-    d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
+    // Four global counters followed by [squared-error, valid-pixels] for
+    // every camera. Per-camera counters are accumulated by the same training
+    // pixels as the epoch score, so image quality needs no extra renders.
+    this._statsWords = 4 + cams.length * 2;
+    this._statsZero = new Uint32Array(this._statsWords);
+    this.bufStats = buf(this._statsWords * 4, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'stats');
+    d.queue.writeBuffer(this.bufStats, 0, this._statsZero);
     // (2) the batch GPU timer: one timestamp pair brackets each step's
     // whole pass (stepOnce is a single submit). Absent without the
     // timestamp-query feature — the batch adapter falls back to wall dt.
@@ -500,7 +505,7 @@ export class GSTrainer {
       this._tsHavePrev = false;
       this._tsPrevSlots = 0;
     }
-    this.bufStatsRead = buf(16, B.COPY_DST | B.MAP_READ, 'statsRead');
+    this.bufStatsRead = buf(this._statsWords * 4, B.COPY_DST | B.MAP_READ, 'statsRead');
     this.bufParamsRead = buf(nb, B.COPY_DST | B.MAP_READ, 'paramsRead'); // cap-sized
     this.bufCamGrad = buf((cams.length + 1) * 8 * 4, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'camGrad');
     d.queue.writeBuffer(this.bufCamGrad, 0, new Int32Array((cams.length + 1) * 8));
@@ -1254,17 +1259,16 @@ export class GSTrainer {
       this._mEnc = d.createCommandEncoder();
       this._ringUsed = 0;
     }
-    // shuffled epochs: deal the pass, reshuffle when spent. The skip loop
-    // below still advances past holdout/excluded (a re-dealt collision
-    // just trains one camera twice in a pass — harmless).
-    if (!this._camDeck.length) this._camDeck = shuffledCamDeck(this.camMeta.length, this.rand);
-    let ci = this._camDeck.pop();
-    // skip the holdout and any excluded (e.g. motion-blurred) cameras
-    for (let tries = 0; tries < 16; tries++) {
-      const bad = ci === this.holdout || (this.excluded && this.excluded.has(ci));
-      if (!bad) break;
-      ci = (ci + 1) % this.camMeta.length;
+    // A shuffled epoch contains every trainable camera exactly once. Filtering
+    // before dealing avoids substituting adjacent cameras for holdout/removed
+    // entries (which used to duplicate some images and skip others).
+    if (!this._camDeck.length) {
+      this._camDeck = shuffledCamDeck(this.camMeta.length, this.rand)
+        .filter((ci) => ci !== this.holdout && !(this.excluded && this.excluded.has(ci)));
     }
+    // Degenerate configurations are rejected by setup/UI, but retain a safe
+    // fallback rather than indexing undefined if every camera was excluded.
+    const ci = this._camDeck.length ? this._camDeck.pop() : 0;
     const meta = this.camMeta[ci];
     this.lastCam = ci; // which camera this step trains on (UI pulse)
     if (this.shK && (this.opts.shRamp ?? true)) {
@@ -1633,7 +1637,7 @@ export class GSTrainer {
       : new Float32Array(this.camUniforms[ci]);
     uni[24] = 0; uni[25] = 0; uni[26] = 0; // evaluate on black whatever the training background was
     const rows = this.camMeta.length + 1;
-    d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
+    d.queue.writeBuffer(this.bufStats, 0, this._statsZero);
     this._writeTrainUniforms(uni);
     const enc = d.createCommandEncoder();
     const p = enc.beginComputePass();
@@ -1685,7 +1689,7 @@ export class GSTrainer {
       }
       ssim = ssimIndexRgb(pred, target, width, height, valid);
     }
-    d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
+    d.queue.writeBuffer(this.bufStats, 0, this._statsZero);
     this.pixelsSeen = 0; // running train-psnr window was clobbered
     const mse = v / 16 / (validPx * 3);
     return { psnr: mse > 0 ? -10 * Math.log10(mse) : Infinity, camGrad, ...(includeSsim ? { ssim } : {}) };
@@ -1741,9 +1745,9 @@ export class GSTrainer {
     if (!this.ready) throw new Error('GSTrainer.readLoss: setup() did not complete');
     const d = this.device;
     const enc = d.createCommandEncoder();
-    enc.copyBufferToBuffer(this.bufStats, 0, this.bufStatsRead, 0, 16);
+    enc.copyBufferToBuffer(this.bufStats, 0, this.bufStatsRead, 0, this._statsWords * 4);
     d.queue.submit([enc.finish()]);
-    d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
+    d.queue.writeBuffer(this.bufStats, 0, this._statsZero);
     const px = this.pixelsSeen;
     this.pixelsSeen = 0;
     await this.bufStatsRead.mapAsync(GPUMapMode.READ);
@@ -1751,6 +1755,10 @@ export class GSTrainer {
     const v = s[0];
     const validPx = s[2]; // valid-pixel count (undistortion borders excluded)
     this.entryOverflowTiles = (this.entryOverflowTiles || 0) + s[3];
+    this.cameraScores = this.camMeta.map((_, ci) => {
+      const sum = s[4 + ci * 2], n = s[5 + ci * 2];
+      return n > 0 && sum > 0 ? -10 * Math.log10(sum / 16 / (n * 3)) : null;
+    });
     this.bufStatsRead.unmap();
     if (px === 0 || validPx === 0) return null;
     const mse = v / 16 / (validPx * 3);

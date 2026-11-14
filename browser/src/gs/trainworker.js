@@ -115,6 +115,7 @@ export function createTrainWorkerHandler(deps = {}) {
     }
     if (patch.holdout !== undefined) tr.holdout = patch.holdout;
     if (patch.excluded !== undefined) tr.excluded = new Set(patch.excluded);
+    if (patch.holdout !== undefined || patch.excluded !== undefined) tr._camDeck = [];
     if (patch.growLimit !== undefined) tr.growLimit = patch.growLimit;
     if (patch.protect !== undefined) tr.protect = patch.protect && { ...patch.protect };
     if (patch.freezePos !== undefined) tr.setFreezePos(patch.freezePos.from, patch.freezePos.to);
@@ -290,7 +291,9 @@ export function createTrainWorkerHandler(deps = {}) {
       }
       case 'readLoss': {
         const tr = need();
-        return { value: { mse: await tr.readLoss(), entryOverflowTiles: tr.entryOverflowTiles || 0 } };
+        const mse = await tr.readLoss();
+        return { value: { mse, cameraScores: tr.cameraScores || [],
+          entryOverflowTiles: tr.entryOverflowTiles || 0 } };
       }
       case 'eval': {
         const tr = need();

@@ -100,6 +100,7 @@ export class RemoteTrainer {
   async readLoss() {
     const r = await this._rpc.call('readLoss', {});
     if (r.entryOverflowTiles) this.entryOverflowTiles = r.entryOverflowTiles;
+    this.cameraScores = Array.isArray(r.cameraScores) ? r.cameraScores : [];
     return r.mse;
   }
 

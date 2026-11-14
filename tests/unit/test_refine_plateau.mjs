@@ -1,11 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { scorePlateaued } from '../../src/session.js';
-import { FastRobustZLEMA as EngineZLEMA, SKIP_FIRST } from '../../src/zlema.js';
-import { FastRobustZLEMA as ChartZLEMA } from '../../app/js/chart.js';
 
 const sessionSource = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
-const zlemaSource = readFileSync(new URL('../../src/zlema.js', import.meta.url), 'utf8');
 const trainerSource = readFileSync(new URL('../../src/gs/trainer.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 
@@ -18,10 +15,10 @@ const eligible = (extra = {}) => ({ window: W, ...extra });
 
 const rising = line(9, NOW - W, 150, 20, 1.0);
 assert.equal(scorePlateaued(rising, NOW, eligible()), false,
-  'a healthy filtered climb must not trigger growth');
+  'a healthy raw epoch-score climb must not trigger growth');
 const flat = line(9, NOW - W, 150, 20, 0.0);
 assert.equal(scorePlateaued(flat, NOW, eligible()), true,
-  'a ZLEMA plateau alone triggers growth');
+  'a raw epoch-score plateau alone triggers growth');
 const crawl = line(9, NOW - W, 150, 20, 0.05);
 assert.equal(scorePlateaued(crawl, NOW, eligible()), true,
   'a crawl below the slope threshold triggers growth');
@@ -30,7 +27,7 @@ assert.equal(scorePlateaued(climb, NOW, eligible()), false,
   'a climb at or above the slope threshold does not trigger growth');
 const falling = line(9, NOW - W, 150, 20, -0.5);
 assert.equal(scorePlateaued(falling, NOW, eligible()), true,
-  'a falling filtered score triggers triage');
+  'a falling raw epoch score triggers triage');
 const tooFew = line(3, NOW - W, 400, 20, 0.0);
 assert.equal(scorePlateaued(tooFew, NOW, eligible()), false,
   'three points are warming up, never a plateau');
@@ -40,7 +37,7 @@ assert.equal(scorePlateaued(short, NOW, eligible()), false,
 assert.equal(scorePlateaued([], NOW), false);
 const withNan = [[9000, 20], [9200, NaN], [9400, 20], [9600, 20], [9800, 20], [10000, 20]];
 assert.equal(scorePlateaued(withNan, NOW, eligible()), true,
-  'a NaN filtered readout is skipped, not fatal');
+  'a NaN epoch readout is skipped, not fatal');
 assert.equal(scorePlateaued(flat, NOW - 5000, eligible()), false,
   'points past the horizon do not count');
 assert.equal(scorePlateaued(flat, NOW, eligible({ after: NOW - 300 })), false,
@@ -60,7 +57,7 @@ assert.equal(scorePlateaued(over, NOW, eligible()), false,
 assert.match(sessionSource, /export function scorePlateaued\(history, nowIter/,
   'the detector is exported for tests and reuse');
 assert.match(sessionSource, /return robustSlope < slope;/,
-  'growth should use only the robust ZLEMA plateau slope');
+  'growth should use only the robust raw epoch-score plateau slope');
 assert.match(sessionSource, /const convergenceGap = this\.opts\.plateauMinGap \?\? 700;/,
   'the post-growth backoff defaults to at least 700 iterations');
 assert.match(sessionSource, /sinceRefine >= convergenceGap/,
@@ -100,34 +97,20 @@ assert.match(sessionSource, /this\._em\.emit\('event', \{ kind: 'overflow', iter
 assert.match(appSource, /if \(e\.kind === 'overflow' && S\._ovWarned !== \(S\.runId \?\? 'live'\)\) \{/,
   'the app flashes once per run');
 
-// ---- the trigger reads the graph's history, not the raw readouts -------------
-assert.equal(ChartZLEMA, EngineZLEMA,
-  'the graph and the trigger should share one filter class');
-assert.equal(SKIP_FIRST, 3,
-  'the trigger should hold back the same cold-start samples as the graph');
-assert.match(sessionSource, /import \{ FastRobustZLEMA, SKIP_FIRST \} from '\.\/zlema\.js';/,
-  'the session should import the shared filter');
-assert.match(sessionSource, /this\.zlemaHistory = \[\];   \/\/ \[iter, filteredPsnrTrain\]/,
-  'the constructor should open an empty filtered history');
-assert.match(sessionSource, /if \(this\.lossHistory\.length > SKIP_FIRST\) \{/,
-  'every raw readout past the hold should also feed the shared filter');
-assert.match(sessionSource, /this\.zlemaHistory\.push\(\[trainer\.iter, this\._zlema\.update\(m\.psnrTrain\)\]\);/,
-  'the trigger history should store filtered values per iteration');
-assert.match(sessionSource, /setLossHistory\(rows\) \{[\s\S]*this\._zlema\.series\(this\.lossHistory\.slice\(SKIP_FIRST\)\)/,
-  'a restored history should replay the graph pass through a fresh filter');
+// ---- the trigger reads the exact raw series plotted by the graph -----------
+assert.doesNotMatch(sessionSource, /FastRobustZLEMA|SKIP_FIRST|zlemaHistory|_zlema/,
+  'the session should perform no ZLEMA calculation');
+assert.match(sessionSource, /currentScore = this\.lossHistory\.length/,
+  'growth recovery should use the latest raw complete-epoch score');
+assert.match(sessionSource, /scorePlateaued\(this\.lossHistory, trainer\.iter/,
+  'the plateau detector should read the same raw series as the graph');
+assert.match(sessionSource, /setLossHistory\(rows\) \{[\s\S]*this\.lossHistory = rows\.map/,
+  'restored history should stay raw');
 assert.match(appSource, /session\.setLossHistory\(history\);/,
-  'reopening a run should hydrate the filtered history with it');
-// the engine's incremental feed is the graph's fresh pass, sample for sample
+  'reopening a run should hydrate that raw history');
 const spiky = Array(8).fill(0).map((_, k) => [NOW - W + k * 150, 20 + (k * 150 * 0.2) / 1000]);
 spiky[6][1] -= 2.5; spiky[7][1] -= 2.0;
-const incrFeed = new EngineZLEMA();
-const triggerHist = [];
-spiky.forEach(([i, v], k) => { if (k >= SKIP_FIRST) triggerHist.push([i, incrFeed.update(v)]); });
-assert.deepEqual(triggerHist, new EngineZLEMA().series(spiky.slice(SKIP_FIRST)),
-  'incremental per-push updates should equal the graph fresh pass');
 assert.equal(scorePlateaued(spiky, NOW, { window: W }), true,
-  'the detector should judge the supplied filtered score shape without raw variance');
-assert.equal(scorePlateaued(triggerHist, NOW, { window: W }), false,
-  'the filtered slope and full-window requirements should reject this short transient');
+  'the robust raw slope should judge the supplied complete-epoch samples directly');
 
 console.log('plateau-driven refine + 1M mobile ceiling + overflow warnings: passed');

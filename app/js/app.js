@@ -3721,9 +3721,8 @@ function formatTrainingScore(psnr) {
   return (S.scoreScale === 'similarity' ? psnrToApproxSsimPercent(psnr) : psnr).toFixed(2);
 }
 
-/** The score as shown: the ZLEMA curve's end once a chart has drawn one,
- *  else the latest raw sample. Raw stays stored everywhere — dots, hover
- *  and history all read it — only the headline number is filtered. */
+/** The score as shown: the latest complete shuffled-camera epoch. The
+ * headline, graph line, hover and saved history all use the same raw value. */
 function shownScore(which) {
   const raw = which === 'hold' ? S.psnrHold : S.psnrTrain;
   for (const c of [chart, dchart]) {
@@ -3842,6 +3841,13 @@ function onMetrics(m) {
     m.psnrTrain != null ? m.psnrTrain.toFixed(2) : '', m.psnrHold != null ? m.psnrHold.toFixed(2) : '']);
   if (m.psnrTrain != null) S.psnrTrain = m.psnrTrain;
   if (m.psnrHold != null) S.psnrHold = m.psnrHold;
+  if (Array.isArray(m.frameScores) && S.scene?.cams) {
+    for (const cam of S.scene.cams) {
+      const score = cam.ci >= 0 ? m.frameScores[cam.ci] : null;
+      if (Number.isFinite(score)) cam.psnr = score;
+    }
+    paintStrip();
+  }
   if (m.psnrHold != null) (S.holdHist ??= []).push([m.iter, m.psnrHold]);
   if (Number.isFinite(m.splats)) (S.splatHist ??= []).push([m.iter, m.splats]);
   // the first few hundred cycles rocket from near-nothing to the real curve —
@@ -6631,11 +6637,23 @@ async function thumbBmp(i) {
   }
 }
 
+function frameScoreColor(value, scores) {
+  if (!Number.isFinite(value) || !scores.length) return '#2fd4c1';
+  const lo = Math.min(...scores), hi = Math.max(...scores);
+  const q = hi > lo ? clamp((value - lo) / (hi - lo), 0, 1) : 1;
+  const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
+  const rgb = q < 0.5
+    ? mix([239, 91, 76], [242, 193, 78], q * 2)
+    : mix([242, 193, 78], [47, 212, 193], (q - 0.5) * 2);
+  return `rgb(${rgb.join(',')})`;
+}
+
 function paintStrip() {
   const sc = $('strip-scroll');
   if (!sc) return;
   const active = (S.state === 'train' && S.session && S.session.training && S.scene)
     ? (S.scene.cams.find((c) => c.ci === S.session.activeCam) || {}).i : -1;
+  const imageScores = (S.scene?.cams || []).map((c) => c.psnr).filter(Number.isFinite);
   S.photos.forEach((p, i) => {
     const b = sc.children[i];
     if (!b) return;
@@ -6649,11 +6667,13 @@ function paintStrip() {
     tag.hidden = !t;
     if (t) { tag.dataset.t = c.state; tag.textContent = t; }
     const bar = b.querySelector('.frame-bar i');
-    const score = c && (c.psnr != null ? c.psnr
-      : (S.state !== 'ready' && c.state !== 'unplaced'
-        ? (c.state === 'holdout' ? S.psnrHold : S.psnrTrain) : null));
+    // Per-image values come from that camera's contribution to the latest
+    // complete shuffled epoch (or the explicit holdout evaluation), never
+    // from the global score copied onto every thumbnail.
+    const score = c && (Number.isFinite(c.psnr) ? c.psnr
+      : (c.state === 'holdout' && Number.isFinite(S.psnrHold) ? S.psnrHold : null));
     bar.style.width = score != null ? `${clamp((score - 12) / 22, 0, 1) * 100}%` : '0%';
-    bar.style.background = c && c.state === 'holdout' ? '#f2a03f' : '#2fd4c1';
+    bar.style.background = frameScoreColor(score, imageScores);
   });
 }
 

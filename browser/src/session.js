@@ -24,7 +24,6 @@
 // batching, auto-stop, refine cadence, blur exclusion, holdout choice, PSNR
 // conversion, and the hidden-tab watchdog.
 
-import { FastRobustZLEMA, SKIP_FIRST } from './zlema.js';
 import { decodeFrames } from './io/frames.js';
 import { reconFromKnownCameras } from './io/cameras.js';
 import { focalPxFrom35 } from './io/exif.js';
@@ -232,8 +231,8 @@ class Emitter {
   }
 }
 
-/** Robust plateau test for score-driven refinement. The filtered ZLEMA slope
- * is the sole convergence signal; post-growth score recovery is gated
+/** Robust plateau test for score-driven refinement. The raw complete-epoch
+ * score slope is the convergence signal; post-growth recovery is gated
  * separately in the training loop below. */
 export function scorePlateaued(history, nowIter, {
   window = 1200, slope = 0.2, minPoints = 4, minSpan = window * 0.75,
@@ -271,12 +270,9 @@ export class Session {
     this.holdout = -1;
     this.testCams = [];
     this.training = false;
+    // One raw point per complete shuffled camera epoch. The same unfiltered
+    // series drives the graph, headline score and plateau detector.
     this.lossHistory = [];  // [iter, psnrTrain]
-    // the graph's curve, kept incrementally: same filter, same parameters,
-    // same cold-start hold as the score plot (zlema.js) — the plateau slope
-    // below reads THIS, so the trigger trips on the line the user sees
-    this.zlemaHistory = [];   // [iter, filteredPsnrTrain]
-    this._zlema = new FastRobustZLEMA();
     // Intervention cycle: plateau -> expected score drop -> recovery to the
     // pre-intervention reference -> a fresh plateau. This blocks repeated
     // growth while the model is still rebuilding quality.
@@ -306,14 +302,9 @@ export class Session {
     this.view = new SessionView(this);
   }
 
-  /** Hydrate a restored score history: raw rows stay raw (dots, exports),
-   *  and the filtered curve replays through a fresh filter — the same
-   *  fresh pass the graph runs per draw, so a reopened run's trigger
-   *  history matches its plotted line from the first slope test. */
+  /** Hydrate a restored raw epoch-score history. */
   setLossHistory(rows) {
     this.lossHistory = rows.map((r) => Array.from(r || []));
-    this._zlema = new FastRobustZLEMA();
-    this.zlemaHistory = this._zlema.series(this.lossHistory.slice(SKIP_FIRST));
   }
 
   on(type, fn) { return this._em.on(type, fn); }
@@ -911,7 +902,11 @@ export class Session {
   /** Commit the training split computed by _applyTrainingSplit. */
   async _commitSplit(excluded) {
     if (this._remote) await this.trainer.setConfig({ excluded: [...excluded], holdout: this.holdout });
-    else { this.trainer.excluded = excluded; this.trainer.holdout = this.holdout; }
+    else {
+      this.trainer.excluded = excluded; this.trainer.holdout = this.holdout;
+      this.trainer._camDeck = [];
+    }
+    this._scoreTrainer = null; // the next score starts a fresh complete deck
   }
 
   /** After a run with photometric pose optimisation (trainer opts.camOpt): log how far
@@ -1391,7 +1386,6 @@ export class Session {
     this._fences = [];
     this._ips = null;
     this._thrT = null;
-    this._statsGap = 6000;
     this._lastStats = performance.now();
     this._metricsLock = null;    // readbacks on the dead device never resolve
     this._instantChecked = false;   // the fresh device re-proves its fences
@@ -1401,8 +1395,7 @@ export class Session {
     this._readOverrun = false;
     this._framePending = false;
     this.lossHistory = [];
-    this.zlemaHistory = [];
-    this._zlema = new FastRobustZLEMA();
+    this._scoreTrainer = null;
     this._lastHold = null;
     this._lastHoldEval = 0;
     this._itersAtStats = 0;
@@ -1700,6 +1693,15 @@ export class Session {
           (this._instantSuspect || this._readOverrun)) {
         batch = Math.min(batch, 8);
       }
+      // A score spans exactly one shuffled deck: every trainable image once.
+      // Cap the GPU batch at the deck boundary so readLoss cannot mix epochs.
+      const scoreGroupSize = Math.max(1, trainer.camMeta.reduce((n, _, ci) =>
+        n + (ci !== trainer.holdout && !(trainer.excluded && trainer.excluded.has(ci)) ? 1 : 0), 0));
+      if (this._scoreTrainer !== trainer) {
+        this._scoreTrainer = trainer;
+        this._scoreGroupLeft = scoreGroupSize;
+      }
+      batch = Math.min(batch, Math.max(1, this._scoreGroupLeft));
       // (4) over budget: skip the submit, keep the view alive, idle a beat
       // for the queue to drain — then re-evaluate next frame
       const cutMs = this._submitCutMs(batch);
@@ -1750,6 +1752,7 @@ export class Session {
         for (let k = 0; k < batch; k++) trainer.stepOnce();
         if (typeof trainer.endGpuBatch === 'function') gpuMs = await trainer.endGpuBatch();
       }
+      this._scoreGroupLeft -= batch;
       // (3) the ceiling's own signal: reads before refine() below can move n
       this._govNoteGpu(gpuMs, batch, trainer.n);
       this._lastGpuMs = gpuMs; // (4) corrects the submit prediction next frame
@@ -1762,14 +1765,14 @@ export class Session {
       const sinceRefine = trainer.iter - (trainer.lastRefine || 0);
       const plateauWindow = this.opts.plateauWindow ?? 1200;
       const convergenceGap = this.opts.plateauMinGap ?? 700;
-      const currentScore = this.zlemaHistory.length ? this.zlemaHistory.at(-1)[1] : null;
+      const currentScore = this.lossHistory.length ? this.lossHistory.at(-1)[1] : null;
       const recovered = this._refineRecoveryTarget == null ||
         (Number.isFinite(currentScore) && currentScore >= this._refineRecoveryTarget - (this.opts.plateauRecoverySlack ?? 0.05));
       if (recovered && this._refineRecoveryTarget != null) this._refineRecoveryTarget = null;
       let plateau = false;
       if (this.opts.refinePlateau !== false && trainer.iter >= plateauWindow && recovered &&
           sinceRefine >= convergenceGap) {
-        plateau = scorePlateaued(this.zlemaHistory, trainer.iter, {
+        plateau = scorePlateaued(this.lossHistory, trainer.iter, {
           window: plateauWindow,
           // First growth observes 75% of the 1,200-cycle window. After a
           // growth, the explicit 700-cycle backoff is also the fresh-evidence
@@ -1844,11 +1847,15 @@ export class Session {
 
       const now = performance.now();
       let tMet = 0;
-      if (now - this._lastStats > (this._statsGap ?? 6000)) {
+      if (this._scoreGroupLeft <= 0) {
         const m0 = performance.now();
         await this._emitMetrics();
         tMet = performance.now() - m0;
-        this._govUpdate(); // duty governor runs on the stats cadence
+        this._govUpdate(); // duty governor runs once per complete camera group
+        // Splits can change while the readback is in flight; recompute the
+        // next complete shuffled group from the authoritative trainer set.
+        this._scoreGroupLeft = Math.max(1, trainer.camMeta.reduce((n, _, ci) =>
+          n + (ci !== trainer.holdout && !(trainer.excluded && trainer.excluded.has(ci)) ? 1 : 0), 0));
       }
 
       const v0 = performance.now();
@@ -1983,15 +1990,13 @@ export class Session {
     // frame present goes out now instead of queueing behind the stall
     await tick();
     const mse = await trainer.readLoss();
-    if (mse != null && mse > 0) {
+    // Scheduled reads occur only at a complete deck boundary. A final/manual
+    // stop may leave a partial deck; drain it for consistency but never plot
+    // that incomplete group as though every image contributed.
+    if (!final && mse != null && mse > 0) {
       m.psnrTrain = -10 * Math.log10(mse);
       this.lossHistory.push([trainer.iter, m.psnrTrain]);
-      // the trigger's history shadows the graph's: past the cold-start
-      // hold, every raw readout also feeds the shared filter (one update
-      // per push — a causal pass, identical to the graph's fresh series)
-      if (this.lossHistory.length > SKIP_FIRST) {
-        this.zlemaHistory.push([trainer.iter, this._zlema.update(m.psnrTrain)]);
-      }
+      m.frameScores = Array.isArray(trainer.cameraScores) ? trainer.cameraScores.slice() : [];
     }
     // tile-sort overflow used to be silent (dropped tiles render as
     // background): the count is cumulative on the trainer in both the
@@ -2021,13 +2026,11 @@ export class Session {
     } else if (this._lastHold != null) {
       m.psnrHold = this._lastHold;
     }
-    // The readbacks above drain every queued batch first — seconds on a slow
-    // GPU. Start the next fixed six-second accumulation interval only after
-    // this readout completes, so plotting never causes back-to-back drains.
+    // This read closes one complete shuffled camera group. Timing remains
+    // diagnostic only; it never decides when the next graph point appears.
     const end = performance.now();
     this._lastStats = end;
     this._itersAtStats = trainer.iter;
-    this._statsGap = 6000;
     // a multi-second drain means the loop submitted faster than the GPU
     // drains — the backlog instant fences hide everywhere else. Without a
     // batch timer there is nothing else to pace off, so stay conservative

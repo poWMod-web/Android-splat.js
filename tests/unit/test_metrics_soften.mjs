@@ -67,7 +67,7 @@ try {
   assert.deepEqual(evalCalls, [1], 'a drained readout should defer the holdout instead of stacking hitches');
   assert.equal(s._lastHoldEval, 5000, 'the cadence must not advance on a deferred eval (it retries next readout)');
   assert.equal(m.psnrHold, 28.5, 'the deferred readout should report the last known holdout score');
-  assert.equal(s._statsGap, 6000, 'score accumulation never runs more often than every six seconds');
+  assert.equal(s._statsGap, undefined, 'score plotting should no longer have a time cadence');
   const fin = await s._emitMetricsInner(true);
   assert.deepEqual(evalCalls, [1, 1], 'final always evaluates — the done screen needs its number');
   assert.equal(s._lastHoldEval, 9000);

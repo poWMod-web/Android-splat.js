@@ -384,7 +384,7 @@ async function smallTrainer(trainerOpts = {}) {
   f._sched = { raf: (fn) => scheduled.push(fn), runFrame: () => {} };
   let steps = 0, ticks = 0;
   f.trainer = {
-    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50,
+    camMeta: Array.from({ length: 20 }, () => ({ w: 8, h: 8 })), iter: 0, n: 50, readLoss: async () => 0.01,
     stepOnce() { steps++; },
     device: { queue: { async onSubmittedWorkDone() {} } },
   };
@@ -423,7 +423,7 @@ async function smallTrainer(trainerOpts = {}) {
   e._sched = { raf: () => {}, runFrame: () => {} };
   let esteps = 0;
   e.trainer = {
-    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50,
+    camMeta: Array.from({ length: 100 }, () => ({ w: 8, h: 8 })), iter: 0, n: 50, readLoss: async () => 0.01,
     stepOnce() { esteps++; },
     device: { queue: { async onSubmittedWorkDone() {} } },
   };
@@ -622,7 +622,7 @@ async function smallTrainer(trainerOpts = {}) {
   const s = createSession({});
   let steps = 0;
   s.trainer = {
-    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50,
+    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50, readLoss: async () => 0.01,
     stepOnce() { steps++; this.iter++; },
     device: { queue: { async onSubmittedWorkDone() {} } },
   };
@@ -649,7 +649,7 @@ async function smallTrainer(trainerOpts = {}) {
   // visible pages keep the rAF path: the pump sits idle
   const v = createSession({});
   v.trainer = {
-    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50,
+    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50, readLoss: async () => 0.01,
     stepOnce() {}, device: { queue: { async onSubmittedWorkDone() {} } },
   };
   v.view._tick = () => {};

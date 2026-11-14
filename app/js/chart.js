@@ -2,10 +2,6 @@
 // the moments where the optimiser changed its own setup, and an optional ghost
 // run so "what if" is a comparison instead of a claim.
 
-import { FastRobustZLEMA, SKIP_FIRST } from '../../src/zlema.js';
-// re-exported: the filter's tests and readers keep importing it from here
-export { FastRobustZLEMA };
-
 /** Approximate SSIM percentage from PSNR (in dB), per the app's calibration. */
 export function psnrToApproxSsimPercent(psnr) {
   if (psnr === Infinity) return 100;
@@ -59,23 +55,9 @@ export class Chart {
     return { train: this.train, hold: this.hold };
   }
 
-  /** Raw post-hold samples (still in dB): the dots' material and the
-   *  hover's lookup — never the held-back cold start. */
-  _heldRaw(series) {
-    return series.length > SKIP_FIRST ? series.slice(SKIP_FIRST) : [];
-  }
-
-  /** Raw-dB ZLEMA pass over the post-hold samples: the curve's material.
-   *  Fresh pass per call — redraws and scale toggles can't desync it. */
-  _filteredRaw(series) {
-    const held = this._heldRaw(series);
-    if (!held.length) return [];
-    return new FastRobustZLEMA().series(held);
-  }
-
+  /** Display the measured complete-epoch samples directly. */
   _displaySeries(series) {
-    return this._filteredRaw(series)
-      .map(([iter, value]) => [iter, this._displayValue(value)]);
+    return (series || []).map(([iter, value]) => [iter, this._displayValue(value)]);
   }
 
   /** Dynamic x extent for the given last-sample iters: the data's reach
@@ -123,23 +105,16 @@ export class Chart {
     if (pw <= 0 || ph <= 0) return;
 
     const active = this._activeSeries();
-    const trainHeld = this._heldRaw(active.train);
-    const holdHeld = this._heldRaw(active.hold);
-    const trainF = this._filteredRaw(active.train);
-    const holdF = this._filteredRaw(active.hold);
-    // the score readouts show the ZLEMA curve's end, not the latest raw
-    // sample — one source of truth for the number and the line
-    this.lastTrainF = trainF.length ? trainF[trainF.length - 1][1] : null;
-    this.lastHoldF = holdF.length ? holdF[holdF.length - 1][1] : null;
-    const train = trainF.map(([iter, value]) => [iter, this._displayValue(value)]);
-    const hold = holdF.map(([iter, value]) => [iter, this._displayValue(value)]);
+    const trainRaw = active.train;
+    const holdRaw = active.hold;
+    // The line and headline use the measured complete-epoch value directly.
+    this.lastTrainF = trainRaw.length ? trainRaw[trainRaw.length - 1][1] : null;
+    this.lastHoldF = holdRaw.length ? holdRaw[holdRaw.length - 1][1] : null;
+    const train = this._displaySeries(trainRaw);
+    const hold = this._displaySeries(holdRaw);
     const ghostTrain = this._displaySeries(this.ghost?.train || []);
     const ghostHold = this._displaySeries(this.ghost?.hold || []);
-    // the raw dots behind the filtered lines: tiny and light — the honest
-    // scatter the curve summarizes (ghost stays line-only)
-    const trainDots = trainHeld.map(([iter, value]) => [iter, this._displayValue(value)]);
-    const holdDots = holdHeld.map(([iter, value]) => [iter, this._displayValue(value)]);
-    const ys = [...train, ...hold, ...ghostTrain, ...ghostHold, ...trainDots, ...holdDots].map((p) => p[1]);
+    const ys = [...train, ...hold, ...ghostTrain, ...ghostHold].map((p) => p[1]);
     let lo = ys.length ? Math.min(...ys) : (this.scale === 'similarity' ? 0 : 10);
     let hi = ys.length ? Math.max(...ys) : (this.scale === 'similarity' ? 100 : 30);
     const minSpan = this.scale === 'similarity' ? 1 : 6;
@@ -202,15 +177,6 @@ export class Chart {
       line(ghostTrain, 'rgba(147,161,160,.35)', [4, 3], 1.2);
       line(ghostHold, 'rgba(147,161,160,.22)', [2, 3], 1.2);
     }
-    const dots = (pts, color) => {
-      if (!pts.length) return;
-      ctx.fillStyle = color;
-      for (const p of pts) {
-        ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 0.75 * dpr, 0, 7); ctx.fill();
-      }
-    };
-    dots(holdDots, 'rgba(242,160,63,.35)');
-    dots(trainDots, 'rgba(47,212,193,.30)');
     line(hold, '#f2a03f', [5, 3], 1.5);
     line(train, '#2fd4c1', null, 1.8);
 
@@ -220,8 +186,7 @@ export class Chart {
       const x = X(this.mark != null ? this.mark : last[0]);
       ctx.strokeStyle = 'rgba(230,236,235,.25)'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(x, t); ctx.lineTo(x, t + ph); ctx.stroke();
-      // the dot rides the drawn (trimmed, smoothed) line's end, not the raw
-      // sample — else it floats off the curve it terminates
+      // The endpoint rides the last measured complete-epoch score.
       const drawn = train[train.length - 1];
       if (this.mark == null && drawn) {
         ctx.fillStyle = '#2fd4c1';
@@ -230,10 +195,10 @@ export class Chart {
     }
 
     // hover readout
-    if (this.hover && trainHeld.length) {
+    if (this.hover && trainRaw.length) {
       const it = this._frac(this.hover.x) * xMax;
       const near = (arr) => arr.length ? arr.reduce((a, p) => Math.abs(p[0] - it) < Math.abs(a[0] - it) ? p : a) : null;
-      const a = near(trainHeld), h = near(holdHeld), n = near(this.splats);
+      const a = near(trainRaw), h = near(holdRaw), n = near(this.splats);
       const ev = this.events.find((e) => Math.abs(e.at * this.maxIter - it) < xMax * .012);
       if (a) {
         const x = X(a[0]);

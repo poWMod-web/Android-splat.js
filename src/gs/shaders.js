@@ -858,7 +858,11 @@ ${mode === 2 ? '' : /* wgsl */ `      if (isPhoto) { // subject pixels only: PSN
       // squared error for the PSNR metric, DITHERED before quantization: plain
       // truncation zeroes sub-quantum pixels and inflates PSNR above ~40dB
       let dith = fract(sin(f32(pi) * 12.9898) * 43758.5453);
-      atomicAdd(&stats[0], u32(dot(err, err) * 16.0 + dith));
+      let scoreAt = 4u + u32(cam.misc2.y) * 2u;
+      let scoreErr = u32(dot(err, err) * 16.0 + dith);
+      atomicAdd(&stats[0], scoreErr);
+      atomicAdd(&stats[scoreAt], scoreErr);
+      atomicAdd(&stats[scoreAt + 1u], 1u);
       atomicAdd(&stats[1], u32(lossv * 32768.0)); // training loss (grad-check)
 ${camGrad ? `      let ci8 = u32(cam.misc2.y) * 8u;
       camAdd(ci8 + 6u, dot(eg, C) * gain); // d/d(log gain)
@@ -2032,7 +2036,11 @@ fn main(@builtin(global_invocation_id) g: vec3u) {
   atomicAdd(&stats[2], 1u);
   let err = (gain * C + vec3f(cam.misc2.w)) - tcol;
   let dith = fract(sin(f32(pi) * 12.9898) * 43758.5453);
-  atomicAdd(&stats[0], u32(dot(err, err) * 16.0 + dith));
+  let scoreAt = 4u + u32(cam.misc2.y) * 2u;
+  let scoreErr = u32(dot(err, err) * 16.0 + dith);
+  atomicAdd(&stats[0], scoreErr);
+  atomicAdd(&stats[scoreAt], scoreErr);
+  atomicAdd(&stats[scoreAt + 1u], 1u);
   const DELTA = 0.03;
   let root = sqrt(err * err + vec3f(DELTA * DELTA));
   let eg = err / root;

@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { Chart, psnrToApproxSsimPercent, FastRobustZLEMA } from '../../app/js/chart.js';
+import { Chart, psnrToApproxSsimPercent } from '../../app/js/chart.js';
 
 const chartSource = readFileSync(new URL('../../app/js/chart.js', import.meta.url), 'utf8');
-const zlemaSource = readFileSync(new URL('../../src/zlema.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 const appCss = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
@@ -37,8 +36,8 @@ scoreChart.scale = 'similarity';
 assert.deepEqual(scoreChart._activeSeries(), { train: scoreChart.train, hold: scoreChart.hold },
   'the approximate scale should reuse the PSNR samples, without a separate model-derived history');
 const simPlotted = scoreChart._displaySeries(scoreChart.train);
-assert.deepEqual(simPlotted.map((p) => p[0]), [300, 400, 500, 600],
-  'the similarity graph should plot past the held samples');
+assert.deepEqual(simPlotted.map((p) => p[0]), [0, 100, 200, 300, 400, 500, 600],
+  'the similarity graph should plot every measured epoch sample');
 for (const p of simPlotted) {
   assert.ok(Math.abs(p[1] - formula(25)) < 1e-9,
     'the graph should apply the requested PSNR-to-SSIM approximation to each plotted sample');
@@ -97,46 +96,15 @@ assert.match(appSource, /\$\('d-chart-wrap'\)\.hidden = vis !== 'chart'/,
 assert.match(appCss, /\.sheet-vis canvas\[hidden\]\s*\{\s*display:\s*none\s*;/,
   'inactive Details canvases should stay hidden despite the general canvas display rule');
 
-// the cold start is HELD, not trimmed after the fact: short series draw
-// nothing at all, so early points never appear and then vanish
-const holdChart = new Chart(chartCanvas);
-holdChart.train = [[0, 10], [100, 12], [200, 14]];
-assert.deepEqual(holdChart._displaySeries(holdChart.train), [],
-  'the plot should hold back the first few samples entirely');
-const trimChart = new Chart(chartCanvas);
-trimChart.train = [[0, 10], [100, 12], [200, 14], [300, 16], [400, 18], [500, 20]];
-const drawn = trimChart._displaySeries(trimChart.train);
-assert.deepEqual(drawn.map((p) => p[0]), [300, 400, 500],
-  'the plot should start the line past the held samples');
-assert.equal(drawn[0][1], 16,
-  'the filter should latch the first plotted sample');
-assert.match(zlemaSource, /export const SKIP_FIRST = 3;/,
-  'the cold-start hold should cover the first three samples');
-assert.match(chartSource, /import \{ FastRobustZLEMA, SKIP_FIRST \} from '..\/..\/src\/zlema\.js';/,
-  'the graph should read the shared filter, not a private copy');
-// zero-lag EMA with a Z-score spike clamp: latch, track flats, tame spikes
-const zlatch = new FastRobustZLEMA();
-assert.equal(zlatch.update(20), 20, 'the first sample latches the level');
-const zflat = new FastRobustZLEMA();
-zflat.update(25);
-assert.ok(Math.abs(zflat.update(25) - 25) < 1e-9 && Math.abs(zflat.update(25) - 25) < 1e-9,
-  'flat samples pass through the filter');
-const zspike = new FastRobustZLEMA();
-for (let i = 0; i < 30; i++) zspike.update(20);
-const zclamped = zspike.update(40);
-assert.ok(zclamped < 21,
-  `a +20 dB spike should clamp near the level instead of yanking the curve (got ${zclamped})`);
-const zseries = new FastRobustZLEMA().series([[0, 10], [100, 12], [200, 14]]);
-assert.deepEqual(zseries.map((p) => p[0]), [0, 100, 200],
-  'a series pass should keep every sample iteration');
-assert.equal(zseries[0][1], 10, 'a series pass should latch its first sample');
-assert.match(zlemaSource, /export class FastRobustZLEMA/,
-  'the curve should run through the zero-lag filter');
-assert.match(chartSource, /new FastRobustZLEMA\(\)\.series\(held\)/,
-  'each draw should run a fresh filter pass over the held samples');
-// raw dots: tiny — the curve carries the reading, the scatter just shows it
-assert.match(chartSource, /ctx\.arc\(X\(p\[0\]\), Y\(p\[1\]\), 0\.75 \* dpr, 0, 7\)/,
-  'raw-sample dots should be much smaller than the old 1.5px');
+// Raw complete-epoch values are the line itself: no held samples, filter or dots.
+const rawChart = new Chart(chartCanvas);
+rawChart.train = [[0, 10], [100, 12], [200, 14]];
+assert.deepEqual(rawChart._displaySeries(rawChart.train), rawChart.train,
+  'the plot should use measured epoch scores directly');
+assert.doesNotMatch(chartSource, /FastRobustZLEMA|SKIP_FIRST|_filteredRaw|_heldRaw|trainDots|holdDots/,
+  'the chart should contain no ZLEMA path or raw scatter layer');
+assert.doesNotMatch(chartSource, /0\.75 \* dpr/,
+  'the little raw-score dots should be removed');
 assert.doesNotMatch(chartSource, /frac \* pw|progress wash|rgba\(94, 231, 214, \.055\)/,
   'the score graph should not cover its completed fraction with a green overlay');
 // dynamic x: the axis grows with the plotted data, like the y-axis
@@ -146,34 +114,13 @@ assert.equal(xChart._xMaxFor([0]), 1, 'an empty plot should still have a span');
 xChart.maxIter = 40000;
 assert.equal(xChart._xMaxFor([40000]), 40000, 'the axis should never run past the horizon');
 assert.equal(xChart._xMaxFor([100, 5000]), 5300, 'the furthest series should set the axis');
-// the score readouts show the filtered curve end, not the raw sample
+// the score readouts show the latest raw complete-epoch sample
 assert.match(appSource, /function shownScore\(which\)/,
-  'the app should resolve the displayed score through the filter');
+  'the app should resolve the latest measured score consistently');
 assert.match(appSource, /formatTrainingScore\(shownScore\('train'\)\)/,
-  'the dock score should show the filtered train value');
+  'the dock score should show the raw epoch train value');
 assert.match(appSource, /const gap = \(shownScore\('train'\) != null && shownScore\('hold'\) != null\)/,
-  'the details gap should compare filtered scores');
+  'the details gap should compare raw epoch scores');
 
-
-// cold-start warmup: a steep initial rise tracks instead of clamping
-assert.match(zlemaSource, /minStd = 0\.25/,
-  'the noise floor defaults to the dB scale (~50% of expected readout sigma)');
-assert.match(zlemaSource, /this\.warmup = 4;/,
-  'the first updates after the latch track unclamped while the variance seeds');
-const zramp = new FastRobustZLEMA();
-const rampEnd = [10, 14, 18, 22, 26, 28, 29, 30, 30.5, 30.7, 30.8]
-  .reduce((_, v) => zramp.update(v), 0);
-assert.ok(Math.abs(rampEnd - 30.8) < 2,
-  `a steep early rise should track within 2 dB by readout 11 (got ${rampEnd.toFixed(2)})`);
-const zwarm = new FastRobustZLEMA();
-zwarm.update(10); zwarm.update(14);
-assert.ok(zwarm.variance > 1,
-  'the warmup seeds the variance from the observed steps, opening the gate at the signal scale');
-const zflat2 = new FastRobustZLEMA();
-for (let i = 0; i < 40; i++) zflat2.update(20);
-let zslow = 20;
-for (let i = 0; i < 20; i++) zslow = zflat2.update(20 + (i + 1) * 0.3);
-assert.ok(Math.abs(zslow - 26) < 1,
-  `a gradual mid-run rise should track within 1 dB (got ${zslow.toFixed(2)})`);
 
 console.log('PSNR and approximate SSIM graph scales: passed');
