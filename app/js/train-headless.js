@@ -247,6 +247,17 @@ function scoreText(value) {
     : `${value.toFixed(1)} dB`;
 }
 
+// Progress JSON stays bounded, but it must represent the whole run. A tail
+// made the left side of the monitor chart vanish as soon as the service had
+// emitted 400 newer samples after an Activity→service handoff.
+function decimateHistory(rows, max = 800) {
+  if (!Array.isArray(rows) || rows.length <= max) return Array.isArray(rows) ? rows : [];
+  const out = [];
+  const step = (rows.length - 1) / (max - 1);
+  for (let i = 0; i < max; i++) out.push(rows[Math.round(i * step)]);
+  return out;
+}
+
 function postProgress(force = false) {
   if (!bridge || !ses || !ses.trainer || ending) return;
   const now = Date.now();
@@ -272,10 +283,11 @@ function postProgress(force = false) {
       iter, maxIters: manifest ? manifest.maxIters : 0,
       splats: ses.trainer.n | 0, psnr, scoreScale: manifest?.scoreScale || 'db', ips: +ips.toFixed(1),
       training: !!ses.training, gpu: Math.round((ses.opts.gpuUsage ?? 1) * 100), at: now,
-      // A bounded durable tail powers the foreground monitor without creating
-      // a second trainer/WebGPU device. Values are measured, never inferred.
-      scoreHistory: (ses.lossHistory || []).slice(-400),
-      splatHistory: splatHist.slice(-400),
+      // Bounded whole-run samples power the foreground monitor without
+      // creating a second trainer/WebGPU device. Keep both endpoints so the
+      // Activity portion of a handed-off run never scrolls out of the chart.
+      scoreHistory: decimateHistory(ses.lossHistory || []),
+      splatHistory: decimateHistory(splatHist),
       events: chartEvents.slice(-300),
     }));
   } catch (e) { log('progress post failed', e); }

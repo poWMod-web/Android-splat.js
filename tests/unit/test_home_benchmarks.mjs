@@ -27,8 +27,12 @@ assert.match(wall, /host\.replaceChildren\(heading, grid\);\s*host\.hidden = fal
   'SAVED ON THIS DEVICE refresh stays visible even when the catalog is empty');
 assert.doesNotMatch(wall, /if \(!tiles\.length\) \{ host\.hidden = true/,
   'an empty scan/model list must not hide its refresh affordance');
-assert.match(app, /visibilitychange[\s\S]*S\.state === 'ready'[\s\S]*mountWall\(\)/,
+assert.match(app, /function refreshHomeWall\(\)[\s\S]*S\.state === 'ready'[\s\S]*mountWall\(\)/,
   'returning to a visible Home screen should automatically refresh saved models');
+assert.match(app, /addEventListener\('pageshow', refreshHomeWall\)[\s\S]*addEventListener\('focus', refreshHomeWall\)/,
+  'every retained-WebView return should refresh Home, not only BFCache restores');
+assert.match(app, /visibilitychange[\s\S]*!document\.hidden\) refreshHomeWall\(\)/,
+  'becoming visible should use the same guarded Home refresh');
 assert.match(app, /nativeNewer[\s\S]*Keep main's full model record[\s\S]*status: nativeRow\.status[\s\S]*splats: nativeRow\.splats/,
   'service-owned Android progress must overlay stale IndexedDB card metadata');
 assert.match(app, /openNativeFresh[\s\S]*mirrorHeadlessRun\(r\.id, nativeRow\)/,

@@ -6171,13 +6171,18 @@ async function mountWall() {
   }
 }
 
-window.addEventListener('pageshow', (e) => {
-  if (e.persisted && document.getElementById('gallery')) mountWall().catch(() => {});
-});
+function refreshHomeWall() {
+  const start = $('start');
+  if (S.state === 'ready' && start && !start.hidden) mountWall().catch(() => {});
+}
+// Android may retain the same WebView while another Activity or the training
+// service owns the screen. Refresh on every real return, not only BFCache
+// pageshow: native captures/checkpoints can have changed without a reload or
+// a visibility transition.
+window.addEventListener('pageshow', refreshHomeWall);
+window.addEventListener('focus', refreshHomeWall);
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && S.state === 'ready' && $('start') && !$('start').hidden) {
-    mountWall().catch(() => {});
-  }
+  if (!document.hidden) refreshHomeWall();
 });
 
 /** From the viewer into the studio: the shared creation's photographs become

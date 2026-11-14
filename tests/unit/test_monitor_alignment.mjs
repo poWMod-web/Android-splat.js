@@ -9,7 +9,12 @@ const session = readFileSync(new URL('../../src/session.js', import.meta.url), '
 const align = readFileSync(new URL('../../app/js/align.js', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
 
-assert.match(headless, /scoreHistory: \(ses\.lossHistory \|\| \[\]\)\.slice\(-400\)/);
+assert.match(headless, /function decimateHistory\(rows, max = 800\)[\s\S]*\(rows\.length - 1\) \/ \(max - 1\)/,
+  'background progress should bound payloads by sampling the whole run');
+assert.match(headless, /scoreHistory: decimateHistory\(ses\.lossHistory \|\| \[\]\)/);
+assert.match(headless, /splatHistory: decimateHistory\(splatHist\)/);
+assert.doesNotMatch(headless, /scoreHistory:[^\n]*slice\(-400\)/,
+  'the Activity side of the curve must not disappear from the monitor after handoff');
 assert.match(headless, /events: chartEvents\.slice\(-300\)/,
   'background progress carries prune/grow marks to the monitor');
 assert.match(app, /c\.events = \(Array\.isArray\(progress\.events\)/,
