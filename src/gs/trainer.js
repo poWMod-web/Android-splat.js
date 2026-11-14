@@ -1755,9 +1755,11 @@ export class GSTrainer {
     const v = s[0];
     const validPx = s[2]; // valid-pixel count (undistortion borders excluded)
     this.entryOverflowTiles = (this.entryOverflowTiles || 0) + s[3];
-    this.cameraScores = this.camMeta.map((_, ci) => {
+    this.cameraErrors = this.camMeta.map((_, ci) => {
       const sum = s[4 + ci * 2], n = s[5 + ci * 2];
-      return n > 0 && sum > 0 ? -10 * Math.log10(sum / 16 / (n * 3)) : null;
+      // Mean squared error is enough for relative image ranking. Do not turn
+      // every camera into a separately presented/evaluated PSNR metric.
+      return n > 0 ? sum / 16 / (n * 3) : null;
     });
     this.bufStatsRead.unmap();
     if (px === 0 || validPx === 0) return null;

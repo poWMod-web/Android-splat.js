@@ -114,6 +114,14 @@ assert.equal(xChart._xMaxFor([0]), 1, 'an empty plot should still have a span');
 xChart.maxIter = 40000;
 assert.equal(xChart._xMaxFor([40000]), 40000, 'the axis should never run past the horizon');
 assert.equal(xChart._xMaxFor([100, 5000]), 5300, 'the furthest series should set the axis');
+assert.deepEqual(xChart._xWindow(100), { min: 0, max: 100 }, 'the default shows all history');
+xChart.xZoom = 4;
+assert.deepEqual(xChart._xWindow(100), { min: 75, max: 100 },
+  'x zoom should retain only the newest right-anchored quarter');
+assert.match(chartSource, /this\.xZoom = Math\.max\(1, Math\.min\(64,[\s\S]*this\._pinchZoom \* d \/ this\._pinchDistance/,
+  'two-pointer pinch should control right-anchored x zoom on every Chart');
+assert.match(chartSource, /const visible = \(series\)[\s\S]*iter >= xMin[\s\S]*const ys = \[\.\.\.train, \.\.\.hold/,
+  'older scores should be excluded before visible-window y autoscaling');
 // the score readouts show the latest raw complete-epoch sample
 assert.match(appSource, /function shownScore\(which\)/,
   'the app should resolve the latest measured score consistently');

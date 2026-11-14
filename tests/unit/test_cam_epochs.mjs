@@ -49,10 +49,12 @@ assert.match(trainer, /this\._statsWords = 4 \+ cams\.length \* 2/,
   'GPU statistics should retain error and pixel count for every image');
 assert.match(shaders, /atomicAdd\(&stats\[scoreAt\], scoreErr\)[\s\S]*atomicAdd\(&stats\[scoreAt \+ 1u\], 1u\)/,
   'training pixels should feed their image score without an extra render');
-assert.match(session, /if \(!final && mse != null && mse > 0\)[\s\S]*m\.frameScores = Array\.isArray\(trainer\.cameraScores\)/,
-  'only complete scheduled epochs should expose graph and per-image scores');
-assert.match(app, /function frameScoreColor\(value, scores\)[\s\S]*\[239, 91, 76\][\s\S]*\[242, 193, 78\][\s\S]*\[47, 212, 193\]/,
-  'filmstrip scores should grade worst red through yellow to best teal');
+assert.match(session, /if \(!final && mse != null && mse > 0\)[\s\S]*m\.frameErrors = Array\.isArray\(trainer\.cameraErrors\)/,
+  'only complete scheduled epochs should expose graph and per-image accumulated errors');
+assert.match(trainer, /this\.cameraErrors = this\.camMeta\.map[\s\S]*return n > 0 \? sum \/ 16 \/ \(n \* 3\) : null/,
+  'per-image placement should use existing normalized error, not separate PSNR evaluation');
+assert.match(app, /function frameErrorColor\(value, errors\)[\s\S]*\[239, 91, 76\][\s\S]*\[242, 193, 78\][\s\S]*\[47, 212, 193\]/,
+  'filmstrip errors should grade worst red through yellow to best teal');
 assert.doesNotMatch(app, /c\.state === 'holdout' \? S\.psnrHold : S\.psnrTrain/,
   'filmstrip lines must not copy the global score onto every image');
 

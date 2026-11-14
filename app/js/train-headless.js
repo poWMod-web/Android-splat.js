@@ -31,6 +31,8 @@ let snapCam = null;
 let files = [];
 let ending = false;        // finalize/abort in flight — the metrics beat stands down
 let ckptBusy = false;
+let periodicCkptPending = false, lastCkptAt = 0, lastCkptIter = 0;
+const PERIODIC_CKPT_MS = 60000, PERIODIC_CKPT_ITERS = 1500;
 let lastProgAt = 0, lastProgIter = -1;
 let ips = 0, ipsAt = 0, ipsIter = 0;
 let shotBusy = false;
@@ -165,6 +167,7 @@ async function boot() {
     if (snapCam) ses.view.setCamera(snapCam);
     else log('no usable monitor camera — snapshots off');
     ipsIter = st.iter; ipsAt = Date.now();
+    lastCkptIter = st.iter; lastCkptAt = Date.now();
     const wasPaused = (await fetchJson('status.json').catch(() => null) || {}).status === 'paused';
     postStatus({ status: wasPaused ? 'paused' : 'active' });
     postProgress(true);
@@ -178,7 +181,10 @@ async function boot() {
       // Metrics emit from the active frame promise; prune only after it exits,
       // or pauseAndDrain would wait on the frame that called this handler.
       const iter = m && Number.isFinite(m.iter) ? m.iter : ses.trainer.iter;
-      setTimeout(() => { void maybeEarlyPrune(iter); }, 0);
+      setTimeout(() => {
+        void maybeEarlyPrune(iter);
+        void maybePeriodicCheckpoint(iter);
+      }, 0);
     });
   } catch (e) {
     await fail(e);
@@ -203,6 +209,19 @@ function onEvent(e) {
   else if (e.kind === 'device-lost' || e.kind === 'worker-error' || e.kind === 'train-error') {
     fail(`headless run faulted: ${e.message || e.kind} (last checkpoint kept)`);
   }
+}
+
+async function maybePeriodicCheckpoint(iter) {
+  if (periodicCkptPending || ckptBusy || ending || !ses?.trainer || !ses.training) return;
+  const now = Date.now();
+  if (now - lastCkptAt < PERIODIC_CKPT_MS || iter - lastCkptIter < PERIODIC_CKPT_ITERS) return;
+  periodicCkptPending = true;
+  try {
+    if (await secureFileCheckpoint()) {
+      lastCkptAt = Date.now();
+      lastCkptIter = ses?.trainer?.iter || iter;
+    }
+  } finally { periodicCkptPending = false; }
 }
 
 async function maybeEarlyPrune(iter) {
@@ -293,9 +312,10 @@ function postProgress(force = false) {
   } catch (e) { log('progress post failed', e); }
 }
 
-/** One-shot file checkpoint: the raw state plus a recon that carries the
+/** Serialized file checkpoint: the raw state plus a recon that carries the
  *  display cloud and leveling forward (the rebuilt session has neither — its
- *  recon holds no points and no capture metadata). Transitions only. */
+ *  recon holds no points and no capture metadata). Used at transitions and
+ *  periodically from the metrics beat, never through overlapping calls. */
 async function secureFileCheckpoint() {
   if (ckptBusy || !ses || !ses.trainer) return false;
   let resume = false;

@@ -86,6 +86,8 @@ for (const call of ['postProgress', 'writeRunJson', 'writeRunChunk', 'writeSnaps
   assert.ok(driver.includes(call), `driver calls bridge.${call}`);
 }
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
+assert.match(app, /if \(status\?\.status === 'finished'\) return true;/,
+  'durable finished status should be authoritative without a final service heartbeat');
 for (const fn of ['stageHeadlessRun', 'secureFileCheckpoint', 'enterMonitor', 'adoptHeadlessRun']) {
   assert.ok(app.includes(`function ${fn}`), `app implements ${fn}`);
 }
@@ -140,6 +142,10 @@ assert.doesNotMatch(svc, /case "activity-foreground"|returnToActivity|returnHand
   'the service must have no automatic foreground-return path');
 assert.match(svc, /beat\.put\("alive", false\)[\s\S]*RunFiles\.writeJson[\s\S]*service\.json/,
   'Java should acknowledge service GPU teardown before Activity adoption');
+assert.match(driver, /async function maybePeriodicCheckpoint\(iter\)[\s\S]*PERIODIC_CKPT_MS[\s\S]*PERIODIC_CKPT_ITERS[\s\S]*await secureFileCheckpoint\(\)/,
+  'uninterrupted service training should periodically serialize a checkpoint from the metrics beat');
+assert.match(driver, /if \(ckptBusy \|\| !ses \|\| !ses\.trainer\) return false/,
+  'periodic and transition checkpoints must share the no-overlap guard');
 assert.match(driver, /const secured = await secureFileCheckpoint\(\);[\s\S]*if \(!secured\)[\s\S]*ses\.start\(\)/,
   'a failed handback checkpoint should keep service training instead of returning stale state');
 assert.match(app, /status\.status === 'interrupted' && status\.stopped[\s\S]*showRecovery\(runId, status\)/,

@@ -3794,6 +3794,13 @@ function onMetrics(m) {
     m.psnrTrain != null ? m.psnrTrain.toFixed(2) : '', m.psnrHold != null ? m.psnrHold.toFixed(2) : '']);
   if (m.psnrTrain != null) S.psnrTrain = m.psnrTrain;
   if (m.psnrHold != null) S.psnrHold = m.psnrHold;
+  if (Array.isArray(m.frameErrors) && S.scene?.cams) {
+    for (const cam of S.scene.cams) {
+      const error = cam.ci >= 0 ? m.frameErrors[cam.ci] : null;
+      if (Number.isFinite(error)) cam.error = error;
+    }
+    paintStrip();
+  }
   if (m.psnrHold != null) (S.holdHist ??= []).push([m.iter, m.psnrHold]);
   if (Number.isFinite(m.splats)) (S.splatHist ??= []).push([m.iter, m.splats]);
   // the first few hundred cycles rocket from near-nothing to the real curve —
@@ -4733,19 +4740,6 @@ function perfCard() {
   card.querySelector('#perf-dl').addEventListener('click', downloadPerfLog);
 }
 
-/** after the run: an honest per-photograph score, filled in the background */
-async function scoreFrames() {
-  const gen = S.gen;
-  for (const c of S.scene.cams) {
-    if (c.ci < 0 || S.gen !== gen || S.state !== 'done') return;
-    try {
-      c.psnr = await S.session.evalFramePsnr(c.ci);
-      paintStrip();
-      if (!$('details').hidden) renderDetails();
-    } catch { return; }
-  }
-}
-
 // ── stage controls (train/done) ─────────────────────────────────────────────
 function seg(items, active, onPick) {
   const d = document.createElement('div');
@@ -5125,7 +5119,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     // Stable URLs include presets and canonical native AR archives. Prefer
     // them even for own captures: loading "last capture" here can substitute
     // a newer scan and detach images from this model's saved camera poses.
-    flash(viewOnly ? 'Opening saved model …' : 'Fetching the photos …', 60000);
+    flash(viewOnly ? 'Loading model …' : 'Fetching the photos …', 60000);
     files = await Promise.all(srcUrls.map(async (u, i) => {
       const r = await fetch(u);
       if (!r.ok) throw new Error(`photo fetch failed (${r.status})`);
@@ -5146,7 +5140,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
       return;
     }
   }
-  flash(viewOnly ? 'Opening saved model …' : 'Preparing to continue training …', 60000);
+  flash(viewOnly ? 'Loading model …' : 'Preparing to continue training …', 60000);
   let g, engine, stateIter = null, recipe = null;
   if (lr.state) {
     // leave checkpoint: the trainer's raw floats — nothing baked, nothing
@@ -6550,11 +6544,27 @@ async function thumbBmp(i) {
   }
 }
 
+function frameErrorRank(value, errors) {
+  if (!Number.isFinite(value) || !errors.length) return null;
+  const lo = Math.min(...errors), hi = Math.max(...errors);
+  return hi > lo ? 1 - clamp((value - lo) / (hi - lo), 0, 1) : 1;
+}
+function frameErrorColor(value, errors) {
+  const q = frameErrorRank(value, errors);
+  if (q == null) return '#2fd4c1';
+  const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
+  const rgb = q < 0.5
+    ? mix([239, 91, 76], [242, 193, 78], q * 2)
+    : mix([242, 193, 78], [47, 212, 193], (q - 0.5) * 2);
+  return `rgb(${rgb.join(',')})`;
+}
+
 function paintStrip() {
   const sc = $('strip-scroll');
   if (!sc) return;
   const active = (S.state === 'train' && S.session && S.session.training && S.scene)
     ? (S.scene.cams.find((c) => c.ci === S.session.activeCam) || {}).i : -1;
+  const imageErrors = (S.scene?.cams || []).map((c) => c.error).filter(Number.isFinite);
   S.photos.forEach((p, i) => {
     const b = sc.children[i];
     if (!b) return;
@@ -6567,11 +6577,10 @@ function paintStrip() {
     tag.hidden = !t;
     if (t) { tag.dataset.t = c.state; tag.textContent = t; }
     const bar = b.querySelector('.frame-bar i');
-    const score = c && (c.psnr != null ? c.psnr
-      : (S.state !== 'ready' && c.state !== 'unplaced'
-        ? (c.state === 'holdout' ? S.psnrHold : S.psnrTrain) : null));
-    bar.style.width = score != null ? `${clamp((score - 12) / 22, 0, 1) * 100}%` : '0%';
-    bar.style.background = c && c.state === 'holdout' ? '#f2a03f' : '#2fd4c1';
+    const error = c && Number.isFinite(c.error) ? c.error : null;
+    const rank = frameErrorRank(error, imageErrors);
+    bar.style.width = rank != null ? `${15 + rank * 85}%` : '0%';
+    bar.style.background = frameErrorColor(error, imageErrors);
   });
 }
 
@@ -6676,8 +6685,8 @@ function toggleScoreScale() {
   updateHeadlessScoreScale();
 }
 
-function chartTip(h) {
-  const tip = $('chart-tip');
+function chartTip(h, id = 'chart-tip') {
+  const tip = $(id);
   if (!tip) return;
   if (!h) { tip.hidden = true; return; }
   tip.hidden = false;
@@ -8586,14 +8595,6 @@ function openDetails() {
     syncDetailsUrl();
     return;
   }
-  // per-photo scores: one render + readback per camera, started the first
-  // time the sheet asks for them (not at finish, where they stole the GPU
-  // from the viewer)
-  if (S.state === 'done' && S.session && S.session.trainer && S.session.trainer.device &&
-      S.scene && S._scoredGen !== S.gen) {
-    S._scoredGen = S.gen;
-    scoreFrames().catch(() => {});
-  }
   $('d-export').replaceChildren(buildExport());
   renderDetails();
   syncDetailsUrl();
@@ -8776,7 +8777,7 @@ function renderDetails() {
   if (vis === 'perf') $('d-perf').textContent = S.detailTab === 'gpu' ? buildGpuReport() : buildPerfReport();
   if (vis === 'chart') {
     if (!dchart) {
-      dchart = new Chart($('d-chart'), {});
+      dchart = new Chart($('d-chart'), { onHover: (h) => chartTip(h, 'd-chart-tip') });
       $('d-chart-scale')?.addEventListener('click', toggleScoreScale);
     }
     dchart.maxIter = S.maxIters;

@@ -1300,8 +1300,25 @@ export class Session {
   async growNow() {
     const trainer = this.trainer;
     if (!trainer) throw new Error('seed() first');
+    const currentScore = this.lossHistory.length ? this.lossHistory.at(-1)[1] : null;
+    const gap = this.opts.plateauMinGap ?? 700;
+    if (this._refineRecoveryTarget != null) {
+      const recovered = Number.isFinite(currentScore) &&
+        currentScore >= this._refineRecoveryTarget - (this.opts.plateauRecoverySlack ?? 0.05);
+      if (!recovered) throw new Error(`growth is waiting for score recovery to ${this._refineRecoveryTarget.toFixed(2)} dB`);
+      this._refineRecoveryTarget = null;
+    }
+    if ((trainer.lastRefine || 0) > 0 && trainer.iter - trainer.lastRefine < gap) {
+      throw new Error(`growth backoff has ${gap - (trainer.iter - trainer.lastRefine)} cycles remaining`);
+    }
+    const previousRecoveryTarget = this._refineRecoveryTarget;
+    const previousLastRefine = trainer.lastRefine || 0;
     const wasTraining = await this.pauseAndDrain();
     try {
+      // Manual and automatic growth share one intervention cycle: remember
+      // the pre-growth score and require both recovery and fresh evidence.
+      this._refineRecoveryTarget = Number.isFinite(currentScore) ? currentScore : null;
+      trainer.lastRefine = trainer.iter;
       const r = await this._locked(() => trainer.refine());
       this._log(`grow-now @${trainer.iter}: relocated ${r.moved || 0}, grew +${r.grown || 0} -> ${r.n} splats`);
       this._em.emit('event', { kind: 'grow-now', iter: trainer.iter, ...r });
@@ -1313,6 +1330,8 @@ export class Session {
       } else if (wasTraining) this.start();
       return r;
     } catch (e) {
+      this._refineRecoveryTarget = previousRecoveryTarget;
+      trainer.lastRefine = previousLastRefine;
       if (wasTraining) this.start();
       throw e;
     }
@@ -1996,7 +2015,7 @@ export class Session {
     if (!final && mse != null && mse > 0) {
       m.psnrTrain = -10 * Math.log10(mse);
       this.lossHistory.push([trainer.iter, m.psnrTrain]);
-      m.frameScores = Array.isArray(trainer.cameraScores) ? trainer.cameraScores.slice() : [];
+      m.frameErrors = Array.isArray(trainer.cameraErrors) ? trainer.cameraErrors.slice() : [];
     }
     // tile-sort overflow used to be silent (dropped tiles render as
     // background): the count is cumulative on the trainer in both the

@@ -3841,10 +3841,10 @@ function onMetrics(m) {
     m.psnrTrain != null ? m.psnrTrain.toFixed(2) : '', m.psnrHold != null ? m.psnrHold.toFixed(2) : '']);
   if (m.psnrTrain != null) S.psnrTrain = m.psnrTrain;
   if (m.psnrHold != null) S.psnrHold = m.psnrHold;
-  if (Array.isArray(m.frameScores) && S.scene?.cams) {
+  if (Array.isArray(m.frameErrors) && S.scene?.cams) {
     for (const cam of S.scene.cams) {
-      const score = cam.ci >= 0 ? m.frameScores[cam.ci] : null;
-      if (Number.isFinite(score)) cam.psnr = score;
+      const error = cam.ci >= 0 ? m.frameErrors[cam.ci] : null;
+      if (Number.isFinite(error)) cam.error = error;
     }
     paintStrip();
   }
@@ -4787,19 +4787,6 @@ function perfCard() {
   card.querySelector('#perf-dl').addEventListener('click', downloadPerfLog);
 }
 
-/** after the run: an honest per-photograph score, filled in the background */
-async function scoreFrames() {
-  const gen = S.gen;
-  for (const c of S.scene.cams) {
-    if (c.ci < 0 || S.gen !== gen || S.state !== 'done') return;
-    try {
-      c.psnr = await S.session.evalFramePsnr(c.ci);
-      paintStrip();
-      if (!$('details').hidden) renderDetails();
-    } catch { return; }
-  }
-}
-
 // ── stage controls (train/done) ─────────────────────────────────────────────
 function seg(items, active, onPick) {
   const d = document.createElement('div');
@@ -5179,7 +5166,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     // Stable URLs include presets and canonical native AR archives. Prefer
     // them even for own captures: loading "last capture" here can substitute
     // a newer scan and detach images from this model's saved camera poses.
-    flash(viewOnly ? 'Opening saved model …' : 'Fetching the photos …', 60000);
+    flash(viewOnly ? 'Loading model …' : 'Fetching the photos …', 60000);
     files = await Promise.all(srcUrls.map(async (u, i) => {
       const r = await fetch(u);
       if (!r.ok) throw new Error(`photo fetch failed (${r.status})`);
@@ -5200,7 +5187,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
       return;
     }
   }
-  flash(viewOnly ? 'Opening saved model …' : 'Preparing to continue training …', 60000);
+  flash(viewOnly ? 'Loading model …' : 'Preparing to continue training …', 60000);
   let g, engine, stateIter = null, recipe = null;
   if (lr.state) {
     // leave checkpoint: the trainer's raw floats — nothing baked, nothing
@@ -6637,10 +6624,15 @@ async function thumbBmp(i) {
   }
 }
 
-function frameScoreColor(value, scores) {
-  if (!Number.isFinite(value) || !scores.length) return '#2fd4c1';
-  const lo = Math.min(...scores), hi = Math.max(...scores);
-  const q = hi > lo ? clamp((value - lo) / (hi - lo), 0, 1) : 1;
+function frameErrorRank(value, errors) {
+  if (!Number.isFinite(value) || !errors.length) return null;
+  const lo = Math.min(...errors), hi = Math.max(...errors);
+  // 1 = lowest error/best placement, 0 = highest error/worst placement.
+  return hi > lo ? 1 - clamp((value - lo) / (hi - lo), 0, 1) : 1;
+}
+function frameErrorColor(value, errors) {
+  const q = frameErrorRank(value, errors);
+  if (q == null) return '#2fd4c1';
   const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
   const rgb = q < 0.5
     ? mix([239, 91, 76], [242, 193, 78], q * 2)
@@ -6653,7 +6645,7 @@ function paintStrip() {
   if (!sc) return;
   const active = (S.state === 'train' && S.session && S.session.training && S.scene)
     ? (S.scene.cams.find((c) => c.ci === S.session.activeCam) || {}).i : -1;
-  const imageScores = (S.scene?.cams || []).map((c) => c.psnr).filter(Number.isFinite);
+  const imageErrors = (S.scene?.cams || []).map((c) => c.error).filter(Number.isFinite);
   S.photos.forEach((p, i) => {
     const b = sc.children[i];
     if (!b) return;
@@ -6667,13 +6659,12 @@ function paintStrip() {
     tag.hidden = !t;
     if (t) { tag.dataset.t = c.state; tag.textContent = t; }
     const bar = b.querySelector('.frame-bar i');
-    // Per-image values come from that camera's contribution to the latest
-    // complete shuffled epoch (or the explicit holdout evaluation), never
-    // from the global score copied onto every thumbnail.
-    const score = c && (Number.isFinite(c.psnr) ? c.psnr
-      : (c.state === 'holdout' && Number.isFinite(S.psnrHold) ? S.psnrHold : null));
-    bar.style.width = score != null ? `${clamp((score - 12) / 22, 0, 1) * 100}%` : '0%';
-    bar.style.background = frameScoreColor(score, imageScores);
+    // Use the camera's already-accumulated training MSE only for relative
+    // placement. No per-image PSNR evaluation is launched for the strip.
+    const error = c && Number.isFinite(c.error) ? c.error : null;
+    const rank = frameErrorRank(error, imageErrors);
+    bar.style.width = rank != null ? `${15 + rank * 85}%` : '0%';
+    bar.style.background = frameErrorColor(error, imageErrors);
   });
 }
 
@@ -6796,8 +6787,8 @@ function positionChartTip(tip, h) {
   tip.style.transform = y > th + 86 ? 'translate(-50%, calc(-100% - 70px))' : 'translate(-50%, 70px)';
 }
 
-function chartTip(h) {
-  const tip = $('chart-tip');
+function chartTipAt(id, h) {
+  const tip = $(id);
   if (!tip) return;
   if (!h) { tip.hidden = true; return; }
   tip.hidden = false;
@@ -6807,6 +6798,7 @@ function chartTip(h) {
     (h.event ? `<br><span style="color:#93a1a0">${h.event}</span>` : '');
   positionChartTip(tip, h);
 }
+function chartTip(h) { chartTipAt('chart-tip', h); }
 
 // ── flash ───────────────────────────────────────────────────────────────────
 function flash(msg, ms = 2800, links = []) {
@@ -7635,6 +7627,10 @@ async function headlessTakeover(runId) {
       fetch(Headless.fresh(Headless.runUrl(runId, 'status.json'))).then((r) => r.ok ? r.json() : null),
       fetch(Headless.fresh(Headless.runUrl(runId, 'service.json'))).then((r) => r.ok ? r.json() : null),
     ]);
+    // Finished is a committed model state, not a live-training ownership claim.
+    // Completion intentionally tears Java down, so a missing/stale final
+    // service heartbeat must never turn this durable result into "lost".
+    if (status?.status === 'finished') return true;
     if (status && !Headless.isLiveStatus(status) && service &&
         (service.alive === false || !Headless.heartbeatFresh(service))) return true;
   } catch { /* command + acknowledgment loop below remains authoritative */ }
@@ -7649,6 +7645,7 @@ async function headlessTakeover(runId) {
     catch { /* a torn/transition read is not proof the GPU is gone */ }
     try { service = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json(); }
     catch { service = null; }
+    if (status?.status === 'finished') return true;
     const stateReleased = !status || !Headless.isLiveStatus(status) || status.owner === 'activity';
     const serviceReleased = !!service &&
       (service.alive === false || !Headless.heartbeatFresh(service));
@@ -7689,7 +7686,7 @@ async function adoptHeadlessRun(runId, mode) {
   document.getElementById('cv-model')?.remove();
   gpuCanvas = null;
   window.scrollTo(0, 0);
-  flash(mode === 'finished' ? 'Opening the finished model …' : 'Resuming training here …', 60000);
+  flash(mode === 'finished' ? 'Loading model …' : 'Resuming training here …', 60000);
   let handbackStatus = {};
   try {
     const manifest = Headless.validateManifest(
@@ -7737,6 +7734,12 @@ async function adoptHeadlessRun(runId, mode) {
     $('monitor').hidden = true;
     document.getElementById('cv-monitor')?.remove();
     if (mode === 'finished') {
+      // Finished is authoritative even when Java's final service heartbeat is
+      // stale/missing. The takeover helper recognizes that committed status
+      // without sending the completed run through interruption recovery.
+      if (!(await headlessTakeover(runId))) {
+        throw new Error('the finished background run could not be opened yet');
+      }
       await continueLocalRun(true);
       if (S.state !== 'done' || !S.session || !S.session.trainer) {
         throw new Error('the finished model did not rebuild');
@@ -7777,6 +7780,15 @@ async function adoptHeadlessRun(runId, mode) {
     // Put recovery in front of the user instead of trainDeadEnd's Home screen.
     S._hlStaged = runId; S._hlPhotos = true; S._hlCkptBusy = false;
     const reason = String((e && e.message) || e);
+    if (mode === 'finished') {
+      // Never rewrite a durable finished result as interrupted merely because
+      // this viewer could not allocate/rebuild immediately. Home can reopen
+      // the same finished checkpoint on the next tap.
+      S.state = 'ready';
+      showHome();
+      flash(`Training finished and is saved on this device. The viewer could not open yet (${reason}); tap the finished model to retry.`, 12000);
+      return false;
+    }
     const restarts = handbackStatus.gpuRestarts | 0;
     const b = headlessBridge();
     if (mode !== 'finished' && restarts < 1 &&
@@ -8696,14 +8708,6 @@ function openDetails() {
     syncDetailsUrl();
     return;
   }
-  // per-photo scores: one render + readback per camera, started the first
-  // time the sheet asks for them (not at finish, where they stole the GPU
-  // from the viewer)
-  if (S.state === 'done' && S.session && S.session.trainer && S.session.trainer.device &&
-      S.scene && S._scoredGen !== S.gen) {
-    S._scoredGen = S.gen;
-    scoreFrames().catch(() => {});
-  }
   $('d-export').replaceChildren(buildExport());
   renderDetails();
   syncDetailsUrl();
@@ -8886,7 +8890,7 @@ function renderDetails() {
   if (vis === 'perf') $('d-perf').textContent = S.detailTab === 'gpu' ? buildGpuReport() : buildPerfReport();
   if (vis === 'chart') {
     if (!dchart) {
-      dchart = new Chart($('d-chart'), {});
+      dchart = new Chart($('d-chart'), { onHover: (h) => chartTipAt('d-chart-tip', h) });
       $('d-chart-scale')?.addEventListener('click', toggleScoreScale);
     }
     dchart.maxIter = S.maxIters;

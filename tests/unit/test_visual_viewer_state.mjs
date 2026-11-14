@@ -10,7 +10,7 @@ assert.match(render, /S\.atFrame >= 0 && \(S\.state !== 'train' \|\| S\.trainVis
   'photo comparison controls must disappear with training visuals');
 assert.match(toggle, /syncTrainingVisualsControl\(\);\s*renderControls\(\);/,
   'hiding visuals must repaint controls immediately');
-assert.match(continuation, /viewOnly \? 'Opening saved model …' : 'Preparing to continue training …'/,
+assert.match(continuation, /viewOnly \? 'Loading model …' : 'Preparing to continue training …'/,
   'view-only checkpoint loading must not claim training is resuming');
 
 console.log('training visual controls + view-only messaging: passed');

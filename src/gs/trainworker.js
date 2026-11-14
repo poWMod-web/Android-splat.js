@@ -292,7 +292,7 @@ export function createTrainWorkerHandler(deps = {}) {
       case 'readLoss': {
         const tr = need();
         const mse = await tr.readLoss();
-        return { value: { mse, cameraScores: tr.cameraScores || [],
+        return { value: { mse, cameraErrors: tr.cameraErrors || [],
           entryOverflowTiles: tr.entryOverflowTiles || 0 } };
       }
       case 'eval': {

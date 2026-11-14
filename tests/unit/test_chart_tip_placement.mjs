@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 
 const chartSource = readFileSync(new URL('../../app/js/chart.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
+const html = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 
 // The hover readout rides the cursor inside the plot: pinned to the top edge
 // it hung past the stage in the expanded graph and hid behind the dock.
@@ -19,8 +20,12 @@ assert.match(tip, /wrap\.clientWidth[\s\S]*tip\.offsetWidth[\s\S]*Math\.max\(tw 
   'the readout should clamp sideways inside the plot');
 assert.match(tip, /translate\(-50%, calc\(-100% - 70px\)\)[\s\S]*translate\(-50%, 70px\)/,
   'the readout should float 70px clear of the cursor, flipping below it near the top');
-assert.match(tip, /function chartTip\(h\)[\s\S]*positionChartTip\(tip, h\)/,
-  'foreground training should use the shared above-cursor placement');
+assert.match(tip, /function chartTipAt\(id, h\)[\s\S]*positionChartTip\(tip, h\)[\s\S]*function chartTip\(h\)/,
+  'foreground and details training graphs should use the shared above-cursor placement');
+assert.match(html, /class="chart-tip" id="d-chart-tip"/,
+  'the model Details score graph should have a visible cursor readout');
+assert.match(appSource, /new Chart\(\$\('d-chart'\), \{ onHover: \(h\) => chartTipAt\('d-chart-tip', h\) \}\)/,
+  'the Details graph should wire its cursor to that readout');
 assert.match(appSource, /new Chart\(\$\('mon-chart'\)[\s\S]*tip\.textContent[\s\S]*positionChartTip\(tip, h\)/,
   'background monitoring should use the same above-cursor placement');
 
