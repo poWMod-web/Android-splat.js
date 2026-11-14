@@ -233,23 +233,42 @@ class Emitter {
 }
 
 /** Robust plateau test for score-driven refinement. A capacity-starved model can
- * oscillate around a flat ceiling, so raw residual standard deviation is
- * diagnostic rather than a veto. We compare medians of the first and last
- * thirds (robust to spikes) and require a full fresh window. Recovery from an
- * intervention is gated separately by the Session state machine below. */
-export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, minPoints = 4, after = -Infinity } = {}) {
+ * oscillate around a flat ceiling, so raw variance is a POSITIVE saturation
+ * signal rather than a veto. The filtered curve catches ordinary stalls; a
+ * rising raw MAD catches the observed noisy-under-capacity plateau before the
+ * filter has become perfectly flat. Recovery is gated separately below. */
+export function scorePlateaued(history, nowIter, {
+  window = 1200, slope = 0.1, noisySlope = 0.35, minPoints = 4,
+  after = -Infinity, rawHistory = null, noiseRatio = 1.35, noiseFloor = 0.08,
+} = {}) {
   if (!Array.isArray(history) || !history.length) return false;
-  const pts = history.filter(([i, p]) => Number.isFinite(i) && Number.isFinite(p) &&
-    i >= Math.max(nowIter - window, after) && i <= nowIter).sort((a, b) => a[0] - b[0]);
+  const floor = Math.max(nowIter - window, after);
+  const take = (rows) => (Array.isArray(rows) ? rows : [])
+    .filter(([i, p]) => Number.isFinite(i) && Number.isFinite(p) && i >= floor && i <= nowIter)
+    .sort((a, b) => a[0] - b[0]);
+  const pts = take(history);
   if (pts.length < minPoints || pts.at(-1)[0] - pts[0][0] < window * 0.75) return false;
+  const medianValues = (a) => { const v = a.map((p) => p[1]).sort((x, y) => x - y); return v[v.length >> 1]; };
   const q = Math.max(2, Math.floor(pts.length / 3));
-  const median = (a) => { const v = a.map((p) => p[1]).sort((x, y) => x - y); return v[v.length >> 1]; };
   const early = pts.slice(0, q), late = pts.slice(-q);
   const dt = late.reduce((n, p) => n + p[0], 0) / q - early.reduce((n, p) => n + p[0], 0) / q;
   if (!(dt > 0)) return false;
-  const robustSlope = (median(late) - median(early)) * 1000 / dt;
-  return robustSlope < slope;
+  const robustSlope = (medianValues(late) - medianValues(early)) * 1000 / dt;
+  if (robustSlope < slope) return true;
+
+  const raw = take(rawHistory);
+  if (raw.length < 6 || raw.at(-1)[0] - raw[0][0] < window * 0.75) return false;
+  const mid = Math.floor(raw.length / 2);
+  const mad = (rows) => {
+    const m = medianValues(rows);
+    return medianValues(rows.map(([i, p]) => [i, Math.abs(p - m)]));
+  };
+  const earlyNoise = mad(raw.slice(0, mid)), lateNoise = mad(raw.slice(mid));
+  const noiseRising = lateNoise >= noiseFloor &&
+    lateNoise >= Math.max(earlyNoise * noiseRatio, earlyNoise + 0.03);
+  return noiseRising && robustSlope < noisySlope;
 }
+
 
 
 export class Session {
@@ -1254,8 +1273,7 @@ export class Session {
   async updateCameraPose(ci, R, t) {
     const trainer = this.trainer;
     if (!trainer || !trainer.camMeta?.[ci]) throw new Error('camera is not trainable');
-    const wasTraining = this.training;
-    if (wasTraining) this.pause();
+    const wasTraining = await this.pauseAndDrain();
     try {
       await this._locked(async () => {
         if (this._remote) await trainer.updateCameraPose(ci, R, t);
@@ -1729,8 +1747,8 @@ export class Session {
 
       const tEnc = performance.now() - t0;
 
-      // Score-driven refinement: automatic relocation/growth happens ONLY
-      // after the filtered PSNR has converged into a low-variance plateau.
+      // Score-driven refinement: ordinary filtered-score plateaus and the
+      // rising raw variance of an under-capacity plateau are both eligible.
       // Evidence is reset at each growth, then a complete fresh window must
       // accumulate. There is no fixed cadence and no ever-growing delay.
       const sinceRefine = trainer.iter - (trainer.lastRefine || 0);
@@ -1741,16 +1759,20 @@ export class Session {
         (Number.isFinite(currentScore) && currentScore >= this._refineRecoveryTarget - (this.opts.plateauRecoverySlack ?? 0.05));
       if (recovered && this._refineRecoveryTarget != null) this._refineRecoveryTarget = null;
       let plateau = false;
-      if (this.opts.refinePlateau !== false && trainer.iter > 1500 && recovered &&
+      if (this.opts.refinePlateau !== false && trainer.iter >= plateauWindow && recovered &&
           sinceRefine >= convergenceGap) {
         plateau = scorePlateaued(this.zlemaHistory, trainer.iter, {
           window: plateauWindow,
           slope: this.opts.plateauSlope ?? 0.1,
+          noisySlope: this.opts.plateauNoisySlope ?? 0.35,
+          rawHistory: this.lossHistory,
+          noiseRatio: this.opts.plateauNoiseRatio ?? 1.35,
+          noiseFloor: this.opts.plateauNoiseFloor ?? 0.08,
           after: trainer.lastRefine || 0,
         });
       }
       let refineResult = null;
-      if (trainer.iter > 1500 && plateau) {
+      if (trainer.iter >= plateauWindow && plateau) {
         // Remember quality before mutation. The next refine cannot happen on
         // the low post-grow plateau; quality must first recover to this mark.
         this._refineRecoveryTarget = Number.isFinite(currentScore) ? currentScore : null;

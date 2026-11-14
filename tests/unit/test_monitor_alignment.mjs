@@ -10,6 +10,12 @@ const align = readFileSync(new URL('../../app/js/align.js', import.meta.url), 'u
 const css = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
 
 assert.match(headless, /scoreHistory: \(ses\.lossHistory \|\| \[\]\)\.slice\(-400\)/);
+assert.match(headless, /events: chartEvents\.slice\(-300\)/,
+  'background progress carries prune/grow marks to the monitor');
+assert.match(app, /c\.events = \(Array\.isArray\(progress\.events\)/,
+  'the monitor graph renders durable service marks');
+assert.match(headless, /e\.kind === 'prune-continue'/);
+assert.match(headless, /e\.kind === 'grow-now'/);
 assert.match(app, /new Chart\(\$\('mon-chart'\)/);
 assert.match(app, /async function refreshMonitorPreview\(\)/);
 assert.match(app, /bridge\.headlessCommand\('headless-snapshot', runId\)/);
@@ -44,8 +50,13 @@ assert.match(session, /const work = this\._frameLoop\(\);[\s\S]*this\._frameWork
 assert.match(app, /adjacentPoseCandidates\(S\.photos, S\.scene\.cams, i\)/);
 assert.match(align, /ransacE\(/);
 assert.match(align, /selectPose\(/);
-assert.match(app, /Automatic alignment found/);
-assert.match(app, /Manual frame alignment/);
+assert.match(align, /const neighbours = \[-2, -1, 1, 2\]/,
+  'automatic alignment uses two pictures on either side');
+assert.match(app, /Balanced · \$\{good\.length\} neighbours/,
+  'consistent adjacent poses are offered as a consensus placement');
+assert.match(app, /undoSelectedAlignment/);
+assert.doesNotMatch(app, /Manual frame alignment|manualAlignSelected/,
+  'the first alignment version is automatic-only');
 assert.match(app, /align\.id = 'c-align'/,
   'Align belongs to the selected-frame controls');
 assert.doesNotMatch(app, /strip-align|Align selected/,

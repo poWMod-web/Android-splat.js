@@ -43,8 +43,16 @@ assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.09), NOW, { window: W })
   'the default trips under 0.1 dB/kiter');
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.11), NOW, { window: W }), false,
   'the default holds at and above 0.1 dB/kiter');
+const filteredCrawl = line(9, NOW - W, 150, 20, 0.2);
+const risingNoise = filteredCrawl.map((r, i) => [r[0], r[1] + (i % 2 ? 1 : -1) * (i < 4 ? 0.02 : 0.2)]);
+assert.equal(scorePlateaued(filteredCrawl, NOW, { window: W, rawHistory: risingNoise }), true,
+  'increasing raw variance triggers an under-capacity plateau before the filtered line is perfectly flat');
+const healthyFiltered = line(9, NOW - W, 150, 20, 1.0);
+const healthyNoisy = healthyFiltered.map((r, i) => [r[0], r[1] + (i % 2 ? 1 : -1) * (i < 4 ? 0.02 : 0.2)]);
+assert.equal(scorePlateaued(healthyFiltered, NOW, { window: W, rawHistory: healthyNoisy }), false,
+  'increasing noise cannot interrupt a strongly improving score');
 
-// ---- wiring pins: growth follows fresh low-variance plateaus ---------------
+// ---- wiring pins: growth follows recovery and robust plateaus --------------
 assert.match(sessionSource, /export function scorePlateaued\(history, nowIter/,
   'the detector is exported for tests and reuse');
 assert.doesNotMatch(sessionSource, /stdDev <= maxStdDev/,
@@ -53,8 +61,12 @@ assert.match(sessionSource, /sinceRefine >= convergenceGap/,
   'a full convergence gap must elapse after the prior growth');
 assert.match(sessionSource, /const recovered = this\._refineRecoveryTarget == null[\s\S]*after: trainer\.lastRefine \|\| 0/,
   'the next plateau needs recovery to its reference and fresh evidence');
-assert.match(sessionSource, /if \(trainer\.iter > 1500 && plateau\) \{/,
-  'automatic growth should run only on a measured score plateau');
+assert.match(sessionSource, /if \(trainer\.iter >= plateauWindow && plateau\) \{/,
+  'automatic growth should run only after a full measured score window');
+assert.match(sessionSource, /rawHistory: this\.lossHistory/,
+  'the live controller evaluates rising variance in raw score samples');
+assert.match(sessionSource, /lateNoise >= Math\.max\(earlyNoise \* noiseRatio, earlyNoise \+ 0\.03\)/,
+  'raw noise must materially increase, not merely remain noisy');
 assert.doesNotMatch(sessionSource, /sinceRefine >= refineEvery \|\| plateau|_plateauGap \* 2/,
   'neither fixed cadence nor exponential delays should bypass repeated convergence');
 assert.match(sessionSource, /\[score plateaued\]/,

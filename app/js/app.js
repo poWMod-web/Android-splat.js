@@ -4775,10 +4775,15 @@ function renderControls() {
         syncFrameUrl();
       }));
     const align = document.createElement('button');
-    align.className = 'cbtn'; align.id = 'c-align'; align.textContent = 'Align';
+    align.className = 'cbtn'; align.id = 'c-align'; align.textContent = 'Align'; align.disabled = !!S._aligning;
     align.title = 'Correct this selected image’s camera pose';
     align.addEventListener('click', alignSelectedFrame);
     c.appendChild(align);
+    if (S._alignUndo?.i === S.sel) {
+      const undo = document.createElement('button'); undo.className = 'cbtn'; undo.id = 'c-align-undo';
+      undo.textContent = 'Undo align'; undo.disabled = !!S._aligning;
+      undo.addEventListener('click', undoSelectedAlignment); c.appendChild(undo);
+    }
   }
 
   if (S.state !== 'done') return;
@@ -6289,64 +6294,117 @@ function select(i) {
   if (!$('details').hidden) renderDetails();
 }
 
-async function commitAlignedPose(i, R, centre, source) {
-  const cam = S.scene.cams[i];
-  const t = [-(R[0]*centre[0]+R[1]*centre[1]+R[2]*centre[2]),
+function poseT(R, centre) {
+  return [-(R[0]*centre[0]+R[1]*centre[1]+R[2]*centre[2]),
     -(R[3]*centre[0]+R[4]*centre[1]+R[5]*centre[2]),
     -(R[6]*centre[0]+R[7]*centre[1]+R[8]*centre[2])];
+}
+
+async function applyAlignedPose(i, R, t, source, remember = true) {
+  const cam = S.scene.cams[i];
+  if (remember) S._alignUndo = { i, R: [...cam.R], t: [...cam.t] };
   await S.session.updateCameraPose(cam.ci, R, t);
-  cam.R = Array.from(R); cam.t = t;
+  cam.R = Array.from(R); cam.t = Array.from(t);
   // Make durability immediate; normal checkpoints and background staging then
   // carry the same recon/trainer pose without a second pose catalogue.
   await checkpointRun('align').catch((e) => console.warn('[align] checkpoint', e));
-  goToFrame(i); paintStrip();
+  goToFrame(i); paintStrip(); renderControls();
   flash(`Frame ${i + 1} aligned (${source}) and checkpointed.`, 6000);
 }
 
-function manualAlignSelected(i) {
-  const cam = S.scene.cams[i], old = { R: [...cam.R], t: [...cam.t] };
-  leaveFrame();
-  const card = document.createElement('div'); card.className = 'upcard'; card.id = 'align-manual';
-  card.innerHTML = `<b>Manual frame alignment</b><span class="sog-status">Orbit to the photograph’s correct viewpoint, then save. The old pose remains available until you confirm.</span><div class="row"><button class="btn" data-save="1">Save this view</button><button class="btn linkish">Cancel</button></div>`;
-  $('stage').appendChild(card);
-  card.addEventListener('click', async (e) => {
+async function undoSelectedAlignment() {
+  const u = S._alignUndo;
+  if (!u || u.i !== S.sel || S._aligning) return;
+  if (!confirm(`Undo the alignment of frame ${u.i + 1}?`)) return;
+  S._aligning = true; renderControls();
+  try {
+    await applyAlignedPose(u.i, u.R, u.t, 'undo', false);
+    S._alignUndo = null; renderControls();
+  } catch (err) { flash(`Could not undo alignment: ${err.message}`, 8000); }
+  finally { S._aligning = false; renderControls(); }
+}
+
+const quatDistanceDeg = (a, b) => 2 * Math.acos(clamp(Math.abs(a.reduce((n, x, k) => n + x * b[k], 0)), -1, 1)) * 180 / Math.PI;
+
+function alignmentChoices(cs, cams, i) {
+  if (!cs.length) return [];
+  const rows = cs.map((c) => ({ ...c, q: quatFromR(c.Rworld), weight: Math.max(1, c.inliers) }));
+  // Robust medoid: one bad essential solution cannot drag all four anchors.
+  let medoid = rows[0], best = Infinity;
+  for (const a of rows) {
+    const cost = rows.reduce((n, b) => n + quatDistanceDeg(a.q, b.q) * b.weight, 0);
+    if (cost < best) { best = cost; medoid = a; }
+  }
+  const good = rows.filter((r) => quatDistanceDeg(r.q, medoid.q) <= 12);
+  if (!good.length) return [];
+  const before = [1, 2].map((d) => cams[i - d]).find((c) => c?.R);
+  const after = [1, 2].map((d) => cams[i + d]).find((c) => c?.R);
+  const current = camCentre(cams[i]);
+  let centre = current;
+  if (before && after) {
+    const a = camCentre(before), b = camCentre(after);
+    centre = a.map((v, k) => (v + b[k]) / 2);
+  }
+  const choices = [];
+  if (good.length >= 2) {
+    let q = good[0].q, total = good[0].weight;
+    for (const row of good.slice(1)) {
+      q = qslerp(q, row.q, row.weight / (total + row.weight)); total += row.weight;
+    }
+    choices.push({ label: `Balanced · ${good.length} neighbours`, R: quatToR(q), centre,
+      source: `${good.length}-neighbour consensus` });
+  }
+  for (const row of good) choices.push({
+    label: `Anchor frame ${row.frame + 1} · ${row.inliers} matches`,
+    R: row.Rworld, centre, source: `frame ${row.frame + 1}`,
+  });
+  return choices;
+}
+
+function showAlignmentChoices(i, choices) {
+  document.getElementById('align-options')?.remove();
+  const card = document.createElement('div'); card.className = 'upcard'; card.id = 'align-options';
+  const title = document.createElement('b'); title.textContent = `Align frame ${i + 1}`;
+  const note = document.createElement('span'); note.className = 'sog-status';
+  note.textContent = 'Choose an automatic placement derived from up to two pictures before and two after. Balanced rejects disagreeing anchors. You can undo after applying.';
+  const row = document.createElement('div'); row.className = 'row';
+  choices.forEach((choice, k) => {
+    const b = document.createElement('button'); b.className = k === 0 ? 'btn btn-accent' : 'btn';
+    b.textContent = choice.label; b.dataset.choice = String(k); row.appendChild(b);
+  });
+  const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel'; row.appendChild(cancel);
+  card.append(title, note, row); $('stage').appendChild(card);
+  row.addEventListener('click', async (e) => {
     if (e.target.tagName !== 'BUTTON') return;
-    const save = e.target.dataset.save; card.remove();
-    if (!save) { cam.R = old.R; cam.t = old.t; goToFrame(i); return; }
-    const p = vp.freePose(), C = camCentre(p);
-    if (!confirm(`Replace frame ${i + 1}'s pose with this manual alignment?`)) { goToFrame(i); return; }
-    try { await commitAlignedPose(i, p.R, C, 'manual'); } catch (err) { flash(`Alignment failed: ${err.message}`, 8000); }
+    const k = Number(e.target.dataset.choice);
+    if (!Number.isInteger(k) || !choices[k]) { card.remove(); return; }
+    const choice = choices[k];
+    if (!confirm(`Apply “${choice.label}” to frame ${i + 1}?`)) return;
+    card.remove(); S._aligning = true; renderControls();
+    try { await applyAlignedPose(i, choice.R, poseT(choice.R, choice.centre), choice.source); }
+    catch (err) { flash(`Alignment failed: ${err.message}`, 8000); }
+    finally { S._aligning = false; renderControls(); }
   });
 }
 
 async function alignSelectedFrame() {
   const i = S.sel, cam = S.scene?.cams?.[i];
   if (!cam?.R || S._aligning) return;
-  if (!confirm(`Align frame ${i + 1}? Training pauses at a safe boundary. Automatic alignment uses feature matches to the previous and next placed images; nothing changes until you confirm.`)) return;
-  S._aligning = true; if ($('c-align')) $('c-align').disabled = true;
+  if (!confirm(`Find automatic placements for frame ${i + 1}? Training pauses only when you apply one.`)) return;
+  S._aligning = true; renderControls();
   try {
-    flash('Matching adjacent images …', 10000);
+    flash('Matching two pictures before and two after …', 15000);
     const cs = await adjacentPoseCandidates(S.photos, S.scene.cams, i);
-    let reliable = cs.length >= 1;
-    let R = cs[0]?.Rworld;
-    if (cs.length >= 2) {
-      const qa = quatFromR(cs[0].Rworld), qb0 = quatFromR(cs[1].Rworld);
-      const dot = Math.abs(qa.reduce((n, x, k) => n + x * qb0[k], 0));
-      const disagreement = 2 * Math.acos(clamp(dot, -1, 1)) * 180 / Math.PI;
-      reliable = disagreement <= 8;
-      if (reliable) R = quatToR(qslerp(qa, cs[1].Rworld ? quatFromR(cs[1].Rworld) : qa, .5));
+    const choices = alignmentChoices(cs, S.scene.cams, i);
+    if (!choices.length) {
+      flash('Automatic alignment could not find a consistent adjacent-image placement. No pose was changed.', 8000);
+      return;
     }
-    const neighbours = [S.scene.cams[i - 1], S.scene.cams[i + 1]].filter((c) => c?.R);
-    const centres = neighbours.map(camCentre);
-    const C = centres.length === 2 ? centres[0].map((v, k) => (v + centres[1][k]) / 2) : camCentre(cam);
-    const evidence = cs.map((c) => `${c.side}: ${c.inliers}/${c.matches} inliers`).join(', ');
-    if (reliable && confirm(`Automatic alignment found ${evidence}. Apply the feature-derived rotation and neighbour-anchored position?`)) {
-      await commitAlignedPose(i, R, C, 'automatic');
-    } else if (confirm(`${evidence || 'Adjacent features were insufficient or inconsistent.'}\n\nOpen manual alignment instead?`)) manualAlignSelected(i);
+    showAlignmentChoices(i, choices);
   } catch (err) {
     console.warn('[align]', err);
-    if (confirm(`Automatic alignment could not be validated (${err.message}). Open manual alignment?`)) manualAlignSelected(i);
-  } finally { S._aligning = false; if ($('c-align')) $('c-align').disabled = false; }
+    flash(`Automatic alignment could not be validated: ${err.message}. No pose was changed.`, 8000);
+  } finally { S._aligning = false; renderControls(); }
 }
 
 function wireStage() {
@@ -7400,6 +7458,8 @@ function paintMonitorLive(progress) {
     for (const row of rows) if (Number.isFinite(row[0]) && Number.isFinite(row[1])) c.push(row[0], row[1], null, nearSplats(row[0]));
     c.scale = progress.scoreScale === 'similarity' ? 'similarity' : 'db';
     c.maxIter = progress.maxIters || Math.max(1, progress.iter || 1);
+    c.events = (Array.isArray(progress.events) ? progress.events : [])
+      .map((e) => ({ ...e, at: e.iter / c.maxIter }));
     c.resize(); c.draw();
   }
 

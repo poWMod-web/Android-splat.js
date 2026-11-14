@@ -174,6 +174,11 @@ function onEvent(e) {
     chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned −${(e.culled || 0).toLocaleString('en-US')}` });
   if (e.kind === 'dead-cull')
     chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned −${(e.culled || 0).toLocaleString('en-US')} dead` });
+  if (e.kind === 'grow-now' && e.grown > 0)
+    chartEvents.push({ iter: e.iter, kind: 'grow', label: `Grew +${(e.grown || 0).toLocaleString('en-US')}` });
+  if (e.kind === 'prune-continue')
+    chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned ${(e.from || 0).toLocaleString('en-US')}→${(e.to || 0).toLocaleString('en-US')}` });
+  if (chartEvents.length > 300) chartEvents = chartEvents.slice(-300);
   if (e.kind === 'train-complete') finalize();
   else if (e.kind === 'device-lost' || e.kind === 'worker-error' || e.kind === 'train-error') {
     fail(`headless run faulted: ${e.message || e.kind} (last checkpoint kept)`);
@@ -216,6 +221,7 @@ function postProgress(force = false) {
       // a second trainer/WebGPU device. Values are measured, never inferred.
       scoreHistory: (ses.lossHistory || []).slice(-400),
       splatHistory: splatHist.slice(-400),
+      events: chartEvents.slice(-300),
     }));
   } catch (e) { log('progress post failed', e); }
 }
