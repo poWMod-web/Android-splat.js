@@ -7213,6 +7213,7 @@ function enterMonitor(runId) {
   $('mon-preview').hidden = true;
   $('mon-gpu').value = String(S.settings.gpu ?? 100); $('mon-gpu-v').textContent = `${$('mon-gpu').value}%`;
   $('mon-refresh').disabled = false; $('mon-refresh').textContent = 'Refresh preview';
+  $('mon-save').disabled = false;
   $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
   if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
   // This is a status screen, not a viewer. A snapshot behind the card's
@@ -7305,6 +7306,22 @@ function wireMonitorOnce() {
         flash(grow ? 'Growing the background model …' : `Pruning ${percent}% of the background model …`, 5000);
       } catch (err) { flash(`Could not send prune/grow: ${err.message}`, 7000); }
     });
+  });
+  $('mon-save').addEventListener('click', () => {
+    const runId = S._monRun;
+    if (!runId || !confirm('Stop background training here and save the current model?')) return;
+    const button = $('mon-save'); button.disabled = true;
+    try {
+      const bridge = headlessBridge();
+      if (!bridge) throw new Error('background service bridge is unavailable');
+      bridge.headlessCommand('headless-save', runId);
+      flash('Stopping at a safe GPU boundary and saving the current model …', 60000);
+      setTimeout(() => {
+        if (S.state === 'monitor' && S._monRun === runId) button.disabled = false;
+      }, 15000);
+    } catch (err) {
+      button.disabled = false; flash(`Could not stop and save: ${err.message}`, 8000);
+    }
   });
   $('mon-stop').addEventListener('click', async () => {
     if (!S._monRun) return;

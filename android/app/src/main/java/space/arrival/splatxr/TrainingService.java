@@ -207,6 +207,9 @@ public final class TrainingService extends Service {
             case "headless-resume":
                 headlessCommand(intent, "window.__headlessResume&&window.__headlessResume()");
                 break;
+            case "headless-save":
+                headlessCommand(intent, "window.__headlessSave&&window.__headlessSave()");
+                break;
             case "headless-snapshot":
                 headlessCommand(intent, "window.__headlessSnapshot&&window.__headlessSnapshot()");
                 break;

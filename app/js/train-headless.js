@@ -357,6 +357,20 @@ globalThis.__headlessStop = async () => {
     await fail(e);
   }
 };
+let saveBusy = false;
+globalThis.__headlessSave = async () => {
+  if (!ses || ending || saveBusy) return;
+  saveBusy = true;
+  let wasTraining = false;
+  try {
+    wasTraining = await ses.pauseAndDrain();
+    await ses.finish(); // train-complete event owns checkpoint, snapshot and final status
+  } catch (e) {
+    if (wasTraining && ses && !ses.training) ses.start();
+    postStatus({ status: ses?.training ? 'active' : 'paused', commandError: `stop & save failed: ${e.message || e}` });
+    postProgress(true);
+  } finally { saveBusy = false; }
+};
 globalThis.__headlessSnapshot = async () => {
   if (!ses || ending) return;
   let resume = false;

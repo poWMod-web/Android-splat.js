@@ -33,10 +33,14 @@ assert.match(headless, /globalThis\.__headlessGpu = \(percent\)/);
 assert.match(headless, /ses\.opts\.gpuUsage = v \/ 100/);
 assert.match(headless, /gpu: Math\.round\(\(ses\.opts\.gpuUsage \?\? 1\) \* 100\)/,
   'progress reports the service trainer’s authoritative live duty');
-for (const cmd of ['headless-prune', 'headless-grow']) {
+for (const cmd of ['headless-prune', 'headless-grow', 'headless-save']) {
   assert.ok(main.includes(cmd), `${cmd} must cross the Activity bridge`);
   assert.ok(service.includes(cmd), `${cmd} must dispatch in the service`);
 }
+assert.match(app, /bridge\.headlessCommand\('headless-save', runId\)/);
+assert.match(headless, /globalThis\.__headlessSave = async \(\) =>/);
+assert.match(headless, /await ses\.pauseAndDrain\(\);[\s\S]*await ses\.finish\(\)/,
+  'Stop & save crosses a safe GPU boundary before finalizing');
 assert.match(headless, /globalThis\.__headlessGrow/);
 assert.match(headless, /globalThis\.__headlessPrune/);
 assert.match(headless, /resume = await ses\.pauseAndDrain\(\);[\s\S]*const state = await packState\(ses\)/,

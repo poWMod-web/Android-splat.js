@@ -23,8 +23,8 @@ assert.equal(scorePlateaued(noisyFlat, NOW, { window: W }), true,
   'a noisy under-capacity ceiling is still a plateau');
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.05), NOW, { window: W }), true,
   'a crawl (+0.05 dB/kiter) plateaus');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.2), NOW, { window: W }), false,
-  'a climb (+0.2 dB/kiter) does not');
+assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.25), NOW, { window: W }), false,
+  'a climb (+0.25 dB/kiter) does not');
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, -0.5), NOW, { window: W }), true,
   'a falling score trips triage too');
 assert.equal(scorePlateaued(line(3, NOW - W, 400, 20, 0.0), NOW, { window: W }), false,
@@ -39,14 +39,14 @@ assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.0), NOW - 5000, { window
 assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.0), NOW,
   { window: W, after: NOW - 300 }), false,
   'score evidence from before the prior growth must not trigger another growth');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.09), NOW, { window: W }), true,
-  'the default trips under 0.1 dB/kiter');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.11), NOW, { window: W }), false,
-  'the default holds at and above 0.1 dB/kiter');
-const filteredCrawl = line(9, NOW - W, 150, 20, 0.2);
+assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.19), NOW, { window: W }), true,
+  'the default trips under 0.2 dB/kiter');
+assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.21), NOW, { window: W }), false,
+  'the default holds at and above 0.2 dB/kiter');
+const filteredCrawl = line(9, NOW - W, 150, 20, 0.19);
 const risingNoise = filteredCrawl.map((r, i) => [r[0], r[1] + (i % 2 ? 1 : -1) * (i < 4 ? 0.02 : 0.2)]);
 assert.equal(scorePlateaued(filteredCrawl, NOW, { window: W, rawHistory: risingNoise }), true,
-  'increasing raw variance triggers an under-capacity plateau before the filtered line is perfectly flat');
+  'increasing raw variance accompanies a filtered under-capacity plateau below 0.2 dB/kiter');
 const healthyFiltered = line(9, NOW - W, 150, 20, 1.0);
 const healthyNoisy = healthyFiltered.map((r, i) => [r[0], r[1] + (i % 2 ? 1 : -1) * (i < 4 ? 0.02 : 0.2)]);
 assert.equal(scorePlateaued(healthyFiltered, NOW, { window: W, rawHistory: healthyNoisy }), false,
@@ -71,8 +71,8 @@ assert.doesNotMatch(sessionSource, /sinceRefine >= refineEvery \|\| plateau|_pla
   'neither fixed cadence nor exponential delays should bypass repeated convergence');
 assert.match(sessionSource, /\[score plateaued\]/,
   'plateau-triggered refines say so in the log');
-assert.match(sessionSource, /slope: this\.opts\.plateauSlope \?\? 0\.1,/,
-  'the loop trips under 0.1 dB/kiter');
+assert.match(sessionSource, /slope: this\.opts\.plateauSlope \?\? 0\.2,/,
+  'the loop trips under 0.2 dB/kiter');
 assert.equal((trainerSource.match(/growUntil \?\? 0\.90 \* this\.horizon/g) || []).length, 4,
   'growth runs to 90% of the horizon on every refine path');
 

@@ -238,7 +238,7 @@ class Emitter {
  * rising raw MAD catches the observed noisy-under-capacity plateau before the
  * filter has become perfectly flat. Recovery is gated separately below. */
 export function scorePlateaued(history, nowIter, {
-  window = 1200, slope = 0.1, noisySlope = 0.35, minPoints = 4,
+  window = 1200, slope = 0.2, noisySlope = 0.2, minPoints = 4,
   after = -Infinity, rawHistory = null, noiseRatio = 1.35, noiseFloor = 0.08,
 } = {}) {
   if (!Array.isArray(history) || !history.length) return false;
@@ -1763,8 +1763,8 @@ export class Session {
           sinceRefine >= convergenceGap) {
         plateau = scorePlateaued(this.zlemaHistory, trainer.iter, {
           window: plateauWindow,
-          slope: this.opts.plateauSlope ?? 0.1,
-          noisySlope: this.opts.plateauNoisySlope ?? 0.35,
+          slope: this.opts.plateauSlope ?? 0.2,
+          noisySlope: this.opts.plateauNoisySlope ?? 0.2,
           rawHistory: this.lossHistory,
           noiseRatio: this.opts.plateauNoiseRatio ?? 1.35,
           noiseFloor: this.opts.plateauNoiseFloor ?? 0.08,
