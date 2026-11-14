@@ -201,10 +201,12 @@ assert.match(app, /async function runGrowNow\(\) \{/,
 const growBody = session.slice(session.indexOf('async growNow()'), session.indexOf('async finish()'));
 assert.ok(!growBody.includes('softPrune'),
   'a manual growth pass never culls, even with soft prune on');
-assert.match(growBody, /this\._refineRecoveryTarget != null[\s\S]*currentScore >= this\._refineRecoveryTarget[\s\S]*this\._refineRecoveryTarget = Number\.isFinite\(currentScore\)/,
-  'manual growth should require recovery to the pre-growth score before another intervention');
-assert.match(growBody, /trainer\.iter - trainer\.lastRefine < gap/,
-  'manual growth should share automatic growth cycle backoff');
+assert.doesNotMatch(growBody, /currentScore >= this\._refineRecoveryTarget|growth backoff has/,
+  'automatic score/cycle backoff must never reject a manual growth request');
+assert.match(growBody, /this\._refineRecoveryTarget = Number\.isFinite\(currentScore\)[\s\S]*trainer\.lastRefine = trainer\.iter[\s\S]*trainer\.refine\(\)/,
+  'manual growth should run immediately, then restart automatic growth backoff');
+assert.match(pruneBody, /this\._refineRecoveryTarget = Number\.isFinite\(currentScore\)[\s\S]*this\.trainer\.lastRefine = iter/,
+  'manual pruning should run immediately, then restart automatic growth backoff');
 
 
 // ---- failed boots publish nothing (the prune-failure cascade, 2026-11) ----

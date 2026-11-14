@@ -9,8 +9,8 @@ for (const [name, source] of [['Android', app], ['Browser', browser]]) {
   const wireEnd = source.indexOf('function buildStrip(', wireStart);
   assert.ok(wireStart >= 0 && wireEnd > wireStart, `${name}: filmstrip long-press wiring should exist`);
   const wire = source.slice(wireStart, wireEnd);
-  assert.match(wire, /setTimeout\([\s\S]*removeTrainingImage\(i\)[\s\S]*650/,
-    `${name}: holding a trainable thumbnail should request removal`);
+  assert.match(wire, /setTimeout\([\s\S]*removeTrainingImage\(i\)[\s\S]*1000/,
+    `${name}: holding a trainable thumbnail for one second should request removal`);
   assert.match(wire, /Math\.hypot\([\s\S]*> 10\) cancel\(\)/,
     `${name}: scrolling the filmstrip should cancel the hold`);
   assert.match(wire, /if \(!fired\) return;[\s\S]*preventDefault\(\)[\s\S]*stopImmediatePropagation\(\)/,

@@ -1180,6 +1180,7 @@ export class Session {
   async pruneAndContinue(ratio = 0.5, { onStatus = null, onProgress = null } = {}) {
     const trainer = this.trainer;
     if (!trainer) throw new Error('seed() first');
+    const currentScore = this.lossHistory.length ? this.lossHistory.at(-1)[1] : null;
     // Pause OUTSIDE the readback lock. An active frame can itself be waiting
     // for that lock; taking it first would deadlock, while skipping this
     // barrier caused GPUBuffer "outstanding map pending" in the service.
@@ -1219,6 +1220,10 @@ export class Session {
           after = await this.trainer.evalCamPsnr(this.holdout);
           delta = after - before;
         }
+        // The button itself is never blocked by backoff. Its completed edit
+        // does, however, restart automatic growth's evidence/recovery window.
+        this._refineRecoveryTarget = Number.isFinite(currentScore) ? currentScore : null;
+        this.trainer.lastRefine = iter;
         resume();
         this._capAsked = false;
         if (delta != null && delta < -0.5) {
@@ -1294,29 +1299,19 @@ export class Session {
 
   /** Manual growth pass, any time: one immediate refine (relocate the dead
    *  + grow into the highest-error donors) outside the schedule — the
-   *  Prune/Grow button's other half. Pure growth: one refine, no cull —
-   *  lastRefine untouched. At a full cap it asks the ceiling question
-   *  instead of growing into nothing. */
+   *  Prune/Grow button's other half. Manual intent bypasses automatic
+   *  recovery/cycle gates, but resets those gates so automatic growth waits
+   *  for this intervention to recover. */
   async growNow() {
     const trainer = this.trainer;
     if (!trainer) throw new Error('seed() first');
     const currentScore = this.lossHistory.length ? this.lossHistory.at(-1)[1] : null;
-    const gap = this.opts.plateauMinGap ?? 700;
-    if (this._refineRecoveryTarget != null) {
-      const recovered = Number.isFinite(currentScore) &&
-        currentScore >= this._refineRecoveryTarget - (this.opts.plateauRecoverySlack ?? 0.05);
-      if (!recovered) throw new Error(`growth is waiting for score recovery to ${this._refineRecoveryTarget.toFixed(2)} dB`);
-      this._refineRecoveryTarget = null;
-    }
-    if ((trainer.lastRefine || 0) > 0 && trainer.iter - trainer.lastRefine < gap) {
-      throw new Error(`growth backoff has ${gap - (trainer.iter - trainer.lastRefine)} cycles remaining`);
-    }
     const previousRecoveryTarget = this._refineRecoveryTarget;
     const previousLastRefine = trainer.lastRefine || 0;
     const wasTraining = await this.pauseAndDrain();
     try {
-      // Manual and automatic growth share one intervention cycle: remember
-      // the pre-growth score and require both recovery and fresh evidence.
+      // Remember the pre-growth score so only the automatic scheduler must
+      // require recovery and fresh evidence before its next intervention.
       this._refineRecoveryTarget = Number.isFinite(currentScore) ? currentScore : null;
       trainer.lastRefine = trainer.iter;
       const r = await this._locked(() => trainer.refine());

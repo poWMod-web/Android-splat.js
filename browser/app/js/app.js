@@ -6516,7 +6516,7 @@ function wireFrameLongPress(el, i) {
       timer = 0; fired = true;
       navigator.vibrate?.(35);
       void removeTrainingImage(i);
-    }, 650);
+    }, 1000);
   });
   el.addEventListener('pointermove', (e) => {
     if (timer && Math.hypot(e.clientX - x, e.clientY - y) > 10) cancel();
