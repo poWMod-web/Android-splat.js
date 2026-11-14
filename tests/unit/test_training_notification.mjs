@@ -105,8 +105,10 @@ assert.match(app, /function androidNotifTick\(\)/,
   'training progress should tick the notification');
 assert.match(app, /function androidNotifStop\(finished\)/,
   'training end should settle the notification');
-assert.match(app, /S\.runId = keepId \|\| `run_[\s\S]*?`;\s*androidNotifStart\(\);/,
-  'every training run should be background-safe from the first cycle');
+assert.match(app, /S\.runId = keepId \|\| `run_[\s\S]*?runRecordReady[\s\S]*await runRecordReady[\s\S]*androidNotifStart\(\);\s*stageHeadlessRun\(\);/,
+  'run identity must be durable before notification and service staging use it');
+assert.doesNotMatch(app, /stageHeadlessRun\(\);[\s\S]*S\.runId = stale\.id/,
+  'same-source adoption must never change the run ID after Android staging');
 assert.match(app, /S\.itersPerSec = m\.itersPerSec;\s*androidNotifTick\(\);/,
   'every metrics beat should offer the notification fresh stats');
 assert.match(app, /now - \(S\._notifT \|\| 0\) < 2500/,

@@ -69,3 +69,8 @@ const dockFn = app.slice(dockStart, app.indexOf('function syncScoreScaleControls
 assert.match(dockFn, /#stage > \.chartwrap, #stage > \.chartwrap-expanded[\s\S]*forEach\(\(el\) => el\.remove\(\)\)/,
   'every dock transition must destroy a score graph reparented into stage');
 console.log('back-button visibility + overlay cleanup on navigation: passed');
+
+const doneStart = app.indexOf('function enterDone()');
+const done = app.slice(doneStart, app.indexOf('/** Avatar mode', doneStart));
+assert.match(done, /S\.state = 'done';[\s\S]*\$\('btn-new'\)\.hidden = false/,
+  'every model-view path must expose Back as an enterDone invariant');

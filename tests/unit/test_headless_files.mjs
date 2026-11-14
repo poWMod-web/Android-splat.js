@@ -214,8 +214,14 @@ assert.match(app, /async function checkpointRun\(reason\)[\s\S]*writeDurableRunC
   'Back and Stop & keep must persist to Android files independently of IndexedDB');
 assert.match(app, /async function mirrorHeadlessRun\(runId, status\)[\s\S]*state\.bin[\s\S]*saveRun\(rec\)/,
   'boot should rediscover an Android run directory as a Home library record');
+assert.match(app, /function assertCheckpointPair\(parsed, recon\)[\s\S]*recon\.iter !== parsed\.iter/,
+  'native readers should reject a state/reconstruction pair observed mid-publication');
+assert.match(driver, /recon\.iter !== st\.iter[\s\S]*checkpoint transaction incomplete/,
+  'the service should not boot from mismatched checkpoint generations');
 assert.match(app, /async function nativeCaptureTiles\(rows = null\)[\s\S]*listCaptureArchives\(\)[\s\S]*importNativeCapture\(b, row\.captureId\)/,
   'Home should enumerate native Android scan archives independently of IndexedDB');
+assert.match(app, /Native Java protects references[\s\S]*listRuns\(\)[\s\S]*run\?\.recon\?\.source\?\.captureId[\s\S]*deleteCaptureArchive/,
+  'capture deletion should protect both durable Android and main-style IndexedDB model references');
 assert.match(main, /public String listRecoverableRuns\(\)[\s\S]*RunFiles\.listDurableRuns/,
   'the bridge should expose complete Android run directories to Home');
 assert.match(main, /public String listHomeLibrary\(\)[\s\S]*listCaptureArchives\(\)[\s\S]*RunFiles\.listDurableRuns[\s\S]*previewUri/,
@@ -259,6 +265,14 @@ assert.match(runFiles, /listDurableRuns\(Context ctx\)[\s\S]*"discarded"\.equals
 const stage = app.slice(app.indexOf('function stageHeadlessRun()'), app.indexOf('/** Upload photo bytes'));
 assert.doesNotMatch(stage, /cleanRunDirs|resetCaptureSession/,
   'handoff must not delete old run directories or native scan archives');
+assert.match(sessionIo, /nativeCaptureId[\s\S]*captureId: S\.preset\.capture\.metadata\.nativeCaptureId/,
+  'every reconstruction checkpoint should retain its canonical native capture identity');
+assert.match(driver, /manifest\?\.photoSource === 'urls' \? manifest\.photoUrls\[i\] : H\.photoUrl/,
+  'service checkpoints must preserve canonical native URLs instead of inventing copied run-photo paths');
+assert.match(main, /progress\.json[\s\S]*progressNewer = progress\.optLong\("at"[\s\S]*Math\.max\(status\.optInt\("iter"[\s\S]*progressNewer && progress\.has\("splats"\)[\s\S]*progressNewer && progress\.has\("psnr"\)/,
+  'Home should merge service progress only when newer than lifecycle status');
+assert.match(app, /headlessStatusWrite\(status[\s\S]*splats:[\s\S]*psnr:/,
+  'Activity lifecycle status should carry the same model numbers as its checkpoint');
 assert.match(stage, /photoSource = native \? 'urls' : 'files'[\s\S]*photoUrls: files\.map/,
   'native handoff manifests should reference canonical archive URLs');
 assert.match(app, /function updateHeadlessGpu\(value\)[\s\S]*gpu: v[\s\S]*writeRunJson\(S\.runId, 'manifest\.json'/,

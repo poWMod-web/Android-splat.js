@@ -171,6 +171,8 @@ export function buildReconJson(S) {
       ...(Number.isFinite(f.srcW) ? { nw: f.srcW, nh: f.srcH } : {}) })),
     source: {
       preset: S.preset && !String(S.preset.id).startsWith('__') ? S.preset.id : null,
+      ...(S.preset?.capture?.metadata?.nativeCaptureId
+        ? { captureId: S.preset.capture.metadata.nativeCaptureId } : {}),
       names: (S.loadedFiles || []).map((f) => f.name),
       // absolute URLs where the images live (preset runs resolve against the
       // deployment's data root — own captures have no URL and stay names-only)

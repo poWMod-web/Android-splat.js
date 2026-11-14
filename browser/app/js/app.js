@@ -1221,6 +1221,17 @@ async function nativeCaptureTiles(rows = null) {
     if (row.previewUri) tile.prepend(Object.assign(new Image(), { src: row.previewUri, alt: '' }));
     tileMenu(tile.querySelector('.run-menu'), [
       { label: 'Delete', danger: true, act: async () => {
+        // Native Java protects references from durable run manifests. Check
+        // main-style IndexedDB records too, including a run whose first file
+        // checkpoint has not landed yet.
+        const { listRuns } = await import('./store.js');
+        const referenced = (await listRuns()).find((run) =>
+          String(run?.srcKey || '').replace(/^native:/, '') === row.captureId ||
+          run?.recon?.source?.captureId === row.captureId);
+        if (referenced) {
+          flash('Delete its trained models first; this scan is still their source.', 7000);
+          return;
+        }
         let answer = { deleted: false, reason: 'unsupported' };
         try { answer = JSON.parse(b.deleteCaptureArchive(row.captureId)); } catch { /* report below */ }
         if (answer.deleted) tile.remove();
@@ -2765,7 +2776,7 @@ async function startPrepInner() {
 
     buildSceneFromSession();
     mountModelCanvas();
-    startTraining();
+    await startTraining();
   } catch (e) {
     if (S.gen !== gen) return;
     console.error(e);
@@ -3124,7 +3135,7 @@ function localRunName(preset) {
   return name;
 }
 
-function startTraining() {
+async function startTraining() {
   S.state = 'train';
   // a history entry of our own: the phone's Back (and the browser's) pops
   // here, into the popstate checkpoint-leave — never straight out of the app
@@ -3160,10 +3171,9 @@ function startTraining() {
   S._resumeRunId = null;
   const keepId = resumeId || S.runId || null;
   S.runId = keepId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-  androidNotifStart();   // background-safe from the first cycle
-  stageHeadlessRun();   // migrate-on-swipe: the files-dir handoff stages from the first cycle
   S._ckptIter = 0;
-  (async () => {
+  let freshRunId = null;
+  const runRecordReady = (async () => {
     const runGen = S.gen;
     const pid = String((S.preset && S.preset.id) || '');
     // own captures carry a stable source key — the adoption lookup below
@@ -3219,22 +3229,32 @@ function startTraining() {
       detailProgress: captureRunProgressDetails(),
       detailGpu: gpuFacts(false),
     });
-    // Save the model record before the optional thumbnail fetch; Back/close
-    // should not race image decoding and lose the run's first snapshot.
-    if (S.gen !== runGen) return;
+    // The durable identity now exists. Optional thumbnail work stays off
+    // this barrier; the service manifest must never be staged under a run ID
+    // that a later IndexedDB adoption changes.
+    if (S.gen === runGen) freshRunId = runId;
+  })();
+  try { await runRecordReady; }
+  catch (e) { console.warn('[run] initial model record failed', e); }
+  if (!S.session || S.state !== 'train') return;
+  androidNotifStart();
+  stageHeadlessRun();
+  if (freshRunId) (async () => {
     try {
       const p = S.photos && S.photos[0];
-      if (p && p.url) {
-        const bmp = await createImageBitmap(await (await fetch(p.url)).blob(), { resizeWidth: 320 });
-        const cv = document.createElement('canvas');
-        cv.width = bmp.width; cv.height = bmp.height;
-        cv.getContext('2d').drawImage(bmp, 0, 0);
-        bmp.close();
-        const thumb = await new Promise((res) => cv.toBlob(res, 'image/webp', 0.8));
-        if (thumb && S.gen === runGen) await patchRun(runId, { thumb });
+      if (!p || !p.url) return;
+      const bmp = await createImageBitmap(await (await fetch(p.url)).blob(), { resizeWidth: 320 });
+      const cv = document.createElement('canvas');
+      cv.width = bmp.width; cv.height = bmp.height;
+      cv.getContext('2d').drawImage(bmp, 0, 0);
+      bmp.close();
+      const thumb = await new Promise((res) => cv.toBlob(res, 'image/webp', 0.8));
+      if (thumb && S.runId === freshRunId) {
+        const { patchRun } = await import('./store.js');
+        await patchRun(freshRunId, { thumb });
       }
-    } catch { /* the tile just goes textless */ }
-  })().catch(() => {});
+    } catch { /* the tile can fall back to its source preview */ }
+  })();
   const first = S.scene.cams.find((c) => c.R && c.state !== 'holdout') || S.scene.cams[0];
   if (first && first.R) {
     S.sel = first.i;
@@ -3641,7 +3661,8 @@ async function checkpointRun(reason) {
     // write succeeding: quota/process-profile loss was hiding completed runs.
     const fileSaved = await writeDurableRunCheckpoint(state, recon, {
       status: reason === 'finish' ? 'finished' : (S.session.training ? 'active' : 'paused'),
-      owner: 'activity', iter: it, at: Date.now(),
+      owner: 'activity', iter: it, splats: S.session.trainer.n | 0,
+      psnr: S.psnrHold ?? S.psnrTrain ?? null, at: Date.now(),
     }).catch((e) => { console.warn('[checkpoint] Android mirror failed', e); return false; });
     let idbSaved = false;
     try {
@@ -3957,7 +3978,7 @@ async function deviceLostRecovery(msg) {
     buildSceneFromSession();
     mountModelCanvas();
     quietView(S.session.view.resync && S.session.view.resync());
-    startTraining();
+    await startTraining();
   } catch (err) {
     console.error(err);
     if (S.gen === gen) {
@@ -4055,6 +4076,9 @@ if (!IOS) document.addEventListener('visibilitychange', () => {
  *  state checkpoint (viewOnly continueLocalRun). */
 function enterDone() {
   S.state = 'done';
+  // Every model-view path converges here; Back is an invariant of the viewer,
+  // not a responsibility each restore/finish caller may forget.
+  $('btn-new').hidden = false;
   syncTrainingVisualsControl();
   S.atFrame = -1; S.fadeTo = 0;
   vp.lock = null; vp.freeF = null;
@@ -4281,6 +4305,8 @@ async function finish() {
         iter: S.iter, maxIters: S.maxIters, splats: S.splats || 0,
         psnr: S.psnrHold ?? S.psnrTrain ?? null, minutes: S.minutes,
         frames: (S.photos || []).length, ownSrc: true,
+        ...(S.preset?.capture?.metadata?.nativeCaptureId
+          ? { srcKey: `native:${S.preset.capture.metadata.nativeCaptureId}` } : {}),
         state: ckpt.state, recon: ckpt.recon,
         detailSolve: captureRunSolveDetails(),
         detailProgress: captureRunProgressDetails(),
@@ -5317,7 +5343,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     // store's blobs matched by name above, reused by reference and never
     // re-saved, so continuing costs no extra image storage
     S._resumeRunId = lr.id;
-    startTraining();
+    await startTraining();
     flash(`Continuing from ${fmt(baseIter)} cycles — +${fmt(S.maxIters - baseIter)} more.`, 6000);
   } catch (e) {
     if (S.gen !== gen) throw e;   // superseded mid-flight: another screen owns the UI now
@@ -6821,6 +6847,8 @@ function headlessStatusWrite(status, iter = null) {
     b.writeRunJson(S.runId, 'status.json', JSON.stringify({
       status, owner: 'activity',
       iter: iter ?? (S.session && S.session.trainer ? S.session.trainer.iter | 0 : 0),
+      splats: S.session && S.session.trainer ? S.session.trainer.n | 0 : (S.splats || 0),
+      psnr: S.psnrHold ?? S.psnrTrain ?? null,
       at: Date.now(),
     }));
   } catch { /* best-effort */ }
@@ -6885,6 +6913,13 @@ function headlessProgressDetails(recon, manifest, status = {}) {
 /** Mirror Android's durable run directory into the local library. This makes
  * a service checkpoint visible on Home even when IndexedDB was evicted before
  * handoff, and keeps a second independently discoverable copy of state.bin. */
+function assertCheckpointPair(parsed, recon) {
+  if (!parsed || !recon) throw new Error('checkpoint is incomplete');
+  if (Number.isFinite(recon.iter) && Number.isFinite(parsed.iter) && recon.iter !== parsed.iter) {
+    throw new Error(`checkpoint transaction is still publishing (${parsed.iter} / ${recon.iter})`);
+  }
+}
+
 async function mirrorHeadlessRun(runId, status) {
   const manifest = Headless.validateManifest(
     await (await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')))).json());
@@ -6893,6 +6928,7 @@ async function mirrorHeadlessRun(runId, status) {
     await (await fetch(Headless.fresh(Headless.runUrl(runId, 'state.bin')))).arrayBuffer());
   const { parseState } = await import('./session_io.js');
   const parsed = parseState(stateBytes);
+  assertCheckpointPair(parsed, recon);
   recon.source = {
     preset: null, names: [...manifest.photos],
     urls: manifest.photoSource === 'urls'
@@ -7226,7 +7262,8 @@ async function adoptHeadlessRun(runId, mode) {
     handbackStatus = status;
     S._hlGpuRestarts = status.gpuRestarts | 0;
     const { parseState } = await import('./session_io.js');
-    parseState(stateBytes);   // torn writes refuse HERE, not mid-rebuild
+    const parsed = parseState(stateBytes);
+    assertCheckpointPair(parsed, recon); // reject a state/recon publication in progress
     let thumb = null;
     try {
       const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.png')));

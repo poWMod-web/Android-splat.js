@@ -83,6 +83,9 @@ async function boot() {
     const st = parseState(await fetchBytes('state.bin'));
     recon = await fetchJson('recon.json');
     if (!recon || !Array.isArray(recon.cams) || !recon.cams.length) throw new Error('recon has no cameras');
+    if (Number.isFinite(recon.iter) && recon.iter !== st.iter) {
+      throw new Error(`checkpoint transaction incomplete (${st.iter} / ${recon.iter})`);
+    }
     chartEvents = Array.isArray(recon.stats?.events) ? recon.stats.events.map((e) => ({ ...e })) : [];
     // photos matched BY NAME to the run's own frame order (same rule as the
     // app's continue path — re-sorting against imgIdx would mis-train)
@@ -245,7 +248,9 @@ async function secureFileCheckpoint() {
   } finally { ckptBusy = false; }
 }
 
-const filesWithUrls = () => files.map((f) => Object.assign(f, { url: H.photoUrl(runId, f.name) }));
+const filesWithUrls = () => files.map((f, i) => Object.assign(f, {
+  url: manifest?.photoSource === 'urls' ? manifest.photoUrls[i] : H.photoUrl(runId, f.name),
+}));
 
 /** The finished run is secured exactly like the app's finish(): a raw state
  *  checkpoint plus recon, a snapshot for the tile, and the finished status —

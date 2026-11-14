@@ -698,9 +698,21 @@ public final class MainActivity extends Activity {
                     row.put("owner", status.optString("owner", ""));
                     row.put("at", status.optLong("at", 0));
                     row.put("stopped", status.optBoolean("stopped", false));
-                    row.put("iter", status.optInt("iter", 0));
-                    row.put("splats", status.optInt("splats", 0));
-                    if (status.has("psnr")) row.put("psnr", status.optDouble("psnr"));
+                    String progressRaw = RunFiles.readJson(MainActivity.this, runId, "progress.json");
+                    JSONObject progress = progressRaw == null ? new JSONObject() : new JSONObject(progressRaw);
+                    // The service publishes high-frequency numbers separately
+                    // from lifecycle status. Merge only when that beat is at
+                    // least as new: a stale service progress file must not
+                    // overwrite a later Activity handback/checkpoint.
+                    boolean progressNewer = progress.optLong("at", 0) >= status.optLong("at", 0);
+                    row.put("iter", progressNewer
+                            ? Math.max(status.optInt("iter", 0), progress.optInt("iter", 0))
+                            : status.optInt("iter", 0));
+                    row.put("splats", progressNewer && progress.has("splats")
+                            ? progress.optInt("splats", status.optInt("splats", 0))
+                            : status.optInt("splats", 0));
+                    if (progressNewer && progress.has("psnr")) row.put("psnr", progress.optDouble("psnr"));
+                    else if (status.has("psnr")) row.put("psnr", status.optDouble("psnr"));
                     File thumb = new File(RunFiles.runDir(MainActivity.this, runId), "thumb.webp");
                     File snapshot = new File(RunFiles.runDir(MainActivity.this, runId), "snapshot.png");
                     if (thumb.isFile()) row.put("previewUri", "https://appassets.androidplatform.net/runs/" + runId + "/thumb.webp");
