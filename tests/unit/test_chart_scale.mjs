@@ -137,6 +137,10 @@ assert.match(chartSource, /new FastRobustZLEMA\(\)\.series\(held\)/,
 // raw dots: tiny — the curve carries the reading, the scatter just shows it
 assert.match(chartSource, /ctx\.arc\(X\(p\[0\]\), Y\(p\[1\]\), 0\.75 \* dpr, 0, 7\)/,
   'raw-sample dots should be much smaller than the old 1.5px');
+assert.match(chartSource, /const frac = Math\.min\(1, active\.train\[active\.train\.length - 1\]\[0\] \/ this\.maxIter\)[\s\S]*ctx\.fillRect\(l, t, Math\.max\(0, frac \* pw\), ph\)/,
+  'the pale green wash should represent completed iteration fraction');
+assert.match(chartSource, /const scoreAt = \(iter\)[\s\S]*for \(const e of this\.events\)[\s\S]*ctx\.arc\(x, Y\(value\), 4 \* dpr/,
+  'growth and prune events should have visible markers directly on the score curve');
 // dynamic x: the axis grows with the plotted data, like the y-axis
 const xChart = new Chart(chartCanvas);
 assert.equal(xChart._xMaxFor([100]), 106, 'early data should use the full width plus headroom');
