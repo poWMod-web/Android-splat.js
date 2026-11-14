@@ -24,12 +24,13 @@ assert.ok(!validName('../state.bin') && !validName('..') && !validName('a/b') &&
 
 // ── manifest ────────────────────────────────────────────────────────────────
 const m = buildManifest({
-  runId: 'run_1_2', name: 'Local Scene', maxIters: 20000, gpu: 100,
+  runId: 'run_1_2', name: 'Local Scene', maxIters: 20000, gpu: 100, scoreScale: 'similarity',
   srcKey: 'k', photos: ['a.jpg', 'b.jpg', 'c.jpg'], photoSource: 'files',
   settings: { buf: 1 },
 });
 assert.equal(validateManifest(m), m);
 assert.equal(m.version, 1);
+assert.equal(m.scoreScale, 'similarity', 'the service handoff should retain the selected score unit');
 assert.throws(() => validateManifest({ ...m, version: 2 }), /version/);
 assert.throws(() => validateManifest({ ...m, runId: '../x' }), /runId/);
 assert.throws(() => validateManifest({ ...m, maxIters: 500 }), /horizon/);

@@ -49,10 +49,11 @@ export function validName(name) {
 }
 
 /** The manifest the Activity stages at Start (versioned for forward tolerance). */
-export function buildManifest({ runId, name, maxIters, gpu, srcKey, photos, photoSource, photoUrls, settings }) {
+export function buildManifest({ runId, name, maxIters, gpu, scoreScale, srcKey, photos, photoSource, photoUrls, settings }) {
   return {
     version: 1, runId, name: name || 'model', maxIters: maxIters | 0,
     gpu: Math.min(100, Math.max(10, Math.round(gpu ?? 100))),
+    scoreScale: scoreScale === 'similarity' ? 'similarity' : 'db',
     srcKey: srcKey || null, photos: [...photos], photoSource,
     ...(photoSource === 'urls' ? { photoUrls: [...(photoUrls || [])] } : {}),
     settings: settings ? { ...settings } : null,

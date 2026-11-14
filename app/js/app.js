@@ -310,6 +310,7 @@ const S = {
   regCams: [],                 // cameras as they register (beat 3)
   solveStats: { pairsChecked: 0, pairsUsable: 0, solveSec: 0 },
   chartEvents: [],             // real refine/growth moments for the curve
+  splatHist: [],               // [iteration, count] for the graph cursor
   scoreScale: 'db',
   flash: null,
   detailTab: 'score',
@@ -2161,7 +2162,7 @@ async function open(preset, autostart = false) {
   S.chartEvents = [];
   S.maxIters = PERF.on ? PERF.iters : INITIAL_ITERS;
   S.perfMetrics = [];
-  S.holdHist = [];
+  S.holdHist = []; S.splatHist = [];
 
   S._lastReady = null;
   S.growthStopped = false;
@@ -2390,7 +2391,7 @@ async function startPrepInner() {
   // metrics tick; stale dB and splat counts flash the same way).
   S.iter = 0; S.splats = 0; S.psnrTrain = null; S.psnrHold = null;
   S.itersPerSec = 0; S.minutes = 0; S.etaAt = null;
-  S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
+  S.holdHist = []; S.splatHist = []; S.chartEvents = [];  S.growthStopped = false;
   S.feats = new Map(); S.lastPairEv = null; S.shownPair = null; S.regCams = [];
   S.regPts = null; S.regPtsCount = 0; S.growNote = null;
   S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
@@ -3209,6 +3210,7 @@ function startTraining() {
   syncTrainingVisualsControl();
   if (chart) {
     chart.train = (S.session.lossHistory || []).map(([i, v]) => [i, v]);
+    chart.splats = (S.splatHist || []).slice();
     chart.hold = (S.holdHist || []).slice();
     chart.maxIter = S.maxIters;
     chart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
@@ -3476,6 +3478,7 @@ function captureRunProgressDetails() {
   return {
     chart: compactRows(history, 800),
     holds: compactRows(holds, 800),
+    splats: compactRows(S.splatHist || [], 800),
     events: (S.chartEvents || []).slice(-300).map((e) => ({ ...e })),
     perf: {
       frames: (perf.frames || []).slice(-6000).map((r) => Array.from(r || [])),
@@ -3534,6 +3537,7 @@ function restoreRunDetails(run, session = S.session, opts = {}) {
   S._savedDetailSettings = progress.settings || null;
   S.chartEvents = Array.isArray(progress.events) ? progress.events.map((e) => ({ ...e })) : [];
   S.holdHist = Array.isArray(progress.holds) ? progress.holds.map((r) => Array.from(r || [])) : [];
+  S.splatHist = Array.isArray(progress.splats) ? progress.splats.map((r) => Array.from(r || [])) : [];
   S.perfMetrics = Array.isArray(progress.metrics) ? progress.metrics.map((m) => Array.from(m || [])) : [];
   const lastMetric = S.perfMetrics[S.perfMetrics.length - 1];
   if (lastMetric && Number.isFinite(+lastMetric[2])) S.itersPerSec = +lastMetric[2];
@@ -3670,6 +3674,7 @@ function queueMetricsPaint() {
       if (dchart) {
         const history = (S.session && S.session.lossHistory) || [];
         dchart.train = history.map(([i, v]) => [i, v]);
+        dchart.splats = (S.splatHist || []).slice();
         dchart.hold = (S.holdHist || []).slice();
         dchart.maxIter = S.maxIters;
         dchart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
@@ -3710,10 +3715,11 @@ function onMetrics(m) {
   if (m.psnrTrain != null) S.psnrTrain = m.psnrTrain;
   if (m.psnrHold != null) S.psnrHold = m.psnrHold;
   if (m.psnrHold != null) (S.holdHist ??= []).push([m.iter, m.psnrHold]);
+  if (Number.isFinite(m.splats)) (S.splatHist ??= []).push([m.iter, m.splats]);
   // the first few hundred cycles rocket from near-nothing to the real curve —
   // charting that ramp squashes the whole run's y-scale into a corner
   if (chart && m.psnrTrain != null && m.iter >= Math.min(500, S.maxIters * 0.02)) {
-    chart.push(m.iter, m.psnrTrain, m.psnrHold ?? null);
+    chart.push(m.iter, m.psnrTrain, m.psnrHold ?? null, m.splats);
     chart.maxIter = S.maxIters;
     chart.events = S.chartEvents.map((e) => ({ ...e, at: e.iter / S.maxIters }));
     queueMetricsPaint();
@@ -3907,7 +3913,7 @@ async function deviceLostRecovery(msg) {
     await S.session.recover();
     if (S.gen !== gen) return;
     S.iter = 0; S.psnrTrain = null; S.psnrHold = null;
-    S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
+    S.holdHist = []; S.splatHist = []; S.chartEvents = [];  S.growthStopped = false;
     S.plyBlob = null; S.sogBlob = null;
     buildSceneFromSession();
     mountModelCanvas();
@@ -4282,7 +4288,7 @@ async function restoreSession(src) {
     S._resumeRunId = null;
     S.feats = new Map(); S.lastPairEv = null;
     S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
-    S.chartEvents = []; S.holdHist = [];  S.perfMetrics = []; S.itersPerSec = 0;
+    S.chartEvents = []; S.holdHist = []; S.splatHist = [];  S.perfMetrics = []; S.itersPerSec = 0;
     S._savedGpuFacts = null; S._savedDetailSettings = null;
     // a run that was already shared knows its space: the viewer offers its
     // link and its listing, where a reload used to leave only a Download
@@ -5245,7 +5251,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     if (S.lodPlan) ses.trainer.growLimit = S.lodPlan.levels[S.lodPlan.idx] || S.lodPlan.levels[0];
     S.iter = baseIter;
     S.psnrTrain = null; S.psnrHold = null;
-    S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
+    S.holdHist = []; S.splatHist = []; S.chartEvents = [];  S.growthStopped = false;
     restoreRunDetails(lr, ses, viewOnly ? {} : { trimToIter: baseIter });
     buildSceneFromSession();
     mountModelCanvas();
@@ -5324,6 +5330,7 @@ async function continueTraining() {
   syncTrainingVisualsControl();
   if (chart) {
     chart.train = S.session.lossHistory.map(([i, v]) => [i, v]);
+    chart.splats = (S.splatHist || []).slice();
     chart.hold = (S.holdHist || []).slice();
     chart.maxIter = S.maxIters;
     chart.draw();
@@ -6437,6 +6444,7 @@ function toggleScoreScale() {
   if (dchart) { dchart.scale = S.scoreScale; dchart.draw(); }
   syncScoreScaleControls();
   renderTrainingScore();
+  updateHeadlessScoreScale();
 }
 
 function chartTip(h) {
@@ -6444,7 +6452,8 @@ function chartTip(h) {
   if (!tip) return;
   if (!h) { tip.hidden = true; return; }
   tip.hidden = false;
-  tip.innerHTML = `${fmt(h.iter)} · <b style="color:#2fd4c1">${h.train.toFixed(1)} ${h.unit}</b>` +
+  tip.innerHTML = `${fmt(h.iter)} cycles${h.splats != null ? ` · ${fmt(h.splats)} splats` : ''}<br>` +
+    `<b style="color:#2fd4c1">${h.train.toFixed(1)} ${h.unit}</b>` +
     (h.hold != null ? ` / <b style="color:#f2a03f">${h.hold.toFixed(1)} ${h.unit}</b>` : '') +
     (h.event ? `<br><span style="color:#93a1a0">${h.event}</span>` : '');
   // the readout rides the cursor INSIDE the plot: pinned to the top edge it
@@ -6591,6 +6600,14 @@ async function headlessServiceAlive(runId) {
 }
 /** Keep the staged service recipe in sync with the live GPU duty slider.
  * The service reads this manifest when it boots after backgrounding. */
+function updateHeadlessScoreScale() {
+  const b = headlessBridge();
+  if (!b || !S._hlManifest || S._hlManifest.runId !== S.runId || S._hlStaged !== S.runId) return;
+  S._hlManifest = { ...S._hlManifest, scoreScale: S.scoreScale };
+  try { b.writeRunJson(S.runId, 'manifest.json', JSON.stringify(S._hlManifest)); }
+  catch (e) { console.warn('[headless] score unit update failed', e); }
+}
+
 function updateHeadlessGpu(value) {
   const b = headlessBridge();
   const v = Math.min(100, Math.max(10, Math.round(+value || 100)));
@@ -6625,7 +6642,8 @@ function stageHeadlessRun() {
       const photoSource = native ? 'urls' : 'files';
       const manifest = Headless.buildManifest({
         runId, name: (S._localRun && S._localRun.name) || (S.preset && S.preset.name) || 'model',
-        maxIters: S.maxIters, gpu: S.settings.gpu, srcKey: cap?.metadata?.nativeCaptureId || null,
+        maxIters: S.maxIters, gpu: S.settings.gpu, scoreScale: S.scoreScale,
+        srcKey: cap?.metadata?.nativeCaptureId || null,
         photos: names, photoSource,
         ...(native ? { photoUrls: files.map((f) => f.url) } : {}), settings: S.settings,
       });
@@ -6802,6 +6820,7 @@ function headlessProgressDetails(recon, manifest, status = {}) {
   return {
     chart: Array.isArray(stats.chart) ? stats.chart.map((r) => Array.from(r || [])) : [],
     holds: Array.isArray(stats.holds) ? stats.holds.map((r) => Array.from(r || [])) : [],
+    splats: Array.isArray(stats.splats) ? stats.splats.map((r) => Array.from(r || [])) : [],
     events: Array.isArray(stats.events) ? stats.events.map((e) => ({ ...e })) : [],
     perf: { frames: [], marks: [] }, metrics: [],
     settings: { ...((manifest && manifest.settings) || {}) },
@@ -8377,6 +8396,7 @@ function renderDetails() {
     const hist = (S.session.lossHistory && S.session.lossHistory.length)
       ? S.session.lossHistory : (rstats.chart || []);
     dchart.train = hist.map(([i, v]) => [i, v]);
+    dchart.splats = (S.splatHist || []).slice();
     dchart.hold = chart ? chart.hold : ((S.holdHist && S.holdHist.length ? S.holdHist : rstats.holds) || []).slice();
     dchart.events = S.chartEvents.map((e) => ({ ...e, at: e.iter / S.maxIters }));
     dchart.resize();

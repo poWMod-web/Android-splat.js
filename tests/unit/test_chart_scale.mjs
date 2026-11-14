@@ -30,11 +30,14 @@ const scoreChart = new Chart(chartCanvas);
 // reads through sample by sample
 scoreChart.train = [[0, 25], [100, 25], [200, 25], [300, 25], [400, 25], [500, 25]];
 scoreChart.hold = [[0, 15], [100, 25]];
+scoreChart.push(600, 25, null, 123456);
+assert.deepEqual(scoreChart.splats.at(-1), [600, 123456],
+  'the graph should retain splat counts for cursor readouts');
 scoreChart.scale = 'similarity';
 assert.deepEqual(scoreChart._activeSeries(), { train: scoreChart.train, hold: scoreChart.hold },
   'the approximate scale should reuse the PSNR samples, without a separate model-derived history');
 const simPlotted = scoreChart._displaySeries(scoreChart.train);
-assert.deepEqual(simPlotted.map((p) => p[0]), [300, 400, 500],
+assert.deepEqual(simPlotted.map((p) => p[0]), [300, 400, 500, 600],
   'the similarity graph should plot past the held samples');
 for (const p of simPlotted) {
   assert.ok(Math.abs(p[1] - formula(25)) < 1e-9,
@@ -61,6 +64,10 @@ assert.match(appSource, /const next = S\.scoreScale === 'db' \? 'Use %' : 'Use d
   'the scale button should say Use % for the percentage graph');
 assert.match(chartSource, /unit: this\.scale === 'similarity' \? '%' : 'dB'/,
   'the chart tooltip should show only the percent unit');
+assert.match(chartSource, /splats: n \? Math\.round\(n\[1\]\) : null/,
+  'the graph cursor should report the count nearest its score sample');
+assert.match(appSource, /h\.splats != null[\s\S]*fmt\(h\.splats\)[\s\S]*splats/,
+  'the visible cursor tooltip should include that splat count');
 assert.doesNotMatch(appSource, /maybeEvaluateSsim|evalGraphSsim|evalGraphMetrics/,
   'displaying the approximate scale must not launch a model SSIM evaluation');
 assert.match(appSource, /function toggleScoreScale\(\)[\s\S]*S\.scoreScale = S\.scoreScale === 'db' \? 'similarity' : 'db'/,

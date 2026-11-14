@@ -184,6 +184,7 @@ export function buildReconJson(S) {
       // the training curve, decimated to ~400 points
       chart: decimate(ses.lossHistory || [], 800).map(([i, p]) => [i, +p.toFixed(3)]),
       holds: (S.holdHist || []).map(([i, p]) => [i, +p.toFixed(3)]),
+      splats: decimate(S.splatHist || [], 800).map(([i, n]) => [i, Math.round(n)]),
       events: (S.chartEvents || []).slice(-300).map((e) => ({ ...e })),
     },
     cloud,
@@ -580,6 +581,7 @@ export function trimProgressToIter(progress, iter) {
     ...src,
     ...(Array.isArray(src.chart) ? { chart: src.chart.filter(rowBefore) } : {}),
     ...(Array.isArray(src.holds) ? { holds: src.holds.filter(rowBefore) } : {}),
+    ...(Array.isArray(src.splats) ? { splats: src.splats.filter(rowBefore) } : {}),
     ...(Array.isArray(src.events) ? { events: src.events.filter(evBefore) } : {}),
     ...(Array.isArray(src.metrics) ? { metrics: src.metrics.filter(metBefore) } : {}),
   };

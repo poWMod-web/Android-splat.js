@@ -19,7 +19,7 @@ export class Chart {
     this.cv = canvas;
     this.ctx = canvas.getContext('2d');
     this.scale = 'db';
-    this.train = []; this.hold = [];
+    this.train = []; this.hold = []; this.splats = [];
     this.ghost = null; this.events = []; this.maxIter = 40000;
     this.onHover = onHover; this.onScrub = onScrub;
     this.hover = null; this.scrubbable = false; this.mark = null;
@@ -107,12 +107,13 @@ export class Chart {
     this.draw();
   }
 
-  push(iter, train, hold) {
+  push(iter, train, hold, splats = null) {
     this.train.push([iter, train]);
     if (hold != null) this.hold.push([iter, hold]);
+    if (Number.isFinite(splats)) this.splats.push([iter, splats]);
   }
 
-  reset() { this.train = []; this.hold = []; }
+  reset() { this.train = []; this.hold = []; this.splats = []; }
 
   draw() {
     const ctx = this.ctx, W = this.cv.width, H = this.cv.height, dpr = this.dpr || 1;
@@ -242,7 +243,7 @@ export class Chart {
     if (this.hover && trainHeld.length) {
       const it = this._frac(this.hover.x) * xMax;
       const near = (arr) => arr.length ? arr.reduce((a, p) => Math.abs(p[0] - it) < Math.abs(a[0] - it) ? p : a) : null;
-      const a = near(trainHeld), h = near(holdHeld);
+      const a = near(trainHeld), h = near(holdHeld), n = near(this.splats);
       const ev = this.events.find((e) => Math.abs(e.at * this.maxIter - it) < xMax * .012);
       if (a) {
         const x = X(a[0]);
@@ -257,6 +258,7 @@ export class Chart {
           yPct: this.hover.y * 100,
           iter: Math.round(a[0]),
           train: this._displayValue(a[1]), hold: h ? this._displayValue(h[1]) : null,
+          splats: n ? Math.round(n[1]) : null,
           unit: this.scale === 'similarity' ? '%' : 'dB', event: ev ? ev.label : null,
         });
       }

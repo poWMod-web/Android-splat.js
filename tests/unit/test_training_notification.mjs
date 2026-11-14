@@ -5,6 +5,7 @@ const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8'
 const manifest = readFileSync(new URL('../../android/app/src/main/AndroidManifest.xml', import.meta.url), 'utf8');
 const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
 const service = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
+const headless = readFileSync(new URL('../../app/js/train-headless.js', import.meta.url), 'utf8');
 
 // The manifest declares the background-training service and its permissions.
 assert.match(manifest, /<uses-permission android:name="android\.permission\.FOREGROUND_SERVICE" \/>/,
@@ -116,6 +117,12 @@ assert.match(app, /function notifScore\(\) \{[\s\S]*?S\.scoreScale === 'similari
   'the notification score should follow the dB/% switch');
 assert.match(app, /\$\{notifScore\(\)\}\$\{fmt\(S\.splats\)\} splats/,
   'progress ticks and the finish summary should share the unit-aware score');
+assert.match(app, /function toggleScoreScale\(\)[\s\S]*updateHeadlessScoreScale\(\)/,
+  'changing the unit before handoff should rewrite the staged service manifest');
+assert.match(headless, /manifest\?\.scoreScale === 'similarity'[\s\S]*psnrToApproxSsimPercent\(value\)/,
+  'the service notification should retain the selected percentage conversion');
+assert.match(headless, /ses\.trainer\.n\.toLocaleString\('en-US'\)\} splats/,
+  'service-owned progress notifications should show the live splat count');
 assert.match(app, /if \(on\) \{ if \(!notifSetPaused\(false\)\) androidNotifStart\(\); \}/,
   'resuming should flip the shade button, restarting the service only on old bridges');
 assert.match(app, /else if \(!notifSetPaused\(true\)\) androidNotifStop\(false\);/,

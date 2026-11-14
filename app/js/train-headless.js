@@ -17,6 +17,7 @@ import {
   parseState, packState, buildReconJson, continuedInputDim, continuedBuf,
 } from './session_io.js';
 import * as H from './headless.js';
+import { psnrToApproxSsimPercent } from './chart.js';
 
 const qs = new URLSearchParams(location.search);
 const runId = qs.get('run') || '';
@@ -34,6 +35,7 @@ let lastProgAt = 0, lastProgIter = -1;
 let ips = 0, ipsAt = 0, ipsIter = 0;
 let shotBusy = false;
 let psnr = null;
+let splatHist = [];
 let chartEvents = [];
 
 const b64 = (u8, size = 262144) => {
@@ -137,6 +139,7 @@ async function boot() {
     // from the Activity samples so service metrics append instead of replacing
     // everything before the handoff.
     const priorChart = (recon.stats && recon.stats.chart) || [];
+    splatHist = ((recon.stats && recon.stats.splats) || []).map((r) => Array.from(r || []));
     ses.setLossHistory(priorChart);
     if (priorChart.length && Number.isFinite(+priorChart[priorChart.length - 1][1]))
       psnr = +priorChart[priorChart.length - 1][1];
@@ -174,11 +177,22 @@ function onEvent(e) {
   }
 }
 
+function scoreText(value) {
+  if (!Number.isFinite(value)) return '';
+  return manifest?.scoreScale === 'similarity'
+    ? `${psnrToApproxSsimPercent(value).toFixed(1)} %`
+    : `${value.toFixed(1)} dB`;
+}
+
 function postProgress(force = false) {
   if (!bridge || !ses || !ses.trainer || ending) return;
   const now = Date.now();
   const iter = ses.trainer.iter | 0;
   if (!force && now - lastProgAt < 2500 && iter === lastProgIter) return;
+  if (!splatHist.length || splatHist[splatHist.length - 1][0] !== iter) {
+    splatHist.push([iter, ses.trainer.n | 0]);
+    if (splatHist.length > 2000) splatHist = splatHist.slice(-2000);
+  }
   lastProgAt = now; lastProgIter = iter;
   if (now - ipsAt >= 5000) {
     ips = (iter - ipsIter) * 1000 / Math.max(1, now - ipsAt);
@@ -190,7 +204,7 @@ function postProgress(force = false) {
   try {
     bridge.postProgress(runId, JSON.stringify({
       title: `Training ${manifest ? manifest.name : 'model'}`,
-      text: `${psnr != null ? `${psnr.toFixed(1)} dB · ` : ''}${iter.toLocaleString('en-US')} / ${(manifest ? manifest.maxIters : 0).toLocaleString('en-US')}`,
+      text: `${scoreText(psnr) ? `${scoreText(psnr)} · ` : ''}${ses.trainer.n.toLocaleString('en-US')} splats · ${iter.toLocaleString('en-US')} / ${(manifest ? manifest.maxIters : 0).toLocaleString('en-US')}`,
       done: iter, total: manifest ? manifest.maxIters : 0,
       iter, maxIters: manifest ? manifest.maxIters : 0,
       splats: ses.trainer.n | 0, psnr, ips: +ips.toFixed(1),
@@ -216,7 +230,7 @@ async function secureFileCheckpoint() {
       session: ses, preset: { name: manifest.name }, loadedFiles: filesWithUrls(),
       minutes: 0,   // headless wall-clock is unmeasured in V1 (adopt carries iter/score, not minutes)
       psnrTrain: psnr, psnrHold: recon.stats?.psnrHold ?? null,
-      holdHist: (recon.stats && recon.stats.holds) || [],
+      holdHist: (recon.stats && recon.stats.holds) || [], splatHist,
       chartEvents, _localRun: { recon },
     };
     const next = buildReconJson(S);
@@ -248,7 +262,7 @@ async function finalize() {
     postStatus({ status: 'finished', iter, splats, psnr });
     postProgress(true);
     bridge.finishRun(runId, 'Training complete',
-      `${psnr != null ? `${psnr.toFixed(1)} dB · ` : ''}${splats.toLocaleString('en-US')} splats · ${iter.toLocaleString('en-US')} cycles`);
+      `${scoreText(psnr) ? `${scoreText(psnr)} · ` : ''}${splats.toLocaleString('en-US')} splats · ${iter.toLocaleString('en-US')} cycles`);
     log(`finished at iter ${iter}`);
   } catch (e) {
     await fail(e);
