@@ -1129,6 +1129,77 @@ async function lastCaptureTile() {
   return b;
 }
 
+let legacyCaptureMigration = null;
+let legacyCaptureRemounted = false;
+/** Move an old IndexedDB-only AR capture into the canonical native archive.
+ * This is migration, not duplication: the blob record is deleted only after
+ * the native catalog verifies the complete archive. */
+async function migrateLegacyNativeCapture() {
+  const bridge = globalThis.AndroidARBridge;
+  if (!bridge || typeof bridge.writeCaptureArchiveChunk !== 'function') return false;
+  if (legacyCaptureMigration) return legacyCaptureMigration;
+  legacyCaptureMigration = (async () => {
+    const rec = await loadLastCapture();
+    if (!rec || rec.nativeCaptureId || !rec.transforms || !Array.isArray(rec.files) || rec.files.length < 3) return false;
+    const captureId = `legacy_${Math.max(1, Math.round(rec.created || Date.now()))}`;
+    const fileMap = new Map();
+    const files = rec.files.map((entry, i) => {
+      const name = `frame_${String(i).padStart(4, '0')}.jpg`;
+      fileMap.set(String(entry.name || '').split('/').pop(), name);
+      return { ...entry, name };
+    });
+    const writeBytes = async (name, bytes) => {
+      const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      for (let o = 0; o < data.length; o += 262144) {
+        if (!bridge.writeCaptureArchiveChunk(captureId, name,
+          Headless.encodeB64(data.subarray(o, o + 262144)), o + 262144 >= data.length)) {
+          throw new Error(`native archive rejected ${name}`);
+        }
+      }
+    };
+    for (const file of files) {
+      const blob = file.blob;
+      if (!blob || typeof blob.arrayBuffer !== 'function') throw new Error(`legacy frame ${file.name} is missing`);
+      await writeBytes(file.name, await blob.arrayBuffer());
+    }
+    const transforms = JSON.parse(JSON.stringify(rec.transforms));
+    for (const [i, frame] of (transforms.frames || []).entries()) {
+      const old = String(frame.file_path || '').split('/').pop();
+      frame.file_path = `./${fileMap.get(old) || files[i]?.name || ''}`;
+    }
+    const points = (rec.points || []).map((point) => ({ ...point,
+      ...(point.frameName ? { frameName: fileMap.get(String(point.frameName).split('/').pop()) || point.frameName } : {}) }));
+    const enc = new TextEncoder();
+    await writeBytes('transforms.json', enc.encode(JSON.stringify(transforms)));
+    await writeBytes('seed_points.json', enc.encode(JSON.stringify({ points, metadata: rec.metadata || {} })));
+    await writeBytes('capture.json', enc.encode(JSON.stringify({ ...(rec.metadata || {}), frames: files.length,
+      pointCount: points.length, migratedFromIndexedDB: true })));
+    const catalog = JSON.parse(bridge.listHomeLibrary());
+    if (!(catalog.captures || []).some((row) => row.captureId === captureId)) {
+      throw new Error('native archive verification failed');
+    }
+    const { deleteLastCapture, listRuns, patchRun } = await import('./store.js');
+    // Repoint legacy model records before deleting their old image blobs.
+    // Their model state stays their own; image/pose reads now resolve only
+    // through the migrated canonical archive.
+    for (const run of await listRuns()) {
+      const source = run && run.recon && run.recon.source;
+      if (!source || !Array.isArray(source.names) || !source.names.length) continue;
+      const urls = source.names.map((name, i) => {
+        const old = String(name || '').split('/').pop();
+        const nativeName = fileMap.get(old) || files[i]?.name;
+        return nativeName ? `https://appassets.androidplatform.net/captures/${captureId}/${nativeName}` : null;
+      });
+      if (!urls.every(Boolean)) continue;
+      await patchRun(run.id, { srcKey: `native:${captureId}`,
+        recon: { ...run.recon, source: { ...source, urls, captureId } } });
+    }
+    await deleteLastCapture();
+    return true;
+  })().catch((e) => { console.warn('[home] legacy AR migration failed', e); return false; });
+  return legacyCaptureMigration;
+}
+
 /** Every native ARCore archive is a ground-truth scan tile. Only references
  * cross into JS; opening one fetches its files from the stable native folder. */
 async function nativeCaptureTiles(rows = null) {
@@ -5865,6 +5936,15 @@ async function mountWall() {
     }
     load('scans', nativeCaptureTiles(catalog.captures));
     load('files', androidRunTiles(catalog.runs));
+    // Main stores model checkpoints in IndexedDB. Keep those model records in
+    // the union (deduped by run ID); they reference the native capture archive
+    // and are not a second image/pose source.
+    load('local', localRunTiles());
+    migrateLegacyNativeCapture().then((moved) => {
+      if (moved && !legacyCaptureRemounted && token === wallMountToken) {
+        legacyCaptureRemounted = true; mountWall();
+      }
+    });
   } else {
     // Browser/main behavior: its origin-local IndexedDB is the sole library.
     load('capture', lastCaptureTile());

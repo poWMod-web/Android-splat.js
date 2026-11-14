@@ -28,7 +28,10 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.FileOutputStream;
 import java.io.OutputStream;
+import java.util.HashMap;
+import java.util.Map;
 
 public final class MainActivity extends Activity {
     private static final int REQUEST_CAPTURE = 41;
@@ -420,6 +423,8 @@ public final class MainActivity extends Activity {
     }
 
     private final class AndroidARBridge {
+        private final Map<String, OutputStream> captureImports = new HashMap<>();
+
         @JavascriptInterface public boolean isAvailable() { return true; }
 
         @JavascriptInterface public void startCapture() {
@@ -631,6 +636,42 @@ public final class MainActivity extends Activity {
             File[] children = file.listFiles();
             if (children != null) for (File child : children) if (!deleteArchiveTree(child)) return false;
             return file.delete();
+        }
+
+        /** One-time migration for captures saved by older builds only in
+         * IndexedDB. Each file publishes atomically into a canonical native
+         * archive; JavaScript deletes the old blobs only after verification. */
+        @JavascriptInterface public synchronized boolean writeCaptureArchiveChunk(
+                String captureId, String name, String base64, boolean last) {
+            if (captureId == null || !captureId.matches("legacy_[A-Za-z0-9_-]{1,72}") ||
+                    name == null || base64 == null) return false;
+            boolean allowed = name.matches("frame_[0-9]{4}\\.jpg") ||
+                    name.equals("transforms.json") || name.equals("seed_points.json") ||
+                    name.equals("capture.json");
+            if (!allowed) return false;
+            File dir = new File(new File(getFilesDir(), "captures"), captureId);
+            if (!dir.exists() && !dir.mkdirs()) return false;
+            File target = new File(dir, name);
+            File tmp = new File(dir, name + ".tmp");
+            String key = target.getAbsolutePath();
+            try {
+                OutputStream out = captureImports.get(key);
+                if (out == null) {
+                    try { tmp.delete(); } catch (Exception ignored) { }
+                    out = new FileOutputStream(tmp, false);
+                    captureImports.put(key, out);
+                }
+                out.write(Base64.decode(base64, Base64.DEFAULT));
+                if (!last) return true;
+                out.close(); captureImports.remove(key);
+                if (target.exists() && !target.delete()) return false;
+                return tmp.renameTo(target);
+            } catch (Exception e) {
+                OutputStream out = captureImports.remove(key);
+                if (out != null) try { out.close(); } catch (Exception ignored) { }
+                try { tmp.delete(); } catch (Exception ignored) { }
+                return false;
+            }
         }
 
         /** One Android-app-data catalog for Home. ARCore archives are the

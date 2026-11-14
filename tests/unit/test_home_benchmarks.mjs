@@ -13,10 +13,10 @@ assert.doesNotMatch(html, /btn-xr-example|Try a scene with known cameras|Synthet
 assert.doesNotMatch(app, /onExample|btn-xr-example|fetchGallery|HOME_BENCHMARK_IDS|creationTile\(/,
   'the synthetic example and remote community/benchmark gallery must not be active in the app');
 const wall = app.match(/async function mountWall\(\)[\s\S]*?(?=\/\*\* From the viewer into the studio)/)?.[0] || '';
-assert.match(wall, /lastCaptureTile\(\)[\s\S]*localRunTiles\(\)/,
-  'the saved-work area should be populated only from local captures and runs');
+assert.match(wall, /listHomeLibrary\(\)[\s\S]*nativeCaptureTiles\(catalog\.captures\)[\s\S]*androidRunTiles\(catalog\.runs\)[\s\S]*localRunTiles\(\)/,
+  'Android should merge canonical captures with native and main-branch model checkpoints');
 assert.match(wall, /typeof native\.listHomeLibrary === 'function'[\s\S]*listHomeLibrary\(\)[\s\S]*nativeCaptureTiles\(catalog\.captures\)[\s\S]*androidRunTiles\(catalog\.runs\)[\s\S]*else \{[\s\S]*lastCaptureTile\(\)[\s\S]*localRunTiles\(\)/,
-  'Android must use one app-data catalog while browser main keeps one IndexedDB library');
+  'Android captures stay native while model checkpoints retain main-branch compatibility');
 assert.doesNotMatch(wall, /Promise\.all\(/,
   'catalog tile groups should paint independently');
 assert.doesNotMatch(wall, /fetch\(|import\(['"]\.\/share\.js/,

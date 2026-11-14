@@ -239,7 +239,7 @@ class Emitter {
  *  dB/kiter. Needs minPoints finite samples spanning most of the window —
  *  anything less is "still warming up", never a plateau. Flat OR falling
  *  trips it: a stalled score wants fresh capacity, a falling one triage. */
-export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, minPoints = 4, after = -Infinity } = {}) {
+export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, minPoints = 4, after = -Infinity, maxStdDev = 0.15 } = {}) {
   if (!Array.isArray(history) || !history.length) return false;
   const pts = [];
   for (const [i, p] of history) {
@@ -252,7 +252,12 @@ export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, m
   const n = pts.length;
   const denom = n * sxx - sx * sx;
   if (!(denom > 0)) return false;
-  return (n * sxy - sx * sy) / denom * 1000 < slope;
+  const m = (n * sxy - sx * sy) / denom;
+  const b = (sy - m * sx) / n;
+  let residual2 = 0;
+  for (const [i, p] of pts) residual2 += (p - (m * i + b)) ** 2;
+  const stdDev = Math.sqrt(residual2 / n);
+  return m * 1000 < slope && stdDev <= maxStdDev;
 }
 
 export class Session {
@@ -276,9 +281,8 @@ export class Session {
     // below reads THIS, so the trigger trips on the line the user sees
     this.zlemaHistory = [];   // [iter, filteredPsnrTrain]
     this._zlema = new FastRobustZLEMA();
-    // Automatic growth is plateau-only. Repeated plateaus back off so a flat
-    // score cannot trigger capacity changes every few hundred iterations.
-    this._plateauGap = opts.plateauMinGap ?? 1200;
+    // Automatic growth is plateau-only. After each growth, a fresh full
+    // convergence window must accumulate before the next plateau can qualify.
     this._fences = [];      // in-flight batch fences (see _frameLoop)
     this._govAuto = 1;      // duty governor: auto duty, min()'d with the slider
     this._govLag = 0;       // event-loop lag EWMA (ms)
@@ -1333,7 +1337,6 @@ export class Session {
     this.lossHistory = [];
     this.zlemaHistory = [];
     this._zlema = new FastRobustZLEMA();
-    this._plateauGap = this.opts.plateauMinGap ?? 1200;
     this._lastHold = null;
     this._lastHoldEval = 0;
     this._itersAtStats = 0;
@@ -1685,27 +1688,25 @@ export class Session {
       const tEnc = performance.now() - t0;
 
       // Score-driven refinement: automatic relocation/growth happens ONLY
-      // after the filtered PSNR has plateaued. Each accepted plateau doubles
-      // the minimum gap (bounded), and evidence must be newer than the prior
-      // refine. There is no fixed-cadence growth backstop.
+      // after the filtered PSNR has converged into a low-variance plateau.
+      // Evidence is reset at each growth, then a complete fresh window must
+      // accumulate. There is no fixed cadence and no ever-growing delay.
       const sinceRefine = trainer.iter - (trainer.lastRefine || 0);
       const plateauWindow = this.opts.plateauWindow ?? 1200;
-      const plateauBaseGap = this.opts.plateauMinGap ?? 1200;
-      const plateauMaxGap = this.opts.plateauMaxGap ?? 10000;
+      const convergenceGap = this.opts.plateauMinGap ?? plateauWindow;
       let plateau = false;
       if (this.opts.refinePlateau !== false && trainer.iter > 1500 &&
-          sinceRefine >= this._plateauGap) {
+          sinceRefine >= convergenceGap) {
         plateau = scorePlateaued(this.zlemaHistory, trainer.iter, {
           window: plateauWindow,
           slope: this.opts.plateauSlope ?? 0.1,
+          maxStdDev: this.opts.plateauStdDev ?? 0.15,
           after: trainer.lastRefine || 0,
         });
       }
       let refineResult = null;
       if (trainer.iter > 1500 && plateau) {
         trainer.lastRefine = trainer.iter;
-        this._plateauGap = Math.min(plateauMaxGap,
-          Math.max(plateauBaseGap, this._plateauGap * 2));
         // tandem prune: cull the lowest-mass fraction FIRST (until 85% of
         // the run), so this same refine regrows the freed capacity into
         // the highest-error donors — one prune/multiply cycle, not two

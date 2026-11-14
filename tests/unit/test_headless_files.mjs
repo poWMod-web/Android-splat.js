@@ -219,6 +219,12 @@ assert.match(app, /entry\.previewUri[\s\S]*new Image\(\)[\s\S]*src: entry\.previ
   'file-backed model cards should restore main-style image previews when available');
 assert.match(app, /writeRunBlob\(S\.runId, 'thumb\.webp', thumb\)/,
   'finished Android models should persist their Home preview beside the checkpoint');
+assert.match(main, /writeCaptureArchiveChunk[\s\S]*legacy_[A-Za-z0-9_{}\[\]\\.+*?-]+[\s\S]*captures/,
+  'legacy IndexedDB AR scans should have an atomic path into the canonical native archive');
+assert.match(app, /async function migrateLegacyNativeCapture\(\)[\s\S]*writeCaptureArchiveChunk[\s\S]*listHomeLibrary\(\)[\s\S]*deleteLastCapture\(\)/,
+  'legacy AR blobs should be deleted only after native archive verification');
+assert.match(app, /Repoint legacy model records[\s\S]*srcKey: `native:\$\{captureId\}`[\s\S]*source: \{ \.\.\.source, urls, captureId \}/,
+  'legacy model checkpoints should reference the migrated canonical archive before old blobs are removed');
 const durableList = runFiles.slice(runFiles.indexOf('List<String> listDurableRuns(Context ctx)'),
   runFiles.indexOf('String recoverActive(Context ctx)'));
 assert.match(durableList, /state\.bin[\s\S]*recon\.json[\s\S]*manifest\.json/,
