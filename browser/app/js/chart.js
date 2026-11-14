@@ -224,32 +224,6 @@ export class Chart {
     line(hold, '#f2a03f', [5, 3], 1.5);
     line(train, '#2fd4c1', null, 1.8);
 
-    // Put intervention marks ON the score curve as well as at the top edge.
-    // The old 2px top dot + faint dashed line was technically present but
-    // effectively invisible on a phone, so growth/prune looked unreported.
-    const scoreAt = (iter) => {
-      if (!train.length) return null;
-      if (iter <= train[0][0]) return train[0][1];
-      for (let i = 1; i < train.length; i++) {
-        if (iter <= train[i][0]) {
-          const a = train[i - 1], z = train[i];
-          const f = (iter - a[0]) / Math.max(1, z[0] - a[0]);
-          return a[1] + f * (z[1] - a[1]);
-        }
-      }
-      return train[train.length - 1][1];
-    };
-    for (const e of this.events) {
-      const iter = e.at * this.maxIter;
-      const value = scoreAt(iter);
-      const x = X(iter);
-      if (value == null || x < l || x > l + pw) continue;
-      ctx.fillStyle = e.kind === 'grow' ? '#f2a03f'
-        : e.kind === 'prune' ? '#93a1a0' : '#6b7877';
-      ctx.strokeStyle = 'rgba(7,9,9,.9)'; ctx.lineWidth = 1.5 * dpr;
-      ctx.beginPath(); ctx.arc(x, Y(value), 4 * dpr, 0, 7); ctx.fill(); ctx.stroke();
-    }
-
     // playhead
     const last = active.train[active.train.length - 1];
     if (last) {
