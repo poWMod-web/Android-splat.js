@@ -21,6 +21,14 @@ assert.doesNotMatch(wall, /Promise\.all\(/,
   'catalog tile groups should paint independently');
 assert.doesNotMatch(wall, /fetch\(|import\(['"]\.\/share\.js/,
   'mounting saved work must not issue network requests');
+assert.match(wall, /heading = document\.createElement\('button'\)[\s\S]*wall-refresh[\s\S]*heading\.addEventListener\('click', \(\) => mountWall\(\)\)/,
+  'the saved-work heading should explicitly refresh the native and IndexedDB catalogs');
+assert.match(app, /visibilitychange[\s\S]*S\.state === 'ready'[\s\S]*mountWall\(\)/,
+  'returning to a visible Home screen should automatically refresh saved models');
+assert.match(app, /nativeNewer[\s\S]*Keep main's full model record[\s\S]*status: nativeRow\.status[\s\S]*splats: nativeRow\.splats/,
+  'service-owned Android progress must overlay stale IndexedDB card metadata');
+assert.match(app, /openNativeFresh[\s\S]*mirrorHeadlessRun\(r\.id, nativeRow\)/,
+  'opening a newer native checkpoint should refresh the model record before continuing');
 assert.doesNotMatch(xrUi, /btn-xr-example|onExample/,
   'XR UI must not retain a handler for the removed demo tile');
 assert.doesNotMatch(html, /fonts\.googleapis\.com|fonts\.gstatic\.com/,

@@ -695,6 +695,9 @@ public final class MainActivity extends Activity {
                     String statusRaw = RunFiles.readJson(MainActivity.this, runId, "status.json");
                     JSONObject status = statusRaw == null ? new JSONObject() : new JSONObject(statusRaw);
                     row.put("status", status.optString("status", "interrupted"));
+                    row.put("owner", status.optString("owner", ""));
+                    row.put("at", status.optLong("at", 0));
+                    row.put("stopped", status.optBoolean("stopped", false));
                     row.put("iter", status.optInt("iter", 0));
                     row.put("splats", status.optInt("splats", 0));
                     if (status.has("psnr")) row.put("psnr", status.optDouble("psnr"));

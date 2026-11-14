@@ -1137,3 +1137,9 @@ a.cbtn { text-decoration: none; }
   font-size: 11px;
   line-height: 1.2;
 }
+
+/* The saved-work heading is also an explicit refresh control. Background
+   service progress lives outside IndexedDB, so Home must offer a deliberate
+   rescan without making the user reload the whole WebView. */
+.wall-refresh { display: block; margin: 0 auto 8px; padding: 8px 10px; border-radius: 8px; }
+.wall-refresh:hover, .wall-refresh:focus-visible { color: var(--paper); background: rgba(255,255,255,.05); }

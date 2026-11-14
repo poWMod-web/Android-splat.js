@@ -1291,14 +1291,34 @@ function tileMenu(btn, items) {
   });
 }
 
+let wallBlobUrls = [];
+function wallBlobUrl(blob) {
+  const url = URL.createObjectURL(blob);
+  wallBlobUrls.push(url);
+  return url;
+}
+
 async function localRunTiles(nativeRows = [], captureRows = []) {
   const { listRuns, deleteRun } = await import('./store.js');
   const runs = await listRuns();
   const nativeByRun = new Map((nativeRows || []).map((row) => [row.runId, row]));
   const captureById = new Map((captureRows || []).map((row) => [row.captureId, row]));
   const tiles = [];
-  for (const r of runs) {
+  for (const stored of runs) {
+    const nativeRow = nativeByRun.get(stored.id) || null;
+    const nativeNewer = !!(nativeRow && (nativeRow.iter || 0) >= (stored.iter || 0));
+    // Keep main's full model record, but paint live/durable Android metadata
+    // over stale IndexedDB fields. The latter cannot update while the service
+    // trains in its separate process.
+    const r = nativeNewer ? { ...stored,
+      name: nativeRow.name || stored.name,
+      status: nativeRow.status || stored.status,
+      iter: nativeRow.iter ?? stored.iter,
+      splats: nativeRow.splats ?? stored.splats,
+      psnr: nativeRow.psnr ?? stored.psnr,
+    } : stored;
     const live = S.runId === r.id && S.state === 'train';
+    const backgroundLive = !!(nativeRow && Headless.isLiveStatus(nativeRow));
     const src = r.recon && r.recon.source;
     const urlSrc = !!(src && Array.isArray(src.urls) && src.urls.length && src.urls.every(Boolean));
     const retrainable = !!(r.ownSrc || urlSrc);
@@ -1310,6 +1330,8 @@ async function localRunTiles(nativeRows = [], captureRows = []) {
     // splats · dB · MB — a scene is a scene, wherever it was trained
     const state = r.status === 'finished'
       ? `${fmt(r.splats || 0)} splats${r.psnr != null ? ` · ${(+r.psnr).toFixed(1)} dB` : ''}${r.sog ? ` · ${Math.max(1, Math.round(r.sog.size / 1e6))} MB` : ''}`
+      : backgroundLive
+        ? `${r.status === 'paused' ? 'background paused' : 'background training'} · ${fmt(r.splats || 0)} splats · ${fmt(r.iter || 0)} cycles`
       : live
         ? `training now · ${fmt(r.iter || 0)} cycles`
         : (r.state && r.recon)
@@ -1327,13 +1349,26 @@ async function localRunTiles(nativeRows = [], captureRows = []) {
       <span class="galname">${esc(r.name || 'Training run')}</span>
       ${desc ? `<span class="galdesc">${esc(desc)}</span>` : ''}
       <span class="galmeta">${state}</span>`;
-    if (r.thumb) b.prepend(Object.assign(new Image(), { src: URL.createObjectURL(r.thumb), alt: '' }));
+    if (r.thumb) b.prepend(Object.assign(new Image(), { src: wallBlobUrl(r.thumb), alt: '' }));
     else {
-      const nativeRow = nativeByRun.get(r.id);
       const captureId = String(r.srcKey || '').replace(/^native:/, '');
       const fallbackPreview = nativeRow?.previewUri || captureById.get(captureId)?.previewUri;
       if (fallbackPreview) b.prepend(Object.assign(new Image(), { src: fallbackPreview, alt: '' }));
     }
+    const openNativeFresh = async (viewOnly) => {
+      if (!nativeRow) return false;
+      if (backgroundLive) { enterMonitor(r.id); return true; }
+      try {
+        flash('Refreshing the saved model …', 60000);
+        const rec = await mirrorHeadlessRun(r.id, nativeRow);
+        S._localRun = rec;
+        await continueLocalRun(viewOnly);
+        return true;
+      } catch (e) {
+        flash(`Could not refresh this model: ${e.message}`, 8000);
+        return false;
+      }
+    };
     const viewFromState = (rec) => {
       S._localRun = rec;
       continueLocalRun(true).catch((e) => {
@@ -1384,7 +1419,11 @@ async function localRunTiles(nativeRows = [], captureRows = []) {
         await deleteRun(r.id); b.remove();
       } },
     ]);
-    b.addEventListener('click', () => {
+    b.addEventListener('click', async () => {
+      if (backgroundLive) { enterMonitor(r.id); return; }
+      if (nativeNewer && nativeRow && (nativeRow.iter || 0) > (stored.iter || 0)) {
+        await openNativeFresh(nativeRow.status === 'finished'); return;
+      }
       if (r.sog && r.recon) {
         restoreSession({
           url: URL.createObjectURL(r.sog),
@@ -5954,9 +5993,15 @@ async function mountWall() {
   const host = $('gallery');
   if (!host) return;
   const token = ++wallMountToken;
-  const heading = document.createElement('p');
-  heading.className = 'eyebrow';
-  heading.textContent = 'SAVED ON THIS DEVICE';
+  for (const url of wallBlobUrls) URL.revokeObjectURL(url);
+  wallBlobUrls = [];
+  const heading = document.createElement('button');
+  heading.type = 'button';
+  heading.className = 'eyebrow wall-refresh';
+  heading.textContent = 'SAVED ON THIS DEVICE  ↻';
+  heading.title = 'Refresh saved captures and models';
+  heading.setAttribute('aria-label', 'Refresh saved captures and models');
+  heading.addEventListener('click', () => mountWall());
   const grid = document.createElement('div');
   grid.className = 'galgrid';
   const slots = { scans: [], files: [], capture: [], local: [] };
@@ -6016,6 +6061,11 @@ async function mountWall() {
 
 window.addEventListener('pageshow', (e) => {
   if (e.persisted && document.getElementById('gallery')) mountWall().catch(() => {});
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && S.state === 'ready' && $('start') && !$('start').hidden) {
+    mountWall().catch(() => {});
+  }
 });
 
 /** From the viewer into the studio: the shared creation's photographs become
