@@ -1297,6 +1297,25 @@ export class Session {
     return removed;
   }
 
+  /** Return a previously removed source image to the training loss without
+   * changing any persisted photo/camera indices. It returns as an ordinary
+   * training camera; a former holdout is intentionally not recreated. */
+  async includeCameraImage(ci) {
+    const trainer = this.trainer;
+    const selected = trainer?.camMeta?.[ci];
+    if (!selected) throw new Error('camera is not trainable');
+    const imgIdx = selected.imgIdx;
+    const restored = trainer.camMeta.map((m, i) => m.imgIdx === imgIdx ? i : -1).filter((i) => i >= 0);
+    const wasTraining = await this.pauseAndDrain();
+    try {
+      for (const rc of this.recon?.cams || []) if (rc.imgIdx === imgIdx) rc.excluded = false;
+      const excluded = new Set(trainer.excluded || []);
+      for (const i of restored) excluded.delete(i);
+      await this._commitSplit(excluded);
+    } finally { if (wasTraining) this.start(); }
+    return restored;
+  }
+
   /** Manual growth pass, any time: one immediate refine (relocate the dead
    *  + grow into the highest-error donors) outside the schedule — the
    *  Prune/Grow button's other half. Manual intent bypasses automatic

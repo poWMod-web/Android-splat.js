@@ -3,21 +3,22 @@ import { readFileSync } from 'node:fs';
 
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 const browser = readFileSync(new URL('../../browser/app/js/app.js', import.meta.url), 'utf8');
+const session = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
 
 for (const [name, source] of [['Android', app], ['Browser', browser]]) {
   const wireStart = source.indexOf('function wireFrameLongPress(');
   const wireEnd = source.indexOf('function buildStrip(', wireStart);
   assert.ok(wireStart >= 0 && wireEnd > wireStart, `${name}: filmstrip long-press wiring should exist`);
   const wire = source.slice(wireStart, wireEnd);
-  assert.match(wire, /setTimeout\([\s\S]*removeTrainingImage\(i\)[\s\S]*1000/,
-    `${name}: holding a trainable thumbnail for one second should request removal`);
+  assert.match(wire, /setTimeout\([\s\S]*cam\.state === 'removed' \? restoreTrainingImage\(i\) : removeTrainingImage\(i\)[\s\S]*1000/,
+    `${name}: a one-second hold should remove active images or restore removed ones`);
   assert.match(wire, /Math\.hypot\([\s\S]*> 10\) cancel\(\)/,
     `${name}: scrolling the filmstrip should cancel the hold`);
   assert.match(wire, /if \(!fired\) return;[\s\S]*preventDefault\(\)[\s\S]*stopImmediatePropagation\(\)/,
     `${name}: the release click after a completed hold must not select the image`);
 
   const removeStart = source.indexOf('async function removeTrainingImage(');
-  const removeEnd = source.indexOf('function wireFrameLongPress(', removeStart);
+  const removeEnd = source.indexOf('async function restoreTrainingImage(', removeStart);
   const remove = source.slice(removeStart, removeEnd);
   assert.match(remove, /inAppConfirm\('Remove image from training'[\s\S]*excludeCameraImage\(cam\.ci\)/,
     `${name}: removal requires a titled in-app confirmation and uses stable camera exclusion`);
@@ -27,10 +28,22 @@ for (const [name, source] of [['Android', app], ['Browser', browser]]) {
     `${name}: removed state should be visible and durable`);
   assert.doesNotMatch(remove, /S\.photos\.splice|S\.scene\.cams\.splice/,
     `${name}: removal must not shift persisted photo/camera indices`);
+  const restoreStart = source.indexOf('async function restoreTrainingImage(');
+  const restoreEnd = source.indexOf('function wireFrameLongPress(', restoreStart);
+  const restore = source.slice(restoreStart, restoreEnd);
+  assert.match(restore, /inAppConfirm\('Restore image to training'[\s\S]*includeCameraImage\(cam\.ci\)[\s\S]*cam\.state = 'placed'/,
+    `${name}: removed thumbnails should confirm and restore the stable camera entry`);
+  assert.match(source, /c\?\.state === 'removed' \? 'Long press to restore to training'/,
+    `${name}: removed thumbnails should advertise their reversible action`);
   assert.match(source, /\['align', 'remove-image'\]\.includes\(reason\)[\s\S]*\['train', 'done'\]\.includes\(S\.state\)/,
     `${name}: removal checkpoints should work during training and on completed models`);
   assert.match(source, /status: S\.state === 'done' \? 'finished'/,
     `${name}: editing a completed model must preserve its finished status`);
 }
 
-console.log('filmstrip long-press image removal: passed');
+assert.match(session, /async includeCameraImage\(ci\)[\s\S]*rc\.excluded = false[\s\S]*excluded\.delete\(i\)[\s\S]*_commitSplit\(excluded\)/,
+  'restoring an image should re-enable every camera backed by it and reset the epoch deck');
+assert.doesNotMatch(session.slice(session.indexOf('async includeCameraImage('), session.indexOf('async growNow()')),
+  /\.splice\(/, 'restoring an image must preserve camera and reconstruction indices');
+
+console.log('filmstrip long-press image removal and restoration: passed');

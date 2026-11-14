@@ -6615,18 +6615,42 @@ async function removeTrainingImage(i) {
   }
 }
 
+async function restoreTrainingImage(i) {
+  if (S._removingImage) return;
+  const cam = S.scene?.cams?.[i];
+  if (!S.session?.trainer || !cam || cam.ci < 0) {
+    flash('This image is not part of the trainable camera set.', 5000);
+    return;
+  }
+  if (cam.state !== 'removed') return;
+  if (!(await inAppConfirm('Restore image to training', `Return frame ${i + 1} to the training set?`, 'Restore image'))) return;
+  S._removingImage = true;
+  try {
+    await S.session.includeCameraImage(cam.ci);
+    cam.state = 'placed'; cam.error = null; cam.psnr = null;
+    await checkpointRun('remove-image').catch((e) => console.warn('[restore-image] checkpoint', e));
+    paintStrip(); renderControls();
+    flash(`Frame ${i + 1} restored to training.`, 6000);
+  } catch (err) {
+    flash(`Could not restore the image: ${err.message}`, 8000);
+  } finally {
+    S._removingImage = false;
+    renderControls();
+  }
+}
+
 function wireFrameLongPress(el, i) {
   let timer = 0, x = 0, y = 0, fired = false;
   const cancel = () => { clearTimeout(timer); timer = 0; };
   el.addEventListener('pointerdown', (e) => {
     if (e.button != null && e.button !== 0) return;
     const cam = S.scene?.cams?.[i];
-    if (!S.session?.trainer || !cam || cam.ci < 0 || cam.state === 'removed') return;
+    if (!S.session?.trainer || !cam || cam.ci < 0) return;
     fired = false; x = e.clientX; y = e.clientY;
     timer = setTimeout(() => {
       timer = 0; fired = true;
       navigator.vibrate?.(35);
-      void removeTrainingImage(i);
+      void (cam.state === 'removed' ? restoreTrainingImage(i) : removeTrainingImage(i));
     }, 1000);
   });
   el.addEventListener('pointermove', (e) => {
@@ -6744,6 +6768,7 @@ function paintStrip() {
     b.dataset.sel = i === S.sel ? '1' : '0';
     b.dataset.live = i === active ? '1' : '0';
     b.dataset.state = c ? c.state : 'placed';
+    b.title = c?.state === 'removed' ? 'Long press to restore to training' : 'Long press to remove from training';
     const tag = b.querySelector('.frame-tag');
     const t = c && c.state === 'holdout' ? 'held' :
       c && c.state === 'removed' ? 'removed' : c && c.state === 'unplaced' ? 'out' : null;
