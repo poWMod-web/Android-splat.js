@@ -690,6 +690,7 @@ public final class MainActivity extends Activity {
                     String manifestRaw = RunFiles.readJson(MainActivity.this, runId, "manifest.json");
                     JSONObject manifest = manifestRaw == null ? new JSONObject() : new JSONObject(manifestRaw);
                     row.put("name", manifest.optString("name", "Training run"));
+                    row.put("srcKey", manifest.optString("srcKey", ""));
                     row.put("photoCount", manifest.optJSONArray("photos") == null ? 0 : manifest.optJSONArray("photos").length());
                     String statusRaw = RunFiles.readJson(MainActivity.this, runId, "status.json");
                     JSONObject status = statusRaw == null ? new JSONObject() : new JSONObject(statusRaw);
@@ -701,6 +702,16 @@ public final class MainActivity extends Activity {
                     File snapshot = new File(RunFiles.runDir(MainActivity.this, runId), "snapshot.png");
                     if (thumb.isFile()) row.put("previewUri", "https://appassets.androidplatform.net/runs/" + runId + "/thumb.webp");
                     else if (snapshot.isFile()) row.put("previewUri", "https://appassets.androidplatform.net/runs/" + runId + "/snapshot.png");
+                    else {
+                        String captureId = manifest.optString("srcKey", "").replaceFirst("^native:", "");
+                        File capture = new File(new File(getFilesDir(), "captures"), captureId);
+                        File[] frames = capture.listFiles((d, name) -> name.matches("frame_[0-9]{4}\\.jpg"));
+                        if (frames != null && frames.length > 0) {
+                            java.util.Arrays.sort(frames, java.util.Comparator.comparing(File::getName));
+                            row.put("previewUri", "https://appassets.androidplatform.net/captures/" +
+                                    captureId + "/" + frames[0].getName());
+                        }
+                    }
                     runs.put(row);
                 } catch (Exception ignored) { /* one malformed run cannot empty Home */ }
             }
@@ -724,8 +735,12 @@ public final class MainActivity extends Activity {
                     item.put("captureId", dir.getName());
                     item.put("created", dir.lastModified());
                     item.put("frameCount", count);
-                    item.put("previewUri", "https://appassets.androidplatform.net/captures/" +
-                            dir.getName() + "/frame_0000.jpg");
+                    File[] frames = dir.listFiles((d, name) -> name.matches("frame_[0-9]{4}\\.jpg"));
+                    if (frames != null && frames.length > 0) {
+                        java.util.Arrays.sort(frames, java.util.Comparator.comparing(File::getName));
+                        item.put("previewUri", "https://appassets.androidplatform.net/captures/" +
+                                dir.getName() + "/" + frames[0].getName());
+                    }
                     out.put(item);
                 }
             } catch (Exception ignored) { }

@@ -1290,9 +1290,11 @@ function tileMenu(btn, items) {
   });
 }
 
-async function localRunTiles() {
+async function localRunTiles(nativeRows = [], captureRows = []) {
   const { listRuns, deleteRun } = await import('./store.js');
   const runs = await listRuns();
+  const nativeByRun = new Map((nativeRows || []).map((row) => [row.runId, row]));
+  const captureById = new Map((captureRows || []).map((row) => [row.captureId, row]));
   const tiles = [];
   for (const r of runs) {
     const live = S.runId === r.id && S.state === 'train';
@@ -1325,6 +1327,12 @@ async function localRunTiles() {
       ${desc ? `<span class="galdesc">${esc(desc)}</span>` : ''}
       <span class="galmeta">${state}</span>`;
     if (r.thumb) b.prepend(Object.assign(new Image(), { src: URL.createObjectURL(r.thumb), alt: '' }));
+    else {
+      const nativeRow = nativeByRun.get(r.id);
+      const captureId = String(r.srcKey || '').replace(/^native:/, '');
+      const fallbackPreview = nativeRow?.previewUri || captureById.get(captureId)?.previewUri;
+      if (fallbackPreview) b.prepend(Object.assign(new Image(), { src: fallbackPreview, alt: '' }));
+    }
     const viewFromState = (rec) => {
       S._localRun = rec;
       continueLocalRun(true).catch((e) => {
@@ -1355,6 +1363,7 @@ async function localRunTiles() {
           flash('Could not save the new model name on this device.', 6000);
           return;
         }
+        await renameAndroidRun(r.id, name);
         r.name = name;
         const title = b.querySelector('.galname');
         if (title) title.textContent = name;
@@ -1401,6 +1410,20 @@ async function localRunTiles() {
   return tiles;
 }
 
+
+async function renameAndroidRun(runId, name) {
+  const bridge = headlessBridge();
+  if (!bridge || typeof bridge.writeRunJson !== 'function' || !Headless.validRunId(runId)) return false;
+  try {
+    const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')));
+    if (!response.ok) return false;
+    const manifest = await response.json();
+    manifest.name = name;
+    const ok = bridge.writeRunJson(runId, 'manifest.json', JSON.stringify(manifest));
+    if (ok && S._hlManifest?.runId === runId) S._hlManifest = manifest;
+    return !!ok;
+  } catch { return false; }
+}
 
 /** Lightweight Home tiles for checkpoints in Android app data. Unlike the
  * old rediscovery pass, this does not copy every state.bin into IndexedDB
@@ -1461,6 +1484,18 @@ async function androidRunTiles(ids = null) {
       };
       tileMenu(tile.querySelector('.run-menu'), [
         { label: finished ? 'View' : 'Continue', act: openFileRun },
+        { label: 'Rename', act: async () => {
+          const previousName = manifest.name || 'Training run';
+          const name = await textCard('Rename this model', previousName);
+          if (!name || name === previousName) return;
+          if (!(await renameAndroidRun(runId, name))) {
+            flash('Could not save the new model name on this device.', 6000); return;
+          }
+          manifest.name = name;
+          const title = tile.querySelector('.galname');
+          if (title) title.textContent = name;
+          flash(`Renamed to ${name}.`, 4000);
+        } },
         { label: 'Delete', danger: true, act: async () => {
           if (typeof bridge.deleteRunArchive === 'function' && bridge.deleteRunArchive(runId) === false) {
             flash('A running model cannot be deleted.', 6000); return;
@@ -4962,9 +4997,24 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
   }
   const recon = lr.recon;
   let files;
-  const srcUrls = (recon.source && recon.source.urls) || [];
-  if (!lr.ownSrc && srcUrls.length && srcUrls.every(Boolean)) {
-    // preset / shared runs: the photographs live at stable URLs — refetch
+  const sourceNames = (recon.source && recon.source.names) || (recon.frames || []).map((f) => f.name);
+  const savedCaptureId = recon.source?.captureId || String(lr.srcKey || '').replace(/^native:/, '') || null;
+  let srcUrls = (recon.source && recon.source.urls) || [];
+  // Records created before native URLs were stored still have a stable source
+  // key and frame names. Repair those references instead of consulting the
+  // mutable "last capture" slot, which can pair the model with wrong poses.
+  if ((!srcUrls.length || !srcUrls.every(Boolean)) &&
+      /^[A-Za-z0-9_-]{1,80}$/.test(savedCaptureId || '') && sourceNames.length) {
+    srcUrls = sourceNames.map((name) =>
+      `https://appassets.androidplatform.net/captures/${savedCaptureId}/${encodeURIComponent(name)}`);
+    recon.source = { ...(recon.source || {}), names: sourceNames, urls: srcUrls, captureId: savedCaptureId };
+    import('./store.js').then(({ patchRun }) => patchRun(lr.id,
+      { srcKey: `native:${savedCaptureId}`, recon })).catch(() => {});
+  }
+  if (srcUrls.length && srcUrls.every(Boolean)) {
+    // Stable URLs include presets and canonical native AR archives. Prefer
+    // them even for own captures: loading "last capture" here can substitute
+    // a newer scan and detach images from this model's saved camera poses.
     flash('Fetching the photos …', 60000);
     files = await Promise.all(srcUrls.map(async (u, i) => {
       const r = await fetch(u);
@@ -5074,8 +5124,10 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     // keep the source identity: own captures stay '__own' (the next resume goes
     // back to the capture store), URL-backed runs keep their preset/urls so a
     // leaving during THIS run checkpoints a resumable source list again
+    const nativeCaptureId = savedCaptureId;
     S.preset = lr.ownSrc
-      ? { id: '__own', name: `${lr.name || 'Your photos'}` }
+      ? { id: '__own', name: `${lr.name || 'Your photos'}`,
+          ...(nativeCaptureId ? { capture: { metadata: { nativeARCore: true, nativeCaptureId } } } : {}) }
       : { id: (recon.source && recon.source.preset) || '__url', name: `${lr.name || 'Your photos'}` };
     S.loadedFiles = files.map((f, i) => Object.assign(f, { url: srcUrls[i] || undefined }));
     S.photos = files.map((f, i) => ({ url: URL.createObjectURL(f), name: f.name, i }));
@@ -5906,9 +5958,12 @@ async function mountWall() {
 
   const paint = () => {
     if (token !== wallMountToken) return;
-    const fileIds = new Set(slots.files.map((tile) => tile.dataset.runId).filter(Boolean));
-    const uniqueLocal = slots.local.filter((tile) => !fileIds.has(tile.dataset.runId));
-    const tiles = [...slots.scans, ...slots.files, ...slots.capture, ...uniqueLocal];
+    // Match main: IndexedDB run records are the model cards (thumbnail,
+    // rename, saved poses, in-place continuation). Android run files are a
+    // recovery fallback only when that same run record is absent.
+    const localIds = new Set(slots.local.map((tile) => tile.dataset.runId).filter(Boolean));
+    const recoveryFiles = slots.files.filter((tile) => !localIds.has(tile.dataset.runId));
+    const tiles = [...slots.scans, ...slots.capture, ...slots.local, ...recoveryFiles];
     grid.replaceChildren(...tiles);
     if (!tiles.length) { host.hidden = true; return; }
     if (!heading.isConnected) host.append(heading, grid);
@@ -5939,7 +5994,7 @@ async function mountWall() {
     // Main stores model checkpoints in IndexedDB. Keep those model records in
     // the union (deduped by run ID); they reference the native capture archive
     // and are not a second image/pose source.
-    load('local', localRunTiles());
+    load('local', localRunTiles(catalog.runs, catalog.captures));
     migrateLegacyNativeCapture().then((moved) => {
       if (moved && !legacyCaptureRemounted && token === wallMountToken) {
         legacyCaptureRemounted = true; mountWall();
@@ -6774,6 +6829,7 @@ async function mirrorHeadlessRun(runId, status) {
     urls: manifest.photoSource === 'urls'
       ? [...manifest.photoUrls]
       : manifest.photos.map((n) => Headless.photoUrl(runId, n)),
+    ...(manifest.srcKey ? { captureId: manifest.srcKey } : {}),
   };
   let thumb = null;
   try {
@@ -6788,7 +6844,8 @@ async function mirrorHeadlessRun(runId, status) {
     iter: parsed.iter, maxIters: manifest.maxIters,
     splats: status.splats ?? recon.splats ?? parsed.gaussians.n,
     psnr: status.psnr ?? recon.stats?.psnrTrain ?? null,
-    frames: manifest.photos.length, ownSrc: false,
+    frames: manifest.photos.length, ownSrc: !!manifest.srcKey,
+    ...(manifest.srcKey ? { srcKey: `native:${manifest.srcKey}` } : {}),
     state: new Blob([stateBytes]), recon, detailProgress,
     ...(thumb ? { thumb } : {}),
   };
@@ -7141,6 +7198,7 @@ async function adoptHeadlessRun(runId, mode) {
       urls: manifest.photoSource === 'urls'
       ? [...manifest.photoUrls]
       : manifest.photos.map((n) => Headless.photoUrl(runId, n)),
+      ...(manifest.srcKey ? { captureId: manifest.srcKey } : {}),
     };
     const rec = {
       id: runId, name: manifest.name, status: 'finished',
@@ -7148,7 +7206,8 @@ async function adoptHeadlessRun(runId, mode) {
       iter: status.iter ?? recon.iter ?? 0, maxIters: manifest.maxIters,
       splats: status.splats ?? recon.splats ?? 0,
       psnr: status.psnr ?? (recon.stats && recon.stats.psnrTrain) ?? null,
-      frames: manifest.photos.length, ownSrc: false,
+      frames: manifest.photos.length, ownSrc: !!manifest.srcKey,
+      ...(manifest.srcKey ? { srcKey: `native:${manifest.srcKey}` } : {}),
       state: new Blob([stateBytes]), recon,
       detailProgress: headlessProgressDetails(recon, manifest, status),
       ...(thumb ? { thumb } : {}),

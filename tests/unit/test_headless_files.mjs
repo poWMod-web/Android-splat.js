@@ -233,8 +233,20 @@ assert.doesNotMatch(durableList, /readJson\(ctx, id, \"photos\.json\"\)|photos\.
   'loss of old photo handoff metadata must not hide an independently viewable model');
 assert.match(app, /async function androidRunTiles\(ids = null\)[\s\S]*listRecoverableRuns\(\)[\s\S]*Stored in Android app data/,
   'Home should show lightweight Android-file models without first copying state into IndexedDB');
-assert.match(app, /fileIds = new Set\(slots\.files[\s\S]*uniqueLocal = slots\.local\.filter/,
-  'a stale IDB record must not suppress its authoritative Android-file Home tile');
+assert.match(app, /localIds = new Set\(slots\.local[\s\S]*recoveryFiles = slots\.files\.filter/,
+  'main-style model cards should win by run ID while Android files remain a recovery fallback');
+assert.match(main, /listCaptureArchives\(\)[\s\S]*Arrays\.sort\(frames[\s\S]*frames\[0\]\.getName\(\)/,
+  'native capture previews must use the first real frame rather than assume frame 0000');
+assert.doesNotMatch(main, /previewUri[^;]*frame_0000\.jpg/,
+  'ARCore numbering starts at frame 0001, so a hard-coded frame 0000 preview is broken');
+assert.match(app, /Records created before native URLs were stored[\s\S]*appassets\.androidplatform\.net\/captures\/[\s\S]*patchRun\(lr\.id/,
+  'older model records must reconstruct and persist exact canonical frame references from their source key');
+assert.match(app, /if \(srcUrls\.length && srcUrls\.every\(Boolean\)\)[\s\S]*Stable URLs include presets and canonical native AR archives/,
+  'native continuations must reload the exact archive URLs paired with saved camera poses');
+assert.match(app, /const nativeCaptureId = savedCaptureId[\s\S]*nativeARCore: true, nativeCaptureId[\s\S]*S\.loadedFiles = files\.map/,
+  'continued AR runs must retain canonical capture identity for later checkpoints and handoffs');
+assert.match(app, /async function renameAndroidRun[\s\S]*manifest\.name = name[\s\S]*writeRunJson/,
+  'renaming a model must update its durable Android manifest as well as IndexedDB');
 assert.doesNotMatch(app, /for \(const runId of ids\.slice\(0, 12\)\)/,
   'Android model discovery must not retain the old twelve-run display cap');
 assert.match(runFiles, /listDurableRuns\(Context ctx\)[\s\S]*"discarded"\.equals\(value\)[\s\S]*out\.add\(id\)/,
