@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
+const browserApp = readFileSync(new URL('../../browser/app/js/app.js', import.meta.url), 'utf8');
 const headless = readFileSync(new URL('../../app/js/train-headless.js', import.meta.url), 'utf8');
 const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
 const service = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
@@ -65,6 +66,16 @@ assert.match(align, /const neighbours = \[-2, -1, 1, 2\]/,
 assert.match(app, /Balanced · \$\{good\.length\} neighbours/,
   'consistent adjacent poses are offered as a consensus placement');
 assert.match(app, /undoSelectedAlignment/);
+for (const [name, source] of [['Android', app], ['Browser', browserApp]]) {
+  assert.match(source, /function inAppConfirm\(title, message[\s\S]*dialog\.showModal\(\)/,
+    `${name}: alignment confirmation should use a branded in-app dialog`);
+  assert.match(source, /inAppConfirm\(`Align frame \$\{i \+ 1\}`[\s\S]*'Find placements'/,
+    `${name}: the alignment dialog should have a meaningful frame title`);
+  assert.doesNotMatch(source, /confirm\(`(?:Undo the alignment|Apply “|Find automatic placements)/,
+    `${name}: alignment must not use an origin-titled browser confirmation`);
+}
+assert.match(css, /\.app-confirm[\s\S]*\.app-confirm \.dlg-head h2/,
+  'the branded alignment confirmation should have dedicated modal styling');
 assert.doesNotMatch(app, /Manual frame alignment|manualAlignSelected/,
   'the first alignment version is automatic-only');
 assert.match(app, /align\.id = 'c-align'/,

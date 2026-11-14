@@ -606,6 +606,13 @@ button.countv:hover { color: var(--accent); }
 .upcard input:focus { border-color: var(--accent-30); }
 .upcard-row { display: flex; gap: 8px; justify-content: flex-end; }
 
+/* Branded confirmation replaces WebView's origin-titled JavaScript prompt. */
+.app-confirm { width: min(420px, calc(100% - 32px)); }
+.app-confirm .dlg-head { padding: 20px 22px 14px; }
+.app-confirm .dlg-head h2 { margin: 0; font-size: 21px; }
+.app-confirm .dlg-body { display: grid; gap: 20px; padding: 18px 22px 20px; }
+.app-confirm .dlg-body p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+
 /* the ?perf benchmark summary */
 #perfcard { width: min(560px, 92%); }
 /* the Timing tab: the log takes the canvas's slot in the details sheet */

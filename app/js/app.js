@@ -6350,6 +6350,37 @@ function select(i) {
   if (!$('details').hidden) renderDetails();
 }
 
+function inAppConfirm(title, message, confirmLabel = 'Continue') {
+  return new Promise((resolve) => {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'app-confirm';
+    const head = document.createElement('div'); head.className = 'dlg-head';
+    const heading = document.createElement('h2'); heading.textContent = title;
+    head.appendChild(heading);
+    const body = document.createElement('div'); body.className = 'dlg-body';
+    const copy = document.createElement('p'); copy.textContent = message;
+    const actions = document.createElement('div'); actions.className = 'upcard-row';
+    const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel';
+    const accept = document.createElement('button'); accept.className = 'btn btn-accent'; accept.textContent = confirmLabel;
+    actions.append(cancel, accept); body.append(copy, actions); dialog.append(head, body);
+    document.body.appendChild(dialog);
+    let answered = false;
+    const finish = (answer) => {
+      if (answered) return;
+      answered = true;
+      if (dialog.open) dialog.close();
+      dialog.remove();
+      resolve(answer);
+    };
+    cancel.addEventListener('click', () => finish(false));
+    accept.addEventListener('click', () => finish(true));
+    dialog.addEventListener('cancel', (e) => { e.preventDefault(); finish(false); });
+    dialog.addEventListener('click', (e) => { if (e.target === dialog) finish(false); });
+    dialog.showModal();
+    accept.focus();
+  });
+}
+
 function poseT(R, centre) {
   return [-(R[0]*centre[0]+R[1]*centre[1]+R[2]*centre[2]),
     -(R[3]*centre[0]+R[4]*centre[1]+R[5]*centre[2]),
@@ -6371,7 +6402,7 @@ async function applyAlignedPose(i, R, t, source, remember = true) {
 async function undoSelectedAlignment() {
   const u = S._alignUndo;
   if (!u || u.i !== S.sel || S._aligning) return;
-  if (!confirm(`Undo the alignment of frame ${u.i + 1}?`)) return;
+  if (!(await inAppConfirm('Undo alignment', `Restore frame ${u.i + 1} to its previous camera alignment?`, 'Undo alignment'))) return;
   S._aligning = true; renderControls();
   try {
     await applyAlignedPose(u.i, u.R, u.t, 'undo', false);
@@ -6435,7 +6466,7 @@ function showAlignmentChoices(i, choices) {
     const k = Number(e.target.dataset.choice);
     if (!Number.isInteger(k) || !choices[k]) { card.remove(); return; }
     const choice = choices[k];
-    if (!confirm(`Apply “${choice.label}” to frame ${i + 1}?`)) return;
+    if (!(await inAppConfirm('Apply alignment', `Apply “${choice.label}” to frame ${i + 1}?`, 'Apply'))) return;
     card.remove(); S._aligning = true; renderControls();
     try { await applyAlignedPose(i, choice.R, poseT(choice.R, choice.centre), choice.source); }
     catch (err) { flash(`Alignment failed: ${err.message}`, 8000); }
@@ -6454,7 +6485,7 @@ function showUnalignedFrameRemoval(i, why) {
   row.append(keep, remove); card.append(title, note, row); $('stage').appendChild(card);
   keep.addEventListener('click', () => card.remove());
   remove.addEventListener('click', async () => {
-    if (!confirm(`Remove frame ${i + 1} from this model? The original capture remains saved on this device.`)) return;
+    if (!(await inAppConfirm('Remove image from model', `Remove frame ${i + 1} from this model? The original capture remains saved on this device.`, 'Remove image'))) return;
     card.remove(); S._aligning = true; renderControls();
     try {
       const cam = S.scene?.cams?.[i];
@@ -6472,7 +6503,7 @@ function showUnalignedFrameRemoval(i, why) {
 async function alignSelectedFrame() {
   const i = S.sel, cam = S.scene?.cams?.[i];
   if (!cam?.R || S._aligning) return;
-  if (!confirm(`Find automatic placements for frame ${i + 1}? Training pauses only when you apply one.`)) return;
+  if (!(await inAppConfirm(`Align frame ${i + 1}`, 'Find automatic placements from nearby images? Training pauses only when you apply one.', 'Find placements'))) return;
   S._aligning = true; renderControls();
   try {
     flash('Matching two pictures before and two after …', 15000);
