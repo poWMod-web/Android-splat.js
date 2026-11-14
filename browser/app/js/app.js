@@ -3655,7 +3655,7 @@ async function checkpointRun(reason) {
   if (!S.runId || !S.session || !S.session.trainer) return null;
   // 'finish' runs in the done state, BEFORE the export chain: the result is
   // secured even if sog compression or the device dies right after training
-  if (reason === 'finish' ? S.state !== 'done' : reason === 'align' ? !['train', 'done'].includes(S.state) : S.state !== 'train') return null;
+  if (reason === 'finish' ? S.state !== 'done' : ['align', 'remove-image'].includes(reason) ? !['train', 'done'].includes(S.state) : S.state !== 'train') return null;
   const it = S.session.trainer.iter | 0;
   if (S._ckptBusy || (reason === 'hidden' && it < 200)) return null;
   // hidden fires on every tab switch — only rewrite after real progress
@@ -3680,7 +3680,7 @@ async function checkpointRun(reason) {
     // Android app data is the durable fallback and must not depend on an IDB
     // write succeeding: quota/process-profile loss was hiding completed runs.
     const fileSaved = await writeDurableRunCheckpoint(state, recon, {
-      status: reason === 'finish' ? 'finished' : (S.session.training ? 'active' : 'paused'),
+      status: S.state === 'done' ? 'finished' : (S.session.training ? 'active' : 'paused'),
       owner: 'activity', iter: it, splats: S.session.trainer.n | 0,
       psnr: S.psnrHold ?? S.psnrTrain ?? null, at: Date.now(),
     }).catch((e) => { console.warn('[checkpoint] Android mirror failed', e); return false; });
@@ -3689,7 +3689,7 @@ async function checkpointRun(reason) {
       const { patchRun, saveRun } = await import('./store.js');
       idbSaved = await patchRun(S.runId, patch);
       if (!idbSaved) {
-        await saveRun({ id: S.runId, name: localRunName(S.preset), status: 'training',
+        await saveRun({ id: S.runId, name: localRunName(S.preset), status: S.state === 'done' ? 'finished' : 'training',
           createdAt: Date.now(), updatedAt: Date.now(), maxIters: S.maxIters,
           frames: (S.loadedFiles || []).length, ownSrc: true, ...patch });
         idbSaved = true;
@@ -6476,6 +6476,63 @@ function wireStage() {
 }
 
 // ── filmstrip ───────────────────────────────────────────────────────────────
+async function removeTrainingImage(i) {
+  if (S._removingImage) return;
+  const cam = S.scene?.cams?.[i];
+  if (!S.session?.trainer || !cam || cam.ci < 0) {
+    flash('This image is not part of the trainable camera set.', 5000);
+    return;
+  }
+  if (cam.state === 'removed') {
+    flash(`Frame ${i + 1} is already removed from training.`, 4000);
+    return;
+  }
+  if (!confirm(`Remove frame ${i + 1} from training? The original image will remain saved on this device.`)) return;
+  S._removingImage = true;
+  try {
+    await S.session.excludeCameraImage(cam.ci);
+    cam.state = 'removed'; cam.error = null; cam.psnr = null;
+    await checkpointRun('remove-image').catch((e) => console.warn('[remove-image] checkpoint', e));
+    if (S.atFrame === i) leaveFrame();
+    paintStrip(); renderControls();
+    flash(`Frame ${i + 1} removed from training.`, 6000);
+  } catch (err) {
+    flash(`Could not remove the image: ${err.message}`, 8000);
+  } finally {
+    S._removingImage = false;
+    renderControls();
+  }
+}
+
+function wireFrameLongPress(el, i) {
+  let timer = 0, x = 0, y = 0, fired = false;
+  const cancel = () => { clearTimeout(timer); timer = 0; };
+  el.addEventListener('pointerdown', (e) => {
+    if (e.button != null && e.button !== 0) return;
+    const cam = S.scene?.cams?.[i];
+    if (!S.session?.trainer || !cam || cam.ci < 0 || cam.state === 'removed') return;
+    fired = false; x = e.clientX; y = e.clientY;
+    timer = setTimeout(() => {
+      timer = 0; fired = true;
+      navigator.vibrate?.(35);
+      void removeTrainingImage(i);
+    }, 650);
+  });
+  el.addEventListener('pointermove', (e) => {
+    if (timer && Math.hypot(e.clientX - x, e.clientY - y) > 10) cancel();
+  });
+  el.addEventListener('pointerup', cancel);
+  el.addEventListener('pointercancel', cancel);
+  el.addEventListener('pointerleave', cancel);
+  el.addEventListener('contextmenu', (e) => {
+    if (timer || fired) e.preventDefault();
+  });
+  el.addEventListener('click', (e) => {
+    if (!fired) return;
+    fired = false; e.preventDefault(); e.stopImmediatePropagation();
+  }, true);
+}
+
 function buildStrip(deferPhotos = false) {
   const strip = $('strip');
   strip.innerHTML = '<div class="strip-scroll" id="strip-scroll"></div>';
@@ -6516,6 +6573,9 @@ function buildStrip(deferPhotos = false) {
     b.dataset.i = i;
     b.innerHTML = `<div class="ph"></div>
       <span class="frame-tag" hidden></span><div class="frame-bar"><i></i></div>`;
+    b.title = 'Long press to remove from training';
+    b.style.webkitTouchCallout = 'none';
+    wireFrameLongPress(b, i);
     b.addEventListener('click', () => { fill(b); select(i); });
     sc.appendChild(b);
     if (io) io.observe(b);
