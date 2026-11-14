@@ -137,6 +137,8 @@ assert.match(chartSource, /new FastRobustZLEMA\(\)\.series\(held\)/,
 // raw dots: tiny — the curve carries the reading, the scatter just shows it
 assert.match(chartSource, /ctx\.arc\(X\(p\[0\]\), Y\(p\[1\]\), 0\.75 \* dpr, 0, 7\)/,
   'raw-sample dots should be much smaller than the old 1.5px');
+assert.doesNotMatch(chartSource, /frac \* pw|progress wash|rgba\(94, 231, 214, \.055\)/,
+  'the score graph should not cover its completed fraction with a green overlay');
 // dynamic x: the axis grows with the plotted data, like the y-axis
 const xChart = new Chart(chartCanvas);
 assert.equal(xChart._xMaxFor([100]), 106, 'early data should use the full width plus headroom');

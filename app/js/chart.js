@@ -159,16 +159,6 @@ export class Chart {
     const X = (i) => l + (i / xMax) * pw;
     const Y = (v) => t + ph - ((v - lo) / (hi - lo)) * ph;
 
-    // faint progress wash left of the latest sample — the chart quietly
-    // doubles as a progress bar without competing with the curve
-    if (active.train.length) {
-      // the wash keeps progress meaning (fraction of the horizon) while
-      // the curve above it enjoys the dynamic axis
-      const frac = Math.min(1, active.train[active.train.length - 1][0] / this.maxIter);
-      ctx.fillStyle = 'rgba(94, 231, 214, .055)';
-      ctx.fillRect(l, t, Math.max(0, frac * pw), ph);
-    }
-
     // grid
     ctx.font = `400 ${11 * dpr}px "Spline Sans Mono", monospace`;
     ctx.textBaseline = 'middle';
