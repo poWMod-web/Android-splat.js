@@ -57,6 +57,7 @@
     <h1 id="mon-name">Model</h1>
     <p class="origin" id="mon-sub" hidden></p>
     <div class="xr-capabilities" aria-label="Run status"><span id="mon-state">—</span><span id="mon-iter">—</span><span id="mon-score">—</span><span id="mon-splats">—</span><span id="mon-updated"></span></div>
+    <div class="monitor-gpu tmeta-gpu" title="Share of wall time used by background GPU training. Takes effect immediately."><label for="mon-gpu">GPU usage</label><input id="mon-gpu" type="range" min="10" max="100" step="5" value="100"><span id="mon-gpu-v">100%</span></div>
     <div class="monitor-live-grid">
       <div class="monitor-preview" id="mon-preview" hidden><canvas id="mon-model"></canvas><small>Service-rendered preview</small></div>
       <div class="chartwrap monitor-chartwrap"><canvas id="mon-chart"></canvas><div class="chart-tip" id="mon-chart-tip" hidden></div></div>

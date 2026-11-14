@@ -531,7 +531,7 @@ public final class MainActivity extends Activity {
             } catch (Exception ignored) { /* the service times out instead */ }
         }
 
-        /** A command to the headless twin (pause/resume/stop/snapshot/ping). Plain
+        /** A command to the headless twin (pause/resume/stop/snapshot/prune/grow/ping). Plain
          *  start: the service is already foreground while a run lives. */
         @JavascriptInterface public void headlessCommand(String action, String runId) {
             if (action == null || runId == null) return;
@@ -545,6 +545,17 @@ public final class MainActivity extends Activity {
                         .putExtra("action", action)
                         .putExtra("runId", runId));
             } catch (Exception ignored) { /* the twin is gone; the files say so */ }
+        }
+
+        /** Live service GPU duty, as a validated whole percentage. */
+        @JavascriptInterface public void headlessGpu(String runId, int percent) {
+            if (!RunFiles.validRunId(runId) || percent < 10 || percent > 100) return;
+            try {
+                startService(new Intent(MainActivity.this, TrainingService.class)
+                        .putExtra("action", "headless-gpu")
+                        .putExtra("runId", runId)
+                        .putExtra("gpuPercent", percent));
+            } catch (Exception ignored) { /* progress files remain authoritative */ }
         }
 
         /** Numeric prune argument is a separate validated bridge method: never

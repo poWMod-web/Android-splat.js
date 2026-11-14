@@ -18,6 +18,14 @@ assert.doesNotMatch(livePaint, /snapshot|headlessCommand/,
 assert.match(app, /bridge\.headlessPrune\(S\._monRun, percent\)/);
 assert.match(main, /headlessPrune\(String runId, int percent\)/);
 assert.match(service, /getIntExtra\("prunePercent", 25\)/);
+assert.match(app, /bridge\.headlessGpu\(S\._monRun, value\)/,
+  'monitor GPU slider must update the live service trainer');
+assert.match(main, /headlessGpu\(String runId, int percent\)/);
+assert.match(service, /getIntExtra\("gpuPercent", 100\)/);
+assert.match(headless, /globalThis\.__headlessGpu = \(percent\)/);
+assert.match(headless, /ses\.opts\.gpuUsage = v \/ 100/);
+assert.match(headless, /gpu: Math\.round\(\(ses\.opts\.gpuUsage \?\? 1\) \* 100\)/,
+  'progress reports the service trainer’s authoritative live duty');
 for (const cmd of ['headless-prune', 'headless-grow']) {
   assert.ok(main.includes(cmd), `${cmd} must cross the Activity bridge`);
   assert.ok(service.includes(cmd), `${cmd} must dispatch in the service`);

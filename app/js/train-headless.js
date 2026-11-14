@@ -211,7 +211,7 @@ function postProgress(force = false) {
       done: iter, total: manifest ? manifest.maxIters : 0,
       iter, maxIters: manifest ? manifest.maxIters : 0,
       splats: ses.trainer.n | 0, psnr, scoreScale: manifest?.scoreScale || 'db', ips: +ips.toFixed(1),
-      training: !!ses.training, at: now,
+      training: !!ses.training, gpu: Math.round((ses.opts.gpuUsage ?? 1) * 100), at: now,
       // A bounded durable tail powers the foreground monitor without creating
       // a second trainer/WebGPU device. Values are measured, never inferred.
       scoreHistory: (ses.lossHistory || []).slice(-400),
@@ -360,6 +360,12 @@ async function manualModelEdit(kind, keep = 0.75) {
     postStatus({ status: ses.training ? 'active' : 'paused', commandError: String(e.message || e) });
   } finally { manualEdit = false; }
 }
+globalThis.__headlessGpu = (percent) => {
+  const v = Math.max(10, Math.min(100, Math.round(Number(percent) || 100)));
+  if (ses) ses.opts.gpuUsage = v / 100;
+  if (manifest) manifest.gpu = v;
+  postProgress(true);
+};
 globalThis.__headlessGrow = () => manualModelEdit('grow');
 globalThis.__headlessPrune = (keep) => manualModelEdit('prune', keep);
 

@@ -220,6 +220,12 @@ public final class TrainingService extends Service {
             case "headless-grow":
                 headlessCommand(intent, "window.__headlessGrow&&window.__headlessGrow()");
                 break;
+            case "headless-gpu": {
+                int percent = intent.getIntExtra("gpuPercent", 100);
+                if (percent < 10 || percent > 100) break;
+                headlessCommand(intent, "window.__headlessGpu&&window.__headlessGpu(" + percent + ")");
+                break;
+            }
             case "headless-ack": {
                 String runId = intent.getStringExtra("runId");
                 if (runId != null && runId.equals(handoffRunId) && !handoffSettled) {

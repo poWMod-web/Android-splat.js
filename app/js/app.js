@@ -7151,6 +7151,7 @@ function enterMonitor(runId) {
   }
   S._monChart.reset();
   $('mon-preview').hidden = true;
+  $('mon-gpu').value = String(S.settings.gpu ?? 100); $('mon-gpu-v').textContent = `${$('mon-gpu').value}%`;
   $('mon-refresh').disabled = false; $('mon-refresh').textContent = 'Refresh preview';
   $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
   if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
@@ -7172,6 +7173,33 @@ function wireMonitorOnce() {
     try { b.headlessCommand(S._monPaused ? 'headless-resume' : 'headless-pause', S._monRun); } catch { /* best-effort */ }
     S._monPaused = !S._monPaused;
     syncMonitorButtons();
+  });
+  const monGpu = $('mon-gpu');
+  monGpu.addEventListener('pointerdown', () => { S._monGpuDragging = true; });
+  const endGpuDrag = () => { S._monGpuDragging = false; };
+  monGpu.addEventListener('pointerup', endGpuDrag); monGpu.addEventListener('pointercancel', endGpuDrag);
+  monGpu.addEventListener('input', () => {
+    const value = Math.min(100, Math.max(10, parseInt(monGpu.value, 10) || 100));
+    $('mon-gpu-v').textContent = `${value}%`;
+    S.settings.gpu = value;
+    const bridge = headlessBridge();
+    try {
+      if (!bridge?.headlessGpu) throw new Error('this app build cannot change background GPU usage');
+      bridge.headlessGpu(S._monRun, value);
+    } catch (err) { flash(`Could not change background GPU usage: ${err.message}`, 7000); }
+  });
+  monGpu.addEventListener('change', () => {
+    S._monGpuDragging = false;
+    const value = Math.min(100, Math.max(10, parseInt(monGpu.value, 10) || 100));
+    const panel = $('set-gpu');
+    if (panel) { panel.value = String(value); $('set-gpu-v').textContent = `${value}%`; }
+    saveSettings();
+    if (S._monManifest && S._monManifest.runId === S._monRun) {
+      S._monManifest = { ...S._monManifest, gpu: value,
+        settings: { ...(S._monManifest.settings || {}), gpu: value } };
+      try { headlessBridge()?.writeRunJson(S._monRun, 'manifest.json', JSON.stringify(S._monManifest)); }
+      catch (e) { console.warn('[headless] monitor GPU persistence failed', e); }
+    }
   });
   $('mon-refresh').addEventListener('click', refreshMonitorPreview);
   $('mon-prune').addEventListener('click', () => {
@@ -7262,6 +7290,7 @@ function syncMonitorButtons() {
 }
 async function paintMonitorHead(runId) {
   S._monRecovery = false;
+  S._monManifest = null;
   $('mon-name').textContent = 'Model';
   $('mon-sub').hidden = true;
   $('mon-sub').textContent = '';
@@ -7272,10 +7301,16 @@ async function paintMonitorHead(runId) {
     if (S.state === 'monitor' && S._monRun === runId && manifest?.name) {
       $('mon-name').textContent = manifest.name;
     }
+    if (S.state === 'monitor' && S._monRun === runId && manifest) {
+      S._monManifest = manifest;
+      const value = Math.min(100, Math.max(10, Math.round(manifest.gpu ?? manifest.settings?.gpu ?? 100)));
+      S.settings.gpu = value;
+      $('mon-gpu').value = String(value); $('mon-gpu-v').textContent = `${value}%`;
+    }
   } catch { /* the neutral model title remains */ }
 }
-/** The monitor tick (5 s): status/progress paint, snapshot when visuals are
- *  on, and the transitions — finished adopts, dead/interrupted recovers. */
+/** The monitor tick (5 s): status/progress paint and lifecycle transitions.
+ * Preview rendering is explicit-only through Refresh preview. */
 async function monitorPoll(now, force = false) {
   if (S.state !== 'monitor' || !S._monRun || S._monRecovery) return;
   // Stop & continue intentionally makes the service publish a final
@@ -7382,6 +7417,10 @@ function paintMonitorProgress(status, progress) {
         : `${(+p.psnr).toFixed(1)} dB`)
     : '—';
   $('mon-splats').textContent = p.splats != null ? fmt(p.splats) : '—';
+  if (!S._monGpuDragging && Number.isFinite(+p.gpu)) {
+    const value = Math.min(100, Math.max(10, Math.round(+p.gpu)));
+    $('mon-gpu').value = String(value); $('mon-gpu-v').textContent = `${value}%`;
+  }
   const age = p.at ? Math.max(0, Math.round((Date.now() - p.at) / 1000)) : null;
   $('mon-updated').textContent = age == null ? '' : age < 8 ? 'live' : `updated ${age}s ago`;
 }

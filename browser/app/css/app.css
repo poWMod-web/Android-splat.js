@@ -1157,3 +1157,5 @@ a.cbtn { text-decoration: none; }
 .strip-align { position: absolute; right: 10px; top: -42px; z-index: 8; backdrop-filter: blur(8px); }
 
 .monitor-preview[hidden] + .monitor-chartwrap { grid-column: 1 / -1; }
+.monitor-gpu { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 10px auto 0; color: var(--dim); font: 11px var(--mono); }
+.monitor-gpu input { width: min(260px, 48vw); }
