@@ -6722,6 +6722,24 @@ function toggleScoreScale() {
   updateHeadlessScoreScale();
 }
 
+function positionChartTip(tip, h) {
+  // Both foreground and background readouts ride above the cursor inside the
+  // plot. Clamp sideways; only flip below when there is genuinely no room.
+  const wrap = tip.parentElement;
+  const W = wrap ? wrap.clientWidth : 0, H = wrap ? wrap.clientHeight : 0;
+  if (!W || !H) {
+    tip.style.left = `${h.xPct}%`; tip.style.top = '4px';
+    tip.style.transform = 'translate(-50%, calc(-100% - 70px))';
+    return;
+  }
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  const x = Math.max(tw / 2 + 4, Math.min(W - tw / 2 - 4, (h.xPct / 100) * W));
+  const y = (Math.max(0, Math.min(100, h.yPct ?? 0)) / 100) * H;
+  tip.style.left = `${(x / W) * 100}%`;
+  tip.style.top = `${(y / H) * 100}%`;
+  tip.style.transform = y > th + 86 ? 'translate(-50%, calc(-100% - 70px))' : 'translate(-50%, 70px)';
+}
+
 function chartTip(h) {
   const tip = $('chart-tip');
   if (!tip) return;
@@ -6731,18 +6749,7 @@ function chartTip(h) {
     `<b style="color:#2fd4c1">${h.train.toFixed(1)} ${h.unit}</b>` +
     (h.hold != null ? ` / <b style="color:#f2a03f">${h.hold.toFixed(1)} ${h.unit}</b>` : '') +
     (h.event ? `<br><span style="color:#93a1a0">${h.event}</span>` : '');
-  // the readout rides the cursor INSIDE the plot: pinned to the top edge it
-  // hung past the stage in the expanded graph and hid behind the dock.
-  // Clamped sideways, floating 70px clear of the cursor (below it near the top).
-  const wrap = tip.parentElement;
-  const W = wrap ? wrap.clientWidth : 0, H = wrap ? wrap.clientHeight : 0;
-  if (!W || !H) { tip.style.left = `${h.xPct}%`; tip.style.top = '4px'; return; }
-  const tw = tip.offsetWidth, th = tip.offsetHeight;
-  const x = Math.max(tw / 2 + 4, Math.min(W - tw / 2 - 4, (h.xPct / 100) * W));
-  const y = (Math.max(0, Math.min(100, h.yPct ?? 0)) / 100) * H;
-  tip.style.left = `${(x / W) * 100}%`;
-  tip.style.top = `${(y / H) * 100}%`;
-  tip.style.transform = y > th + 86 ? 'translate(-50%, calc(-100% - 70px))' : 'translate(-50%, 70px)';
+  positionChartTip(tip, h);
 }
 
 // ── flash ───────────────────────────────────────────────────────────────────
@@ -7263,7 +7270,7 @@ function enterMonitor(runId) {
       if (!h) { tip.hidden = true; return; }
       tip.hidden = false;
       tip.textContent = `${fmt(h.iter)} cycles${h.splats != null ? ` · ${fmt(h.splats)} splats` : ''} · ${h.train.toFixed(1)} ${h.unit}`;
-      tip.style.left = `${clamp(h.xPct, 18, 75)}%`; tip.style.top = `${clamp(h.yPct, 10, 70)}%`;
+      positionChartTip(tip, h);
     } });
   }
   S._monChart.reset();
