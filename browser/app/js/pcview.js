@@ -9,7 +9,7 @@
 let pcPromise = null;
 const loadPc = () => (pcPromise ??= import('../vendor/playcanvas.min.mjs'));
 
-export async function createSogView(sogUrl, { radius = 10, yUp = false } = {}) {
+export async function createSogView(sogUrl, { radius = 10 } = {}) {
   const pc = await loadPc();
 
   const v = {
@@ -68,16 +68,14 @@ export async function createSogView(sogUrl, { radius = 10, yUp = false } = {}) {
     });
     v.entity = new pc.Entity('splat');
     v.entity.addComponent('gsplat', { asset });
-    // solver (SfM) worlds are OpenCV y-down and need the half-turn into
-    // PlayCanvas's y-up stage; known-camera (AR) worlds are y-up already
-    v.entity.setEulerAngles(yUp ? 0 : 180, 0, 0);
+    // the SfM world is OpenCV y-down; PlayCanvas is y-up
+    v.entity.setEulerAngles(180, 0, 0);
     app.root.addChild(v.entity);
     app.start();
   };
 
   // OpenCV-convention camera -> PC entity pose. R rows are the camera axes
-  // in the model's world; the 180deg-X entity flip on y-down worlds means
-  // world_pc = (x,-y,-z), while y-up worlds map straight across.
+  // in (y-down) world; the 180deg-X entity flip means world_pc = (x,-y,-z).
   const q = () => new pc.Quat();
   const m = () => new pc.Mat4();
   const setCam = (c) => {
@@ -87,12 +85,11 @@ export async function createSogView(sogUrl, { radius = 10, yUp = false } = {}) {
       -(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]),
       -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]),
       -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2])];
-    const s = yUp ? 1 : -1;
-    const px = C[0], py = s * C[1], pz = s * C[2];
+    const px = C[0], py = -C[1], pz = -C[2];
     // columns: right, up, back (in pc world)
-    const right = [R[0], s * R[1], s * R[2]];
-    const up = [-R[3], -s * R[4], -s * R[5]];
-    const back = [-R[6], -s * R[7], -s * R[8]];
+    const right = [R[0], -R[1], -R[2]];
+    const up = [-R[3], R[4], R[5]];
+    const back = [-R[6], R[7], R[8]];
     const mat = m();
     mat.set([
       right[0], right[1], right[2], 0,

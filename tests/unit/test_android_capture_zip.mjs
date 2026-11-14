@@ -117,13 +117,14 @@ assert.match(app, /datasetFromSelection\(all, fromZip \? \{ fromZip: true \} : \
 assert.match(app, /Left out of the zip import:/,
   'the app should name what the zip import left out');
 
-// 6. the parity script must keep carrying the fix to the mirror (it copies
-// app/js whole, so a future "simplification" that drops the intake files
-// would silently re-break the browser — fail loudly instead)
+// 6. the parity script must keep carrying shared intake files to Browser,
+// while deliberately preserving its viewer/background boundary files.
 const syncSh = readFileSync(new URL('../../tools/sync-browser.sh', import.meta.url), 'utf8');
-assert.match(syncSh, /cp -r app\/js\/\. browser\/app\/js\//,
-  'the parity script must keep mirroring the intake sources');
-assert.match(syncSh, /check_dir app\/js browser\/app\/js/,
-  'the parity script must keep verifying the mirrored sources');
+assert.match(syncSh, /for src in app\/js\/\*/,
+  'the parity script must keep mirroring shared intake sources');
+assert.match(syncSh, /check "\$src" "browser\/app\/js\/\$f"/,
+  'the parity script must verify every mirrored shared JS source');
+assert.match(syncSh, /BROWSER_OWNED_JS="app\.js pcview\.js headless\.js"/,
+  'viewer/background integration must remain Browser-owned');
 
 console.log('android capture zips (app + browser mirror) accepted, strays named, hand picks strict: passed');

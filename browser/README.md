@@ -8,17 +8,17 @@ local-only, no AR capture, no avatar route, no share backend. Drop in
 photos, a video, or an exported `.zip` and train a splat model in the
 tab. The result is a standard 3DGS `.ply` that opens in any splat viewer.
 
-It is self-contained: a generated `index.html` plus vendored,
-byte-identical copies of the app (`app/` → `app/`, the viewer
-`vendor/` files, the SOG codec) and the engine (`src/`). Keeping the
-app subtree one level under the root preserves every relative import
-untouched (`../avatar`, `../../src`, …) — no rewriting, no build
-step, no imports that leave this folder. Copy it anywhere and serve it.
+It is self-contained: a generated `index.html`, vendored shared app
+files and assets, and the engine (`src/`). Keeping the app subtree one
+level under the root preserves every relative import untouched
+(`../avatar`, `../../src`, …) — no imports leave this folder.
 
-The mirrors are synced from the repo by `tools/sync-browser.sh` (run it
-from the repo root after changing any mirrored source);
-`tests/unit/test_browser_vendor.mjs` fails on drift, and the profile
-gates are pinned by `tests/unit/test_browser_shell.mjs`.
+Shared files are synced by `tools/sync-browser.sh`. The Browser project
+owns `app/js/app.js`, `pcview.js`, and `headless.js`; the sync preserves
+rather than overwrites them, so Android viewer/background changes cannot
+silently enter Browser. The Android service driver `train-headless.js`
+is not shipped. `tests/unit/test_browser_vendor.mjs` enforces this
+boundary and byte-identity for the remaining shared files.
 
 ## Run it
 
@@ -50,9 +50,10 @@ marker or `?shell=browser`) hides only what doesn't fit a plain tab:
   service worker. Runs, captures, and models stay in this origin's
   IndexedDB — nothing leaves the machine.
 
-Everything else — wall library, setup card, live training dock with
-the score curve, model viewer, Details sheet, session/photo exports —
-is the same code running the same way.
+The wall library, setup card, live training dock, Details sheet, and
+exports retain the shared product flow. Model viewing and background
+integration are Browser-owned so they can stay aligned with upstream
+browser behavior instead of Android service behavior.
 
 ## Inputs
 
@@ -76,13 +77,18 @@ Notes:
 
 ## Files
 
-Generated (never edit here — edit the source and re-run
+Generated or mirrored (edit the source and re-run
 `tools/sync-browser.sh`):
 
 - `index.html` — generated from `app/index.html`: install bits out,
   shell marker in.
-- `app/js/`, `app/css/`, `app/avatar/` — the app, whole.
+- Shared files under `app/js/`, plus `app/css/` and `app/avatar/`.
 - `src/` — the engine, whole (`createSession`, solver, trainer, …).
+
+Browser-owned (edit deliberately in this folder; sync preserves them):
+
+- `app/js/app.js`, `app/js/pcview.js`, `app/js/headless.js`.
+- `train-headless.js` is Android-only and intentionally absent.
 - `app/models/splat-transform.bundle.mjs` + `app/vendor/st-worker.mjs`
   — the on-demand SOG codec (fetched only when a SOG export or import
   needs it).
@@ -94,5 +100,5 @@ Native (this shell's own words):
 - `README.md` — this file.
 
 Pinned by `tests/unit/test_browser_webapp.mjs` (structure),
-`tests/unit/test_browser_vendor.mjs` (mirror byte-identity), and
-`tests/unit/test_browser_shell.mjs` (profile gates).
+`tests/unit/test_browser_vendor.mjs` (shared-file identity and protected
+boundaries), and `tests/unit/test_browser_shell.mjs` (profile gates).
