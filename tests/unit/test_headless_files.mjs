@@ -162,7 +162,20 @@ assert.match(driver, /const secured = await secureFileCheckpoint\(\);[\s\S]*if \
 assert.match(app, /status\.status === 'interrupted' && status\.stopped[\s\S]*showRecovery\(runId, status\)/,
   'a stopped service checkpoint should wait on recovery UI for Continue here');
 assert.match(app, /'mon-continue'\)\.addEventListener\('click'[\s\S]*returnHeadlessRun\(S\._monRun\)/,
-  'only the Continue here button should request service ownership');
+  'Continue here should request service ownership');
+assert.match(app, /'mon-background'\)\.addEventListener\('click'[\s\S]*headlessCommand\('headless-start', runId\)/,
+  'a recoverable paused checkpoint should also be restartable in headless background mode');
+assert.match(main, /action\.equals\("headless-start"\)[\s\S]*startForegroundService\(intent\)/,
+  'an explicit background restart should create a foreground service safely');
+assert.match(svc, /case "headless-start"[\s\S]*restartHeadless\(runId\)[\s\S]*bootHeadlessNow\(runId, true\)/,
+  'the service should boot the stored checkpoint despite the deliberately visible monitor Activity');
+const monitorHtml = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
+assert.match(monitorHtml, /id="mon-background">Continue in background<\/button>/,
+  'recovery UI should offer background continuation alongside Continue here');
+assert.doesNotMatch(monitorHtml, /id="mon-updated"/,
+  'the monitor should omit live/updated-age status noise');
+assert.doesNotMatch(app, /updated \$\{age\}s ago|age < 8 \? 'live'/,
+  'monitor polling should not rebuild removed heartbeat labels');
 assert.match(app, /service\.alive === false[\s\S]*Headless\.heartbeatFresh\(service\)/,
   'Activity adoption should wait for the post-teardown service acknowledgment');
 const monitorPollStart = app.indexOf('async function monitorPoll(now, force = false)');

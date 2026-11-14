@@ -201,6 +201,11 @@ public final class TrainingService extends Service {
                 main.removeCallbacks(backgroundHandoff);
                 break;
             }
+            case "headless-start": {
+                String runId = intent.getStringExtra("runId");
+                restartHeadless(runId);
+                break;
+            }
             case "headless-pause":
                 headlessCommand(intent, "window.__headlessPause&&window.__headlessPause()");
                 break;
@@ -366,9 +371,34 @@ public final class TrainingService extends Service {
         }, HANDOFF_ACK_MS);
     }
 
+    /** Explicit monitor action: boot a stored checkpoint in the service even
+     * while the Activity remains visible. No Activity trainer exists on the
+     * recovery screen, so this is a deliberate, race-free GPU transfer. */
+    private void restartHeadless(String runId) {
+        if (runId == null || !runId.equals(RunFiles.readActive(this)) ||
+                "finished".equals(statusOf(runId)) || !handoffReady(runId)) {
+            stopSelf();
+            return;
+        }
+        if (headlessActive) {
+            if (runId.equals(headlessRunId)) headlessEval("window.__headlessResume&&window.__headlessResume()");
+            return;
+        }
+        lastPaused = false;
+        if (!foreground) startForegroundTraining("Background training", "Starting…");
+        else { acquireWakeLock(); showOngoing("Background training", "Starting…", 0, 0, false); }
+        writeStatus(runId, "active", "service", -1, null);
+        try {
+            JSONObject beat = new JSONObject();
+            beat.put("alive", true); beat.put("at", System.currentTimeMillis());
+            RunFiles.writeJson(this, runId, "service.json", beat.toString());
+        } catch (Exception ignored) { /* boot progress will refresh it */ }
+        bootHeadlessNow(runId, true);
+    }
+
     /** A monitor command for the headless twin: evaluate now when live, else
-     *  boot for a live marker and retry the (guarded, no-op-safe) call while
-     *  the driver comes up. */
+     * boot for a live marker and retry the guarded, no-op-safe call while the
+     * driver comes up. */
     private void headlessCommand(Intent intent, String script) {
         String runId = intent.getStringExtra("runId");
         if (headlessActive) {
@@ -404,7 +434,9 @@ public final class TrainingService extends Service {
     /** Boot the headless trainer for runId. Every precondition re-validates
      *  here (marker, handoff files, Activity silence, boot budget): the call
      *  sites are delayed and racing by nature. */
-    private void bootHeadlessNow(String runId) {
+    private void bootHeadlessNow(String runId) { bootHeadlessNow(runId, false); }
+
+    private void bootHeadlessNow(String runId, boolean allowVisibleActivity) {
         if (headlessActive) return;
         if (Build.VERSION.SDK_INT < 28) {
             // setDataDirectorySuffix needs Android 9+: older phones keep
@@ -415,7 +447,7 @@ public final class TrainingService extends Service {
         }
         if (runId == null || !runId.equals(RunFiles.readActive(this))) return;
         if (!isLive(statusOf(runId))) return;
-        if (activityFresh(runId)) return;   // the Activity owns it — stand down
+        if (!allowVisibleActivity && activityFresh(runId)) return;   // ordinary takeover: Activity owns it
         if (!handoffReady(runId)) {
             markInterrupted(runId, "the background handoff was incomplete");
             teardown();

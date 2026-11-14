@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
 const browser = readFileSync(new URL('../../browser/app/js/app.js', import.meta.url), 'utf8');
 const session = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
+const headless = readFileSync(new URL('../../app/js/train-headless.js', import.meta.url), 'utf8');
 
 for (const [name, source] of [['Android', app], ['Browser', browser]]) {
   const wireStart = source.indexOf('function wireFrameLongPress(');
@@ -45,5 +46,9 @@ assert.match(session, /async includeCameraImage\(ci\)[\s\S]*rc\.excluded = false
   'restoring an image should re-enable every camera backed by it and reset the epoch deck');
 assert.doesNotMatch(session.slice(session.indexOf('async includeCameraImage('), session.indexOf('async growNow()')),
   /\.splice\(/, 'restoring an image must preserve camera and reconstruction indices');
+assert.ok((app.match(/\.\.\.\(c\.excluded \? \{ excluded: true \} : \{\}\)/g) || []).length >= 2,
+  'finished-model loading and continuation should both carry removed-image markers into the session');
+assert.match(headless, /useReconstruction\([\s\S]*c\.excluded \? \{ excluded: true \}/,
+  'background continuation should carry removed-image markers into the service session');
 
 console.log('filmstrip long-press image removal and restoration: passed');

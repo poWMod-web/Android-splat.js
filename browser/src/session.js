@@ -235,7 +235,7 @@ class Emitter {
  * score slope is the convergence signal; post-growth recovery is gated
  * separately in the training loop below. */
 export function scorePlateaued(history, nowIter, {
-  window = 1200, slope = 0.2, minPoints = 4, minSpan = window * 0.75,
+  window = 1200, slope = 0.25, minPoints = 4, minSpan = window * 0.75,
   after = -Infinity,
 } = {}) {
   if (!Array.isArray(history) || !history.length) return false;
@@ -1811,7 +1811,7 @@ export class Session {
           // growth, the explicit 700-cycle backoff is also the fresh-evidence
           // span; recovery to the pre-growth score remains mandatory.
           minSpan: (trainer.lastRefine || 0) > 0 ? convergenceGap : plateauWindow * 0.75,
-          slope: this.opts.plateauSlope ?? 0.2,
+          slope: this.opts.plateauSlope ?? 0.25,
           after: trainer.lastRefine || 0,
         });
       }

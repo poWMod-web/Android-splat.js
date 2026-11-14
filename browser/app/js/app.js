@@ -4450,7 +4450,8 @@ async function restoreSession(src) {
     if (reconJson) {
       ses.useReconstruction({
         known: !!reconJson.knownCameras,
-        cams: reconJson.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
+        cams: reconJson.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy,
+          ...(c.excluded ? { excluded: true } : {}) })),
         points: [],
         k1: reconJson.k1 || 0, k2: reconJson.k2 || 0,
         ...(reconJson.fFeat ? { fFeat: reconJson.fFeat } : {}),
@@ -5334,7 +5335,8 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     if (S.gen !== gen) return;
     ses.useReconstruction({
       known: !!recon.knownCameras,
-      cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
+      cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy,
+        ...(c.excluded ? { excluded: true } : {}) })),
       points: [],
       k1: recon.k1 || 0, k2: recon.k2 || 0,
       ...(recon.fFeat ? { fFeat: recon.fFeat } : {}),
@@ -7464,6 +7466,27 @@ function wireMonitorOnce() {
     flash('Securing the background checkpoint and transferring training here …', 60000);
     if (!(await returnHeadlessRun(S._monRun))) $('mon-stop').disabled = false;
   });
+  $('mon-background').addEventListener('click', () => {
+    const runId = S._monRun, button = $('mon-background');
+    if (!runId || button.disabled) return;
+    button.disabled = true;
+    try {
+      const bridge = headlessBridge();
+      if (!bridge) throw new Error('background service bridge is unavailable');
+      bridge.headlessCommand('headless-start', runId);
+      S._monRecovery = false; S._monPaused = false;
+      $('mon-sub').hidden = true;
+      syncMonitorButtons(); button.disabled = true;
+      flash('Starting the saved checkpoint in background mode …', 10000);
+      setTimeout(() => {
+        if (S.state === 'monitor' && S._monRun === runId) monitorPoll(0, true);
+        button.disabled = false;
+      }, 1000);
+    } catch (err) {
+      button.disabled = false;
+      flash(`Could not start background training: ${err.message}`, 8000);
+    }
+  });
   $('mon-continue').addEventListener('click', async () => {
     if (!S._monRun) return;
     $('mon-continue').disabled = true;
@@ -7495,6 +7518,7 @@ function syncMonitorButtons() {
   const transferring = !!S._handbackRun;
   if ($('mon-stop')) $('mon-stop').disabled = transferring;
   if ($('mon-continue')) $('mon-continue').disabled = transferring;
+  if ($('mon-background')) $('mon-background').disabled = transferring;
   for (const id of ['mon-live', 'mon-rec']) {
     const el = $(id);
     if (el) el.hidden = (id === 'mon-live') === !!S._monRecovery;
@@ -7635,8 +7659,6 @@ function paintMonitorProgress(status, progress) {
     const value = Math.min(100, Math.max(10, Math.round(+p.gpu)));
     $('mon-gpu').value = String(value); $('mon-gpu-v').textContent = `${value}%`;
   }
-  const age = p.at ? Math.max(0, Math.round((Date.now() - p.at) / 1000)) : null;
-  $('mon-updated').textContent = age == null ? '' : age < 8 ? 'live' : `updated ${age}s ago`;
 }
 /** Take the run back from the service: stop any live twin, then verify it
  *  stood down (or was already dead) before local training touches the GPU.

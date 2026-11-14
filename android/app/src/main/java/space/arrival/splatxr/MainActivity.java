@@ -535,15 +535,19 @@ public final class MainActivity extends Activity {
          *  start: the service is already foreground while a run lives. */
         @JavascriptInterface public void headlessCommand(String action, String runId) {
             if (action == null || runId == null) return;
-            if (!action.equals("headless-pause") && !action.equals("headless-resume") &&
+            if (!action.equals("headless-start") && !action.equals("headless-pause") && !action.equals("headless-resume") &&
                     !action.equals("headless-stop") && !action.equals("headless-save") &&
                     !action.equals("headless-snapshot") && !action.equals("headless-prune") && !action.equals("headless-grow") &&
                     !action.equals("headless-ping")) return;
             if (!RunFiles.validRunId(runId)) return;
             try {
-                startService(new Intent(MainActivity.this, TrainingService.class)
+                Intent intent = new Intent(MainActivity.this, TrainingService.class)
                         .putExtra("action", action)
-                        .putExtra("runId", runId));
+                        .putExtra("runId", runId);
+                // Explicitly starting a saved checkpoint may create a fresh
+                // service, so Android 8+ requires the foreground-service path.
+                if (action.equals("headless-start") && Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
+                else startService(intent);
             } catch (Exception ignored) { /* the twin is gone; the files say so */ }
         }
 

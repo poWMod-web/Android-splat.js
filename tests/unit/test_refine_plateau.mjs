@@ -22,7 +22,7 @@ assert.equal(scorePlateaued(flat, NOW, eligible()), true,
 const crawl = line(9, NOW - W, 150, 20, 0.05);
 assert.equal(scorePlateaued(crawl, NOW, eligible()), true,
   'a crawl below the slope threshold triggers growth');
-const climb = line(9, NOW - W, 150, 20, 0.25);
+const climb = line(9, NOW - W, 150, 20, 0.30);
 assert.equal(scorePlateaued(climb, NOW, eligible()), false,
   'a climb at or above the slope threshold does not trigger growth');
 const falling = line(9, NOW - W, 150, 20, -0.5);
@@ -46,12 +46,12 @@ const postGrowth = line(8, NOW - 700, 100, 20, 0.0);
 assert.equal(scorePlateaued(postGrowth, NOW, {
   window: W, minSpan: 700, after: NOW - 700,
 }), true, 'fresh plateau evidence may trigger after the 700-cycle backoff');
-const under = line(9, NOW - W, 150, 20, 0.19);
+const under = line(9, NOW - W, 150, 20, 0.24);
 assert.equal(scorePlateaued(under, NOW, eligible()), true,
-  'the default trips under 0.2 dB/kiter');
-const over = line(9, NOW - W, 150, 20, 0.21);
+  'the default trips under 0.25 dB/kiter');
+const over = line(9, NOW - W, 150, 20, 0.26);
 assert.equal(scorePlateaued(over, NOW, eligible()), false,
-  'the default holds at and above 0.2 dB/kiter');
+  'the default holds at and above 0.25 dB/kiter');
 
 // ---- wiring pins: growth follows recovery and robust plateaus --------------
 assert.match(sessionSource, /export function scorePlateaued\(history, nowIter/,
@@ -74,8 +74,8 @@ assert.doesNotMatch(sessionSource, /sinceRefine >= refineEvery \|\| plateau|_pla
   'neither fixed cadence nor exponential delays should bypass repeated convergence');
 assert.match(sessionSource, /\[score plateaued\]/,
   'plateau-triggered refines say so in the log');
-assert.match(sessionSource, /slope: this\.opts\.plateauSlope \?\? 0\.2,/,
-  'the loop trips under 0.2 dB/kiter');
+assert.match(sessionSource, /slope: this\.opts\.plateauSlope \?\? 0\.25,/,
+  'the loop trips under 0.25 dB/kiter');
 assert.equal((trainerSource.match(/growUntil \?\? 0\.90 \* this\.horizon/g) || []).length, 4,
   'growth runs to 90% of the horizon on every refine path');
 

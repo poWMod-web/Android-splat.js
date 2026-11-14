@@ -144,7 +144,8 @@ async function boot() {
     await ses.load(files);
     ses.useReconstruction({
       known: !!recon.knownCameras,
-      cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
+      cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy,
+        ...(c.excluded ? { excluded: true } : {}) })),
       points: [],
       k1: recon.k1 || 0, k2: recon.k2 || 0,
       ...(recon.fFeat ? { fFeat: recon.fFeat } : {}),
