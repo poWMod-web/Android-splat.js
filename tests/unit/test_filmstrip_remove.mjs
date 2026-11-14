@@ -25,8 +25,10 @@ for (const [name, source] of [['Android', app], ['Browser', browser]]) {
     `${name}: removal requires a titled in-app confirmation and uses stable camera exclusion`);
   assert.doesNotMatch(remove, /\bconfirm\(/,
     `${name}: image removal must not show the WebView origin as its title`);
-  assert.match(remove, /cam\.state = 'removed'[\s\S]*checkpointRun\('remove-image'\)/,
-    `${name}: removed state should be visible and durable`);
+  assert.match(remove, /cam\.state = 'removed'[\s\S]*persistReconEdit\(\)/,
+    `${name}: removed state should be visible and durable through metadata only`);
+  assert.doesNotMatch(remove, /checkpointRun|packState/,
+    `${name}: removing one camera must not rewrite the full splat model`);
   assert.doesNotMatch(remove, /S\.photos\.splice|S\.scene\.cams\.splice/,
     `${name}: removal must not shift persisted photo/camera indices`);
   const restoreStart = source.indexOf('async function restoreTrainingImage(');
@@ -36,10 +38,11 @@ for (const [name, source] of [['Android', app], ['Browser', browser]]) {
     `${name}: removed thumbnails should confirm and restore the stable camera entry`);
   assert.match(source, /c\?\.state === 'removed' \? 'Long press to restore to training'/,
     `${name}: removed thumbnails should advertise their reversible action`);
-  assert.match(source, /\['align', 'remove-image'\]\.includes\(reason\)[\s\S]*\['train', 'done'\]\.includes\(S\.state\)/,
-    `${name}: removal checkpoints should work during training and on completed models`);
-  assert.match(source, /status: S\.state === 'done' \? 'finished'/,
-    `${name}: editing a completed model must preserve its finished status`);
+  assert.match(source, /async function persistReconEdit\(\)[\s\S]*buildReconJson\(S\)[\s\S]*'recon\.json'[\s\S]*patchRun\(S\.runId/,
+    `${name}: camera/training-set edits should update recon metadata in both durable stores`);
+  const editPersist = source.slice(source.indexOf('async function persistReconEdit('), source.indexOf('function formatTrainingScore'));
+  assert.doesNotMatch(editPersist, /packState|state\.bin/,
+    `${name}: metadata persistence must not read or write the full splat state`);
 }
 
 assert.match(session, /async includeCameraImage\(ci\)[\s\S]*rc\.excluded = false[\s\S]*excluded\.delete\(i\)[\s\S]*_commitSplit\(excluded\)/,

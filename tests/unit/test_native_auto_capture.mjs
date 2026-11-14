@@ -7,7 +7,7 @@ assert.match(source, /autoToggle\.setChecked\(false\)/, 'native capture must ret
 assert.match(source, /getInt\("capture_spacing_cm", 10\)/, 'native default spacing must be 10 cm');
 assert.match(source, /if \(value < 2 \|\| value > 200\)/, 'spacing must be editable from 2 to 200 cm');
 assert.match(source, /autoFirstCapturePending = running/,
-  'pressing Start should arm an immediate first tracked sample');
+  'pressing Start should arm the first sample while tracking warms up');
 assert.match(source, /boolean firstAutoDue = autoCaptureEnabled && autoCaptureRunning && autoFirstCapturePending;[\s\S]*\(firstAutoDue \|\| cloudRenderer\.sampleTravel\(position\)\)/,
   'the first sample is due immediately; distance spacing governs later samples');
 assert.match(source, /if \(firstAutoDue && saved\) autoFirstCapturePending = false/,
@@ -24,7 +24,14 @@ assert.match(source, /else if \(autoCaptureRunning\) shutterView\.setLabel\("Sto
   'a running auto capture should offer Stop on the center button');
 assert.match(source, /else shutterView\.setLabel\("Start", "Start auto-capture"\);/,
   'an armed auto capture should offer Start on the center button');
-assert.match(source, /if \(manualDue \|\| autoDue\) \{[\s\S]*boolean saved = capture\(frame\)/);
+assert.match(source, /boolean firstCaptureReady = firstCaptureTrackingReady\(frame\)[\s\S]*if \(manualPending \|\| autoDue\)[\s\S]*if \(firstCaptureReady\)[\s\S]*capture\(frame\)/,
+  'manual and automatic first captures should wait for positional tracking warm-up');
+assert.match(source, /FIRST_CAPTURE_WARMUP_MS = 2000L[\s\S]*FIRST_CAPTURE_MIN_REFERENCES = 24/,
+  'the first image should wait for continuous tracking and a useful ARCore reference set');
+assert.match(source, /frame\.acquirePointCloud\(\)[\s\S]*firstTrackingReferences = Math\.max[\s\S]*elapsed >= FIRST_CAPTURE_FALLBACK_MS/,
+  'pre-capture tracking should collect references continuously with a bounded fallback for texture-poor scenes');
+assert.match(source, /keep manual\/first-auto requests pending/,
+  'a shutter press during warm-up must remain armed rather than being discarded');
 assert.match(source, /distanceSinceCapture \+= distance[\s\S]*return distanceSinceCapture \+ 1e-6f >= spacingMeters/);
 assert.match(source, /void captured\(float\[\] position\)[\s\S]*distanceSinceCapture = 0f/);
 console.log('native ARCore distance auto-capture UI and 10 cm default: passed');

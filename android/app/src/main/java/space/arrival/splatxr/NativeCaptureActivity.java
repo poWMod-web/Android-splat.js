@@ -601,6 +601,12 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private final List<JSONObject> frames = new ArrayList<>();
         private final List<CaptureViewpoint> viewpoints = new ArrayList<>();
         private final TravelCaptureTrigger travelTrigger = new TravelCaptureTrigger(0.10f);
+        private static final long FIRST_CAPTURE_WARMUP_MS = 2000L;
+        private static final long FIRST_CAPTURE_FALLBACK_MS = 5000L;
+        private static final int FIRST_CAPTURE_MIN_REFERENCES = 24;
+        private long firstTrackingAtMs;
+        private long lastWarmupNoticeAtMs;
+        private int firstTrackingReferences;
         private Session arSession;
         // Best ARCore horizontal plane seen while tracking: the export levels the
         // dataset so this ground plane's normal becomes world +Y, cameras above it.
@@ -678,20 +684,27 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 setTrackingTelemetry(tracking);
                 if (tracking) {
                     updateGroundPlane();
+                    boolean firstCaptureReady = firstCaptureTrackingReady(frame);
                     float[] position = frame.getCamera().getPose().getTranslation();
                     boolean firstAutoDue = autoCaptureEnabled && autoCaptureRunning && autoFirstCapturePending;
                     boolean autoDue = autoCaptureEnabled && autoCaptureRunning &&
                             (firstAutoDue || cloudRenderer.sampleTravel(position));
                     if (!autoCaptureEnabled || !autoCaptureRunning) cloudRenderer.breakTravelContinuity();
-                    boolean manualDue = captureRequested.getAndSet(false);
-                    if (manualDue || autoDue) {
-                        boolean saved = capture(frame);
-                        if (firstAutoDue && saved) autoFirstCapturePending = false;
+                    boolean manualPending = captureRequested.get();
+                    if (manualPending || autoDue) {
+                        if (firstCaptureReady) {
+                            boolean manualDue = captureRequested.getAndSet(false);
+                            boolean saved = (manualDue || autoDue) && capture(frame);
+                            if (firstAutoDue && saved) autoFirstCapturePending = false;
+                        } else {
+                            showWarmupStatus(); // keep manual/first-auto requests pending
+                        }
                     }
                     // Render accumulated capture samples each preview frame, but only
                     // successful keyframe capture may add coverage observations.
                     drawCoverage(frame);
                 } else {
+                    resetFirstCaptureTracking();
                     cloudRenderer.breakTravelContinuity();
                 }
             } catch (CameraNotAvailableException e) {
@@ -701,6 +714,46 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 setTrackingTelemetry(false);
                 showStatus("AR frame error: " + safeMessage(e));
             }
+        }
+
+        /** ARCore tracks from session start, not from the shutter. Before the
+         * first saved frame, give its visual-inertial map time to accumulate a
+         * useful positional reference set. Recorded poses are snapshots and do
+         * not receive ARCore's later map corrections retroactively. */
+        private boolean firstCaptureTrackingReady(Frame frame) {
+            if (!frames.isEmpty()) return true;
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (firstTrackingAtMs == 0L) firstTrackingAtMs = now;
+            PointCloud cloud = null;
+            try {
+                cloud = frame.acquirePointCloud();
+                FloatBuffer points = cloud.getPoints(); points.rewind();
+                int references = 0;
+                while (points.remaining() >= 4) {
+                    points.get(); points.get(); points.get();
+                    if (points.get() >= 0.15f) references++;
+                }
+                firstTrackingReferences = Math.max(firstTrackingReferences, references);
+            } catch (Exception ignored) { /* time fallback avoids blocking texture-poor scenes */ }
+            finally { if (cloud != null) cloud.release(); }
+            long elapsed = now - firstTrackingAtMs;
+            return (elapsed >= FIRST_CAPTURE_WARMUP_MS &&
+                    firstTrackingReferences >= FIRST_CAPTURE_MIN_REFERENCES) ||
+                    elapsed >= FIRST_CAPTURE_FALLBACK_MS;
+        }
+
+        private void showWarmupStatus() {
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (now - lastWarmupNoticeAtMs < 500L) return;
+            lastWarmupNoticeAtMs = now;
+            showStatus("Stabilizing AR tracking before the first photo… Move slowly around the subject (" +
+                    firstTrackingReferences + " positional references).");
+        }
+
+        private void resetFirstCaptureTracking() {
+            if (!frames.isEmpty()) return;
+            firstTrackingAtMs = 0L;
+            firstTrackingReferences = 0;
         }
 
         /** Remember the largest stable horizontal plane: the export levels the world to it. */
@@ -987,6 +1040,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         void resetData() {
             coverage.clear(); seeds.clear(); frames.clear(); viewpoints.clear(); capturedFrameCount = 0; capturedSeedCount = 0;
+            firstTrackingAtMs = 0L; firstTrackingReferences = 0; lastWarmupNoticeAtMs = 0L;
             hasGroundPlane = false; groundArea = 0f; groundExtentX = 0f; groundExtentZ = 0f; levelingApplied = false;
             refreshCaptureTelemetry();
             travelTrigger.reset();

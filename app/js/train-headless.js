@@ -231,7 +231,8 @@ async function maybeEarlyPrune(iter) {
   try {
     log('approved speed prune at cycle 500: removing 75%');
     await ses.pruneAndContinue(0.25);
-    await secureFileCheckpoint();
+    // No full-state write here; the next handback or completion checkpoint
+    // captures the pruned model.
     postProgress(true);
   } catch (e) {
     // pruneAndContinue restores the intact unpruned trainer on failure.
@@ -454,7 +455,8 @@ async function manualModelEdit(kind, keep = 0.75) {
   try {
     if (kind === 'grow') await ses.growNow();
     else await ses.pruneAndContinue(Math.max(0.01, Math.min(0.99, Number(keep) || 0.75)));
-    await secureFileCheckpoint();
+    // Manual edits stay live and are serialized only by a required ownership
+    // transition or completion, not by the button itself.
     postProgress(true);
   } catch (e) {
     log(`manual ${kind} failed`, e);

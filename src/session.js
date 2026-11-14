@@ -1700,6 +1700,9 @@ export class Session {
     if (trainer.ready === false) {
       throw new Error('trainer setup did not complete — the seed/reseed failed partway; reload or recover to reboot cleanly');
     }
+    // A MessageChannel frame can already be queued when a hidden run pauses.
+    // Park it before counting/ticking; visible paused views may still repaint.
+    if (!this.training && isHidden()) return;
     this._frameCount++;
 
     if (this.training && trainer.iter >= this._maxIters()) {

@@ -84,7 +84,8 @@ assert.doesNotMatch(app, /strip-align|Align selected/,
   'the filmstrip must not show Align before an image is selected');
 assert.match(css, /#monitor \{ width: 100%; max-width: none; height: calc\(100dvh - 52px\); box-sizing: border-box; \}/,
   'the background monitor covers the full viewport below the app bar');
-assert.match(app, /checkpointRun\('align'\)/);
+assert.match(app, /applyAlignedPose[\s\S]*persistReconEdit\(\)/,
+  'alignment should persist camera metadata without rewriting the splat state');
 assert.match(session, /async updateCameraPose\(ci, R, t\)/);
 assert.match(session, /this\.recon\?\.cams\?\.find/);
 assert.match(app, /No suitable alignment for frame/);

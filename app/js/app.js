@@ -3666,7 +3666,7 @@ async function checkpointRun(reason) {
   if (!S.runId || !S.session || !S.session.trainer) return null;
   // 'finish' runs in the done state, BEFORE the export chain: the result is
   // secured even if sog compression or the device dies right after training
-  if (reason === 'finish' ? S.state !== 'done' : ['align', 'remove-image'].includes(reason) ? !['train', 'done'].includes(S.state) : S.state !== 'train') return null;
+  if (reason === 'finish' ? S.state !== 'done' : S.state !== 'train') return null;
   const it = S.session.trainer.iter | 0;
   if (S._ckptBusy || (reason === 'hidden' && it < 200)) return null;
   // hidden fires on every tab switch — only rewrite after real progress
@@ -3714,6 +3714,31 @@ async function checkpointRun(reason) {
     console.warn('checkpoint failed', e);   // best-effort: never disturb a run
   } finally { S._ckptBusy = false; }
   return null;
+}
+
+/** Persist camera-pose and training-set edits without rereading or rewriting
+ * the full splat state. The next required model checkpoint carries the same
+ * recon again, but these small metadata writes make the edit survive now. */
+async function persistReconEdit() {
+  if (!S.runId || !S.session || !S.session.trainer) return false;
+  const { buildReconJson } = await import('./session_io.js');
+  const recon = buildReconJson(S);
+  let fileSaved = false, idbSaved = false;
+  const bridge = headlessBridge();
+  try {
+    if (S._hlStagePromise) await S._hlStagePromise;
+    if (bridge && S._hlStaged === S.runId && S._hlPhotos) {
+      fileSaved = bridge.writeRunJson(S.runId, 'recon.json', JSON.stringify(recon)) !== false;
+    }
+  } catch (e) { console.warn('[recon-edit] Android metadata write failed', e); }
+  try {
+    const { patchRun } = await import('./store.js');
+    idbSaved = await patchRun(S.runId, {
+      recon, updatedAt: Date.now(), detailSolve: captureRunSolveDetails(),
+    });
+  } catch (e) { console.warn('[recon-edit] IndexedDB metadata write failed', e); }
+  if (S._localRun && S._localRun.id === S.runId) S._localRun.recon = recon;
+  return fileSaved || idbSaved;
 }
 
 function formatTrainingScore(psnr) {
@@ -3805,8 +3830,9 @@ async function maybeEarlyPrune(iter) {
   }
   flash('Approved speed prune: removing 75% of splats and continuing …', 7000);
   try {
+    // The prune changes the live model only. It becomes durable at the next
+    // ordinary transition checkpoint (Back, handoff, or finish).
     await runPruneAndContinue(cfg.ratio);
-    await checkpointRun('early-prune').catch((e) => console.warn('[early-prune] checkpoint', e));
   } finally { cfg.busy = false; publishEarlyPruneState(); }
 }
 
@@ -6396,9 +6422,9 @@ async function applyAlignedPose(i, R, t, source, remember = true) {
   cam.R = Array.from(R); cam.t = Array.from(t);
   // Make durability immediate; normal checkpoints and background staging then
   // carry the same recon/trainer pose without a second pose catalogue.
-  await checkpointRun('align').catch((e) => console.warn('[align] checkpoint', e));
+  await persistReconEdit().catch((e) => console.warn('[align] metadata', e));
   goToFrame(i); paintStrip(); renderControls();
-  flash(`Frame ${i + 1} aligned (${source}) and checkpointed.`, 6000);
+  flash(`Frame ${i + 1} aligned (${source}) and saved.`, 6000);
 }
 
 async function undoSelectedAlignment() {
@@ -6494,7 +6520,7 @@ function showUnalignedFrameRemoval(i, why) {
       if (!cam || cam.ci < 0) throw new Error('image is not part of the trainable camera set');
       await S.session.excludeCameraImage(cam.ci);
       cam.state = 'removed'; cam.psnr = null;
-      await checkpointRun('align').catch((e) => console.warn('[remove-image] checkpoint', e));
+      await persistReconEdit().catch((e) => console.warn('[remove-image] metadata', e));
       leaveFrame(); paintStrip(); renderControls();
       flash(`Frame ${i + 1} removed from training. The original capture was kept.`, 7000);
     } catch (err) { flash(`Could not remove the image: ${err.message}`, 8000); }
@@ -6605,7 +6631,7 @@ async function removeTrainingImage(i) {
   try {
     await S.session.excludeCameraImage(cam.ci);
     cam.state = 'removed'; cam.error = null; cam.psnr = null;
-    await checkpointRun('remove-image').catch((e) => console.warn('[remove-image] checkpoint', e));
+    await persistReconEdit().catch((e) => console.warn('[remove-image] metadata', e));
     if (S.atFrame === i) leaveFrame();
     paintStrip(); renderControls();
     flash(`Frame ${i + 1} removed from training.`, 6000);
@@ -6630,7 +6656,7 @@ async function restoreTrainingImage(i) {
   try {
     await S.session.includeCameraImage(cam.ci);
     cam.state = 'placed'; cam.error = null; cam.psnr = null;
-    await checkpointRun('remove-image').catch((e) => console.warn('[restore-image] checkpoint', e));
+    await persistReconEdit().catch((e) => console.warn('[restore-image] metadata', e));
     paintStrip(); renderControls();
     flash(`Frame ${i + 1} restored to training.`, 6000);
   } catch (err) {
