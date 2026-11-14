@@ -142,10 +142,10 @@ assert.doesNotMatch(svc, /case "activity-foreground"|returnToActivity|returnHand
   'the service must have no automatic foreground-return path');
 assert.match(svc, /beat\.put\("alive", false\)[\s\S]*RunFiles\.writeJson[\s\S]*service\.json/,
   'Java should acknowledge service GPU teardown before Activity adoption');
-assert.match(driver, /async function maybePeriodicCheckpoint\(iter\)[\s\S]*PERIODIC_CKPT_MS[\s\S]*PERIODIC_CKPT_ITERS[\s\S]*await secureFileCheckpoint\(\)/,
-  'uninterrupted service training should periodically serialize a checkpoint from the metrics beat');
+assert.doesNotMatch(driver, /maybePeriodicCheckpoint|PERIODIC_CKPT_/,
+  'uninterrupted background training must not save periodic checkpoints');
 assert.match(driver, /if \(ckptBusy \|\| !ses \|\| !ses\.trainer\) return false/,
-  'periodic and transition checkpoints must share the no-overlap guard');
+  'required transition checkpoints must retain their no-overlap guard');
 assert.match(driver, /const secured = await secureFileCheckpoint\(\);[\s\S]*if \(!secured\)[\s\S]*ses\.start\(\)/,
   'a failed handback checkpoint should keep service training instead of returning stale state');
 assert.match(app, /status\.status === 'interrupted' && status\.stopped[\s\S]*showRecovery\(runId, status\)/,
