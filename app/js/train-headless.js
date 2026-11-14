@@ -179,6 +179,7 @@ function onEvent(e) {
   if (e.kind === 'prune-continue')
     chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned ${(e.from || 0).toLocaleString('en-US')}→${(e.to || 0).toLocaleString('en-US')}` });
   if (chartEvents.length > 300) chartEvents = chartEvents.slice(-300);
+  if (['refine', 'soft-prune', 'dead-cull', 'grow-now', 'prune-continue'].includes(e.kind)) postProgress(true);
   if (e.kind === 'train-complete') finalize();
   else if (e.kind === 'device-lost' || e.kind === 'worker-error' || e.kind === 'train-error') {
     fail(`headless run faulted: ${e.message || e.kind} (last checkpoint kept)`);
