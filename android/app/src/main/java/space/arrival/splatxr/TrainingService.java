@@ -210,9 +210,13 @@ public final class TrainingService extends Service {
             case "headless-snapshot":
                 headlessCommand(intent, "window.__headlessSnapshot&&window.__headlessSnapshot()");
                 break;
-            case "headless-prune":
-                headlessCommand(intent, "window.__headlessPrune&&window.__headlessPrune()");
+            case "headless-prune": {
+                int percent = intent.getIntExtra("prunePercent", 25);
+                if (percent < 1 || percent > 99) break;
+                double keep = (100 - percent) / 100.0;
+                headlessCommand(intent, "window.__headlessPrune&&window.__headlessPrune(" + keep + ")");
                 break;
+            }
             case "headless-grow":
                 headlessCommand(intent, "window.__headlessGrow&&window.__headlessGrow()");
                 break;

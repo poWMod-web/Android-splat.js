@@ -1155,3 +1155,5 @@ a.cbtn { text-decoration: none; }
 @media (max-width: 700px) { .monitor-live-grid { grid-template-columns: 1fr; } }
 .strip { position: relative; }
 .strip-align { position: absolute; right: 10px; top: -42px; z-index: 8; backdrop-filter: blur(8px); }
+
+.monitor-preview[hidden] + .monitor-chartwrap { grid-column: 1 / -1; }

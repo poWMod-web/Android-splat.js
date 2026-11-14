@@ -347,14 +347,13 @@ globalThis.__headlessStop = async () => {
 };
 globalThis.__headlessSnapshot = () => snapshot();
 let manualEdit = false;
-async function manualModelEdit(kind) {
+async function manualModelEdit(kind, keep = 0.75) {
   if (!ses || !ses.trainer || ending || manualEdit) return;
   manualEdit = true;
   try {
     if (kind === 'grow') await ses.growNow();
-    else await ses.pruneAndContinue(0.75); // safe monitor default: prune 25%
+    else await ses.pruneAndContinue(Math.max(0.01, Math.min(0.99, Number(keep) || 0.75)));
     await secureFileCheckpoint();
-    await snapshot();
     postProgress(true);
   } catch (e) {
     log(`manual ${kind} failed`, e);
@@ -362,6 +361,6 @@ async function manualModelEdit(kind) {
   } finally { manualEdit = false; }
 }
 globalThis.__headlessGrow = () => manualModelEdit('grow');
-globalThis.__headlessPrune = () => manualModelEdit('prune');
+globalThis.__headlessPrune = (keep) => manualModelEdit('prune', keep);
 
 boot();

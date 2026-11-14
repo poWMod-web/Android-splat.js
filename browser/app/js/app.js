@@ -561,6 +561,7 @@ function toggleTrainingVisuals() {
   if (S.trainVisuals) S._viewKey = ''; // render the current model at the current camera pose
   else if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
   syncTrainingVisualsControl();
+  renderControls();
 }
 
 // the OAuth popup lands back on this page with ?code= — report and close
@@ -4746,7 +4747,7 @@ function renderControls() {
   c.hidden = !live;
   if (!live) return;
 
-  if (S.atFrame >= 0) {
+  if (S.atFrame >= 0 && (S.state !== 'train' || S.trainVisuals)) {
     c.appendChild(seg([['swipe', 'Swipe'], ['loupe', 'Loupe'], ['error', 'Error']],
       S.compare, (v) => {
         if (S.compare === v) return;   // swallow the click that follows pointerdown
@@ -5087,7 +5088,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     // Stable URLs include presets and canonical native AR archives. Prefer
     // them even for own captures: loading "last capture" here can substitute
     // a newer scan and detach images from this model's saved camera poses.
-    flash('Fetching the photos …', 60000);
+    flash(viewOnly ? 'Opening saved model …' : 'Fetching the photos …', 60000);
     files = await Promise.all(srcUrls.map(async (u, i) => {
       const r = await fetch(u);
       if (!r.ok) throw new Error(`photo fetch failed (${r.status})`);
@@ -5108,7 +5109,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
       return;
     }
   }
-  flash('Preparing to continue training …', 60000);
+  flash(viewOnly ? 'Opening saved model …' : 'Preparing to continue training …', 60000);
   let g, engine, stateIter = null, recipe = null;
   if (lr.state) {
     // leave checkpoint: the trainer's raw floats — nothing baked, nothing
@@ -7131,6 +7132,8 @@ function enterMonitor(runId) {
     } });
   }
   S._monChart.reset();
+  $('mon-preview').hidden = true;
+  $('mon-refresh').disabled = false; $('mon-refresh').textContent = 'Refresh preview';
   $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
   if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
   // This is a status screen, not a viewer. A snapshot behind the card's
@@ -7152,26 +7155,47 @@ function wireMonitorOnce() {
     S._monPaused = !S._monPaused;
     syncMonitorButtons();
   });
+  $('mon-refresh').addEventListener('click', refreshMonitorPreview);
   $('mon-prune').addEventListener('click', () => {
     if (!S._monRun || document.getElementById('mon-edit-pick')) return;
     const card = document.createElement('div');
     card.className = 'upcard'; card.id = 'mon-edit-pick';
-    const title = document.createElement('b'); title.textContent = 'Change the live model?';
+    const title = document.createElement('b'); title.textContent = 'Prune / grow';
     const note = document.createElement('span'); note.className = 'sog-status';
-    note.textContent = 'The background trainer pauses at a safe model boundary. Pruning removes the lowest-mass 25%; growth adds capacity in high-error areas. A checkpoint and preview follow automatically.';
+    note.textContent = 'Fewer splats with room to regrow — or grow into the error right now.';
     const row = document.createElement('div'); row.className = 'row';
-    for (const [label, cmd] of [['Prune 25%', 'headless-prune'], ['Grow now', 'headless-grow'], ['Cancel', '']]) {
-      const button = document.createElement('button'); button.className = cmd ? 'btn' : 'btn linkish';
-      button.textContent = label; if (cmd) button.dataset.cmd = cmd; row.appendChild(button);
+    for (const [label, percent, grow] of [['Prune ¼', 25, false], ['Prune ½', 50, false], ['Grow now', 0, true]]) {
+      const button = document.createElement('button'); button.className = 'btn'; button.textContent = label;
+      if (grow) button.dataset.grow = '1'; else button.dataset.percent = String(percent);
+      row.appendChild(button);
     }
-    card.append(title, note, row);
-    $('monitor').appendChild(card);
-    card.addEventListener('click', (e) => {
+    const custom = document.createElement('input'); custom.id = 'mon-prune-custom'; custom.type = 'number';
+    custom.min = '1'; custom.max = '99'; custom.step = '1'; custom.value = '50'; custom.style.width = '4.5em';
+    custom.title = 'Custom prune percentage (1–99)'; row.appendChild(custom);
+    const customButton = document.createElement('button'); customButton.className = 'btn';
+    customButton.textContent = 'Prune %'; customButton.dataset.custom = '1'; row.appendChild(customButton);
+    const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel'; row.appendChild(cancel);
+    card.append(title, note, row); $('monitor').appendChild(card);
+    row.addEventListener('click', (e) => {
       if (e.target.tagName !== 'BUTTON') return;
-      const cmd = e.target.dataset.cmd; card.remove();
-      if (!cmd) return;
-      try { headlessBridge()?.headlessCommand(cmd, S._monRun); } catch { /* next poll remains authoritative */ }
-      flash(cmd.endsWith('grow') ? 'Growing the background model …' : 'Pruning the background model …', 5000);
+      let percent = e.target.dataset.percent ? Number(e.target.dataset.percent) : 0;
+      if (e.target.dataset.custom) {
+        const keep = readPruneCustom('mon-prune-custom');
+        if (keep == null) {
+          custom.focus(); custom.select(); flash('Enter a whole prune percentage from 1 to 99.', 6000); return;
+        }
+        percent = Math.round((1 - keep) * 100);
+      }
+      const grow = e.target.dataset.grow === '1'; card.remove();
+      if (!grow && !percent) return;
+      const bridge = headlessBridge();
+      try {
+        if (grow) bridge?.headlessCommand('headless-grow', S._monRun);
+        else if (bridge?.headlessPrune) bridge.headlessPrune(S._monRun, percent);
+        else if (percent === 25) bridge?.headlessCommand('headless-prune', S._monRun);
+        else throw new Error('this app build does not support custom background pruning');
+        flash(grow ? 'Growing the background model …' : `Pruning ${percent}% of the background model …`, 5000);
+      } catch (err) { flash(`Could not send prune/grow: ${err.message}`, 7000); }
     });
   });
   $('mon-stop').addEventListener('click', async () => {
@@ -7260,11 +7284,52 @@ async function monitorPoll(now, force = false) {
     if (status.owner === 'service' && !Headless.heartbeatFresh(service)) { showRecovery(runId, status); return; }
     S._monPaused = status.status === 'paused';
     paintMonitorProgress(status, progress);
-    paintMonitorLive(runId, progress);
+    paintMonitorLive(progress);
     syncMonitorButtons();
   } catch (e) { console.warn('[headless] monitor poll failed', e); }
 }
-function paintMonitorLive(runId, progress) {
+async function refreshMonitorPreview() {
+  const runId = S._monRun, button = $('mon-refresh');
+  if (!runId || !button || button.disabled) return;
+  button.disabled = true; button.textContent = 'Rendering …';
+  let before = 0;
+  try {
+    try {
+      const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.json')));
+      if (r.ok) before = Number((await r.json()).at) || 0;
+    } catch { /* first preview */ }
+    const bridge = headlessBridge();
+    if (!bridge) throw new Error('background service bridge is unavailable');
+    bridge.headlessCommand('headless-snapshot', runId);
+    let ready = false;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (S.state !== 'monitor' || S._monRun !== runId) return;
+      try {
+        const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.json')));
+        const meta = r.ok ? await r.json() : null;
+        if (meta && Number(meta.at) > before) { ready = true; break; }
+      } catch { /* snapshot transaction still publishing */ }
+    }
+    if (!ready) throw new Error('preview timed out');
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve; img.onerror = () => reject(new Error('preview image is unreadable'));
+      img.src = Headless.fresh(Headless.runUrl(runId, 'snapshot.png'));
+    });
+    const cv = $('mon-model'), ctx = cv.getContext('2d'), dpr = devicePixelRatio || 1;
+    $('mon-preview').hidden = false;
+    const r = cv.getBoundingClientRect();
+    cv.width = Math.max(1, Math.round(r.width * dpr)); cv.height = Math.max(1, Math.round(r.height * dpr));
+    const f = fitRect(img.width, img.height, cv.width, cv.height, 0);
+    ctx.clearRect(0, 0, cv.width, cv.height); ctx.drawImage(img, f.x, f.y, f.w, f.h);
+    button.textContent = 'Refresh preview';
+  } catch (err) {
+    button.textContent = 'Refresh preview'; flash(`Could not refresh preview: ${err.message}`, 7000);
+  } finally { button.disabled = false; }
+}
+
+function paintMonitorLive(progress) {
   const c = S._monChart;
   if (c && progress) {
     const rows = Array.isArray(progress.scoreHistory) ? progress.scoreHistory : [];
@@ -7280,19 +7345,7 @@ function paintMonitorLive(runId, progress) {
     c.maxIter = progress.maxIters || Math.max(1, progress.iter || 1);
     c.resize(); c.draw();
   }
-  // Service-rendered PNG: near-live visuals with no competing WebGPU owner.
-  const cv = $('mon-model'), ctx = cv && cv.getContext('2d');
-  if (!ctx) return;
-  const img = new Image();
-  img.onload = () => {
-    const dpr = devicePixelRatio || 1, r = cv.getBoundingClientRect();
-    cv.width = Math.max(1, Math.round(r.width * dpr)); cv.height = Math.max(1, Math.round(r.height * dpr));
-    ctx.clearRect(0, 0, cv.width, cv.height);
-    const f = fitRect(img.width, img.height, cv.width, cv.height, 0);
-    ctx.drawImage(img, f.x, f.y, f.w, f.h);
-  };
-  img.src = Headless.fresh(Headless.runUrl(runId, 'snapshot.png'));
-  try { headlessBridge()?.headlessCommand('headless-snapshot', runId); } catch { /* current snapshot is still valid */ }
+
 }
 
 function paintMonitorProgress(status, progress) {

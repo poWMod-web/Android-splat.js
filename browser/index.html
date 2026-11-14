@@ -58,12 +58,13 @@
     <p class="origin" id="mon-sub" hidden></p>
     <div class="xr-capabilities" aria-label="Run status"><span id="mon-state">—</span><span id="mon-iter">—</span><span id="mon-score">—</span><span id="mon-splats">—</span><span id="mon-updated"></span></div>
     <div class="monitor-live-grid">
-      <div class="monitor-preview"><canvas id="mon-model"></canvas><small>Preview updates every few seconds</small></div>
+      <div class="monitor-preview" id="mon-preview" hidden><canvas id="mon-model"></canvas><small>Service-rendered preview</small></div>
       <div class="chartwrap monitor-chartwrap"><canvas id="mon-chart"></canvas><div class="chart-tip" id="mon-chart-tip" hidden></div></div>
     </div>
     <div class="upload" id="mon-live">
       <div class="upload-btns">
         <button class="btn btn-accent" id="mon-pause">Pause</button>
+        <button class="btn btn-outline" id="mon-refresh">Refresh preview</button>
         <button class="btn btn-outline" id="mon-prune">Prune / grow</button>
         <button class="btn btn-outline" id="mon-stop">Stop &amp; continue here</button>
       </div>

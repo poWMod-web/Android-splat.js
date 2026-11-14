@@ -547,6 +547,18 @@ public final class MainActivity extends Activity {
             } catch (Exception ignored) { /* the twin is gone; the files say so */ }
         }
 
+        /** Numeric prune argument is a separate validated bridge method: never
+         * interpolate arbitrary page strings into service JavaScript. */
+        @JavascriptInterface public void headlessPrune(String runId, int percent) {
+            if (!RunFiles.validRunId(runId) || percent < 1 || percent > 99) return;
+            try {
+                startService(new Intent(MainActivity.this, TrainingService.class)
+                        .putExtra("action", "headless-prune")
+                        .putExtra("runId", runId)
+                        .putExtra("prunePercent", percent));
+            } catch (Exception ignored) { /* progress files remain authoritative */ }
+        }
+
         private File captureArchive(String requested) {
             File root = new File(getFilesDir(), "captures");
             if (requested != null && requested.matches("[A-Za-z0-9_-]{1,80}")) {

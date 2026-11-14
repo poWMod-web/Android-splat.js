@@ -10,7 +10,14 @@ const align = readFileSync(new URL('../../app/js/align.js', import.meta.url), 'u
 
 assert.match(headless, /scoreHistory: \(ses\.lossHistory \|\| \[\]\)\.slice\(-400\)/);
 assert.match(app, /new Chart\(\$\('mon-chart'\)/);
-assert.match(app, /snapshot\.png/);
+assert.match(app, /async function refreshMonitorPreview\(\)/);
+assert.match(app, /bridge\.headlessCommand\('headless-snapshot', runId\)/);
+const livePaint = app.slice(app.indexOf('function paintMonitorLive'), app.indexOf('function paintMonitorProgress'));
+assert.doesNotMatch(livePaint, /snapshot|headlessCommand/,
+  'ordinary monitor polling must not render, read, or write a preview');
+assert.match(app, /bridge\.headlessPrune\(S\._monRun, percent\)/);
+assert.match(main, /headlessPrune\(String runId, int percent\)/);
+assert.match(service, /getIntExtra\("prunePercent", 25\)/);
 for (const cmd of ['headless-prune', 'headless-grow']) {
   assert.ok(main.includes(cmd), `${cmd} must cross the Activity bridge`);
   assert.ok(service.includes(cmd), `${cmd} must dispatch in the service`);
