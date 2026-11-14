@@ -70,20 +70,19 @@ assert.match(app, /ses\.useReconstruction\(\{\s*known: !!reconJson\.knownCameras
 assert.match(app, /ses\.useReconstruction\(\{\s*known: !!recon\.knownCameras,/,
   'a continuation should keep the known-camera frame flag');
 
-// The SOG file and camera must receive the SAME world transform. Match
-// arrival-space/main's universal OpenCV-to-PlayCanvas half-turn: branching on
-// semantic "up" changed the browser viewer path without changing SOG bytes.
+// The arrival-space viewer behavior is Browser-only. Android keeps its
+// already-working known-camera y-up mapping and local viewer path.
 assert.match(sessionIo, /knownCameras: !!recon\.known,/,
-  'the recon JSON should still record the known-camera world frame for orbit leveling');
-assert.match(app, /const liteOk = !src\.bytes && src\.url && \(S\._localRun\?\.sog \|\| \/\\\.sog/,
-  'a local blob URL should remain eligible for its saved SOG viewer');
-assert.match(app, /createSogView\(src\.url, \{ radius: reconJson\.sceneRadius \|\| 10 \}\)/,
-  'the lite viewer should use the original coordinate contract');
-assert.match(pcview, /createSogView\(sogUrl, \{ radius = 10 \} = \{\}\)/);
-assert.match(pcview, /v\.entity\.setEulerAngles\(180, 0, 0\)/,
-  'SOG coordinates receive the original world half-turn');
-assert.match(pcview, /const px = C\[0\], py = -C\[1\], pz = -C\[2\]/,
-  'the camera receives the identical world half-turn');
-assert.doesNotMatch(pcview, /yUp/, 'viewer coordinates must not branch away from the SOG asset');
+  'the recon JSON should record the known-camera world frame');
+assert.match(app, /const browserViewer = SHELL === 'browser'/);
+assert.match(app, /\(browserViewer && S\._localRun\?\.sog\) \|\| \/\\\.sog/,
+  'only Browser should recognize its extensionless local blob as a SOG');
+assert.match(app, /const viewOpts = browserViewer[\s\S]*\? \{ radius: reconJson\.sceneRadius \|\| 10 \}[\s\S]*: \{ radius: reconJson\.sceneRadius \|\| 10, yUp: !!reconJson\.knownCameras \}/,
+  'Browser gets upstream coordinates while Android retains known-camera y-up handling');
+assert.match(pcview, /createSogView\(sogUrl, \{ radius = 10, yUp = false \} = \{\}\)/);
+assert.match(pcview, /setEulerAngles\(yUp \? 0 : 180, 0, 0\)/,
+  'Android known-camera models should retain their established entity transform');
+assert.match(pcview, /const s = yUp \? 1 : -1/,
+  'Android camera mapping should retain its established world-frame branch');
 
 console.log('gravity up for known-camera views: passed');

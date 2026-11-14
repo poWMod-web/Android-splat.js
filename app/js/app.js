@@ -4389,7 +4389,10 @@ async function restoreSession(src) {
     // SOG + recon: the lite viewer — the engine renders the compressed splat
     // directly (sorted, WebGL2), nothing decodes to float arrays, and phones
     // without WebGPU can still view. ?nopc forces the trainer view.
-    const liteOk = !src.bytes && src.url && (S._localRun?.sog || /\.sog($|\?)/.test(src.url)) && src.reconUrl &&
+    // Browser-saved SOGs use blob: URLs, so their file extension is gone.
+    // Keep Android's established viewer selection unchanged.
+    const browserViewer = SHELL === 'browser';
+    const liteOk = !src.bytes && src.url && ((browserViewer && S._localRun?.sog) || /\.sog($|\?)/.test(src.url)) && src.reconUrl &&
       !new URLSearchParams(location.search).has('nopc');
     if (liteOk) {
       try {
@@ -4405,7 +4408,10 @@ async function restoreSession(src) {
         }
         await hydrateLocalRunPhotos(reconJson, S._localRun);
         const { createSogView } = await import('./pcview.js');
-        const ses = await createSogView(src.url, { radius: reconJson.sceneRadius || 10 });
+        const viewOpts = browserViewer
+          ? { radius: reconJson.sceneRadius || 10 }
+          : { radius: reconJson.sceneRadius || 10, yUp: !!reconJson.knownCameras };
+        const ses = await createSogView(src.url, viewOpts);
         ses.frames = (reconJson.frames || []).map((f) => ({ ...f }));
         // the Details sheet reads session.recon (cams/points) — same shape
         // the old view-only path built via useReconstruction()
@@ -4430,10 +4436,10 @@ async function restoreSession(src) {
     const { gaussians, reconJson, state } = got;
     await hydrateLocalRunPhotos(reconJson, S._localRun);
     const iter = (state && state.iter) || (reconJson && reconJson.iter) || 0;
-    // Match arrival-space/main: a view-only fallback stays on the main thread.
-    // Moving it to the training worker made the browser viewer depend on an
-    // OffscreenCanvas/WebGPU path that can accept attach yet present no model.
-    const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter), trainWorker: false });
+    // Match arrival-space/main only in the Browser project: its view-only
+    // fallback stays on the main thread. Preserve Android's working viewer.
+    const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter),
+      trainWorker: browserViewer ? false : trainWorkerOpt() });
     if (reconJson) {
       ses.useReconstruction({
         known: !!reconJson.knownCameras,
