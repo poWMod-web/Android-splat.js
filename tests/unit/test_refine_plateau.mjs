@@ -14,51 +14,72 @@ const line = (n, i0, step, p0, slopePerKiter) =>
   Array(n).fill(0).map((_, k) => [i0 + k * step, p0 + (k * step * slopePerKiter) / 1000]);
 const NOW = 10000, W = 1200;
 
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 1.0), NOW, { window: W }), false,
-  'a rising score never plateaus');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.0), NOW, { window: W }), true,
-  'a flat score plateaus');
-const noisyFlat = line(9, NOW - W, 150, 20, 0.0).map((r, i) => [r[0], r[1] + (i % 2 ? 0.35 : -0.35)]);
-assert.equal(scorePlateaued(noisyFlat, NOW, { window: W }), true,
-  'a noisy under-capacity ceiling is still a plateau');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.05), NOW, { window: W }), true,
-  'a crawl (+0.05 dB/kiter) plateaus');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.25), NOW, { window: W }), false,
-  'a climb (+0.25 dB/kiter) does not');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, -0.5), NOW, { window: W }), true,
-  'a falling score trips triage too');
-assert.equal(scorePlateaued(line(3, NOW - W, 400, 20, 0.0), NOW, { window: W }), false,
+const risingRaw = (filtered) => {
+  const mid = Math.floor(filtered.length / 2);
+  const early = [-0.02, -0.01, 0.01, 0.02];
+  const late = [-0.5, -0.25, 0, 0.25, 0.5, 0.65];
+  return filtered.map((r, i) => [r[0], r[1] + (i < mid ? early[i % early.length] : late[(i - mid) % late.length])]);
+};
+const eligible = (filtered, extra = {}) => ({ window: W, rawHistory: risingRaw(filtered), ...extra });
+
+const rising = line(9, NOW - W, 150, 20, 1.0);
+assert.equal(scorePlateaued(rising, NOW, eligible(rising)), false,
+  'rising raw variance cannot interrupt a healthy filtered climb');
+const flat = line(9, NOW - W, 150, 20, 0.0);
+assert.equal(scorePlateaued(flat, NOW, { window: W, rawHistory: flat }), false,
+  'a smooth plateau alone must not trigger growth');
+assert.equal(scorePlateaued(flat, NOW, eligible(flat)), true,
+  'a ZLEMA plateau plus rising raw MAD triggers growth');
+const crawl = line(9, NOW - W, 150, 20, 0.05);
+assert.equal(scorePlateaued(crawl, NOW, eligible(crawl)), true,
+  'a crawl with rising variance triggers growth');
+const climb = line(9, NOW - W, 150, 20, 0.25);
+assert.equal(scorePlateaued(climb, NOW, eligible(climb)), false,
+  'a climb at or above the slope threshold does not trigger growth');
+const falling = line(9, NOW - W, 150, 20, -0.5);
+assert.equal(scorePlateaued(falling, NOW, eligible(falling)), true,
+  'a falling filtered score with rising variance triggers triage');
+const tooFew = line(3, NOW - W, 400, 20, 0.0);
+assert.equal(scorePlateaued(tooFew, NOW, eligible(tooFew)), false,
   'three points are warming up, never a plateau');
-assert.equal(scorePlateaued(line(8, NOW - 200, 25, 20, 0.0), NOW, { window: W }), false,
+const short = line(8, NOW - 200, 25, 20, 0.0);
+assert.equal(scorePlateaued(short, NOW, eligible(short)), false,
   'a window that is not covered is not a plateau');
 assert.equal(scorePlateaued([], NOW), false);
-assert.equal(scorePlateaued([[9000, 20], [9200, NaN], [9400, 20], [9600, 20], [9800, 20], [10000, 20]], NOW, { window: W }), true,
-  'a NaN readout is skipped, not fatal');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.0), NOW - 5000, { window: W }), false,
+const withNan = [[9000, 20], [9200, NaN], [9400, 20], [9600, 20], [9800, 20], [10000, 20]];
+assert.equal(scorePlateaued(withNan, NOW, {
+  window: W, rawHistory: risingRaw(line(7, 9000, 166, 20, 0)),
+}), true, 'a NaN filtered readout is skipped, not fatal');
+assert.equal(scorePlateaued(flat, NOW - 5000, eligible(flat)), false,
   'points past the horizon do not count');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.0), NOW,
-  { window: W, after: NOW - 300 }), false,
+assert.equal(scorePlateaued(flat, NOW, eligible(flat, { after: NOW - 300 })), false,
   'score evidence from before the prior growth must not trigger another growth');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.19), NOW, { window: W }), true,
-  'the default trips under 0.2 dB/kiter');
-assert.equal(scorePlateaued(line(8, NOW - W, 150, 20, 0.21), NOW, { window: W }), false,
+const postGrowth = line(8, NOW - 700, 100, 20, 0.0);
+assert.equal(scorePlateaued(postGrowth, NOW, {
+  window: W, minSpan: 700, after: NOW - 700, rawHistory: risingRaw(postGrowth),
+}), true, 'fresh plateau and rising-variance evidence may trigger after the 700-cycle backoff');
+const under = line(9, NOW - W, 150, 20, 0.19);
+assert.equal(scorePlateaued(under, NOW, eligible(under)), true,
+  'the default trips under 0.2 dB/kiter when raw MAD is rising');
+const over = line(9, NOW - W, 150, 20, 0.21);
+assert.equal(scorePlateaued(over, NOW, eligible(over)), false,
   'the default holds at and above 0.2 dB/kiter');
-const filteredCrawl = line(9, NOW - W, 150, 20, 0.19);
-const risingNoise = filteredCrawl.map((r, i) => [r[0], r[1] + (i % 2 ? 1 : -1) * (i < 4 ? 0.02 : 0.2)]);
-assert.equal(scorePlateaued(filteredCrawl, NOW, { window: W, rawHistory: risingNoise }), true,
-  'increasing raw variance accompanies a filtered under-capacity plateau below 0.2 dB/kiter');
-const healthyFiltered = line(9, NOW - W, 150, 20, 1.0);
-const healthyNoisy = healthyFiltered.map((r, i) => [r[0], r[1] + (i % 2 ? 1 : -1) * (i < 4 ? 0.02 : 0.2)]);
-assert.equal(scorePlateaued(healthyFiltered, NOW, { window: W, rawHistory: healthyNoisy }), false,
-  'increasing noise cannot interrupt a strongly improving score');
+const stableNoiseOffsets = [-0.3, -0.1, 0.1, 0.3];
+const stableNoisy = flat.map((r, i) => [r[0], r[1] + stableNoiseOffsets[i % stableNoiseOffsets.length]]);
+assert.equal(scorePlateaued(flat, NOW, { window: W, rawHistory: stableNoisy }), false,
+  'variance above the floor but not materially rising must not trigger growth');
 
 // ---- wiring pins: growth follows recovery and robust plateaus --------------
 assert.match(sessionSource, /export function scorePlateaued\(history, nowIter/,
   'the detector is exported for tests and reuse');
-assert.doesNotMatch(sessionSource, /stdDev <= maxStdDev/,
-  'noise is diagnostic, not a hard veto on under-capacity plateaus');
+assert.match(sessionSource, /if \(!\(robustSlope < slope\)\) return false;[\s\S]*return noiseRising;/,
+  'growth must require both the ZLEMA plateau and rising raw MAD');
+assert.match(sessionSource, /const convergenceGap = this\.opts\.plateauMinGap \?\? 700;/,
+  'the post-growth backoff defaults to at least 700 iterations');
 assert.match(sessionSource, /sinceRefine >= convergenceGap/,
-  'a full convergence gap must elapse after the prior growth');
+  'the convergence gap must elapse after the prior growth');
+assert.match(sessionSource, /minSpan: \(trainer\.lastRefine \|\| 0\) > 0 \? convergenceGap : plateauWindow \* 0\.75/,
+  'post-growth fresh evidence uses the same 700-cycle minimum');
 assert.match(sessionSource, /const recovered = this\._refineRecoveryTarget == null[\s\S]*after: trainer\.lastRefine \|\| 0/,
   'the next plateau needs recovery to its reference and fresh evidence');
 assert.match(sessionSource, /if \(trainer\.iter >= plateauWindow && plateau\) \{/,
@@ -119,9 +140,9 @@ const triggerHist = [];
 spiky.forEach(([i, v], k) => { if (k >= SKIP_FIRST) triggerHist.push([i, incrFeed.update(v)]); });
 assert.deepEqual(triggerHist, new EngineZLEMA().series(spiky.slice(SKIP_FIRST)),
   'incremental per-push updates should equal the graph fresh pass');
-assert.equal(scorePlateaued(spiky, NOW, { window: W }), true,
-  'raw transient noise may resemble an under-capacity plateau');
-assert.equal(scorePlateaued(triggerHist, NOW, { window: W }), false,
-  'the filtered slope should see through them to the healthy climb');
+assert.equal(scorePlateaued(spiky, NOW, { window: W }), false,
+  'score shape alone cannot trigger without a separate rising-variance history');
+assert.equal(scorePlateaued(triggerHist, NOW, { window: W, rawHistory: spiky }), false,
+  'the filtered slope and full-window requirements should reject this short transient');
 
 console.log('plateau-driven refine + 1M mobile ceiling + overflow warnings: passed');

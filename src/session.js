@@ -232,13 +232,12 @@ class Emitter {
   }
 }
 
-/** Robust plateau test for score-driven refinement. A capacity-starved model can
- * oscillate around a flat ceiling, so raw variance is a POSITIVE saturation
- * signal rather than a veto. The filtered curve catches ordinary stalls; a
- * rising raw MAD catches the observed noisy-under-capacity plateau before the
- * filter has become perfectly flat. Recovery is gated separately below. */
+/** Robust plateau test for score-driven refinement. Growth requires BOTH a
+ * filtered-score plateau and materially rising raw variance: the ZLEMA proves
+ * progress has stalled while raw MAD proves the fixed-capacity fit is becoming
+ * unstable. Recovery is gated separately below. */
 export function scorePlateaued(history, nowIter, {
-  window = 1200, slope = 0.2, noisySlope = 0.2, minPoints = 4,
+  window = 1200, slope = 0.2, minPoints = 4, minSpan = window * 0.75,
   after = -Infinity, rawHistory = null, noiseRatio = 1.35, noiseFloor = 0.08,
 } = {}) {
   if (!Array.isArray(history) || !history.length) return false;
@@ -247,17 +246,19 @@ export function scorePlateaued(history, nowIter, {
     .filter(([i, p]) => Number.isFinite(i) && Number.isFinite(p) && i >= floor && i <= nowIter)
     .sort((a, b) => a[0] - b[0]);
   const pts = take(history);
-  if (pts.length < minPoints || pts.at(-1)[0] - pts[0][0] < window * 0.75) return false;
+  if (pts.length < minPoints || pts.at(-1)[0] - pts[0][0] < minSpan) return false;
   const medianValues = (a) => { const v = a.map((p) => p[1]).sort((x, y) => x - y); return v[v.length >> 1]; };
   const q = Math.max(2, Math.floor(pts.length / 3));
   const early = pts.slice(0, q), late = pts.slice(-q);
   const dt = late.reduce((n, p) => n + p[0], 0) / q - early.reduce((n, p) => n + p[0], 0) / q;
   if (!(dt > 0)) return false;
   const robustSlope = (medianValues(late) - medianValues(early)) * 1000 / dt;
-  if (robustSlope < slope) return true;
+  // Growth requires BOTH signals: a filtered-score plateau and materially
+  // rising raw variance. A smooth plateau is allowed to keep converging.
+  if (!(robustSlope < slope)) return false;
 
   const raw = take(rawHistory);
-  if (raw.length < 6 || raw.at(-1)[0] - raw[0][0] < window * 0.75) return false;
+  if (raw.length < 6 || raw.at(-1)[0] - raw[0][0] < minSpan) return false;
   const mid = Math.floor(raw.length / 2);
   const mad = (rows) => {
     const m = medianValues(rows);
@@ -266,7 +267,7 @@ export function scorePlateaued(history, nowIter, {
   const earlyNoise = mad(raw.slice(0, mid)), lateNoise = mad(raw.slice(mid));
   const noiseRising = lateNoise >= noiseFloor &&
     lateNoise >= Math.max(earlyNoise * noiseRatio, earlyNoise + 0.03);
-  return noiseRising && robustSlope < noisySlope;
+  return noiseRising;
 }
 
 
@@ -1747,13 +1748,12 @@ export class Session {
 
       const tEnc = performance.now() - t0;
 
-      // Score-driven refinement: ordinary filtered-score plateaus and the
-      // rising raw variance of an under-capacity plateau are both eligible.
-      // Evidence is reset at each growth, then a complete fresh window must
-      // accumulate. There is no fixed cadence and no ever-growing delay.
+      // Score-driven refinement requires a filtered-score plateau AND rising
+      // raw variance. Evidence is reset at each growth, then fresh evidence
+      // must accumulate. Backoff is fixed, never exponentially increasing.
       const sinceRefine = trainer.iter - (trainer.lastRefine || 0);
       const plateauWindow = this.opts.plateauWindow ?? 1200;
-      const convergenceGap = this.opts.plateauMinGap ?? plateauWindow;
+      const convergenceGap = this.opts.plateauMinGap ?? 700;
       const currentScore = this.zlemaHistory.length ? this.zlemaHistory.at(-1)[1] : null;
       const recovered = this._refineRecoveryTarget == null ||
         (Number.isFinite(currentScore) && currentScore >= this._refineRecoveryTarget - (this.opts.plateauRecoverySlack ?? 0.05));
@@ -1763,8 +1763,11 @@ export class Session {
           sinceRefine >= convergenceGap) {
         plateau = scorePlateaued(this.zlemaHistory, trainer.iter, {
           window: plateauWindow,
+          // First growth observes 75% of the 1,200-cycle window. After a
+          // growth, the explicit 700-cycle backoff is also the fresh-evidence
+          // span; recovery to the pre-growth score remains mandatory.
+          minSpan: (trainer.lastRefine || 0) > 0 ? convergenceGap : plateauWindow * 0.75,
           slope: this.opts.plateauSlope ?? 0.2,
-          noisySlope: this.opts.plateauNoisySlope ?? 0.2,
           rawHistory: this.lossHistory,
           noiseRatio: this.opts.plateauNoiseRatio ?? 1.35,
           noiseFloor: this.opts.plateauNoiseFloor ?? 0.08,
