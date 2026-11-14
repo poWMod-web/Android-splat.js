@@ -6,6 +6,7 @@ const headless = readFileSync(new URL('../../app/js/train-headless.js', import.m
 const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
 const service = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
 const session = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
+const sessionIo = readFileSync(new URL('../../app/js/session_io.js', import.meta.url), 'utf8');
 const align = readFileSync(new URL('../../app/js/align.js', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../../app/css/app.css', import.meta.url), 'utf8');
 
@@ -75,5 +76,15 @@ assert.match(css, /#monitor \{ width: 100%; max-width: none; height: calc\(100dv
 assert.match(app, /checkpointRun\('align'\)/);
 assert.match(session, /async updateCameraPose\(ci, R, t\)/);
 assert.match(session, /this\.recon\?\.cams\?\.find/);
+assert.match(app, /No suitable alignment for frame/);
+assert.match(app, /remove\.textContent = 'Remove image'/);
+assert.match(app, /S\.session\.excludeCameraImage\(cam\.ci\)/,
+  'failed automatic alignment should offer removal from the trainable camera set');
+assert.match(session, /async excludeCameraImage\(ci\)[\s\S]*rc\.excluded = true[\s\S]*_commitSplit\(excluded\)/,
+  'image removal should exclude the live trainer and mark the reconstruction');
+assert.match(app, /state: rc\?\.excluded \? 'removed'/,
+  'restored removed images should remain visibly excluded');
+assert.match(sessionIo, /\.\.\.\(c\.excluded \? \{ excluded: true \} : \{\}\)/,
+  'checkpoints should persist explicit image removal');
 
 console.log('background monitor controls + durable selected-frame alignment: passed');

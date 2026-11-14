@@ -3102,7 +3102,8 @@ function buildSceneFromSession() {
         i, ci: b.ci, R: b.rc.R, t: b.rc.t, f: b.rc.f,
         w, h, cx: w / 2, cy: h / 2,
         url: p.url, name: p.name,
-        state: b.ci === ses.holdout || (ses.testCams && ses.testCams.includes(b.ci)) ? 'holdout' : 'placed',
+        state: b.rc.excluded ? 'removed' :
+          (b.ci === ses.holdout || (ses.testCams && ses.testCams.includes(b.ci)) ? 'holdout' : 'placed'),
         feats: (S.feats.get(b.rc.imgIdx) || {}).n || 0,
         psnr: null, pano: true,
       };
@@ -3121,7 +3122,8 @@ function buildSceneFromSession() {
         Object.assign(c, {
           R: m.R, t: m.t, f: rc ? rc.f : (m.f || 1000),
           w, h, cx: w / 2, cy: h / 2,
-          state: ci === ses.holdout || (ses.testCams && ses.testCams.includes(ci)) ? 'holdout' : 'placed',
+          state: rc?.excluded ? 'removed' :
+            (ci === ses.holdout || (ses.testCams && ses.testCams.includes(ci)) ? 'holdout' : 'placed'),
           ci,
           feats: (S.feats.get(m.imgIdx) || {}).n || 0,
         });
@@ -6448,6 +6450,32 @@ function showAlignmentChoices(i, choices) {
   });
 }
 
+function showUnalignedFrameRemoval(i, why) {
+  document.getElementById('align-options')?.remove();
+  const card = document.createElement('div'); card.className = 'upcard'; card.id = 'align-options';
+  const title = document.createElement('b'); title.textContent = `No suitable alignment for frame ${i + 1}`;
+  const note = document.createElement('span'); note.className = 'sog-status'; note.textContent = why;
+  const row = document.createElement('div'); row.className = 'row';
+  const keep = document.createElement('button'); keep.className = 'btn linkish'; keep.textContent = 'Keep image';
+  const remove = document.createElement('button'); remove.className = 'btn btn-accent'; remove.textContent = 'Remove image';
+  row.append(keep, remove); card.append(title, note, row); $('stage').appendChild(card);
+  keep.addEventListener('click', () => card.remove());
+  remove.addEventListener('click', async () => {
+    if (!confirm(`Remove frame ${i + 1} from this model? The original capture remains saved on this device.`)) return;
+    card.remove(); S._aligning = true; renderControls();
+    try {
+      const cam = S.scene?.cams?.[i];
+      if (!cam || cam.ci < 0) throw new Error('image is not part of the trainable camera set');
+      await S.session.excludeCameraImage(cam.ci);
+      cam.state = 'removed'; cam.psnr = null;
+      await checkpointRun('align').catch((e) => console.warn('[remove-image] checkpoint', e));
+      leaveFrame(); paintStrip(); renderControls();
+      flash(`Frame ${i + 1} removed from training. The original capture was kept.`, 7000);
+    } catch (err) { flash(`Could not remove the image: ${err.message}`, 8000); }
+    finally { S._aligning = false; renderControls(); }
+  });
+}
+
 async function alignSelectedFrame() {
   const i = S.sel, cam = S.scene?.cams?.[i];
   if (!cam?.R || S._aligning) return;
@@ -6458,13 +6486,15 @@ async function alignSelectedFrame() {
     const cs = await adjacentPoseCandidates(S.photos, S.scene.cams, i);
     const choices = alignmentChoices(cs, S.scene.cams, i);
     if (!choices.length) {
-      flash('Automatic alignment could not find a consistent adjacent-image placement. No pose was changed.', 8000);
+      showUnalignedFrameRemoval(i,
+        'Automatic matching found no consistent adjacent-image placement. Keep the image unchanged, or remove it from this model.');
       return;
     }
     showAlignmentChoices(i, choices);
   } catch (err) {
     console.warn('[align]', err);
-    flash(`Automatic alignment could not be validated: ${err.message}. No pose was changed.`, 8000);
+    showUnalignedFrameRemoval(i,
+      `Automatic alignment could not be validated (${err.message}). Keep the image unchanged, or remove it from this model.`);
   } finally { S._aligning = false; renderControls(); }
 }
 
@@ -6614,7 +6644,8 @@ function paintStrip() {
     b.dataset.live = i === active ? '1' : '0';
     b.dataset.state = c ? c.state : 'placed';
     const tag = b.querySelector('.frame-tag');
-    const t = c && c.state === 'holdout' ? 'held' : c && c.state === 'unplaced' ? 'out' : null;
+    const t = c && c.state === 'holdout' ? 'held' :
+      c && c.state === 'removed' ? 'removed' : c && c.state === 'unplaced' ? 'out' : null;
     tag.hidden = !t;
     if (t) { tag.dataset.t = c.state; tag.textContent = t; }
     const bar = b.querySelector('.frame-bar i');

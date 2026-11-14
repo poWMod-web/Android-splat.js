@@ -164,6 +164,7 @@ export function buildReconJson(S) {
       R: r6(c.R), t: r6(c.t), f: +c.f.toPrecision(7),
       ...(c.fy != null && c.fy !== c.f ? { fy: +c.fy.toPrecision(7) } : {}),
       cx: c.cx, cy: c.cy,
+      ...(c.excluded ? { excluded: true } : {}),
     })),
     frames: ses.frames.map((f) => ({ name: f.name, fw: f.fw, fh: f.fh, tw: f.tw, th: f.th,
       // the file's own pixel size (decodeFrames srcW/srcH): Full-size

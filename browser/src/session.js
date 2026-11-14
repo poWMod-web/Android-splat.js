@@ -232,20 +232,18 @@ class Emitter {
   }
 }
 
-/** Robust plateau test for score-driven refinement. Growth requires BOTH a
- * filtered-score plateau and materially rising raw variance: the ZLEMA proves
- * progress has stalled while raw MAD proves the fixed-capacity fit is becoming
- * unstable. Recovery is gated separately below. */
+/** Robust plateau test for score-driven refinement. The filtered ZLEMA slope
+ * is the sole convergence signal; post-growth score recovery is gated
+ * separately in the training loop below. */
 export function scorePlateaued(history, nowIter, {
   window = 1200, slope = 0.2, minPoints = 4, minSpan = window * 0.75,
-  after = -Infinity, rawHistory = null, noiseRatio = 1.35, noiseFloor = 0.08,
+  after = -Infinity,
 } = {}) {
   if (!Array.isArray(history) || !history.length) return false;
   const floor = Math.max(nowIter - window, after);
-  const take = (rows) => (Array.isArray(rows) ? rows : [])
+  const pts = history
     .filter(([i, p]) => Number.isFinite(i) && Number.isFinite(p) && i >= floor && i <= nowIter)
     .sort((a, b) => a[0] - b[0]);
-  const pts = take(history);
   if (pts.length < minPoints || pts.at(-1)[0] - pts[0][0] < minSpan) return false;
   const medianValues = (a) => { const v = a.map((p) => p[1]).sort((x, y) => x - y); return v[v.length >> 1]; };
   const q = Math.max(2, Math.floor(pts.length / 3));
@@ -253,21 +251,7 @@ export function scorePlateaued(history, nowIter, {
   const dt = late.reduce((n, p) => n + p[0], 0) / q - early.reduce((n, p) => n + p[0], 0) / q;
   if (!(dt > 0)) return false;
   const robustSlope = (medianValues(late) - medianValues(early)) * 1000 / dt;
-  // Growth requires BOTH signals: a filtered-score plateau and materially
-  // rising raw variance. A smooth plateau is allowed to keep converging.
-  if (!(robustSlope < slope)) return false;
-
-  const raw = take(rawHistory);
-  if (raw.length < 6 || raw.at(-1)[0] - raw[0][0] < minSpan) return false;
-  const mid = Math.floor(raw.length / 2);
-  const mad = (rows) => {
-    const m = medianValues(rows);
-    return medianValues(rows.map(([i, p]) => [i, Math.abs(p - m)]));
-  };
-  const earlyNoise = mad(raw.slice(0, mid)), lateNoise = mad(raw.slice(mid));
-  const noiseRising = lateNoise >= noiseFloor &&
-    lateNoise >= Math.max(earlyNoise * noiseRatio, earlyNoise + 0.03);
-  return noiseRising;
+  return robustSlope < slope;
 }
 
 
@@ -976,7 +960,11 @@ export class Session {
     const group = this.trainer.camMeta.map((m, i) => (this.recon && this.recon.cams && this.recon.cams[i] && this.recon.cams[i].crop) ? 1 : 0);
     const medOf = (g) => { const v = sh.filter((x, i) => group[i] === g && (!inLoss || inLoss[i])).sort((a, b) => a - b); return v.length ? v[v.length >> 1] : 0; };
     const med = [medOf(0), medOf(1)];
-    const excluded = new Set();
+    // Explicit removals survive checkpoints and handoffs on the reconstruction
+    // camera. Automatic blur/test exclusions are recomputed around them.
+    const excluded = new Set(this.trainer.camMeta
+      .map((m, ci) => this.recon?.cams?.find((c) => c.imgIdx === m.imgIdx)?.excluded ? ci : -1)
+      .filter((ci) => ci >= 0));
     const blurry = [0, 0];
     // known cameras (useKnownCameras) are mostly renders: their low "sharpness" is a thin
     // object seen edge-on, not motion blur — 16 of 180 sharp renders went out (2026-10-21)
@@ -1289,6 +1277,26 @@ export class Session {
     } finally { if (wasTraining) this.start(); }
   }
 
+  /** Remove an unsuitable source image from loss/evaluation without rebuilding
+   * the model. All camera entries backed by that decoded image are excluded;
+   * the reconstruction marker makes the removal survive checkpoints. */
+  async excludeCameraImage(ci) {
+    const trainer = this.trainer;
+    const selected = trainer?.camMeta?.[ci];
+    if (!selected) throw new Error('camera is not trainable');
+    const imgIdx = selected.imgIdx;
+    const removed = trainer.camMeta.map((m, i) => m.imgIdx === imgIdx ? i : -1).filter((i) => i >= 0);
+    const wasTraining = await this.pauseAndDrain();
+    try {
+      for (const rc of this.recon?.cams || []) if (rc.imgIdx === imgIdx) rc.excluded = true;
+      const excluded = new Set([...(trainer.excluded || []), ...removed]);
+      if (removed.includes(this.holdout)) this.holdout = -1;
+      this.testCams = (this.testCams || []).filter((i) => !removed.includes(i));
+      await this._commitSplit(excluded);
+    } finally { if (wasTraining) this.start(); }
+    return removed;
+  }
+
   /** Manual growth pass, any time: one immediate refine (relocate the dead
    *  + grow into the highest-error donors) outside the schedule — the
    *  Prune/Grow button's other half. Pure growth: one refine, no cull —
@@ -1383,7 +1391,7 @@ export class Session {
     this._fences = [];
     this._ips = null;
     this._thrT = null;
-    this._statsGap = 2000;
+    this._statsGap = 6000;
     this._lastStats = performance.now();
     this._metricsLock = null;    // readbacks on the dead device never resolve
     this._instantChecked = false;   // the fresh device re-proves its fences
@@ -1748,9 +1756,9 @@ export class Session {
 
       const tEnc = performance.now() - t0;
 
-      // Score-driven refinement requires a filtered-score plateau AND rising
-      // raw variance. Evidence is reset at each growth, then fresh evidence
-      // must accumulate. Backoff is fixed, never exponentially increasing.
+      // Score-driven refinement requires a filtered-score plateau. Evidence
+      // is reset at each growth, then fresh evidence must accumulate and the
+      // score must recover from the growth dip. Backoff is fixed.
       const sinceRefine = trainer.iter - (trainer.lastRefine || 0);
       const plateauWindow = this.opts.plateauWindow ?? 1200;
       const convergenceGap = this.opts.plateauMinGap ?? 700;
@@ -1768,9 +1776,6 @@ export class Session {
           // span; recovery to the pre-growth score remains mandatory.
           minSpan: (trainer.lastRefine || 0) > 0 ? convergenceGap : plateauWindow * 0.75,
           slope: this.opts.plateauSlope ?? 0.2,
-          rawHistory: this.lossHistory,
-          noiseRatio: this.opts.plateauNoiseRatio ?? 1.35,
-          noiseFloor: this.opts.plateauNoiseFloor ?? 0.08,
           after: trainer.lastRefine || 0,
         });
       }
@@ -1839,7 +1844,7 @@ export class Session {
 
       const now = performance.now();
       let tMet = 0;
-      if (now - this._lastStats > (this._statsGap ?? 2000)) {
+      if (now - this._lastStats > (this._statsGap ?? 6000)) {
         const m0 = performance.now();
         await this._emitMetrics();
         tMet = performance.now() - m0;
@@ -2017,12 +2022,12 @@ export class Session {
       m.psnrHold = this._lastHold;
     }
     // The readbacks above drain every queued batch first — seconds on a slow
-    // GPU. Pace the next readout from COMPLETION and by what this one cost,
-    // or a fixed 2s cadence turns into back-to-back queue drains.
+    // GPU. Start the next fixed six-second accumulation interval only after
+    // this readout completes, so plotting never causes back-to-back drains.
     const end = performance.now();
     this._lastStats = end;
     this._itersAtStats = trainer.iter;
-    this._statsGap = Math.min(8000, Math.max(2000, (end - tRead) * 2.5));
+    this._statsGap = 6000;
     // a multi-second drain means the loop submitted faster than the GPU
     // drains — the backlog instant fences hide everywhere else. Without a
     // batch timer there is nothing else to pace off, so stay conservative
