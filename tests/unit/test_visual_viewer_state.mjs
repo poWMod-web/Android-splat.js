@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
+const viewport = readFileSync(new URL('../../app/js/viewport.js', import.meta.url), 'utf8');
+const browserViewport = readFileSync(new URL('../../browser/app/js/viewport.js', import.meta.url), 'utf8');
 const render = app.slice(app.indexOf('function renderControls()'), app.indexOf('/** The local-run viewer'));
 const toggle = app.slice(app.indexOf('function toggleTrainingVisuals()'), app.indexOf('// the OAuth popup'));
 const continuation = app.slice(app.indexOf('async function continueLocalRun'), app.indexOf('/** Resume from done'));
@@ -12,5 +14,9 @@ assert.match(toggle, /syncTrainingVisualsControl\(\);\s*renderControls\(\);/,
   'hiding visuals must repaint controls immediately');
 assert.match(continuation, /viewOnly \? 'Loading model …' : 'Preparing to continue training …'/,
   'view-only checkpoint loading must not claim training is resuming');
+for (const [name, source] of [['app', viewport], ['browser', browserViewport]]) {
+  assert.match(source, /if \(o\.model\) s \*= 0\.1/,
+    `${name}: camera pyramids over the training model must render at 10% scale`);
+}
 
 console.log('training visual controls + view-only messaging: passed');
