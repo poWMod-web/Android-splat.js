@@ -24,14 +24,18 @@ assert.match(source, /else if \(autoCaptureRunning\) shutterView\.setLabel\("Sto
   'a running auto capture should offer Stop on the center button');
 assert.match(source, /else shutterView\.setLabel\("Start", "Start auto-capture"\);/,
   'an armed auto capture should offer Start on the center button');
-assert.match(source, /boolean firstCaptureReady = firstCaptureTrackingReady\(frame\)[\s\S]*if \(manualPending \|\| autoDue\)[\s\S]*if \(firstCaptureReady\)[\s\S]*capture\(frame\)/,
-  'manual and automatic first captures should wait for positional tracking warm-up');
-assert.match(source, /FIRST_CAPTURE_WARMUP_MS = 2000L[\s\S]*FIRST_CAPTURE_MIN_REFERENCES = 24/,
-  'the first image should wait for continuous tracking and a useful ARCore reference set');
+assert.match(source, /boolean earlyCaptureReady = earlyCaptureTrackingReady\(frame\)[\s\S]*if \(manualPending \|\| autoDue\)[\s\S]*if \(earlyCaptureReady\)[\s\S]*capture\(frame\)/,
+  'manual and automatic opening captures should wait for positional tracking warm-up');
+assert.match(source, /FIRST_CAPTURE_WARMUP_MS = 8000L[\s\S]*FIRST_CAPTURE_FALLBACK_MS = 12000L[\s\S]*SECOND_CAPTURE_SETTLE_MS = 3000L[\s\S]*FIRST_CAPTURE_MIN_REFERENCES = 40/,
+  'the first two images should receive a substantial ARCore convergence window');
 assert.match(source, /frame\.acquirePointCloud\(\)[\s\S]*firstTrackingReferences = Math\.max[\s\S]*elapsed >= FIRST_CAPTURE_FALLBACK_MS/,
   'pre-capture tracking should collect references continuously with a bounded fallback for texture-poor scenes');
 assert.match(source, /keep manual\/first-auto requests pending/,
   'a shutter press during warm-up must remain armed rather than being discarded');
+assert.match(source, /arSession\.createAnchor\(pose\)[\s\S]*frameAnchors\.add\(anchor\)/,
+  'captured poses should remain attached to ARCore map refinement');
+assert.match(source, /refreshCapturedAnchorPoses\(\)[\s\S]*anchor\.getPose\(\)\.toMatrix[\s\S]*transform_matrix/,
+  'export should replace early shutter snapshots with the latest tracked anchor poses');
 assert.match(source, /distanceSinceCapture \+= distance[\s\S]*return distanceSinceCapture \+ 1e-6f >= spacingMeters/);
 assert.match(source, /void captured\(float\[\] position\)[\s\S]*distanceSinceCapture = 0f/);
 console.log('native ARCore distance auto-capture UI and 10 cm default: passed');

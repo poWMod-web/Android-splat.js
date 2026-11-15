@@ -170,8 +170,10 @@ assert.match(monitorHtml, /id="btn-go-background"[\s\S]*Start in background/,
   'the training configuration should offer a direct background start');
 assert.match(app, /backgroundStart\.addEventListener\('click'[\s\S]*S\.startInBackground = true[\s\S]*btn-go/,
   'direct background start should reuse the validated reconstruction configuration path');
-assert.match(app, /async function startNewRunInBackground\(\)[\s\S]*await secureFileCheckpoint\(\)[\s\S]*S\.session\.dispose\(\)[\s\S]*headlessCommand\('headless-start', runId\)/,
-  'direct background start must secure the initial state and release the Activity GPU before starting the service');
+assert.match(app, /async function startNewRunInBackground\(\)[\s\S]*await secureFileCheckpoint\(\)[\s\S]*S\.session\.dispose\(\)[\s\S]*headlessCommand\('headless-start', runId\)[\s\S]*enterMonitor\(runId\)/,
+  'direct background start must secure state, release the Activity GPU, and start the service before monitoring it');
+assert.match(app, /androidNotifStart\(\);\s*stageHeadlessRun\(\)/,
+  'direct background startup should establish notification permission and foreground-service status before transfer');
 assert.match(main, /action\.equals\("headless-start"\)[\s\S]*startForegroundService\(intent\)/,
   'an explicit background restart should create a foreground service safely');
 assert.match(svc, /case "headless-start"[\s\S]*restartHeadless\(runId\)[\s\S]*bootHeadlessNow\(runId, true\)/,

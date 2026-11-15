@@ -36,8 +36,14 @@ assert.match(source, /Automatically[\s\S]*Manually/,
   'Align should offer automatic and manual modes');
 assert.match(source, /targetPoints\.length < 5[\s\S]*Place at least 5 points/,
   'the alignment image must receive five points before reference selection');
-assert.match(source, /Hold and drag for 5× slower crosshair movement/,
-  'the editor should explain its precision movement and loupe interaction');
+assert.match(source, /another\.textContent = 'Add new point'[\s\S]*if \(!state\.armed\)[\s\S]*Add new point/,
+  'each landmark should require an explicit Add new point action');
+assert.match(source, /Hold and drag for 2× slower crosshair movement[\s\S]*\* \.5/,
+  'the editor should explain and implement half-speed precision movement');
+assert.match(source, /bitmap\.width > bitmap\.height[\s\S]*rotate\(Math\.PI \/ 2\)[\s\S]*portraitRotated/,
+  'landscape camera buffers should be displayed upright in portrait orientation');
+assert.match(source, /wasTraining[\s\S]*S\.session\.pause\(\)[\s\S]*manual-aligning/,
+  'manual alignment should pause training and hide its control hub');
 assert.match(source, /manualPoseFromCorrespondences\([\s\S]*cloud: S\.scene\.xyz/,
   'Finish should solve against registered cameras and the reconstruction cloud');
 

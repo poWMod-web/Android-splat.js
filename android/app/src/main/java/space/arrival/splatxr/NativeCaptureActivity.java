@@ -42,6 +42,7 @@ import com.google.ar.core.ArCoreApk;
 import com.google.ar.core.Camera;
 import com.google.ar.core.CameraConfig;
 import com.google.ar.core.CameraConfigFilter;
+import com.google.ar.core.Anchor;
 import com.google.ar.core.Config;
 import com.google.ar.core.Frame;
 import com.google.ar.core.CameraIntrinsics;
@@ -599,12 +600,17 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         private final Map<String, CoveragePoint> coverage = new HashMap<>();
         private final Map<String, SeedPoint> seeds = new HashMap<>();
         private final List<JSONObject> frames = new ArrayList<>();
+        // Anchors retain ARCore's map refinements after shutter time. Before
+        // export their latest poses replace the early frame snapshots.
+        private final List<Anchor> frameAnchors = new ArrayList<>();
         private final List<CaptureViewpoint> viewpoints = new ArrayList<>();
         private final TravelCaptureTrigger travelTrigger = new TravelCaptureTrigger(0.10f);
-        private static final long FIRST_CAPTURE_WARMUP_MS = 2000L;
-        private static final long FIRST_CAPTURE_FALLBACK_MS = 5000L;
-        private static final int FIRST_CAPTURE_MIN_REFERENCES = 24;
+        private static final long FIRST_CAPTURE_WARMUP_MS = 8000L;
+        private static final long FIRST_CAPTURE_FALLBACK_MS = 12000L;
+        private static final long SECOND_CAPTURE_SETTLE_MS = 3000L;
+        private static final int FIRST_CAPTURE_MIN_REFERENCES = 40;
         private long firstTrackingAtMs;
+        private long firstCaptureAtMs;
         private long lastWarmupNoticeAtMs;
         private int firstTrackingReferences;
         private Session arSession;
@@ -684,7 +690,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 setTrackingTelemetry(tracking);
                 if (tracking) {
                     updateGroundPlane();
-                    boolean firstCaptureReady = firstCaptureTrackingReady(frame);
+                    boolean earlyCaptureReady = earlyCaptureTrackingReady(frame);
                     float[] position = frame.getCamera().getPose().getTranslation();
                     boolean firstAutoDue = autoCaptureEnabled && autoCaptureRunning && autoFirstCapturePending;
                     boolean autoDue = autoCaptureEnabled && autoCaptureRunning &&
@@ -692,7 +698,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                     if (!autoCaptureEnabled || !autoCaptureRunning) cloudRenderer.breakTravelContinuity();
                     boolean manualPending = captureRequested.get();
                     if (manualPending || autoDue) {
-                        if (firstCaptureReady) {
+                        if (earlyCaptureReady) {
                             boolean manualDue = captureRequested.getAndSet(false);
                             boolean saved = (manualDue || autoDue) && capture(frame);
                             if (firstAutoDue && saved) autoFirstCapturePending = false;
@@ -716,12 +722,12 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             }
         }
 
-        /** ARCore tracks from session start, not from the shutter. Before the
-         * first saved frame, give its visual-inertial map time to accumulate a
-         * useful positional reference set. Recorded poses are snapshots and do
-         * not receive ARCore's later map corrections retroactively. */
-        private boolean firstCaptureTrackingReady(Frame frame) {
-            if (!frames.isEmpty()) return true;
+        /** ARCore tracks from session start, not from the shutter. Stabilize
+         * its visual-inertial map before frame one and keep frame two out of
+         * the same startup instant. Captured anchors receive later map
+         * refinements and are sampled again when the dataset is exported. */
+        private boolean earlyCaptureTrackingReady(Frame frame) {
+            if (frames.size() >= 2) return true;
             long now = android.os.SystemClock.elapsedRealtime();
             if (firstTrackingAtMs == 0L) firstTrackingAtMs = now;
             PointCloud cloud = null;
@@ -737,17 +743,26 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
             } catch (Exception ignored) { /* time fallback avoids blocking texture-poor scenes */ }
             finally { if (cloud != null) cloud.release(); }
             long elapsed = now - firstTrackingAtMs;
-            return (elapsed >= FIRST_CAPTURE_WARMUP_MS &&
-                    firstTrackingReferences >= FIRST_CAPTURE_MIN_REFERENCES) ||
-                    elapsed >= FIRST_CAPTURE_FALLBACK_MS;
+            if (frames.isEmpty()) {
+                return (elapsed >= FIRST_CAPTURE_WARMUP_MS &&
+                        firstTrackingReferences >= FIRST_CAPTURE_MIN_REFERENCES) ||
+                        elapsed >= FIRST_CAPTURE_FALLBACK_MS;
+            }
+            return firstCaptureAtMs > 0L && now - firstCaptureAtMs >= SECOND_CAPTURE_SETTLE_MS;
         }
 
         private void showWarmupStatus() {
             long now = android.os.SystemClock.elapsedRealtime();
             if (now - lastWarmupNoticeAtMs < 500L) return;
             lastWarmupNoticeAtMs = now;
-            showStatus("Stabilizing AR tracking before the first photo… Move slowly around the subject (" +
-                    firstTrackingReferences + " positional references).");
+            if (frames.isEmpty()) {
+                showStatus("Stabilizing AR tracking before the first photo… Move slowly around the subject (" +
+                        firstTrackingReferences + " positional references).");
+            } else {
+                long left = Math.max(0L, SECOND_CAPTURE_SETTLE_MS - (now - firstCaptureAtMs));
+                showStatus("Letting ARCore refine the opening map before photo 2… " +
+                        String.format(Locale.US, "%.1f s", left / 1000f));
+            }
         }
 
         private void resetFirstCaptureTracking() {
@@ -984,7 +999,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 item.put("fl_x", focal[0]); item.put("fl_y", focal[1]);
                 item.put("cx", principal[0]); item.put("cy", principal[1]);
                 item.put("w", imageSize[0]); item.put("h", imageSize[1]);
-                frames.add(item);
+                Anchor anchor = arSession.createAnchor(pose);
+                frames.add(item); frameAnchors.add(anchor);
+                if (frames.size() == 1) firstCaptureAtMs = android.os.SystemClock.elapsedRealtime();
                 viewpoints.add(new CaptureViewpoint(matrix, focal[0], focal[1], principal[0], principal[1], imageSize[0], imageSize[1]));
                 capturedFrameCount = frames.size();
                 addColoredSeeds(frame, pose, bitmap, focal, principal, imageSize, name);
@@ -1039,8 +1056,9 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
         }
 
         void resetData() {
-            coverage.clear(); seeds.clear(); frames.clear(); viewpoints.clear(); capturedFrameCount = 0; capturedSeedCount = 0;
-            firstTrackingAtMs = 0L; firstTrackingReferences = 0; lastWarmupNoticeAtMs = 0L;
+            for (Anchor anchor : frameAnchors) try { anchor.detach(); } catch (Exception ignored) { }
+            coverage.clear(); seeds.clear(); frames.clear(); frameAnchors.clear(); viewpoints.clear(); capturedFrameCount = 0; capturedSeedCount = 0;
+            firstTrackingAtMs = 0L; firstCaptureAtMs = 0L; firstTrackingReferences = 0; lastWarmupNoticeAtMs = 0L;
             hasGroundPlane = false; groundArea = 0f; groundExtentX = 0f; groundExtentZ = 0f; levelingApplied = false;
             refreshCaptureTelemetry();
             travelTrigger.reset();
@@ -1050,6 +1068,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         void writeDataset(File dir) throws Exception {
             if (frames.size() < 3) throw new IllegalStateException("Capture at least 3 frames first.");
+            refreshCapturedAnchorPoses();
             JSONObject leveling = applyGroundLeveling();
             JSONObject transforms = new JSONObject();
             JSONObject first = frames.get(0);
@@ -1084,6 +1103,19 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                     .put("leveling", leveling)
                     .put("coordinateConvention", "ARCore world meters; OpenGL camera-to-world transforms; RGB measured from matching camera image; world alignment in leveling (the ground plane normal becomes +Y)");
             writeText(new File(dir, "capture.json"), jsonText(metadata, 2, "capture.json"));
+        }
+
+        /** Replace shutter-time snapshots with each anchor's latest map-refined
+         * pose. This is most important for the first two captures, whose ARCore
+         * world estimate normally moves while the visual-inertial map matures. */
+        private void refreshCapturedAnchorPoses() throws Exception {
+            int n = Math.min(frames.size(), frameAnchors.size());
+            for (int i = 0; i < n; i++) {
+                Anchor anchor = frameAnchors.get(i);
+                if (anchor == null || anchor.getTrackingState() != TrackingState.TRACKING) continue;
+                float[] matrix = new float[16]; anchor.getPose().toMatrix(matrix, 0);
+                if (finite(matrix)) frames.get(i).put("transform_matrix", matrixRows(matrix));
+            }
         }
 
         /** Level the exported world to the ARCore ground plane so the trained model sits

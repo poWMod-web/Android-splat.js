@@ -1170,6 +1170,7 @@ a.cbtn { text-decoration: none; }
 
 /* Numbered landmark editor for manual camera alignment. It occupies only the
    model stage, leaving the filmstrip available for choosing reference views. */
+body.manual-aligning #controls, body.manual-aligning #dock { display: none !important; }
 .manual-align-editor { position: absolute; z-index: 18; inset: 0; display: flex; flex-direction: column; background: rgba(7,9,9,.97); color: var(--paper); }
 .manual-align-head { flex: none; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 6px 14px; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .manual-align-head > b { font-size: 14px; }
