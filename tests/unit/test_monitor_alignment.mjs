@@ -73,15 +73,15 @@ assert.match(app, /undoSelectedAlignment/);
 for (const [name, source] of [['Android', app], ['Browser', browserApp]]) {
   assert.match(source, /function inAppConfirm\(title, message[\s\S]*dialog\.showModal\(\)/,
     `${name}: alignment confirmation should use a branded in-app dialog`);
-  assert.match(source, /inAppConfirm\(`Align frame \$\{i \+ 1\}`[\s\S]*'Find placements'/,
-    `${name}: the alignment dialog should have a meaningful frame title`);
+  assert.match(source, /showAlignModePicker\(i\)[\s\S]*title\.textContent = `Align frame \$\{i \+ 1\}`/,
+    `${name}: the alignment mode picker should have a meaningful frame title`);
   assert.doesNotMatch(source, /confirm\(`(?:Undo the alignment|Apply “|Find automatic placements)/,
     `${name}: alignment must not use an origin-titled browser confirmation`);
 }
 assert.match(css, /\.app-confirm[\s\S]*\.app-confirm \.dlg-head h2/,
   'the branded alignment confirmation should have dedicated modal styling');
-assert.doesNotMatch(app, /Manual frame alignment|manualAlignSelected/,
-  'the first alignment version is automatic-only');
+assert.match(app, /manualPoseFromCorrespondences/,
+  'manual numbered-feature alignment should use the reconstruction geometry');
 assert.match(app, /align\.id = 'c-align'/,
   'Align belongs to the selected-frame controls');
 assert.doesNotMatch(app, /strip-align|Align selected/,

@@ -1167,3 +1167,19 @@ a.cbtn { text-decoration: none; }
 .monitor-preview[hidden] + .monitor-chartwrap { grid-column: 1 / -1; }
 .monitor-gpu { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 10px auto 0; color: var(--dim); font: 11px var(--mono); }
 .monitor-gpu input { width: min(260px, 48vw); }
+
+/* Numbered landmark editor for manual camera alignment. It occupies only the
+   model stage, leaving the filmstrip available for choosing reference views. */
+.manual-align-editor { position: absolute; z-index: 18; inset: 0; display: flex; flex-direction: column; background: rgba(7,9,9,.97); color: var(--paper); }
+.manual-align-head { flex: none; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 6px 14px; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.manual-align-head > b { font-size: 14px; }
+.manual-align-head > small { grid-column: 1 / -1; color: var(--muted); line-height: 1.35; }
+.manual-align-status { color: var(--accent); font: 12px var(--mono); }
+.manual-align-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 7px; }
+.stage .manual-align-canvas { position: static; inset: auto; flex: 1; min-height: 0; width: 100%; height: 100%; cursor: none; touch-action: none; }
+@media (max-width: 620px) {
+  .manual-align-head { grid-template-columns: 1fr; padding: 8px; }
+  .manual-align-head > small, .manual-align-actions { grid-column: 1; }
+  .manual-align-head > small { font-size: 10px; }
+  .manual-align-actions .btn { padding: 7px 9px; font-size: 11px; }
+}

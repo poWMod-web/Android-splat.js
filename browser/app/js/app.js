@@ -26,7 +26,7 @@ import { Developer, fitRect } from './develop.js';
 import { Chart, psnrToApproxSsimPercent } from './chart.js';
 import { bmp, readyBmp, sizedUrl } from './img.js';
 import * as Headless from './headless.js';
-import { adjacentPoseCandidates } from './align.js';
+import { adjacentPoseCandidates, manualPoseFromCorrespondences } from './align.js';
 
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => Math.round(n).toLocaleString('en-US');
@@ -2895,6 +2895,7 @@ function backToSetup() {
  *  trained model funnels through here, so nothing opened on the previous
  *  screen survives the trip. */
 function closeOverlays() {
+  if (S._manualAlign) closeManualAlignment(false);
   document.querySelectorAll('.upcard').forEach((c) => c.remove());
   document.querySelectorAll('.xr-dialog').forEach((d) => { if (d.open) d.close(); else d.remove(); });
   if (!$('details').hidden) {
@@ -6318,7 +6319,9 @@ function leaveFrame() {
 
 function select(i) {
   if (!S.photos.length) return;
-  S.sel = (i + S.photos.length) % S.photos.length;
+  i = (i + S.photos.length) % S.photos.length;
+  if (S._manualAlign) { manualAlignmentSelectFrame(i); return; }
+  S.sel = i;
   $('strip-scroll')?.children[S.sel]?.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
   if ((S.state === 'train' || S.state === 'done') && S.scene) goToFrame(S.sel);
   paintStrip(); renderControls();
@@ -6449,10 +6452,228 @@ function showAlignmentChoices(i, choices) {
   });
 }
 
-async function alignSelectedFrame() {
+
+function closeManualAlignment(returnToTarget = true) {
+  const state = S._manualAlign;
+  if (!state) return;
+  state.resizeObserver?.disconnect();
+  state.editor.remove();
+  S._manualAlign = null;
+  if (returnToTarget && S.scene?.cams?.[state.target]?.R) goToFrame(state.target);
+  paintStrip(); renderControls();
+}
+
+function manualAlignmentSelectFrame(i) {
+  const state = S._manualAlign;
+  if (!state || state.busy) return;
+  const targetPoints = state.marks.get(state.target) || [];
+  if (i !== state.target && targetPoints.length < 5) {
+    flash(`Place at least 5 points on frame ${state.target + 1} first.`, 5000);
+    return;
+  }
+  const cam = S.scene?.cams?.[i];
+  if (!cam?.R || cam.state === 'removed') {
+    flash('Choose a placed image with a registered camera pose.', 5000);
+    return;
+  }
+  state.frame = i; state.pointer = null; state.down = false;
+  S.sel = i; paintStrip();
+  const token = ++state.loadToken;
+  state.status.textContent = `Loading frame ${i + 1} …`;
+  bmp(S.photos[i].url).then((bitmap) => {
+    if (S._manualAlign !== state || token !== state.loadToken || !bitmap) return;
+    state.bitmap = bitmap;
+    state.status.textContent = manualAlignmentStatus(state);
+    drawManualAlignment(state);
+  });
+}
+
+function manualAlignmentStatus(state) {
+  const pts = state.marks.get(state.frame) || [];
+  const targetCount = (state.marks.get(state.target) || []).length;
+  if (state.frame === state.target) {
+    return `${pts.length} point${pts.length === 1 ? '' : 's'} on alignment image · place point ${pts.length + 1}${pts.length < 5 ? ' (5 minimum before choosing a reference)' : ' or choose a reference below'}`;
+  }
+  return `Reference frame ${state.frame + 1} · ${pts.length}/${targetCount} matching points · now place number ${pts.length + 1}`;
+}
+
+function manualCanvasPosition(state, e) {
+  const r = state.canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * state.canvas.width / r.width,
+    y: (e.clientY - r.top) * state.canvas.height / r.height };
+}
+
+function manualPointInside(state, p) {
+  const f = state.fit;
+  return !!f && p.x >= f.x && p.y >= f.y && p.x <= f.x + f.w && p.y <= f.y + f.h;
+}
+
+function commitManualPoint(state) {
+  if (!state.pointer || !manualPointInside(state, state.pointer) || !state.fit) return;
+  const arr = state.marks.get(state.frame) || [];
+  const target = state.marks.get(state.target) || [];
+  if (state.frame !== state.target && arr.length >= target.length) {
+    flash(`All ${target.length} numbered target points are already placed on this reference.`, 5000);
+    return;
+  }
+  arr.push({
+    x: clamp((state.pointer.x - state.fit.x) / state.fit.w, 0, 1),
+    y: clamp((state.pointer.y - state.fit.y) / state.fit.h, 0, 1),
+  });
+  state.marks.set(state.frame, arr);
+  state.status.textContent = manualAlignmentStatus(state);
+  drawManualAlignment(state);
+}
+
+function drawManualAlignment(state) {
+  const cv = state.canvas, ctx = cv.getContext('2d'), dpr = devicePixelRatio || 1;
+  const rect = cv.getBoundingClientRect();
+  const w = Math.max(1, Math.round(rect.width * dpr)), h = Math.max(1, Math.round(rect.height * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  ctx.fillStyle = '#070909'; ctx.fillRect(0, 0, w, h);
+  const b = state.bitmap;
+  if (!b) return;
+  const scale = Math.min(w / b.width, h / b.height);
+  const fw = b.width * scale, fh = b.height * scale;
+  state.fit = { x: (w - fw) / 2, y: (h - fh) / 2, w: fw, h: fh, scale };
+  const f = state.fit;
+  ctx.drawImage(b, f.x, f.y, f.w, f.h);
+
+  const pts = state.marks.get(state.frame) || [];
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = `700 ${12 * dpr}px system-ui`;
+  pts.forEach((p, k) => {
+    const x = f.x + p.x * f.w, y = f.y + p.y * f.h;
+    ctx.beginPath(); ctx.arc(x, y, 10 * dpr, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(7,9,9,.82)'; ctx.fill();
+    ctx.strokeStyle = '#2fd4c1'; ctx.lineWidth = 2 * dpr; ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.fillText(String(k + 1), x, y + .5 * dpr);
+  });
+
+  const p = state.pointer;
+  if (!p || !manualPointInside(state, p)) return;
+  const ix = (p.x - f.x) / f.scale, iy = (p.y - f.y) / f.scale;
+  const radius = 54 * dpr, zoom = 4;
+  ctx.save();
+  ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx.clip();
+  const sr = radius / (f.scale * zoom);
+  ctx.drawImage(b, ix - sr, iy - sr, sr * 2, sr * 2,
+    p.x - radius, p.y - radius, radius * 2, radius * 2);
+  ctx.strokeStyle = 'rgba(255,255,255,.95)'; ctx.lineWidth = 1.5 * dpr;
+  ctx.beginPath(); ctx.moveTo(p.x - radius, p.y); ctx.lineTo(p.x + radius, p.y);
+  ctx.moveTo(p.x, p.y - radius); ctx.lineTo(p.x, p.y + radius); ctx.stroke();
+  ctx.restore();
+  ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+  ctx.strokeStyle = '#2fd4c1'; ctx.lineWidth = 2 * dpr; ctx.stroke();
+}
+
+async function finishManualAlignment(state) {
+  if (state.busy || S._manualAlign !== state) return;
+  const targetPts = state.marks.get(state.target) || [];
+  if (targetPts.length < 5) { flash('Place at least 5 points on the image being aligned.', 6000); return; }
+  const refs = [...state.marks.entries()].filter(([i, pts]) => i !== state.target && pts.length);
+  if (!refs.length) { flash('Choose at least one reference image from the roll and place the same numbered points.', 7000); return; }
+  const short = refs.find(([, pts]) => pts.length < 5);
+  if (short) { flash(`Frame ${short[0] + 1} needs at least 5 matching points.`, 6000); return; }
+  state.busy = true; state.finish.disabled = true; state.status.textContent = 'Triangulating landmarks and refining camera pose …';
+  try {
+    const solved = manualPoseFromCorrespondences({
+      cams: S.scene.cams, target: state.target, marks: state.marks, cloud: S.scene.xyz,
+    });
+    const ok = await inAppConfirm('Apply manual alignment',
+      `${solved.inliers} numbered landmarks agree (${solved.rmsPx.toFixed(1)} px RMS). Apply this camera pose to frame ${state.target + 1}?`, 'Apply alignment');
+    if (!ok) { state.busy = false; state.finish.disabled = false; state.status.textContent = manualAlignmentStatus(state); return; }
+    state.resizeObserver?.disconnect(); state.editor.remove(); S._manualAlign = null;
+    S._aligning = true; renderControls();
+    await applyAlignedPose(state.target, solved.R, solved.t, `${solved.inliers}-point manual match`);
+  } catch (err) {
+    console.warn('[manual-align]', err);
+    flash(`Manual alignment failed: ${err.message}`, 10000);
+    state.busy = false; state.finish.disabled = false; state.status.textContent = manualAlignmentStatus(state);
+  } finally {
+    if (!S._manualAlign) { S._aligning = false; renderControls(); }
+  }
+}
+
+function startManualAlignment(target) {
+  document.getElementById('align-options')?.remove();
+  const editor = document.createElement('div'); editor.className = 'manual-align-editor';
+  const head = document.createElement('div'); head.className = 'manual-align-head';
+  const title = document.createElement('b'); title.textContent = `Manual alignment · frame ${target + 1}`;
+  const status = document.createElement('span'); status.className = 'manual-align-status';
+  const canvas = document.createElement('canvas'); canvas.className = 'manual-align-canvas'; canvas.tabIndex = 0;
+  const actions = document.createElement('div'); actions.className = 'manual-align-actions';
+  const another = document.createElement('button'); another.className = 'btn'; another.textContent = 'Place another point';
+  const undo = document.createElement('button'); undo.className = 'btn'; undo.textContent = 'Undo last point';
+  const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel';
+  const finish = document.createElement('button'); finish.className = 'btn btn-accent'; finish.textContent = 'Finish alignment';
+  const help = document.createElement('small');
+  help.textContent = 'Place numbered points on this image first. Then choose registered images in the roll and mark the same features in number order. Hold and drag for 5× slower crosshair movement; the loupe shows the exact pixel.';
+  actions.append(another, undo, cancel, finish); head.append(title, status, help, actions); editor.append(head, canvas); $('stage').appendChild(editor);
+  const state = { target, frame: target, marks: new Map([[target, []]]), editor, canvas, status, finish,
+    bitmap: null, pointer: null, fit: null, down: false, loadToken: 0, busy: false };
+  S._manualAlign = state;
+
+  canvas.addEventListener('pointerdown', (e) => {
+    if (state.busy || e.button > 0) return;
+    e.preventDefault(); e.stopPropagation(); canvas.setPointerCapture(e.pointerId);
+    state.down = true; state.lastClient = { x: e.clientX, y: e.clientY };
+    state.pointer = manualCanvasPosition(state, e); drawManualAlignment(state);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const p = manualCanvasPosition(state, e);
+    if (state.down && state.pointer) {
+      // Precision mode: physical movement advances the selected image point at
+      // one fifth speed while the magnified crosshair remains over it.
+      state.pointer.x += (p.x - manualCanvasPosition(state, { clientX: state.lastClient.x, clientY: state.lastClient.y }).x) * .2;
+      state.pointer.y += (p.y - manualCanvasPosition(state, { clientX: state.lastClient.x, clientY: state.lastClient.y }).y) * .2;
+      state.lastClient = { x: e.clientX, y: e.clientY };
+    } else state.pointer = p;
+    drawManualAlignment(state);
+  });
+  canvas.addEventListener('pointerup', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    if (!state.down) return; state.down = false; commitManualPoint(state);
+  });
+  canvas.addEventListener('pointercancel', () => { state.down = false; });
+  another.addEventListener('click', () => { canvas.focus(); state.status.textContent = manualAlignmentStatus(state); });
+  undo.addEventListener('click', () => {
+    const pts = state.marks.get(state.frame) || []; pts.pop(); state.marks.set(state.frame, pts);
+    state.status.textContent = manualAlignmentStatus(state); drawManualAlignment(state);
+  });
+  cancel.addEventListener('click', () => closeManualAlignment(true));
+  finish.addEventListener('click', () => void finishManualAlignment(state));
+  state.resizeObserver = new ResizeObserver(() => drawManualAlignment(state));
+  state.resizeObserver.observe(canvas);
+  manualAlignmentSelectFrame(target);
+}
+
+function showAlignModePicker(i) {
+  document.getElementById('align-options')?.remove();
+  const card = document.createElement('div'); card.className = 'upcard'; card.id = 'align-options';
+  const title = document.createElement('b'); title.textContent = `Align frame ${i + 1}`;
+  const note = document.createElement('span'); note.className = 'sog-status';
+  note.textContent = 'Choose automatic feature matching, or manually identify the same numbered features across registered images.';
+  const row = document.createElement('div'); row.className = 'row';
+  const automatic = document.createElement('button'); automatic.className = 'btn btn-accent'; automatic.textContent = 'Automatically';
+  const manual = document.createElement('button'); manual.className = 'btn'; manual.textContent = 'Manually';
+  const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel';
+  row.append(automatic, manual, cancel); card.append(title, note, row); $('stage').appendChild(card);
+  automatic.addEventListener('click', () => { card.remove(); void alignSelectedFrameAutomatically(i); });
+  manual.addEventListener('click', () => startManualAlignment(i));
+  cancel.addEventListener('click', () => card.remove());
+}
+
+
+function alignSelectedFrame() {
   const i = S.sel, cam = S.scene?.cams?.[i];
+  if (!cam?.R || S._aligning || S._manualAlign) return;
+  showAlignModePicker(i);
+}
+
+async function alignSelectedFrameAutomatically(i) {
+  const cam = S.scene?.cams?.[i];
   if (!cam?.R || S._aligning) return;
-  if (!(await inAppConfirm(`Align frame ${i + 1}`, 'Find automatic placements from nearby images? Training pauses only when you apply one.', 'Find placements'))) return;
   S._aligning = true; renderControls();
   try {
     flash('Matching two pictures before and two after …', 15000);
@@ -6590,7 +6811,7 @@ function wireFrameLongPress(el, i) {
   let timer = 0, x = 0, y = 0, fired = false;
   const cancel = () => { clearTimeout(timer); timer = 0; };
   el.addEventListener('pointerdown', (e) => {
-    if (e.button != null && e.button !== 0) return;
+    if (S._manualAlign || (e.button != null && e.button !== 0)) return;
     const cam = S.scene?.cams?.[i];
     if (!S.session?.trainer || !cam || cam.ci < 0) return;
     fired = false; x = e.clientX; y = e.clientY;
