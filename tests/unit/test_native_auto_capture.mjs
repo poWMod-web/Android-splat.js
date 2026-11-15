@@ -32,7 +32,7 @@ assert.match(source, /frame\.acquirePointCloud\(\)[\s\S]*firstTrackingReferences
   'pre-capture tracking should collect references continuously with a bounded fallback for texture-poor scenes');
 assert.match(source, /keep manual\/first-auto requests pending/,
   'a shutter press during warm-up must remain armed rather than being discarded');
-assert.match(source, /arSession\.createAnchor\(pose\)[\s\S]*frameAnchors\.add\(anchor\)/,
+assert.match(source, /capturedAnchor = arSession\.createAnchor\(pose\)[\s\S]*frameAnchors\.add\(capturedAnchor\)/,
   'captured poses should remain attached to ARCore map refinement');
 assert.match(source, /refreshCapturedAnchorPoses\(\)[\s\S]*anchor\.getPose\(\)\.toMatrix[\s\S]*transform_matrix/,
   'export should replace early shutter snapshots with the latest tracked anchor poses');

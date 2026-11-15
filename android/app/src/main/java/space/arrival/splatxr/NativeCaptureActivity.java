@@ -597,6 +597,10 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
     private final class CoverageRenderer {
         private static final int MAX_POINTS = 50000;
         private static final float VOXEL = 0.025f;
+        // Frame.getTimestamp() and the acquired CPU Image timestamp describe
+        // the exposure. Reject a stale CPU image rather than pairing pixels
+        // with a pose sampled from another moment while the phone is moving.
+        private static final long CAPTURE_TIMESTAMP_TOLERANCE_NS = 5_000_000L;
         private final Map<String, CoveragePoint> coverage = new HashMap<>();
         private final Map<String, SeedPoint> seeds = new HashMap<>();
         private final List<JSONObject> frames = new ArrayList<>();
@@ -972,14 +976,21 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
 
         private boolean capture(Frame frame) {
             Image image = null;
+            Anchor capturedAnchor = null;
             try {
                 if (frames.size() >= 200) { showStatus("Maximum of 200 keyframes reached."); return false; }
                 image = frame.acquireCameraImage();
-                byte[] jpeg = jpegFromYuv(image);
-                Bitmap bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
-                String name = String.format(Locale.US, "frame_%04d.jpg", frames.size() + 1);
-                try (FileOutputStream out = new FileOutputStream(new File(outputDir, name))) { out.write(jpeg); }
 
+                // Snapshot exposure metadata immediately after acquiring the
+                // matching CPU image, before YUV conversion, JPEG encoding,
+                // bitmap decoding, or disk I/O can delay this method. Never
+                // sample a later camera pose after image processing.
+                long frameTimestamp = frame.getTimestamp();
+                long imageTimestamp = image.getTimestamp();
+                if (frameTimestamp > 0L && imageTimestamp > 0L &&
+                        Math.abs(frameTimestamp - imageTimestamp) > CAPTURE_TIMESTAMP_TOLERANCE_NS) {
+                    throw new IllegalStateException("ARCore camera image and pose timestamps did not match; holding this capture for a synchronized frame.");
+                }
                 Camera camera = frame.getCamera();
                 Pose pose = camera.getPose();
                 float[] matrix = new float[16]; pose.toMatrix(matrix, 0);
@@ -993,14 +1004,27 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                         focal[0] <= 0 || focal[1] <= 0 || imageSize[0] <= 0 || imageSize[1] <= 0) {
                     throw new IllegalStateException("ARCore returned invalid camera pose or intrinsics for this frame.");
                 }
+                // The anchor is created from that exposure-time pose. ARCore
+                // may refine its world coordinates later, but phone movement
+                // during JPEG processing can no longer change its location.
+                capturedAnchor = arSession.createAnchor(pose);
+
+                byte[] jpeg = jpegFromYuv(image);
+                Bitmap bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
+                if (bitmap == null) throw new IllegalStateException("The synchronized camera image could not be decoded.");
+                String name = String.format(Locale.US, "frame_%04d.jpg", frames.size() + 1);
+                try (FileOutputStream out = new FileOutputStream(new File(outputDir, name))) { out.write(jpeg); }
+
                 JSONObject item = new JSONObject();
                 item.put("file_path", name);
                 item.put("transform_matrix", matrixRows(matrix));
                 item.put("fl_x", focal[0]); item.put("fl_y", focal[1]);
                 item.put("cx", principal[0]); item.put("cy", principal[1]);
                 item.put("w", imageSize[0]); item.put("h", imageSize[1]);
-                Anchor anchor = arSession.createAnchor(pose);
-                frames.add(item); frameAnchors.add(anchor);
+                item.put("capture_timestamp_ns", imageTimestamp);
+                item.put("pose_timestamp_ns", frameTimestamp);
+                frames.add(item); frameAnchors.add(capturedAnchor);
+                capturedAnchor = null; // ownership moved to frameAnchors
                 if (frames.size() == 1) firstCaptureAtMs = android.os.SystemClock.elapsedRealtime();
                 viewpoints.add(new CaptureViewpoint(matrix, focal[0], focal[1], principal[0], principal[1], imageSize[0], imageSize[1]));
                 capturedFrameCount = frames.size();
@@ -1022,6 +1046,7 @@ public final class NativeCaptureActivity extends Activity implements GLSurfaceVi
                 showStatus("Capture failed: " + safeMessage(e));
                 return false;
             } finally {
+                if (capturedAnchor != null) try { capturedAnchor.detach(); } catch (Exception ignored) { }
                 if (image != null) image.close();
             }
         }
