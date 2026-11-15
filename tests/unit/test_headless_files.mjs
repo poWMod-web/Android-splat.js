@@ -97,6 +97,7 @@ for (const call of ['postProgress', 'writeRunJson', 'writeRunChunk', 'writeSnaps
   assert.ok(driver.includes(call), `driver calls bridge.${call}`);
 }
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
+const monitorHtml = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 assert.match(app, /if \(status\?\.status === 'finished'\) return true;/,
   'durable finished status should be authoritative without a final service heartbeat');
 for (const fn of ['stageHeadlessRun', 'secureFileCheckpoint', 'enterMonitor', 'adoptHeadlessRun']) {
@@ -165,11 +166,16 @@ assert.match(app, /'mon-continue'\)\.addEventListener\('click'[\s\S]*returnHeadl
   'Continue here should request service ownership');
 assert.match(app, /'mon-background'\)\.addEventListener\('click'[\s\S]*headlessCommand\('headless-start', runId\)/,
   'a recoverable paused checkpoint should also be restartable in headless background mode');
+assert.match(monitorHtml, /id="btn-go-background"[\s\S]*Start in background/,
+  'the training configuration should offer a direct background start');
+assert.match(app, /backgroundStart\.addEventListener\('click'[\s\S]*S\.startInBackground = true[\s\S]*btn-go/,
+  'direct background start should reuse the validated reconstruction configuration path');
+assert.match(app, /async function startNewRunInBackground\(\)[\s\S]*await secureFileCheckpoint\(\)[\s\S]*S\.session\.dispose\(\)[\s\S]*headlessCommand\('headless-start', runId\)/,
+  'direct background start must secure the initial state and release the Activity GPU before starting the service');
 assert.match(main, /action\.equals\("headless-start"\)[\s\S]*startForegroundService\(intent\)/,
   'an explicit background restart should create a foreground service safely');
 assert.match(svc, /case "headless-start"[\s\S]*restartHeadless\(runId\)[\s\S]*bootHeadlessNow\(runId, true\)/,
   'the service should boot the stored checkpoint despite the deliberately visible monitor Activity');
-const monitorHtml = readFileSync(new URL('../../app/index.html', import.meta.url), 'utf8');
 assert.match(monitorHtml, /id="mon-background">Continue in background<\/button>/,
   'recovery UI should offer background continuation alongside Continue here');
 assert.doesNotMatch(monitorHtml, /id="mon-updated"/,

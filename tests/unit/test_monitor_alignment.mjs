@@ -23,10 +23,14 @@ assert.match(app, /c\.events = \(Array\.isArray\(progress\.events\)/,
   'the monitor graph renders durable service marks');
 assert.match(headless, /e\.kind === 'prune-continue'/);
 assert.match(headless, /e\.kind === 'grow-now'/);
+const livePaint = app.slice(app.indexOf('function paintMonitorLive'), app.indexOf('function paintMonitorProgress'));
 assert.match(app, /new Chart\(\$\('mon-chart'\)/);
+assert.match(app, /'mon-score-unit'\)\.addEventListener\('click'[\s\S]*_monScoreScale[\s\S]*paintMonitorLive/,
+  'the background graph should let the user switch score units');
+assert.match(livePaint, /const scale = S\._monScoreScale[\s\S]*c\.scale = scale/,
+  'the monitor graph should apply its local dB/percentage selection instead of waiting on the service');
 assert.match(app, /async function refreshMonitorPreview\(\)/);
 assert.match(app, /bridge\.headlessCommand\('headless-snapshot', runId\)/);
-const livePaint = app.slice(app.indexOf('function paintMonitorLive'), app.indexOf('function paintMonitorProgress'));
 assert.doesNotMatch(livePaint, /snapshot|headlessCommand/,
   'ordinary monitor polling must not render, read, or write a preview');
 assert.match(app, /bridge\.headlessPrune\(S\._monRun, percent\)/);

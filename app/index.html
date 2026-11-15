@@ -63,7 +63,7 @@
     <div class="monitor-gpu tmeta-gpu" title="Share of wall time used by background GPU training. Takes effect immediately."><label for="mon-gpu">GPU usage</label><input id="mon-gpu" type="range" min="10" max="100" step="5" value="100"><span id="mon-gpu-v">100%</span></div>
     <div class="monitor-live-grid">
       <div class="monitor-preview" id="mon-preview" hidden><canvas id="mon-model"></canvas><small>Service-rendered preview</small></div>
-      <div class="chartwrap monitor-chartwrap"><canvas id="mon-chart"></canvas><div class="chart-tip" id="mon-chart-tip" hidden></div></div>
+      <div class="chartwrap monitor-chartwrap"><button class="chart-unit-toggle" id="mon-score-unit" type="button" title="Show graph scores as approximate similarity percentages">Use %</button><canvas id="mon-chart"></canvas><div class="chart-tip" id="mon-chart-tip" hidden></div></div>
     </div>
     <div class="upload" id="mon-live">
       <div class="upload-btns">
@@ -123,6 +123,7 @@
     <div class="xr-set-tools" id="xr-set-tools" hidden><span id="xr-set-mode"></span><button class="btn btn-outline" id="xr-review-set">Review frames &amp; poses</button><button class="btn btn-outline" id="xr-export-set">Export capture ↓</button></div>
     <div class="startrow">
       <button class="btn btn-accent big btn-cta" id="btn-go">Start training</button>
+      <button class="btn btn-outline big btn-cta" id="btn-go-background" hidden title="Prepare the model, then hand training directly to the Android background service">Start in background</button>
       <select class="q-quick" id="q-quick" title="Training quality — Draft is quick and light, Showcase trains long at the largest splat budget. The gear holds every knob.">
         <option value="draft">Draft</option>
         <option value="standard">Standard</option>

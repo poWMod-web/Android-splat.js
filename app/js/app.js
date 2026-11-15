@@ -595,6 +595,17 @@ function boot() {
   vp.onDragStart = () => { stopTour(); };
   dev = new Developer();
 
+  const backgroundStart = $('btn-go-background');
+  // This route is Android-only: reconstruction and seeding still happen in
+  // the Activity, then the first durable trainer state is handed straight to
+  // the foreground service without entering an Activity-owned training run.
+  backgroundStart.hidden = !(globalThis.AndroidARBridge &&
+    typeof globalThis.AndroidARBridge.headlessCommand === 'function');
+  backgroundStart.addEventListener('click', () => {
+    if (backgroundStart.disabled) return;
+    S.startInBackground = true;
+    $('btn-go').click();
+  });
   $('btn-go').addEventListener('click', async () => {
     if (S.picking) { const p = S.pending || S.preset; closePicker(); await open(p, true); return; }
     if (S.pendingShare) {
@@ -2379,9 +2390,10 @@ async function avatarPrep(gen) {
 async function startPrep() {
   if (S._startBusy) return false;
   S._startBusy = true;
-  const go = $('btn-go');
+  const go = $('btn-go'), backgroundGo = $('btn-go-background');
   const oldLabel = go.textContent;
   go.disabled = true;
+  if (backgroundGo) backgroundGo.disabled = true;
   go.textContent = (S._intakeN || 0) > 0 ? 'Preparing photos…' : 'Starting…';
   try {
     return await startPrepInner();
@@ -2391,9 +2403,11 @@ async function startPrep() {
     return false;
   } finally {
     S._startBusy = false;
+    if (S.state !== 'train' && S.state !== 'monitor') S.startInBackground = false;
     if (S.state === 'ready' || !$('detail').hidden || !$('start').hidden) {
       go.textContent = oldLabel;
       go.disabled = !!S.noGpu;
+      if (backgroundGo) backgroundGo.disabled = !!S.noGpu;
     }
   }
 }
@@ -3166,6 +3180,8 @@ function localRunName(preset) {
 }
 
 async function startTraining() {
+  const directBackground = !!S.startInBackground;
+  S.startInBackground = false;
   S.state = 'train';
   // a history entry of our own: the phone's Back (and the browser's) pops
   // here, into the popstate checkpoint-leave — never straight out of the app
@@ -3267,7 +3283,7 @@ async function startTraining() {
   try { await runRecordReady; }
   catch (e) { console.warn('[run] initial model record failed', e); }
   if (!S.session || S.state !== 'train') return;
-  androidNotifStart();
+  if (!directBackground) androidNotifStart();
   stageHeadlessRun();
   if (freshRunId) (async () => {
     try {
@@ -3305,7 +3321,8 @@ async function startTraining() {
     chart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
     chart.draw();
   }
-  S.session.start();
+  if (directBackground) void startNewRunInBackground();
+  else S.session.start();
 }
 
 function syncTrainButtons() {
@@ -7455,7 +7472,7 @@ function enterMonitor(runId) {
   window.scrollTo(0, 0);
   S.state = 'monitor';
   S._monRun = runId; S._monAt = 0;
-  S._monChartRows = 0;
+  S._monChartRows = 0; S._monScoreScale = null; S._monProgress = null;
   if (!S._monChart) {
     S._monChart = new Chart($('mon-chart'), { onHover: (h) => {
       const tip = $('mon-chart-tip');
@@ -7517,6 +7534,13 @@ function wireMonitorOnce() {
       try { headlessBridge()?.writeRunJson(S._monRun, 'manifest.json', JSON.stringify(S._monManifest)); }
       catch (e) { console.warn('[headless] monitor GPU persistence failed', e); }
     }
+  });
+  $('mon-score-unit').addEventListener('click', () => {
+    const current = S._monScoreScale ||
+      (S._monProgress?.scoreScale === 'similarity' ? 'similarity' : 'db');
+    S._monScoreScale = current === 'db' ? 'similarity' : 'db';
+    paintMonitorLive(S._monProgress);
+    paintMonitorProgress(S._monStatus || {}, S._monProgress);
   });
   $('mon-refresh').addEventListener('click', refreshMonitorPreview);
   $('mon-prune').addEventListener('click', () => {
@@ -7693,6 +7717,7 @@ async function monitorPoll(now, force = false) {
     if (S._handbackRun === runId) return;
     if (status.owner === 'service' && !Headless.heartbeatFresh(service)) { showRecovery(runId, status); return; }
     S._monPaused = status.status === 'paused';
+    S._monStatus = status; S._monProgress = progress;
     paintMonitorProgress(status, progress);
     paintMonitorLive(progress);
     syncMonitorButtons();
@@ -7741,6 +7766,15 @@ async function refreshMonitorPreview() {
 
 function paintMonitorLive(progress) {
   const c = S._monChart;
+  const scale = S._monScoreScale ||
+    (progress?.scoreScale === 'similarity' ? 'similarity' : 'db');
+  const unitButton = $('mon-score-unit');
+  if (unitButton) {
+    unitButton.textContent = scale === 'db' ? 'Use %' : 'Use dB';
+    unitButton.title = scale === 'db'
+      ? 'Show graph scores as approximate similarity percentages'
+      : 'Show graph scores in decibels';
+  }
   if (c && progress) {
     const rows = Array.isArray(progress.scoreHistory) ? progress.scoreHistory : [];
     const splats = Array.isArray(progress.splatHistory) ? progress.splatHistory : [];
@@ -7751,7 +7785,7 @@ function paintMonitorLive(progress) {
       return out;
     };
     for (const row of rows) if (Number.isFinite(row[0]) && Number.isFinite(row[1])) c.push(row[0], row[1], null, nearSplats(row[0]));
-    c.scale = progress.scoreScale === 'similarity' ? 'similarity' : 'db';
+    c.scale = scale;
     c.maxIter = progress.maxIters || Math.max(1, progress.iter || 1);
     c.events = (Array.isArray(progress.events) ? progress.events : [])
       .map((e) => ({ ...e, at: e.iter / c.maxIter }));
@@ -7768,8 +7802,9 @@ function paintMonitorProgress(status, progress) {
   $('mon-iter').textContent = max > 0
     ? `${fmt(iter)} / ${fmt(max)} cycles (${Math.min(99, Math.round(100 * iter / max))}%)`
     : `${fmt(iter)} cycles`;
+  const scoreScale = S._monScoreScale || (p.scoreScale === 'similarity' ? 'similarity' : 'db');
   $('mon-score').textContent = p.psnr != null
-    ? (p.scoreScale === 'similarity'
+    ? (scoreScale === 'similarity'
         ? `${psnrToApproxSsimPercent(+p.psnr).toFixed(1)} %`
         : `${(+p.psnr).toFixed(1)} dB`)
     : '—';
@@ -8009,6 +8044,44 @@ function headlessDiscard(runId) {
   } catch { /* clearing the marker still hides it for this boot */ }
   headlessClear(runId);
 }
+/** Start a freshly configured run directly under the service. Camera solving
+ * and trainer seeding necessarily happen here first; this waits for photo
+ * staging, secures that initial GPU state, then transfers ownership before
+ * the first ordinary Activity training screen can become the run's owner. */
+async function startNewRunInBackground() {
+  const b = headlessBridge(), runId = S.runId;
+  if (!b || !runId || S.state !== 'train' || !S.session) {
+    flash('Direct background training is unavailable in this app build.', 8000);
+    return;
+  }
+  flash('Preparing the background trainer and securing its starting state …', 60000);
+  let ok = false;
+  try {
+    if (S._hlStagePromise) await S._hlStagePromise;
+    ok = await secureFileCheckpoint();
+    if (!ok || S.runId !== runId || !S.session) throw new Error('the initial checkpoint could not be secured');
+    S.session.pause(); S.session.dispose();
+    S.session = null; S.scene = null;
+    document.getElementById('cv-model')?.remove(); gpuCanvas = null;
+    androidNotifStop(false);
+    b.writeRunJson(runId, 'activity.json', JSON.stringify({ alive: false, at: Date.now() }));
+    enterMonitor(runId);
+    b.headlessCommand('headless-start', runId);
+    flash('Training started in background mode.', 8000);
+  } catch (err) {
+    console.warn('[headless] direct start failed', err);
+    // Before disposal the local run remains valid and should simply continue.
+    if (S.session && S.state === 'train') {
+      androidNotifStart();
+      S.session.start();
+      flash(`Could not transfer to background; training continues here: ${err.message}`, 10000);
+    } else {
+      flash(`Could not start background training: ${err.message}`, 10000);
+      showRecovery(runId, { status: 'interrupted', error: err.message });
+    }
+  }
+}
+
 /** Foreground-service handoff: secure one exact checkpoint, then relinquish
  *  the Activity's GPU before the service creates its WebView. A failed save
  *  leaves the local trainer untouched; Java retries while the Activity stays
