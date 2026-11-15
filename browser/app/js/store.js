@@ -111,7 +111,10 @@ export async function deleteRun(id) {
   try {
     const d = await openDb2();
     await tx1(d, 'readwrite', (s) => s.delete(id));
-  } catch { /* gone is gone */ }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function deleteLastCapture() {

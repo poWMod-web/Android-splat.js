@@ -1307,17 +1307,8 @@ function tileMenu(btn, items) {
       if (it.danger) b.className = 'danger';
       b.addEventListener('click', async (ev) => {
         ev.stopPropagation();
-        if (it.danger && b.dataset.armed !== '1') {
-          b.dataset.armed = '1';
-          b.textContent = 'Delete?';
-          b.classList.add('armed');
-          setTimeout(() => {
-            b.dataset.armed = '';
-            b.textContent = it.label;
-            b.classList.remove('armed');
-          }, 3000);
-          return;
-        }
+        if (it.danger && !(await inAppConfirm('Delete permanently',
+          'Delete this item from this device? This cannot be undone.', 'Delete'))) return;
         m.remove();
         await it.act();
       });
@@ -1458,7 +1449,10 @@ async function localRunTiles(nativeRows = [], captureRows = []) {
         if (bridge && typeof bridge.deleteRunArchive === 'function' && bridge.deleteRunArchive(r.id) === false) {
           flash('A running model cannot be deleted.', 6000); return;
         }
-        await deleteRun(r.id); b.remove();
+        if (!(await deleteRun(r.id))) {
+          flash('This model could not be removed from device storage.', 7000); return;
+        }
+        b.remove();
       } },
     ]);
     b.addEventListener('click', async () => {
@@ -1582,7 +1576,10 @@ async function androidRunTiles(ids = null) {
           if (typeof bridge.deleteRunArchive === 'function' && bridge.deleteRunArchive(runId) === false) {
             flash('A running model cannot be deleted.', 6000); return;
           }
-          await deleteRun(runId); tile.remove();
+          if (!(await deleteRun(runId))) {
+            flash('This model could not be removed from device storage.', 7000); return;
+          }
+          tile.remove();
         } },
       ]);
       tile.addEventListener('click', openFileRun);

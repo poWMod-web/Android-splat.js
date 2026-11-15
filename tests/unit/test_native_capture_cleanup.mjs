@@ -4,6 +4,8 @@ import { readFileSync } from 'node:fs';
 const xr = readFileSync(new URL('../../app/js/xr-ui.js', import.meta.url), 'utf8');
 const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
 const nativeCap = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/NativeCaptureActivity.java', import.meta.url), 'utf8');
+const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
+const store = readFileSync(new URL('../../app/js/store.js', import.meta.url), 'utf8');
 
 // A completed native scan is an immutable, ID-addressed archive. New scans
 // and training handoffs must reference it rather than wiping or copying it.
@@ -28,7 +30,15 @@ assert.match(main, /Native scan archives are the image ground truth[\s\S]*public
   'the bridge should export references for a requested archive');
 assert.match(main, /public String deleteCaptureArchive\(String captureId\)[\s\S]*manifest\.json[\s\S]*\"referenced\"/,
   'explicit scan deletion should refuse archives referenced by durable runs');
-assert.match(main, /public boolean deleteRunArchive\(String runId\)[\s\S]*readActive/,
-  'explicit model deletion should protect a live run and remove its durable directory');
+assert.match(main, /public boolean deleteRunArchive\(String runId\)[\s\S]*readActive[\s\S]*status\.json[\s\S]*value\.equals\("active"\)[\s\S]*clearActive[\s\S]*deleteArchiveTree/,
+  'model deletion should protect live trainers but clear stale finished/interrupted recovery pointers');
+assert.match(app, /if \(it\.danger && !\(await inAppConfirm\('Delete permanently'[\s\S]*await it\.act\(\)/,
+  'Delete should use one explicit confirmation instead of silently arming a second click');
+assert.doesNotMatch(app, /dataset\.armed|b\.textContent = 'Delete\?'/,
+  'the obsolete three-second two-click delete gesture must not remain');
+assert.match(store, /export async function deleteRun\(id\)[\s\S]*return true[\s\S]*return false/,
+  'model deletion should report storage failure instead of removing only the visible tile');
+assert.match(app, /if \(!\(await deleteRun\(r\.id\)\)\)[\s\S]*could not be removed from device storage/,
+  'the model tile should disappear only after IndexedDB confirms deletion');
 
 console.log('native capture archive lifecycle: passed');

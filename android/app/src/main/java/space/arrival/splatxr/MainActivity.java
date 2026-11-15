@@ -630,7 +630,20 @@ public final class MainActivity extends Activity {
         /** Explicitly delete a durable run. Live runs are protected. */
         @JavascriptInterface public boolean deleteRunArchive(String runId) {
             if (!RunFiles.validRunId(runId)) return false;
-            if (runId.equals(RunFiles.readActive(MainActivity.this))) return false;
+            if (runId.equals(RunFiles.readActive(MainActivity.this))) {
+                // active.json is a recovery pointer, not proof that a trainer
+                // still owns the run. Finished/interrupted/discarded pointers
+                // can survive a process restart and must not make models
+                // undeletable forever.
+                String value = "";
+                try {
+                    String raw = RunFiles.readJson(MainActivity.this, runId, "status.json");
+                    if (raw != null) value = new JSONObject(raw).optString("status", "");
+                } catch (Exception ignored) { }
+                if (value.equals("staging") || value.equals("booting") ||
+                        value.equals("active") || value.equals("paused")) return false;
+                if (!RunFiles.clearActive(MainActivity.this, runId)) return false;
+            }
             return deleteArchiveTree(RunFiles.runDir(MainActivity.this, runId));
         }
 
