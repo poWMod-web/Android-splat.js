@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { planSoftPrune, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES, CULLED } from '../../src/gs/softprune.js';
+import { planSoftPrune, planDeadCull, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES, CULLED } from '../../src/gs/softprune.js';
 
 // ---- basic cull: the bottom fraction by mass goes --------------------------
 {
@@ -109,4 +109,156 @@ assert.match(COMPACT_SRC, /tmp\[di \+ k\] = src\[si \+ k\]/, 'a ranked scatter i
 assert.match(COMPACT_SRC, /workgroup_size\(256\)/, 'matches the gather dispatch shape');
 assert.equal(COMPACT_TEMP_BYTES, 16 * 1024 * 1024);
 
-console.log('soft-prune planning (rank + chunk): passed');
+// ---- hysteresis: candidates vote, only consecutive offenders die ------------
+{
+  const n = 20000;
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i;
+  const votes = new Uint16Array(n);
+  const w1 = planSoftPrune(masses, n, 0.2, { votes });
+  assert.equal(w1.culled, 0, 'one bad window votes but culls nothing');
+  assert.equal(w1.kept, n);
+  assert.equal(w1.rank, null, 'no cull means no compaction rank');
+  assert.equal(w1.candidates, 4000, 'the bottom fraction still counts as candidates');
+  assert.ok(votes.slice(0, 4000).every((v) => v === 1), 'candidates vote once');
+  assert.ok(votes.slice(4000).every((v) => v === 0), 'the kept reset');
+  const w2 = planSoftPrune(masses, n, 0.2, { votes });
+  assert.equal(w2.culled, 4000, 'a second bad window confirms the cull');
+  assert.equal(w2.kept, 16000);
+  for (let i = 0; i < 4000; i++) assert.equal(w2.rank[i], CULLED, `row ${i} culled`);
+  for (let i = 4000; i < n; i++) assert.equal(w2.rank[i], i - 4000, `row ${i} ranks ${i - 4000}`);
+  // the window turns: yesterday's candidates recover, today's vote fresh
+  const flipped = new Float32Array(n);
+  for (let i = 0; i < n; i++) flipped[i] = n - 1 - i;
+  const w3 = planSoftPrune(flipped, n, 0.2, { votes });
+  assert.equal(w3.culled, 0, 'recovered rows are spared — votes are consecutive, not lifetime');
+  assert.equal(votes[0], 0, 'a good window clears the count');
+  assert.equal(votes[n - 1], 1, 'the new bottom starts at one');
+}
+// ---- deeper confirmation asks more windows ----------------------------------
+{
+  const n = 5000;
+  const votes = new Uint16Array(n);
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i;
+  assert.equal(planSoftPrune(masses, n, 0.5, { votes, votesNeeded: 3, minCull: 1, floor: 1 }).culled, 0);
+  assert.equal(planSoftPrune(masses, n, 0.5, { votes, votesNeeded: 3, minCull: 1, floor: 1 }).culled, 0);
+  assert.equal(planSoftPrune(masses, n, 0.5, { votes, votesNeeded: 3, minCull: 1, floor: 1 }).culled, 2500,
+    'three strikes with votesNeeded 3');
+}
+// ---- the ratchet can be bypassed (pure milestone culls) ---------------------
+{
+  const n = 20000;
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i;
+  const p = planSoftPrune(masses, n, 0.2, { last: 19000, cap: 1000000, minCull: 1, skipRatchet: true });
+  assert.equal(p.kept, 16000, 'a bypassed ratchet holds nothing back');
+  assert.equal(p.culled, 4000);
+  assert.equal(p.floorBound, null);
+  assert.equal(p.candidates, 4000, 'candidates equal the cull without votes');
+  const short = new Uint16Array(10);
+  assert.throws(() => planSoftPrune(masses, n, 0.2, { votes: short }), /holds 10 rows/,
+    'a short vote array refuses instead of misvoting');
+}
+
+// ---- dead cull: zeros die on the second consecutive window ----------------
+{
+  const n = 3000;
+  const votes = new Uint16Array(n);
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i < 2000 ? 0 : i;
+  const first = planDeadCull(masses, n, { votes, minCull: 1, floor: 1 });
+  assert.equal(first.culled, 0, 'one window only votes');
+  assert.equal(first.candidates, 2000, 'every zero-mass row is a candidate');
+  assert.equal(first.rank, null, 'no plan ranks a no-cull window');
+  assert.equal(votes[0], 1, 'a zero row votes up');
+  assert.equal(votes[2999], 0, 'a contributing row stays clean');
+  const second = planDeadCull(masses, n, { votes, minCull: 1, floor: 1 });
+  assert.equal(second.culled, 2000, 'two consecutive zero windows kill');
+  assert.equal(second.kept, 1000);
+  assert.equal(second.rank[0], CULLED, 'a confirmed zero never scatters');
+  assert.equal(second.rank[2000], 0, 'survivors compact from zero');
+  assert.equal(second.rank[2999], 999);
+}
+// ---- dead cull: signal resets the count ------------------------------------
+{
+  const n = 2000;
+  const votes = new Uint16Array(n);
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i < 1500 ? 0 : 3;
+  planDeadCull(masses, n, { votes, minCull: 1, floor: 1 });
+  assert.equal(votes[0], 1);
+  for (let i = 0; i < n; i++) masses[i] = i + 1;
+  const p = planDeadCull(masses, n, { votes, minCull: 1, floor: 1 });
+  assert.equal(p.culled, 0, 'a good window saves every row');
+  assert.equal(votes[0], 0, 'signal clears the count');
+  assert.equal(p.candidates, 0, 'no zeros, no candidates');
+}
+// ---- dead cull: broken stats refuse -----------------------------------------
+{
+  const n = 100;
+  assert.equal(planDeadCull(new Float32Array(n), n, { votes: new Uint16Array(n) }), null,
+    'all-zero mass refuses (stats never accumulated)');
+  const bad = new Float32Array(n).fill(1);
+  bad[50] = NaN;
+  assert.equal(planDeadCull(bad, n, { votes: new Uint16Array(n) }), null,
+    'non-finite mass refuses');
+  assert.throws(() => planDeadCull(new Float32Array(n), n, {}), /votes required/,
+    'hysteresis is mandatory');
+  assert.throws(() => planDeadCull(new Float32Array(n), n, { votes: new Uint16Array(10) }), /holds 10 rows/,
+    'a short vote array refuses instead of misvoting');
+}
+// ---- dead cull: small kills wait, pathological kills refuse ------------------
+{
+  const n = 5000;
+  const votes = new Uint16Array(n);
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i < 10 ? 0 : i + 1;
+  planDeadCull(masses, n, { votes, minCull: 1024, floor: 1 });
+  const p = planDeadCull(masses, n, { votes, minCull: 1024, floor: 1 });
+  assert.equal(p.culled, 0, 'ten dead rows do not pay for a compaction');
+  assert.equal(votes[0], 2, 'but the votes persist for the next window');
+  const votes2 = new Uint16Array(n);
+  const masses2 = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses2[i] = i < 4900 ? 0 : 1;
+  planDeadCull(masses2, n, { votes: votes2, minCull: 1, floor: 1000 });
+  const q = planDeadCull(masses2, n, { votes: votes2, minCull: 1, floor: 1000 });
+  assert.equal(q.culled, 0, 'a cull leaving 100 rows under a 1000 floor refuses');
+  const votes3 = new Uint16Array(n);
+  const masses3 = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses3[i] = i < 3000 ? 0 : i + 1;
+  planDeadCull(masses3, n, { votes: votes3, minCull: 1, floor: 1000 });
+  const r = planDeadCull(masses3, n, { votes: votes3, minCull: 1, floor: 1000 });
+  assert.equal(r.culled, 3000, '2000 survivors over a 1000 floor cull');
+  assert.equal(r.kept, 2000);
+}
+// ---- dead cull: the trainer defaults -----------------------------------------
+{
+  const n = 20000;
+  const votes = new Uint16Array(n);
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i < 2000 ? 0 : i + 1;
+  planDeadCull(masses, n, { votes });
+  const p = planDeadCull(masses, n, { votes });
+  assert.equal(p.culled, 2000, '2000 confirmed dead clear the default minCull');
+}
+
+
+// ---- dead cull: zero means EXACT zero of the quantized mass counter ------
+{
+  // the gather divides an i32 counter (round(alpha*T*8) per pixel touch) by
+  // WFIX=8: any positive reading, however small, is a rendered splat —
+  // near-zero mass is alive, only exact zero dies
+  const n = 5000;
+  const votes = new Uint16Array(n);
+  const masses = new Float32Array(n);
+  for (let i = 0; i < n; i++) masses[i] = i < 2000 ? 1e-9 : i + 1;
+  planDeadCull(masses, n, { votes, minCull: 1, floor: 1 });
+  const p = planDeadCull(masses, n, { votes, minCull: 1, floor: 1 });
+  assert.ok(p, 'sub-quantum mass is not an all-zero window');
+  assert.equal(p.culled, 0, 'sub-quantum-but-nonzero mass is alive, not dead');
+  assert.equal(votes[0], 0, 'any positive mass resets the vote sheet');
+  assert.equal(p.candidates, 0, 'nothing counts as a zero-mass candidate');
+}
+
+console.log('soft-prune + dead-cull planning (rank + chunk): passed');

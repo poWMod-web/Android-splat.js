@@ -30,9 +30,9 @@ assert.doesNotMatch(cont, /persistCapture|saveLastCapture/,
 // Identity reuse lands in startTraining's resume branch (mark live, no new
 // record); checkpoints and compression then overwrite the trained state,
 // poses-stats bundle, and compressed result within that same record.
-assert.match(app, /const resumeId = S\._resumeRunId;[\s\S]*S\.runId = resumeId \|\| `run_/,
+assert.match(app, /const keepId = resumeId \|\| S\.runId \|\| null;[\s\S]*S\.runId = keepId \|\| `run_/,
   'a resumed run id should become the run id instead of minting a new record');
-assert.match(app, /if \(resumeId\) \{[\s\S]*patchRun\(resumeId, \{[\s\S]*status: 'training'/,
+assert.match(app, /if \(keepId\) \{[\s\S]*patchRun\(keepId, livePatch\(\)\)/,
   'resuming should mark the existing record live without creating one');
 assert.match(app, /state, recon, ckptAt: Date\.now\(\), minutes:/,
   'checkpoints should overwrite the raw trained state and recon in place');

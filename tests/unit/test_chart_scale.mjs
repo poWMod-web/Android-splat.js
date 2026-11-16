@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { Chart, psnrToApproxSsimPercent, LivePlateauFilter } from '../../app/js/chart.js';
+import { Chart, psnrToApproxSsimPercent } from '../../app/js/chart.js';
 
 const chartSource = readFileSync(new URL('../../app/js/chart.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
@@ -29,12 +29,19 @@ const scoreChart = new Chart(chartCanvas);
 // reads through sample by sample
 scoreChart.train = [[0, 25], [100, 25], [200, 25], [300, 25], [400, 25], [500, 25]];
 scoreChart.hold = [[0, 15], [100, 25]];
+scoreChart.push(600, 25, null, 123456);
+assert.deepEqual(scoreChart.splats.at(-1), [600, 123456],
+  'the graph should retain splat counts for cursor readouts');
 scoreChart.scale = 'similarity';
 assert.deepEqual(scoreChart._activeSeries(), { train: scoreChart.train, hold: scoreChart.hold },
   'the approximate scale should reuse the PSNR samples, without a separate model-derived history');
-assert.deepEqual(scoreChart._displaySeries(scoreChart.train), [
-  [300, formula(25)], [400, formula(25)], [500, formula(25)],
-], 'the graph should apply the requested PSNR-to-SSIM approximation to each plotted sample');
+const simPlotted = scoreChart._displaySeries(scoreChart.train);
+assert.deepEqual(simPlotted.map((p) => p[0]), [0, 100, 200, 300, 400, 500, 600],
+  'the similarity graph should plot every measured epoch sample');
+for (const p of simPlotted) {
+  assert.ok(Math.abs(p[1] - formula(25)) < 1e-9,
+    'the graph should apply the requested PSNR-to-SSIM approximation to each plotted sample');
+}
 
 assert.match(chartSource, /const ratio = 18 \/ psnr/,
   'the graph should implement the requested approximation formula');
@@ -56,6 +63,10 @@ assert.match(appSource, /const next = S\.scoreScale === 'db' \? 'Use %' : 'Use d
   'the scale button should say Use % for the percentage graph');
 assert.match(chartSource, /unit: this\.scale === 'similarity' \? '%' : 'dB'/,
   'the chart tooltip should show only the percent unit');
+assert.match(chartSource, /splats: n \? Math\.round\(n\[1\]\) : null/,
+  'the graph cursor should report the count nearest its score sample');
+assert.match(appSource, /h\.splats != null[\s\S]*fmt\(h\.splats\)[\s\S]*splats/,
+  'the visible cursor tooltip should include that splat count');
 assert.doesNotMatch(appSource, /maybeEvaluateSsim|evalGraphSsim|evalGraphMetrics/,
   'displaying the approximate scale must not launch a model SSIM evaluation');
 assert.match(appSource, /function toggleScoreScale\(\)[\s\S]*S\.scoreScale = S\.scoreScale === 'db' \? 'similarity' : 'db'/,
@@ -85,32 +96,39 @@ assert.match(appSource, /\$\('d-chart-wrap'\)\.hidden = vis !== 'chart'/,
 assert.match(appCss, /\.sheet-vis canvas\[hidden\]\s*\{\s*display:\s*none\s*;/,
   'inactive Details canvases should stay hidden despite the general canvas display rule');
 
-// the cold start is HELD, not trimmed after the fact: short series draw
-// nothing at all, so early points never appear and then vanish
-const holdChart = new Chart(chartCanvas);
-holdChart.train = [[0, 10], [100, 12], [200, 14]];
-assert.deepEqual(holdChart._displaySeries(holdChart.train), [],
-  'the plot should hold back the first few samples entirely');
-const trimChart = new Chart(chartCanvas);
-trimChart.train = [[0, 10], [100, 12], [200, 14], [300, 16], [400, 18], [500, 20]];
-const drawn = trimChart._displaySeries(trimChart.train);
-assert.deepEqual(drawn.map((p) => p[0]), [300, 400, 500],
-  'the plot should start the line past the held samples');
-assert.equal(drawn[0][1], 16,
-  'the filter should latch the first plotted sample');
-assert.match(chartSource, /SKIP_FIRST = 3/,
-  'the cold-start hold should cover the first three samples');
-// the live plateau filter: latch highs fast, hold noise, decay dips slowly
-const rise = new LivePlateauFilter(0.15, 0.02, 0.05, 2.2);
-assert.equal(rise.update(20), 20, 'the first sample latches the level');
-assert.equal(rise.update(20.02), 20, 'changes inside the deadband hold the level');
-assert.equal(rise.update(21), 21, 'a genuine rise snaps the level up');
-const fall = new LivePlateauFilter(0.15, 0.02, 0.05, 2.2);
-fall.update(20); fall.update(21);
-const dipped = fall.update(15);
-assert.ok(dipped > 20.5 && dipped < 21,
-  'a dip decays slowly instead of plunging the curve');
-assert.match(chartSource, /class LivePlateauFilter/,
-  'the curve should run through the plateau filter');
+// Raw complete-epoch values are the line itself: no held samples, filter or dots.
+const rawChart = new Chart(chartCanvas);
+rawChart.train = [[0, 10], [100, 12], [200, 14]];
+assert.deepEqual(rawChart._displaySeries(rawChart.train), rawChart.train,
+  'the plot should use measured epoch scores directly');
+assert.doesNotMatch(chartSource, /FastRobustZLEMA|SKIP_FIRST|_filteredRaw|_heldRaw|trainDots|holdDots/,
+  'the chart should contain no ZLEMA path or raw scatter layer');
+assert.doesNotMatch(chartSource, /0\.75 \* dpr/,
+  'the little raw-score dots should be removed');
+assert.doesNotMatch(chartSource, /frac \* pw|progress wash|rgba\(94, 231, 214, \.055\)/,
+  'the score graph should not cover its completed fraction with a green overlay');
+// dynamic x: the axis grows with the plotted data, like the y-axis
+const xChart = new Chart(chartCanvas);
+assert.equal(xChart._xMaxFor([100]), 106, 'early data should use the full width plus headroom');
+assert.equal(xChart._xMaxFor([0]), 1, 'an empty plot should still have a span');
+xChart.maxIter = 40000;
+assert.equal(xChart._xMaxFor([40000]), 40000, 'the axis should never run past the horizon');
+assert.equal(xChart._xMaxFor([100, 5000]), 5300, 'the furthest series should set the axis');
+assert.deepEqual(xChart._xWindow(100), { min: 0, max: 100 }, 'the default shows all history');
+xChart.xZoom = 4;
+assert.deepEqual(xChart._xWindow(100), { min: 75, max: 100 },
+  'x zoom should retain only the newest right-anchored quarter');
+assert.match(chartSource, /this\.xZoom = Math\.max\(1, Math\.min\(64,[\s\S]*this\._pinchZoom \* d \/ this\._pinchDistance/,
+  'two-pointer pinch should control right-anchored x zoom on every Chart');
+assert.match(chartSource, /const visible = \(series\)[\s\S]*iter >= xMin[\s\S]*const ys = \[\.\.\.train, \.\.\.hold/,
+  'older scores should be excluded before visible-window y autoscaling');
+// the score readouts show the latest raw complete-epoch sample
+assert.match(appSource, /function shownScore\(which\)/,
+  'the app should resolve the latest measured score consistently');
+assert.match(appSource, /formatTrainingScore\(shownScore\('train'\)\)/,
+  'the dock score should show the raw epoch train value');
+assert.match(appSource, /const gap = \(shownScore\('train'\) != null && shownScore\('hold'\) != null\)/,
+  'the details gap should compare raw epoch scores');
+
 
 console.log('PSNR and approximate SSIM graph scales: passed');

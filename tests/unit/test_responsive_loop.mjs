@@ -384,7 +384,7 @@ async function smallTrainer(trainerOpts = {}) {
   f._sched = { raf: (fn) => scheduled.push(fn), runFrame: () => {} };
   let steps = 0, ticks = 0;
   f.trainer = {
-    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50,
+    camMeta: Array.from({ length: 20 }, () => ({ w: 8, h: 8 })), iter: 0, n: 50, readLoss: async () => 0.01,
     stepOnce() { steps++; },
     device: { queue: { async onSubmittedWorkDone() {} } },
   };
@@ -423,7 +423,7 @@ async function smallTrainer(trainerOpts = {}) {
   e._sched = { raf: () => {}, runFrame: () => {} };
   let esteps = 0;
   e.trainer = {
-    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50,
+    camMeta: Array.from({ length: 100 }, () => ({ w: 8, h: 8 })), iter: 0, n: 50, readLoss: async () => 0.01,
     stepOnce() { esteps++; },
     device: { queue: { async onSubmittedWorkDone() {} } },
   };
@@ -592,6 +592,12 @@ async function smallTrainer(trainerOpts = {}) {
   // (which then dies on the shim GPU — the guard is what we pin)
   await assert.rejects(mk(new Float32Array(64 * 48 * 3).fill(0.5)).seed({ hull: false, maskPoints: false }),
     /requestAdapter|WebGPU not available/);
+  // seedFrom (prune's reseed) refuses with the run-intact message — the old
+  // trainer was never touched, so training (not a reload) is the way on
+  await assert.rejects(mk(null).seedFrom({ data: new Float32Array(16), n: 1 }, {}), /cannot reseed/);
+  // positive control: pixels present sails past the guard into boot
+  await assert.rejects(mk(new Float32Array(64 * 48 * 3).fill(0.5)).seedFrom({ data: new Float32Array(16), n: 1 }, {}),
+    /requestAdapter|WebGPU not available/);
 }
 
 // ---- opts.timestamps === false kills the timer, keeps the merge ----
@@ -606,6 +612,57 @@ async function smallTrainer(trainerOpts = {}) {
   assert.equal(gpu.device.queue.submits, s0 + 1, 'merging is independent of the timer');
   const { trainer: timed } = await smallTrainer({ maxSplats: 6000, capMult: 2, shDeg: 0 });
   assert.ok(timed._tsSet, 'the feature present means the timer builds by default');
+}
+
+// ---- (7b) hidden pages pump frames through a MessageChannel, not rAF/timers ----
+// rAF never fires hidden and worker timers throttle to 1/s, then 1/min —
+// without the pump a swiped-away run crawls, then freezes, then resumes on
+// return. Node has MessageChannel, so the pump runs here too.
+{
+  const s = createSession({});
+  let steps = 0;
+  s.trainer = {
+    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50, readLoss: async () => 0.01,
+    stepOnce() { steps++; this.iter++; },
+    device: { queue: { async onSubmittedWorkDone() {} } },
+  };
+  s.view._tick = () => {};
+  s._ensureScheduler();
+  assert.equal(typeof s._sched.pump, 'function', 'the scheduler builds a channel pump');
+  globalThis.document = { hidden: true };
+  try {
+    s.training = true;
+    s._frameCount = 0;
+    s._lastStats = performance.now();
+    s._scheduleFrame();
+    await new Promise((r) => setTimeout(r, 60));
+    assert.ok(s._frameCount >= 2, `hidden frames chain through the pump (ran ${s._frameCount})`);
+    assert.ok(steps > 0, 'hidden frames run steps');
+    s.training = false;
+    const parked = s._frameCount;
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(s._frameCount, parked, 'pausing parks the pumped loop');
+  } finally {
+    s.training = false;
+    delete globalThis.document;
+  }
+  // visible pages keep the rAF path: the pump sits idle
+  const v = createSession({});
+  v.trainer = {
+    camMeta: [{ w: 8, h: 8 }], iter: 0, n: 50, readLoss: async () => 0.01,
+    stepOnce() {}, device: { queue: { async onSubmittedWorkDone() {} } },
+  };
+  v.view._tick = () => {};
+  v._ensureScheduler();
+  assert.equal(typeof v._sched.pump, 'function', 'the pump exists even when unused');
+  const origPump = v._sched.pump, origRaf = v._sched.raf;
+  let pumped = 0, rafd = 0;
+  v._sched.pump = () => { pumped++; origPump(); };
+  v._sched.raf = (fn) => { rafd++; origRaf(fn); };
+  v._scheduleFrame();
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(pumped, 0, 'visible pages never touch the pump');
+  assert.equal(rafd, 1, 'visible pages schedule through rAF');
 }
 
 console.log('responsive loop (yields, hidden skips, pooled step scratch, duty governor) verified');

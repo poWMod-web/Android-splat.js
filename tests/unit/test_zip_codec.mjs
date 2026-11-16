@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { deflateRawSync } from 'node:zlib';
-import { readZip } from '../../browser/zip.js';
+import { readFileSync } from 'node:fs';
+import { readZip } from '../../app/js/zip.js';
 import { zipStore } from '../../app/js/zip.js';
+
+const zipSource = readFileSync(new URL('../../app/js/zip.js', import.meta.url), 'utf8');
+assert.ok(!/\b(document|window|navigator|localStorage|indexedDB)\b/.test(zipSource),
+  'the zip codec should stay DOM-free (Blob/Response/DecompressionStream are platform, Node-safe)');
 
 const enc = new TextEncoder();
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
@@ -68,4 +73,4 @@ await assert.rejects(readZip(new Uint8Array([1, 2, 3, 4])), /not a zip file/);
   await assert.rejects(readZip(zip), /a\.jpg.*method 12.*unzip it and drop the files/);
 }
 
-console.log('browser zip reader (stored + deflated): passed');
+console.log('zip reader (stored + deflated) + stored writer round-trip: passed');

@@ -5,6 +5,7 @@ const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8'
 const manifest = readFileSync(new URL('../../android/app/src/main/AndroidManifest.xml', import.meta.url), 'utf8');
 const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
 const service = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/TrainingService.java', import.meta.url), 'utf8');
+const headless = readFileSync(new URL('../../app/js/train-headless.js', import.meta.url), 'utf8');
 
 // The manifest declares the background-training service and its permissions.
 assert.match(manifest, /<uses-permission android:name="android\.permission\.FOREGROUND_SERVICE" \/>/,
@@ -15,8 +16,8 @@ assert.match(manifest, /<uses-permission android:name="android\.permission\.WAKE
   'the manifest should allow the training wake lock');
 assert.match(manifest, /<uses-permission android:name="android\.permission\.POST_NOTIFICATIONS" \/>/,
   'the manifest should allow progress notifications');
-assert.match(manifest, /<service android:name="\.TrainingService" android:exported="false" android:foregroundServiceType="specialUse">/,
-  'the manifest should declare the training service as special-use');
+assert.match(manifest, /<service android:name="\.TrainingService" android:exported="false" android:process=":training" android:foregroundServiceType="specialUse">/,
+  'the manifest should declare the training service as special-use in the :training process');
 assert.match(manifest, /PROPERTY_SPECIAL_USE_FGS_SUBTYPE/,
   'the service should declare its special-use subtype property');
 
@@ -26,6 +27,10 @@ assert.match(service, /new NotificationChannel\(\s*CHANNEL_ID, "Training progres
   'the service should post progress on a low-importance channel');
 assert.match(service, /startForeground\(NOTIF_ID, notification, ServiceInfo\.FOREGROUND_SERVICE_TYPE_SPECIAL_USE\)/,
   'the service should start foreground as special-use on Android 14+');
+assert.match(service, /setOngoing\(ongoing\)/,
+  'training should keep a persistent, non-dismissible ongoing notification');
+assert.match(service, /setForegroundServiceBehavior\(Notification\.FOREGROUND_SERVICE_IMMEDIATE\)/,
+  'Android 12+ should expose the foreground-service notification immediately');
 assert.match(service, /PARTIAL_WAKE_LOCK, "SplatXR:training"/,
   'the service should hold a partial wake lock while training');
 assert.match(service, /case "start":[\s\S]*case "update":[\s\S]*case "finish":[\s\S]*default:/,
@@ -37,7 +42,9 @@ assert.match(service, /setProgress\(total, Math\.min\(done, total\), false\)/,
 assert.match(service, /notifications\(\)\.notify\(DONE_ID/,
   'a finish should leave one dismissible summary notification');
 assert.match(service, /public void onTaskRemoved\(Intent rootIntent\) \{/,
-  'swiping the app away should tear the service down');
+  'swiping the app away should reach the takeover-or-teardown branch');
+assert.match(service, /String active = RunFiles\.readActive\(this\);[\s\S]*?if \(active == null\) \{[\s\S]*?teardown\(\);[\s\S]*?sendBroadcast\(handoff\);[\s\S]*?HANDOFF_ACK_MS/,
+  'a swipe with no outlived run should tear down; with one, the service should ask for the pass, settling on a timer');
 assert.match(service, /checkSelfPermission\(Manifest\.permission\.POST_NOTIFICATIONS\)[\s\S]*?!= PackageManager\.PERMISSION_GRANTED\) return;/,
   'the finish summary should be skipped when notifications are denied instead of crashing');
 assert.match(service, /catch \(Exception ignored\) \{ \/\* progress display must never crash training \*\/ \}/,
@@ -46,8 +53,8 @@ assert.match(service, /catch \(Exception ignored\) \{ \/\* a summary must never 
   'the finish summary should never crash the app');
 assert.match(service, /startForeground\(NOTIF_ID, notification[\s\S]*?catch \(Exception e\) \{[\s\S]*?teardown\(\);/,
   'a refused foreground start should stop quietly instead of crashing');
-assert.match(service, /if \(intent == null\) \{ stopSelf\(\); return START_NOT_STICKY; \}/,
-  'a restart without a command should stop instead of going zombie');
+assert.match(service, /if \(intent == null\) \{[\s\S]*?resurrectIfOurs\(active\)[\s\S]*?stopSelf\(\);/,
+  'a restart without a command should resurrect only a service-owned run, else stop instead of going zombie');
 assert.match(service, /releaseWakeLock\(\);/,
   'every teardown path should release the wake lock');
 assert.match(service, /case "paused":/,
@@ -56,6 +63,8 @@ assert.match(service, /builder\.addAction\(lastPaused \? android\.R\.drawable\.i
   'the ongoing notification should carry a Pause/Resume action');
 assert.match(service, /PendingIntent\.getBroadcast\(this, 1, toggle,/,
   'the shade button should fire a broadcast instead of opening the app');
+assert.match(service, /setAction\(MainActivity\.ACTION_RETURN_TRAINING\)[\s\S]*FLAG_ACTIVITY_CLEAR_TOP \| Intent\.FLAG_ACTIVITY_SINGLE_TOP/,
+  'tapping the notification should target the existing Activity and request training ownership');
 assert.match(service, /if \(lastPaused\) releaseWakeLock\(\); else acquireWakeLock\(\);/,
   'a shade pause should free the CPU while keeping the notification up');
 
@@ -96,8 +105,10 @@ assert.match(app, /function androidNotifTick\(\)/,
   'training progress should tick the notification');
 assert.match(app, /function androidNotifStop\(finished\)/,
   'training end should settle the notification');
-assert.match(app, /S\.runId = resumeId \|\| `run_[\s\S]*?`;\s*androidNotifStart\(\);/,
-  'every training run should be background-safe from the first cycle');
+assert.match(app, /S\.runId = keepId \|\| `run_[\s\S]*?runRecordReady[\s\S]*await runRecordReady[\s\S]*androidNotifStart\(\);\s*stageHeadlessRun\(\);/,
+  'run identity must be durable before notification and service staging use it');
+assert.doesNotMatch(app, /stageHeadlessRun\(\);[\s\S]*S\.runId = stale\.id/,
+  'same-source adoption must never change the run ID after Android staging');
 assert.match(app, /S\.itersPerSec = m\.itersPerSec;\s*androidNotifTick\(\);/,
   'every metrics beat should offer the notification fresh stats');
 assert.match(app, /now - \(S\._notifT \|\| 0\) < 2500/,
@@ -108,6 +119,12 @@ assert.match(app, /function notifScore\(\) \{[\s\S]*?S\.scoreScale === 'similari
   'the notification score should follow the dB/% switch');
 assert.match(app, /\$\{notifScore\(\)\}\$\{fmt\(S\.splats\)\} splats/,
   'progress ticks and the finish summary should share the unit-aware score');
+assert.match(app, /function toggleScoreScale\(\)[\s\S]*updateHeadlessScoreScale\(\)/,
+  'changing the unit before handoff should rewrite the staged service manifest');
+assert.match(headless, /manifest\?\.scoreScale === 'similarity'[\s\S]*psnrToApproxSsimPercent\(value\)/,
+  'the service notification should retain the selected percentage conversion');
+assert.match(headless, /ses\.trainer\.n\.toLocaleString\('en-US'\)\} splats/,
+  'service-owned progress notifications should show the live splat count');
 assert.match(app, /if \(on\) \{ if \(!notifSetPaused\(false\)\) androidNotifStart\(\); \}/,
   'resuming should flip the shade button, restarting the service only on old bridges');
 assert.match(app, /else if \(!notifSetPaused\(true\)\) androidNotifStop\(false\);/,

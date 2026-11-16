@@ -49,8 +49,8 @@ assert.match(native, /pose\[0\] \* x \+ pose\[4\] \* y \+ pose\[8\] \* z \+ pose
   'camera frustum corners should be transformed by the captured camera-to-world pose');
 assert.match(native, /final float depth = 0\.012f/,
   'capture camera pyramids should be one tenth of the previous 0.12 m size');
-assert.match(native, /frames\.clear\(\); viewpoints\.clear\(\);/,
-  'reset capture must clear the stored camera viewpoint overlays');
+assert.match(native, /frames\.clear\(\); frameAnchors\.clear\(\); viewpoints\.clear\(\);/,
+  'reset capture must clear camera overlays and their map-refinement anchors');
 assert.doesNotMatch(native, /mvp\[offset(?: \+ 1)?\] = -mvp\[offset(?: \+ 1)?\]/,
   'coverage points must not apply a second clip-space axis reflection');
 const main = readFileSync(resolve(moduleDir, 'src/main/java/space/arrival/splatxr/MainActivity.java'), 'utf8');

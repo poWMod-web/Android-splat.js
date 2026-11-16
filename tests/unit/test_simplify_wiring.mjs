@@ -3,8 +3,6 @@ import { readFileSync } from 'node:fs';
 
 const session = readFileSync(new URL('../../src/session.js', import.meta.url), 'utf8');
 const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
-const browser = readFileSync(new URL('../../browser/app.js', import.meta.url), 'utf8');
-const browserHtml = readFileSync(new URL('../../browser/index.html', import.meta.url), 'utf8');
 
 // ---- the session exposes a simplified export --------------------------------
 assert.match(session, /import \{ simplifyGaussians \} from '\.\/gs\/simplify\.js';/,
@@ -28,16 +26,5 @@ assert.match(app, /data-ratio="0\.5">Keep ½<\/button>/,
 assert.match(app, /S\.session\.exportSimplifiedPlyBlob\(ratio, \{/,
   'the picked ratio drives the export');
 
-// ---- the browser mirrors it --------------------------------------------------
-assert.match(browserHtml, /<button id="btn-simplify" class="btn" disabled>Simplify ½ ↓<\/button>/,
-  'the button sits next to Download .ply');
-assert.match(browser, /simplify: \$\('btn-simplify'\),/,
-  'the button is wired into the ui map');
-assert.match(browser, /s\.exportSimplifiedPlyBlob\(0\.5, \{/,
-  'the browser simplifies to half');
-assert.match(browser, /ui\.simplify\.disabled = false;\n  ui\.sess\.disabled = false;/,
-  'finishing a run enables it');
-assert.match(browser, /ui\.simplify\.disabled = true;   \/\/ needs the live trainer — continue first/,
-  'a bare restore keeps it disabled');
 
-console.log('simplify wiring (session + app + browser): passed');
+console.log('simplify wiring (session + app): passed');

@@ -1,4 +1,4 @@
-// store.js — keep the visitor's last own capture on the device.
+// store.js — durable browser captures and training records.
 //
 // Camera shots and uploads live only in memory; a refresh used to erase a
 // capture that might have taken minutes to walk. Every own set is therefore
@@ -40,8 +40,6 @@ export async function loadLastCapture() {
 // an hour of GPU work. All of it stays in this origin's IndexedDB.
 
 const RUNS = 'runs';
-const KEEP = 12; // newest kept; oldest evicted beyond this
-
 function openDb2() {
   return new Promise((res, rej) => {
     const r = indexedDB.open(DB, 2);
@@ -68,7 +66,16 @@ const tx1 = (d, mode, fn) => new Promise((res, rej) => {
 export async function saveRun(rec) {
   const d = await openDb2();
   await tx1(d, 'readwrite', (s) => s.put(rec));
-  pruneRuns().catch(() => {});
+}
+
+/** Stable identity for an own-capture pick: kind + sorted name:size pairs.
+ *  The same photos re-picked — or restored from the capture slot — produce
+ *  the same key, so a fresh run adopts (replaces) its stale same-source
+ *  record instead of duplicating the tile. Entries arrive as Files (fresh
+ *  picks) or { name, blob } (restored); both shapes read the same. */
+export function captureSrcKey(kind, files) {
+  const parts = (files || []).map((f) => `${f.name}:${f.size ?? f.blob?.size ?? 0}`).sort();
+  return `${kind}:${parts.length}:${parts.join(',')}`;
 }
 
 export async function patchRun(id, patch) {
@@ -104,12 +111,10 @@ export async function deleteRun(id) {
   try {
     const d = await openDb2();
     await tx1(d, 'readwrite', (s) => s.delete(id));
-  } catch { /* gone is gone */ }
-}
-
-async function pruneRuns() {
-  const all = await listRuns();
-  for (const r of all.slice(KEEP)) await deleteRun(r.id);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function deleteLastCapture() {

@@ -231,26 +231,29 @@ class Emitter {
   }
 }
 
-/** Plateau test for score-driven refine cadence: least-squares slope of
- *  train PSNR over the trailing `window` iters stays under `slope`
- *  dB/kiter. Needs minPoints finite samples spanning most of the window —
- *  anything less is "still warming up", never a plateau. Flat OR falling
- *  trips it: a stalled score wants fresh capacity, a falling one triage. */
-export function scorePlateaued(history, nowIter, { window = 1200, slope = 0.1, minPoints = 4 } = {}) {
+/** Robust plateau test for score-driven refinement. The raw complete-epoch
+ * score slope is the convergence signal; post-growth recovery is gated
+ * separately in the training loop below. */
+export function scorePlateaued(history, nowIter, {
+  window = 1200, slope = 0.25, minPoints = 4, minSpan = window * 0.75,
+  after = -Infinity,
+} = {}) {
   if (!Array.isArray(history) || !history.length) return false;
-  const pts = [];
-  for (const [i, p] of history) {
-    if (Number.isFinite(i) && Number.isFinite(p) && i >= nowIter - window && i <= nowIter) pts.push([i, p]);
-  }
-  if (pts.length < minPoints) return false;
-  if (pts[pts.length - 1][0] - pts[0][0] < window * 0.75) return false;
-  let sx = 0, sy = 0, sxx = 0, sxy = 0;
-  for (const [i, p] of pts) { sx += i; sy += p; sxx += i * i; sxy += i * p; }
-  const n = pts.length;
-  const denom = n * sxx - sx * sx;
-  if (!(denom > 0)) return false;
-  return (n * sxy - sx * sy) / denom * 1000 < slope;
+  const floor = Math.max(nowIter - window, after);
+  const pts = history
+    .filter(([i, p]) => Number.isFinite(i) && Number.isFinite(p) && i >= floor && i <= nowIter)
+    .sort((a, b) => a[0] - b[0]);
+  if (pts.length < minPoints || pts.at(-1)[0] - pts[0][0] < minSpan) return false;
+  const medianValues = (a) => { const v = a.map((p) => p[1]).sort((x, y) => x - y); return v[v.length >> 1]; };
+  const q = Math.max(2, Math.floor(pts.length / 3));
+  const early = pts.slice(0, q), late = pts.slice(-q);
+  const dt = late.reduce((n, p) => n + p[0], 0) / q - early.reduce((n, p) => n + p[0], 0) / q;
+  if (!(dt > 0)) return false;
+  const robustSlope = (medianValues(late) - medianValues(early)) * 1000 / dt;
+  return robustSlope < slope;
 }
+
+
 
 export class Session {
   /** @param {SessionOptions} [opts] */
@@ -267,7 +270,13 @@ export class Session {
     this.holdout = -1;
     this.testCams = [];
     this.training = false;
+    // One raw point per complete shuffled camera epoch. The same unfiltered
+    // series drives the graph, headline score and plateau detector.
     this.lossHistory = [];  // [iter, psnrTrain]
+    // Intervention cycle: plateau -> expected score drop -> recovery to the
+    // pre-intervention reference -> a fresh plateau. This blocks repeated
+    // growth while the model is still rebuilding quality.
+    this._refineRecoveryTarget = null;
     this._fences = [];      // in-flight batch fences (see _frameLoop)
     this._govAuto = 1;      // duty governor: auto duty, min()'d with the slider
     this._govLag = 0;       // event-loop lag EWMA (ms)
@@ -291,6 +300,11 @@ export class Session {
     this._em = new Emitter();
     this._debug = null;     // solver internals (feats/tracks) for UI beats
     this.view = new SessionView(this);
+  }
+
+  /** Hydrate a restored raw epoch-score history. */
+  setLossHistory(rows) {
+    this.lossHistory = rows.map((r) => Array.from(r || []));
   }
 
   on(type, fn) { return this._em.on(type, fn); }
@@ -639,7 +653,10 @@ export class Session {
     // lowMem released the frame pixels after the first boot (and the worker
     // owns the seed) — a second seed (recover) has nothing to boot from.
     // Say so plainly instead of crashing inside setup on null rgb.
-    if (this.frames && this.frames.some((f) => !f.rgb)) {
+    // (recover's catch shows the device-lost screen, so this text is for
+    // the log — and it stays "reload": the old trainer died with the
+    // device, so unlike a refused prune there is nothing to resume.)
+    if (this._seedPixelsReleased()) {
       throw new Error('seed data was released after the first boot (lowMem) — reload to train again');
     }
     await this._bootTrainer(trainerOpts, {
@@ -673,11 +690,11 @@ export class Session {
 
   /** trainer.setup with the frame alphas hidden when the session trains unmasked
    *  (opts.maskTraining === false): the packed targets then carry alpha 255. */
-  _setupTrainer(cams, frames, maxW, maxH, radius) {
+  _setupTrainer(trainer, cams, frames, maxW, maxH, radius) {
     const hide = this.opts.maskTraining === false && frames && frames.some((f) => f.alpha);
     const saved = hide ? frames.map((f) => f.alpha) : null;
     if (hide) for (const f of frames) f.alpha = null;
-    try { this.trainer.setup(this.model, cams, frames, maxW, maxH, radius); }
+    try { trainer.setup(this.model, cams, frames, maxW, maxH, radius); }
     finally { if (hide) frames.forEach((f, i) => { f.alpha = saved[i]; }); }
   }
 
@@ -731,6 +748,12 @@ export class Session {
 
   async _bootTrainer(trainerOpts, boot) {
     trainerOpts = this._withTandemBoost(trainerOpts);
+    if (!trainerOpts.softPrune && trainerOpts.useStats === undefined) {
+      // soft-prune-off runs still cull vote-confirmed dead splats, scored
+      // off the same rendered-mass window — without the accumulation the
+      // gather reads all-zero and the dead cull silently never fires
+      trainerOpts = { ...trainerOpts, useStats: true };
+    }
     if (this._shouldOffload()) {
       try {
         await this._bootRemoteTrainer(trainerOpts, boot);
@@ -739,36 +762,43 @@ export class Session {
         if ((this.opts.trainWorker ?? 'auto') === true) throw e;
         if (e && e.workerOwned) throw e;   // the seed moved — fallback would boot from detached buffers
         this._log(`worker training unavailable (${(e && e.message) || e}) — training on the main thread`);
-        this._terminateWorker();
-        this.trainer = null;
+        // the failed boot published nothing: the previous core (a reseed's)
+        // stays live until the fallback below swaps its own in (2026-11)
       }
     }
     const twMode = this.opts.trainWorker ?? 'auto';
     if (twMode === false || twMode === 'never') this._log('training on the main thread (trainWorker disabled)');
     if (!this.gpu) this.gpu = await createGpu({ device: this.opts.device });
     this.gpu.onLost = (info) => this._deviceLost(info);
-    this.trainer = await GSTrainer.create({ ...trainerOpts, gpu: this.gpu });
+    // boot into a local and swap on success: publishing this.trainer BEFORE
+    // setup() meant any setup throw left a half-booted trainer (camMeta set,
+    // buffers missing) that passed the frame guard and then failed every
+    // call cryptically — the prune-failure cascade (2026-11)
+    const next = await GSTrainer.create({ ...trainerOpts, gpu: this.gpu });
     const gi = this.gpu.info || {};
     this._log(`GPU: ${gi.vendor || 'unknown'} ${gi.architecture || ''} — ` +
-      `${this.trainer.tileGrad ? 'tile-shared' : 'direct'} gradient accumulation`);
-    this._setupTrainer(boot.cams, boot.frames, boot.maxW, boot.maxH, boot.radius);
-    if (boot.hullKillFn) this.trainer.hullKill = boot.hullKillFn;
-    if (boot.protect) this.trainer.protect = { ...boot.protect };
-    if (boot.freezePos) this.trainer.setFreezePos(boot.freezePos.from, boot.freezePos.to);
-    if (boot.sh && this.trainer.bufSH) {
+      `${next.tileGrad ? 'tile-shared' : 'direct'} gradient accumulation`);
+    this._setupTrainer(next, boot.cams, boot.frames, boot.maxW, boot.maxH, boot.radius);
+    if (boot.hullKillFn) next.hullKill = boot.hullKillFn;
+    if (boot.protect) next.protect = { ...boot.protect };
+    if (boot.freezePos) next.setFreezePos(boot.freezePos.from, boot.freezePos.to);
+    if (boot.sh && next.bufSH) {
       // a checkpoint with more splats than the cap truncated the params
       // but pasted all shN rows into a cap-sized SH buffer — an upload
       // larger than its buffer. Clamp to the same rows the params kept.
-      const shRows = Math.min(boot.shN ?? this.trainer.cap, this.trainer.cap);
+      const shRows = Math.min(boot.shN ?? next.cap, next.cap);
       if (shRows < boot.shN) {
         this._log(`SH restore truncated to ${shRows} of ${boot.shN} rows (splat cap)`);
       }
-      this.trainer.device.queue.writeBuffer(this.trainer.bufSH, 0,
-        boot.sh.buffer, boot.sh.byteOffset, shRows * this.trainer.shK * 3 * 4);
+      next.device.queue.writeBuffer(next.bufSH, 0,
+        boot.sh.buffer, boot.sh.byteOffset, shRows * next.shK * 3 * 4);
     }
-    this.trainer.excluded = new Set(boot.excluded || []);
-    this.trainer.holdout = boot.holdout ?? -1;
-    if (boot.iter != null) { this.trainer.iter = boot.iter; this.trainer.adamT0 = boot.iter; }
+    next.excluded = new Set(boot.excluded || []);
+    next.holdout = boot.holdout ?? -1;
+    if (boot.iter != null) { next.iter = boot.iter; next.adamT0 = boot.iter; }
+    if (this._worker) this._terminateWorker();   // the replacement is in: retire the previous core
+    this.trainer = next;
+    this._remote = false;
   }
 
   /** Spawn the training worker and upload the seed + targets through the
@@ -783,10 +813,7 @@ export class Session {
     } catch (e) {
       throw new Error(`training worker did not start (${(e && e.message) || e})`);
     }
-    this._worker = worker;
     const remote = new RemoteTrainer(worker, trainerOpts);
-    remote.onEvent('device-lost', (info) => this._deviceLost(info));
-    remote.onEvent('worker-error', (err) => this._workerFailed(err));
     remote.onEvent('log', (m) => this._log(m));
     // lowMem moves (transfers) the seed and targets instead of copying: from
     // the setup postMessage on, the main-side buffers are detached. A worker
@@ -815,6 +842,14 @@ export class Session {
         try { this.gpu.dispose(); } catch { /* already gone */ }
         this.gpu = null;
       }
+      // the replacement is fully booted: retire the previous core (a reseed
+      // that orphaned it carried two live GPU devices) and publish. Fault
+      // events wire up HERE, so a dying replacement never reports against
+      // the previous core it failed to replace (2026-11).
+      if (this._worker) this._terminateWorker();
+      remote.onEvent('device-lost', (info) => this._deviceLost(info));
+      remote.onEvent('worker-error', (err) => this._workerFailed(err));
+      this._worker = worker;
       this.trainer = remote;
       this._remote = true;
       this._workerGen++;
@@ -823,7 +858,12 @@ export class Session {
       this._log(`GPU: ${gi.vendor || 'unknown'} ${gi.architecture || ''} — ` +
         `${mirror.tileGrad ? 'tile-shared' : 'direct'} gradient accumulation (worker)`);
     } catch (e) {
-      this._terminateWorker();
+      // the failed boot published nothing: terminate ONLY the replacement
+      // and fail its RPCs — the previous trainer stays live (a failed prune
+      // reseed keeps training on the unpruned model) and the view stays
+      // attached to it (2026-11)
+      try { remote.abort(e instanceof Error ? e : new Error(String((e && e.message) || e))); } catch { /* gone */ }
+      try { if (typeof worker.terminate === 'function') worker.terminate(); } catch { /* gone */ }
       if (moved) {
         const fatal = new Error(`training worker failed (${(e && e.message) || e}) — ` +
           `the seed already moved to the worker, so training cannot fall back to the main thread; reload to retry`);
@@ -862,7 +902,11 @@ export class Session {
   /** Commit the training split computed by _applyTrainingSplit. */
   async _commitSplit(excluded) {
     if (this._remote) await this.trainer.setConfig({ excluded: [...excluded], holdout: this.holdout });
-    else { this.trainer.excluded = excluded; this.trainer.holdout = this.holdout; }
+    else {
+      this.trainer.excluded = excluded; this.trainer.holdout = this.holdout;
+      this.trainer._camDeck = [];
+    }
+    this._scoreTrainer = null; // the next score starts a fresh complete deck
   }
 
   /** After a run with photometric pose optimisation (trainer opts.camOpt): log how far
@@ -911,7 +955,11 @@ export class Session {
     const group = this.trainer.camMeta.map((m, i) => (this.recon && this.recon.cams && this.recon.cams[i] && this.recon.cams[i].crop) ? 1 : 0);
     const medOf = (g) => { const v = sh.filter((x, i) => group[i] === g && (!inLoss || inLoss[i])).sort((a, b) => a - b); return v.length ? v[v.length >> 1] : 0; };
     const med = [medOf(0), medOf(1)];
-    const excluded = new Set();
+    // Explicit removals survive checkpoints and handoffs on the reconstruction
+    // camera. Automatic blur/test exclusions are recomputed around them.
+    const excluded = new Set(this.trainer.camMeta
+      .map((m, ci) => this.recon?.cams?.find((c) => c.imgIdx === m.imgIdx)?.excluded ? ci : -1)
+      .filter((ci) => ci >= 0));
     const blurry = [0, 0];
     // known cameras (useKnownCameras) are mostly renders: their low "sharpness" is a thin
     // object seen edge-on, not motion blur — 16 of 180 sharp renders went out (2026-10-21)
@@ -983,8 +1031,22 @@ export class Session {
    * camera wiring happens exactly like seed(); pass opts.iter to continue the
    * schedules where the saved run stopped.
    */
+  /** True when a reseed has no pixels to re-upload: lowMem released the
+   *  frame buffers after the first boot. View-only boots need no pixels.
+   *  One predicate for seed(), seedFrom() and prune's pre-check, so the
+   *  three cannot drift apart. */
+  _seedPixelsReleased(viewOnly = false) {
+    return !viewOnly && !!this.frames && this.frames.some((f) => !f.rgb);
+  }
+
   async seedFrom(gaussians, opts = {}) {
     if (!this.recon && !opts.viewOnly) throw new Error('useReconstruction() first');
+    // fail BEFORE touching this.model: a refused reseed leaves the session
+    // bit-identical, so the prune catch resumes the previous trainer onto
+    // the same model it paused (a failed prune never bricks the run)
+    if (this._seedPixelsReleased(opts.viewOnly)) {
+      throw new Error('seed data was released after the first boot (lowMem) — the current run is intact, but it cannot reseed');
+    }
     this._stage({ stage: 'seed', done: 0, total: 1 });
     const radius = opts.sceneRadius ?? this.recon?.sceneRadius ?? 10;
     this.model = { data: gaussians.data, n: gaussians.n, radius, dc: gaussians.dc };
@@ -1076,6 +1138,24 @@ export class Session {
 
   pause() { this.training = false; }
 
+  /** Stop scheduling and wait for the currently submitted frame/readbacks to
+   * settle. GPU buffer mapping is exclusive: prune, checkpoint, snapshot and
+   * grow must cross this barrier before they start their own readback. Returns
+   * whether training was running so callers can restore that state. */
+  async pauseAndDrain() {
+    const wasTraining = !!this.training;
+    this.training = false;
+    this._framePending = false;
+    const active = this._frameWork;
+    if (active) await active;
+    // The finishing frame may have requested a view-only follow-up.
+    this._framePending = false;
+    if (!this._remote && this.trainer?.device?.queue) {
+      await this.trainer.device.queue.onSubmittedWorkDone();
+    }
+    return wasTraining;
+  }
+
   /** Raise the training horizon by `moreIters` and resume. The trainer's
    *  schedules (pos-lr decay, growth stop) are horizon-relative and stretch
    *  with it — this is a real continued run, not idling at floor lr. */
@@ -1090,17 +1170,40 @@ export class Session {
 
   /** Prune-and-continue: compact the model to `ratio` of its splats with
    *  the training-free merge-down, reseed the trainer on the compacted
-   *  model where the schedules stopped, stretch the horizon, and resume.
+   *  model where the schedules stopped (in place when lowMem released
+   *  the pixels — no pixels, no fresh boot), stretch the horizon, and resume.
    *  The holdout is probed before and after (skipped without one); a drop
    *  past 0.5 dB warns but never blocks — training recovers it. Resets
-   *  the cap prompt, so the next ceiling hit asks again. */
-  async pruneAndContinue(ratio = 0.5, { extendIters = null, onStatus = null, onProgress = null } = {}) {
+   *  the cap prompt, so the next ceiling hit asks again. A failed reseed
+   *  leaves the previous trainer live (atomic swap) and a run that was
+   *  training resumes onto it — a failed prune never bricks the run. */
+  async pruneAndContinue(ratio = 0.5, { onStatus = null, onProgress = null } = {}) {
     const trainer = this.trainer;
     if (!trainer) throw new Error('seed() first');
+    const currentScore = this.lossHistory.length ? this.lossHistory.at(-1)[1] : null;
+    // Pause OUTSIDE the readback lock. An active frame can itself be waiting
+    // for that lock; taking it first would deadlock, while skipping this
+    // barrier caused GPUBuffer "outstanding map pending" in the service.
+    const wasTraining = await this.pauseAndDrain();
     return this._locked(async () => {
-      this.training = false;
+      // pure prune: cull and reseed only — the run's state and horizon are
+      // the visitor's, not the button's, so a paused run stays paused and
+      // the horizon never stretches behind their back
       const say = (m) => { this._log(m); if (onStatus) onStatus(m); };
+      // the loop restarts through start(), not the bare flag: the in-flight
+      // frame already exited without rescheduling, and start() no-ops while
+      // training — so the flag drops first to force the reschedule. A paused
+      // run stays paused (the cap-hit card's prune included).
+      const resume = () => { if (wasTraining) { this.training = false; this.start(); } };
       try {
+        // pixel-less (lowMem) + local trainer: the merge-down applies IN
+        // PLACE below — the button works mid-run on phones with no reseed
+        // and no pixels. Pixel-less + worker has no row-upload RPC, so it
+        // refuses here, before the merge-down burns minutes of phone CPU.
+        const noPixels = this._seedPixelsReleased();
+        if (noPixels && this._remote) {
+          throw new Error('seed data was released after the first boot (lowMem) — the current run is intact, but it cannot reseed');
+        }
         const before = this.holdout >= 0 ? await trainer.evalCamPsnr(this.holdout) : null;
         const raw = await trainer.readGaussians();
         say(`pruning ${raw.n.toLocaleString()} splats to ${Math.round(ratio * 100)}% …`);
@@ -1108,7 +1211,8 @@ export class Session {
           { data: raw.data, n: raw.n, sh: raw.sh, shK: raw.shK, dc: raw.dc ?? trainer.dcMode },
           { ratio, onStatus: (m) => say(String(m).replace(/^simplify: /, 'prune: ')), onProgress });
         const iter = trainer.iter;
-        await this.seedFrom(
+        if (noPixels) await trainer.applyPrunedModel({ data: simp.data, n: simp.n, sh: simp.sh, shK: simp.shK });
+        else await this.seedFrom(
           { data: simp.data, n: simp.n, sh: simp.sh, shK: simp.shK, dc: simp.dc },
           { iter });
         let after = null, delta = null;
@@ -1116,8 +1220,11 @@ export class Session {
           after = await this.trainer.evalCamPsnr(this.holdout);
           delta = after - before;
         }
-        const ext = extendIters ?? Math.round((this.opts.maxIters ?? 60000) * 0.25);
-        await this.continueFor(ext);
+        // The button itself is never blocked by backoff. Its completed edit
+        // does, however, restart automatic growth's evidence/recovery window.
+        this._refineRecoveryTarget = Number.isFinite(currentScore) ? currentScore : null;
+        this.trainer.lastRefine = iter;
+        resume();
         this._capAsked = false;
         if (delta != null && delta < -0.5) {
           this._log(`WARNING: prune cost ${(-delta).toFixed(2)} dB ` +
@@ -1127,28 +1234,106 @@ export class Session {
         } else {
           say(`pruned ${raw.n.toLocaleString()} → ${simp.n.toLocaleString()} splats (no holdout — flying blind)`);
         }
-        const out = { from: raw.n, to: simp.n, before, after, delta, maxIters: this.opts.maxIters };
+        const out = { from: raw.n, to: simp.n, before, after, delta, maxIters: this.opts.maxIters, resumed: wasTraining };
         this._em.emit('event', { kind: 'prune-continue', iter, ...out });
         return out;
       } catch (e) {
         // a failed prune must not swallow the prompt — the ceiling is
-        // still full and the user can retry (or keep training at the cap)
+        // still full and the user can retry (or keep training at the cap).
+        // The reseed swaps atomically, so the previous trainer is intact:
+        // a run that was training resumes onto the unpruned model instead
+        // of wedging paused on a half-booted core (2026-11).
         this._capAsked = false;
+        try { resume(); } catch (re) { this._log(`prune cleanup: resume failed (${(re && re.message) || re})`); }
+        if (e && e.workerOwned) {
+          // the replacement's seed moved, but the previous core is intact
+          // (and training again, above) — say that instead of "reload"
+          const f = new Error(`prune reseed failed (${(e.cause && e.cause.message) || 'worker boot failed'}) — the unpruned model is intact`);
+          f.cause = e;
+          throw f;
+        }
         throw e;
       }
     });
   }
 
+  /** Replace one training pose at a paused model boundary. Recon, trainer
+   * metadata and camera uniforms move together so checkpoints reopen exactly. */
+  async updateCameraPose(ci, R, t) {
+    const trainer = this.trainer;
+    if (!trainer || !trainer.camMeta?.[ci]) throw new Error('camera is not trainable');
+    const wasTraining = await this.pauseAndDrain();
+    try {
+      await this._locked(async () => {
+        if (this._remote) await trainer.updateCameraPose(ci, R, t);
+        else {
+          const meta = trainer.camMeta[ci]; meta.R = Array.from(R); meta.t = Array.from(t);
+          trainer.camUniforms[ci] = trainer._camUniform(meta, 1, meta.offset, ci);
+        }
+        const imgIdx = trainer.camMeta[ci].imgIdx;
+        const rc = this.recon?.cams?.find((c) => c.imgIdx === imgIdx);
+        if (rc) { rc.R = Array.from(R); rc.t = Array.from(t); }
+      });
+    } finally { if (wasTraining) this.start(); }
+  }
+
+  /** Remove an unsuitable source image from loss/evaluation without rebuilding
+   * the model. All camera entries backed by that decoded image are excluded;
+   * the reconstruction marker makes the removal survive checkpoints. */
+  async excludeCameraImage(ci) {
+    const trainer = this.trainer;
+    const selected = trainer?.camMeta?.[ci];
+    if (!selected) throw new Error('camera is not trainable');
+    const imgIdx = selected.imgIdx;
+    const removed = trainer.camMeta.map((m, i) => m.imgIdx === imgIdx ? i : -1).filter((i) => i >= 0);
+    const wasTraining = await this.pauseAndDrain();
+    try {
+      for (const rc of this.recon?.cams || []) if (rc.imgIdx === imgIdx) rc.excluded = true;
+      const excluded = new Set([...(trainer.excluded || []), ...removed]);
+      if (removed.includes(this.holdout)) this.holdout = -1;
+      this.testCams = (this.testCams || []).filter((i) => !removed.includes(i));
+      await this._commitSplit(excluded);
+    } finally { if (wasTraining) this.start(); }
+    return removed;
+  }
+
+  /** Return a previously removed source image to the training loss without
+   * changing any persisted photo/camera indices. It returns as an ordinary
+   * training camera; a former holdout is intentionally not recreated. */
+  async includeCameraImage(ci) {
+    const trainer = this.trainer;
+    const selected = trainer?.camMeta?.[ci];
+    if (!selected) throw new Error('camera is not trainable');
+    const imgIdx = selected.imgIdx;
+    const restored = trainer.camMeta.map((m, i) => m.imgIdx === imgIdx ? i : -1).filter((i) => i >= 0);
+    const wasTraining = await this.pauseAndDrain();
+    try {
+      for (const rc of this.recon?.cams || []) if (rc.imgIdx === imgIdx) rc.excluded = false;
+      const excluded = new Set(trainer.excluded || []);
+      for (const i of restored) excluded.delete(i);
+      await this._commitSplit(excluded);
+    } finally { if (wasTraining) this.start(); }
+    return restored;
+  }
+
   /** Manual growth pass, any time: one immediate refine (relocate the dead
    *  + grow into the highest-error donors) outside the schedule — the
-   *  Prune/Grow button's other half. A bonus pass like the tandem regrow:
-   *  lastRefine untouched. At a full cap it asks the ceiling question
-   *  instead of growing into nothing. */
+   *  Prune/Grow button's other half. Manual intent bypasses automatic
+   *  recovery/cycle gates, but resets those gates so automatic growth waits
+   *  for this intervention to recover. */
   async growNow() {
     const trainer = this.trainer;
     if (!trainer) throw new Error('seed() first');
-    return this._locked(async () => {
-      const r = await trainer.refine();
+    const currentScore = this.lossHistory.length ? this.lossHistory.at(-1)[1] : null;
+    const previousRecoveryTarget = this._refineRecoveryTarget;
+    const previousLastRefine = trainer.lastRefine || 0;
+    const wasTraining = await this.pauseAndDrain();
+    try {
+      // Remember the pre-growth score so only the automatic scheduler must
+      // require recovery and fresh evidence before its next intervention.
+      this._refineRecoveryTarget = Number.isFinite(currentScore) ? currentScore : null;
+      trainer.lastRefine = trainer.iter;
+      const r = await this._locked(() => trainer.refine());
       this._log(`grow-now @${trainer.iter}: relocated ${r.moved || 0}, grew +${r.grown || 0} -> ${r.n} splats`);
       this._em.emit('event', { kind: 'grow-now', iter: trainer.iter, ...r });
       if (r.capped && !this._capAsked) {
@@ -1156,9 +1341,14 @@ export class Session {
         this.training = false;
         this._log(`splat cap reached at ${trainer.n} — paused: keep training at the cap, or prune and continue`);
         this._em.emit('event', { kind: 'cap-hit', iter: trainer.iter, splats: trainer.n });
-      }
+      } else if (wasTraining) this.start();
       return r;
-    });
+    } catch (e) {
+      this._refineRecoveryTarget = previousRecoveryTarget;
+      trainer.lastRefine = previousLastRefine;
+      if (wasTraining) this.start();
+      throw e;
+    }
   }
 
   /** End the run early with the model as it stands: final metrics, then the
@@ -1229,7 +1419,6 @@ export class Session {
     this._fences = [];
     this._ips = null;
     this._thrT = null;
-    this._statsGap = 2000;
     this._lastStats = performance.now();
     this._metricsLock = null;    // readbacks on the dead device never resolve
     this._instantChecked = false;   // the fresh device re-proves its fences
@@ -1239,6 +1428,7 @@ export class Session {
     this._readOverrun = false;
     this._framePending = false;
     this.lossHistory = [];
+    this._scoreTrainer = null;
     this._lastHold = null;
     this._lastHoldEval = 0;
     this._itersAtStats = 0;
@@ -1284,9 +1474,12 @@ export class Session {
       arm();
       // a readback rejecting mid-flight (device loss) must not become an
       // unhandled rejection — _frameFailed stops the loop and explains it
-      this._frameLoop().then(
+      const work = this._frameLoop();
+      this._frameWork = work;
+      work.then(
         () => { if (this._frameSeq === id) clearTimeout(this._stallT); },
-        (e) => { if (this._frameSeq === id) clearTimeout(this._stallT); this._frameFailed(e); });
+        (e) => { if (this._frameSeq === id) clearTimeout(this._stallT); this._frameFailed(e); })
+        .finally(() => { if (this._frameWork === work) this._frameWork = null; });
     };
     if (tickWorker) {
       tickWorker.onmessage = () => {
@@ -1294,8 +1487,24 @@ export class Session {
             performance.now() - this._frameScheduledAt > 150) runFrame();
       };
     }
+    // Background driver: a hidden page loses rAF entirely and its worker
+    // timers throttle (1/s hidden, 1/min after five minutes) — the loop
+    // would crawl, then freeze, on swipe-away. Message tasks are NOT
+    // timer-throttled, so a hidden page pumps its frames through a channel
+    // instead; the tick worker stays as the backstop for visible pages.
+    let pump = null;
+    if (typeof MessageChannel === 'function') {
+      try {
+        const ch = new MessageChannel();
+        ch.port1.onmessage = () => runFrame();
+        // Node-only: a listening port holds the event loop open — the pump
+        // must never keep a process (or a test) alive by itself
+        try { ch.port1.unref?.(); ch.port2.unref?.(); } catch { /* browsers have no unref */ }
+        pump = () => ch.port2.postMessage(0);
+      } catch { /* no channel: rAF plus the worker backstop, as before */ }
+    }
     this._sched = {
-      runFrame, tickWorker,
+      runFrame, tickWorker, pump,
       raf: typeof requestAnimationFrame === 'function'
         ? (fn) => requestAnimationFrame(fn) : (fn) => setTimeout(fn, 16),
     };
@@ -1308,7 +1517,11 @@ export class Session {
   _scheduleFrame() {
     this._framePending = true;
     this._frameScheduledAt = performance.now();
-    this._sched.raf(this._sched.runFrame);
+    // hidden (swiped-away, background tab, screen off): rAF never fires and
+    // the worker tick throttles — pump through the channel instead. Decided
+    // per frame, so hiding or showing mid-run just switches drivers.
+    if (isHidden() && this._sched.pump) this._sched.pump();
+    else this._sched.raf(this._sched.runFrame);
   }
 
   /** Effective GPU usage: the governor's auto duty capped by the slider.
@@ -1480,6 +1693,16 @@ export class Session {
   async _frameLoop() {
     const trainer = this.trainer;
     if (!trainer || !trainer.camMeta || this._lost) return;
+    // ready === false is a half-booted trainer (setup threw after camMeta,
+    // before the buffers): fail LOUD here instead of throwing the GPU's
+    // cryptic TypeErrors mid-frame (2026-11). Proxies and mocks leave ready
+    // undefined, which passes.
+    if (trainer.ready === false) {
+      throw new Error('trainer setup did not complete — the seed/reseed failed partway; reload or recover to reboot cleanly');
+    }
+    // A MessageChannel frame can already be queued when a hidden run pauses.
+    // Park it before counting/ticking; visible paused views may still repaint.
+    if (!this.training && isHidden()) return;
     this._frameCount++;
 
     if (this.training && trainer.iter >= this._maxIters()) {
@@ -1506,6 +1729,15 @@ export class Session {
           (this._instantSuspect || this._readOverrun)) {
         batch = Math.min(batch, 8);
       }
+      // A score spans exactly one shuffled deck: every trainable image once.
+      // Cap the GPU batch at the deck boundary so readLoss cannot mix epochs.
+      const scoreGroupSize = Math.max(1, trainer.camMeta.reduce((n, _, ci) =>
+        n + (ci !== trainer.holdout && !(trainer.excluded && trainer.excluded.has(ci)) ? 1 : 0), 0));
+      if (this._scoreTrainer !== trainer) {
+        this._scoreTrainer = trainer;
+        this._scoreGroupLeft = scoreGroupSize;
+      }
+      batch = Math.min(batch, Math.max(1, this._scoreGroupLeft));
       // (4) over budget: skip the submit, keep the view alive, idle a beat
       // for the queue to drain — then re-evaluate next frame
       const cutMs = this._submitCutMs(batch);
@@ -1556,29 +1788,41 @@ export class Session {
         for (let k = 0; k < batch; k++) trainer.stepOnce();
         if (typeof trainer.endGpuBatch === 'function') gpuMs = await trainer.endGpuBatch();
       }
+      this._scoreGroupLeft -= batch;
       // (3) the ceiling's own signal: reads before refine() below can move n
       this._govNoteGpu(gpuMs, batch, trainer.n);
       this._lastGpuMs = gpuMs; // (4) corrects the submit prediction next frame
 
       const tEnc = performance.now() - t0;
 
-      // periodic refinement: relocate dead splats + grow capacity (MCMC-lite).
-      // Cadence is score-driven: a plateaued PSNR pulls the next refine
-      // forward (past a minimum gap, so a flat score can't storm); the
-      // refineEvery cadence stays as the maximum gap, so fast-rising early
-      // training — and any metric outage — still refines on schedule.
-      const refineEvery = this.opts.refineEvery ?? 2500;
+      // Score-driven refinement requires a filtered-score plateau. Evidence
+      // is reset at each growth, then fresh evidence must accumulate and the
+      // score must recover from the growth dip. Backoff is fixed.
       const sinceRefine = trainer.iter - (trainer.lastRefine || 0);
+      const plateauWindow = this.opts.plateauWindow ?? 1200;
+      const convergenceGap = this.opts.plateauMinGap ?? 700;
+      const currentScore = this.lossHistory.length ? this.lossHistory.at(-1)[1] : null;
+      const recovered = this._refineRecoveryTarget == null ||
+        (Number.isFinite(currentScore) && currentScore >= this._refineRecoveryTarget - (this.opts.plateauRecoverySlack ?? 0.05));
+      if (recovered && this._refineRecoveryTarget != null) this._refineRecoveryTarget = null;
       let plateau = false;
-      if (this.opts.refinePlateau !== false && trainer.iter > 1500 &&
-          sinceRefine >= (this.opts.plateauMinGap ?? 400)) {
+      if (this.opts.refinePlateau !== false && trainer.iter >= plateauWindow && recovered &&
+          sinceRefine >= convergenceGap) {
         plateau = scorePlateaued(this.lossHistory, trainer.iter, {
-          window: this.opts.plateauWindow ?? 1200,
-          slope: this.opts.plateauSlope ?? 0.1,
+          window: plateauWindow,
+          // First growth observes 75% of the 1,200-cycle window. After a
+          // growth, the explicit 700-cycle backoff is also the fresh-evidence
+          // span; recovery to the pre-growth score remains mandatory.
+          minSpan: (trainer.lastRefine || 0) > 0 ? convergenceGap : plateauWindow * 0.75,
+          slope: this.opts.plateauSlope ?? 0.25,
+          after: trainer.lastRefine || 0,
         });
       }
       let refineResult = null;
-      if (trainer.iter > 1500 && (sinceRefine >= refineEvery || plateau)) {
+      if (trainer.iter >= plateauWindow && plateau) {
+        // Remember quality before mutation. The next refine cannot happen on
+        // the low post-grow plateau; quality must first recover to this mark.
+        this._refineRecoveryTarget = Number.isFinite(currentScore) ? currentScore : null;
         trainer.lastRefine = trainer.iter;
         // tandem prune: cull the lowest-mass fraction FIRST (until 85% of
         // the run), so this same refine regrows the freed capacity into
@@ -1595,6 +1839,15 @@ export class Session {
             this._log(`tandem prune @${trainer.iter}: culled ${pruned.culled} -> ${pruned.n} splats` +
               (pruned.floorBound === 'ratchet' ? ' (growth ratchet held the floor)' : ''));
             this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
+          }
+        } else if (!sp && trainer.iter <= 0.85 * this._maxIters()) {
+          // soft-prune off: no ratio trims, but vote-confirmed dead splats
+          // (zero rendered mass two windows running) still go — obstructed
+          // rows are pure overhead, never signal
+          const dead = await trainer.pruneDead();
+          if (dead.culled) {
+            this._log(`dead cull @${trainer.iter}: culled ${dead.culled} -> ${dead.n} splats`);
+            this._em.emit('event', { kind: 'dead-cull', iter: trainer.iter, ...dead });
           }
         }
         const r0 = performance.now();
@@ -1616,38 +1869,6 @@ export class Session {
         }
       }
 
-      // early milestones (opt-in, ahead of the tandem above): a gentle
-      // 10% trim every 1000 iterations through 6000 — keep 0.9 each —
-      // each followed by its own bonus regrow, since no scheduled
-      // refine follows this early. The old aggressive ladder (keep 1/4
-      // @500, 1/2 @1000, 3/4 @2000) culled before the model carried
-      // any signal and wedged training irrecoverably. Past `until` of
-      // the run (short test runs) the marks stay unfired.
-      const spm = trainer.opts ? trainer.opts.softPrune : null;
-      if (spm && trainer.iter <= (spm.until ?? 0.85) * this._maxIters()) {
-        this._pruneFired ??= [];
-        const marks = spm.milestones ?? [[1000, 0.9], [2000, 0.9], [3000, 0.9], [4000, 0.9], [5000, 0.9], [6000, 0.9]];
-        // a continued run starts past every mark — only fire within one
-        // window of it, so old milestones never replay back-to-back
-        const due = marks.find(([at]) => trainer.iter >= at &&
-          trainer.iter - at < (spm.every ?? 3000) && !this._pruneFired.includes(at));
-        if (due) {
-          this._pruneFired.push(due[0]);
-          const pruned = await trainer.softPrune(1 - due[1]);
-          if (!pruned.culled) {
-            this._log(`early prune @${trainer.iter}: kept all ${pruned.n} (too few rows or no signal yet)`);
-          } else {
-            this._log(`early prune @${trainer.iter}: culled ${pruned.culled} -> ${pruned.n} splats`);
-            this._em.emit('event', { kind: 'soft-prune', iter: trainer.iter, ...pruned });
-            const b = await trainer.refine();
-            if (!refineResult || b.capped) refineResult = b;
-            if (b.grown) {
-              this._log(`tandem regrow @${trainer.iter}: +${b.grown} -> ${b.n} splats`);
-              this._em.emit('event', { kind: 'tandem-regrow', iter: trainer.iter, ...b });
-            }
-          }
-        }
-      }
       // the ceiling's own prompt: a refine reporting growth-still-scheduled
       // against a full TRUE cap pauses and asks — keep training at the cap,
       // or prune to half and grow on. The UI answers via start() (growth
@@ -1662,11 +1883,15 @@ export class Session {
 
       const now = performance.now();
       let tMet = 0;
-      if (now - this._lastStats > (this._statsGap ?? 2000)) {
+      if (this._scoreGroupLeft <= 0) {
         const m0 = performance.now();
         await this._emitMetrics();
         tMet = performance.now() - m0;
-        this._govUpdate(); // duty governor runs on the stats cadence
+        this._govUpdate(); // duty governor runs once per complete camera group
+        // Splits can change while the readback is in flight; recompute the
+        // next complete shuffled group from the authoritative trainer set.
+        this._scoreGroupLeft = Math.max(1, trainer.camMeta.reduce((n, _, ci) =>
+          n + (ci !== trainer.holdout && !(trainer.excluded && trainer.excluded.has(ci)) ? 1 : 0), 0));
       }
 
       const v0 = performance.now();
@@ -1801,9 +2026,13 @@ export class Session {
     // frame present goes out now instead of queueing behind the stall
     await tick();
     const mse = await trainer.readLoss();
-    if (mse != null && mse > 0) {
+    // Scheduled reads occur only at a complete deck boundary. A final/manual
+    // stop may leave a partial deck; drain it for consistency but never plot
+    // that incomplete group as though every image contributed.
+    if (!final && mse != null && mse > 0) {
       m.psnrTrain = -10 * Math.log10(mse);
       this.lossHistory.push([trainer.iter, m.psnrTrain]);
+      m.frameErrors = Array.isArray(trainer.cameraErrors) ? trainer.cameraErrors.slice() : [];
     }
     // tile-sort overflow used to be silent (dropped tiles render as
     // background): the count is cumulative on the trainer in both the
@@ -1833,13 +2062,11 @@ export class Session {
     } else if (this._lastHold != null) {
       m.psnrHold = this._lastHold;
     }
-    // The readbacks above drain every queued batch first — seconds on a slow
-    // GPU. Pace the next readout from COMPLETION and by what this one cost,
-    // or a fixed 2s cadence turns into back-to-back queue drains.
+    // This read closes one complete shuffled camera group. Timing remains
+    // diagnostic only; it never decides when the next graph point appears.
     const end = performance.now();
     this._lastStats = end;
     this._itersAtStats = trainer.iter;
-    this._statsGap = Math.min(8000, Math.max(2000, (end - tRead) * 2.5));
     // a multi-second drain means the loop submitted faster than the GPU
     // drains — the backlog instant fences hide everywhere else. Without a
     // batch timer there is nothing else to pace off, so stay conservative

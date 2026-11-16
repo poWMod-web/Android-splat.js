@@ -73,12 +73,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
  * 'absolute', null). Deterministic: same inputs, same plan.
  */
 export function planSoftPrune(masses, n, ratio,
-    { minCull = 1024, floor = 8192, last = 0, cap = Infinity, logitOp = null, meanLogS = null } = {}) {
+    { minCull = 1024, floor = 8192, last = 0, cap = Infinity, logitOp = null, meanLogS = null,
+      votes = null, votesNeeded = 2, skipRatchet = false } = {}) {
   if (!(ratio > 0 && ratio < 1)) throw new Error(`planSoftPrune: ratio must be in (0, 1), got ${ratio}`);
   if (!masses || masses.length < n) throw new Error(`planSoftPrune: masses holds ${masses ? masses.length : 0} rows for n=${n}`);
   let target = n - Math.floor(n * ratio);
   let floorBound = null;
-  if (n < cap && last > 0 && target < Math.min(last, n)) {
+  if (!skipRatchet && n < cap && last > 0 && target < Math.min(last, n)) {
     target = Math.min(last, n);   // the cull eats regrowth, not the curve
     floorBound = 'ratchet';
   }
@@ -122,7 +123,79 @@ export function planSoftPrune(masses, n, ratio,
     if (kept >= target) break;
     rank[i] = kept++;
   }
-  return { rank, kept, culled: n - kept, threshold, floorBound };
+  const candidates = n - kept;
+  if (!votes) return { rank, kept, culled: candidates, threshold, floorBound, candidates };
+  if (votes.length < n) throw new Error(`planSoftPrune: votes holds ${votes.length} rows for n=${n}`);
+  // hysteresis (Mobile-GS votes, on our measured-mass signal): candidates
+  // vote, the merely unlucky reset — only consecutive offenders die, so one
+  // noisy window can never kill a useful splat. Floors computed above still
+  // hold: the final cull is a subset of the candidates.
+  const kill = new Uint8Array(n);
+  let final = 0;
+  for (let i = 0; i < n; i++) {
+    if (rank[i] === CULLED) {
+      votes[i]++;
+      if (votes[i] >= votesNeeded) { kill[i] = 1; final++; }
+    } else votes[i] = 0;
+  }
+  // votes persist through a no-cull window (they ARE the window's product)
+  if (final < minCull) return { rank: null, kept: n, culled: 0, threshold, floorBound, candidates };
+  rank.fill(CULLED);
+  kept = 0;
+  for (let i = 0; i < n; i++) if (!kill[i]) rank[i] = kept++;
+  return { rank, kept, culled: final, threshold, floorBound, candidates };
+}
+
+/**
+ * Plan one dead-splat cull for soft-prune-off runs: no ratio, no ratchet,
+ * no floors negotiated — only rows with ZERO rendered mass (obstructed or
+ * transparent for the whole window) are candidates, and only after
+ * `votesNeeded` consecutive windows (the same hysteresis as planSoftPrune:
+ * one noisy window never kills a useful splat).
+ *
+ * masses: Float32Array(n) of rendered mass per splat (gather slot 2).
+ * votes: Uint16Array(n), REQUIRED — hysteresis is the point; rows that
+ *   show mass reset to 0, zero-mass rows vote up, `votesNeeded` dies.
+ * minCull: confirmed kills below this don't pay for a compaction (votes
+ *   persist — they ARE the window's product).
+ * floor: fail-safe survivor count — a cull that would leave fewer rows
+ *   than this refuses instead of trusting pathological stats.
+ * Refuses (null) on short masses, non-finite masses, or all-zero mass
+ * (stats never accumulated — indistinguishable from broken stats, exactly
+ * the case planSoftPrune refuses). Else { rank, kept, culled, candidates }:
+ * rank[i] is the survivor's compacted row or CULLED; candidates counts the
+ * zero-mass rows this window. Deterministic: same inputs, same plan.
+ */
+export function planDeadCull(masses, n, { votes = null, votesNeeded = 2, minCull = 1024, floor = 8192 } = {}) {
+  if (!masses || masses.length < n) throw new Error(`planDeadCull: masses holds ${masses ? masses.length : 0} rows for n=${n}`);
+  if (!votes) throw new Error('planDeadCull: votes required (hysteresis is the point)');
+  if (votes.length < n) throw new Error(`planDeadCull: votes holds ${votes.length} rows for n=${n}`);
+  let max = 0;
+  let candidates = 0;
+  for (let i = 0; i < n; i++) {
+    const m = masses[i];
+    if (!Number.isFinite(m)) return null;                 // fail safe on broken stats
+    if (m > max) max = m;
+    if (m <= 0) candidates++;
+  }
+  // all-zero mass means the stats never accumulated (or a fully occluded
+  // model): culling would eat ARBITRARY rows — refuse, like planSoftPrune
+  if (max <= 0) return null;
+  const kill = new Uint8Array(n);
+  let final = 0;
+  for (let i = 0; i < n; i++) {
+    if (masses[i] <= 0) {
+      votes[i]++;
+      if (votes[i] >= votesNeeded) { kill[i] = 1; final++; }
+    } else votes[i] = 0;
+  }
+  // votes persist through a no-cull window (they ARE the window's product)
+  if (final < minCull) return { rank: null, kept: n, culled: 0, candidates };
+  if (n - final < Math.min(n, floor)) return { rank: null, kept: n, culled: 0, candidates };
+  const rank = new Uint32Array(n).fill(CULLED);
+  let kept = 0;
+  for (let i = 0; i < n; i++) if (!kill[i]) rank[i] = kept++;
+  return { rank, kept, culled: final, candidates };
 }
 
 /**

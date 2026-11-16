@@ -12,12 +12,12 @@ import { createSession, parseCameras, gaussiansToPly, undistortFrames, solveTier
 import { extractSharpFrames, isVideoFile } from '../../src/io/video.js';
 import { recordCaptureVideo, cameraSupported } from './camera.js';
 import { saveLastCapture, loadLastCapture } from './store.js';
-import { initXRUI, reviewCapture, exportCapture } from './xr-ui.js';
-import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture } from './xr-dataset.js';
+import { initXRUI, reviewCapture, exportCapture, importNativeCapture } from './xr-ui.js';
+import { datasetFromSelection, validateDataset, measuredSeeds, storedCapture, unpackZipFile } from './xr-dataset.js';
 import { parseCycleCount, parseLODCount, maxLODLevels, buildLODPlan } from '../../src/training-settings.js';
 import { zipStore } from './zip.js';
 import { saveBlob } from './download.js';
-import { buildSessionZip, fetchModel, gravityUpForKnownRun, continuedInputDim, continuedBuf } from './session_io.js';
+import { buildSessionZip, fetchModel, gravityUpForKnownRun, continuedInputDim, continuedBuf, trimProgressToIter } from './session_io.js';
 import { buildDisplayCloud } from './scene-cloud.js';
 import { REPO, DISCORD, DATA, ownSet } from './data.js';
 
@@ -25,6 +25,8 @@ import { Viewport, camCentre, quatFromR, quatToR, qslerp, rollAngleToUp, snapRol
 import { Developer, fitRect } from './develop.js';
 import { Chart, psnrToApproxSsimPercent } from './chart.js';
 import { bmp, readyBmp, sizedUrl } from './img.js';
+import * as Headless from './headless.js';
+import { adjacentPoseCandidates, manualPoseFromCorrespondences } from './align.js';
 
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => Math.round(n).toLocaleString('en-US');
@@ -34,8 +36,17 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
 
 // Two front doors, one codebase: classic and wall-first layouts use local
 // photo intake and device-saved work (splat-js2, or ?v2 anywhere).
-const WALL_FIRST = /splat-js2/.test(location.pathname)
+// One UI, two shells: the browser/ folder boots this same app with a marker
+// (its generated index.html sets __SPLAT_SHELL) or ?shell=browser — local
+// only, no AR capture, no avatar route, no share backend. Everything else
+// is the same code; the gates below are the whole difference.
+const SHELL = new URLSearchParams(location.search).get('shell') || globalThis.__SPLAT_SHELL || 'app';
+const WALL_FIRST = SHELL === 'browser' || /splat-js2/.test(location.pathname)
   || new URLSearchParams(location.search).has('v2');
+// main's browser trainer always exposed its orbit preview. The shared app
+// may default visuals off on phones, but /browser is a trainer/viewer and
+// presents the evolving splat without another opt-in.
+const defaultTrainingVisuals = () => SHELL === 'browser';
 
 // short first run (phones especially) — the done screen offers "+10k cycles"
 // which stretches the trainer's schedules and resumes. 20k, not 10k: with a
@@ -234,7 +245,7 @@ function readSoftprune() {
  *  selection (or a stored non-preset fraction) shows the percent input. */
 function showSoftprune(v) {
   const sel = $('set-softprune'), custom = $('set-softprune-custom');
-  const fixed = ['', '0.05', '0.1', '0.2', '0.3'];
+  const fixed = ['', '0.01', '0.02', '0.05', '0.1'];
   if (fixed.includes(v) && sel.value !== 'custom') {
     sel.value = v || '';
     custom.hidden = true;
@@ -250,6 +261,30 @@ function showSoftprune(v) {
 function readKeepCustom(id) {
   const pct = Math.round(parseFloat($(id).value) || 0);
   return (pct >= 5 ? Math.min(95, pct) : 50) / 100;
+}
+/** Custom PRUNE percentage is shared by foreground/background pickers and
+ * retained across picker closes and app restarts. */
+const PRUNE_CUSTOM_KEY = 'splat.pruneCustomPercent';
+function rememberedPrunePercent() {
+  try {
+    const raw = Number(localStorage.getItem(PRUNE_CUSTOM_KEY));
+    if (Number.isInteger(raw) && raw >= 1 && raw <= 99) return raw;
+  } catch { /* storage may be unavailable; the in-page default still works */ }
+  return 50;
+}
+function rememberPrunePercent(raw) {
+  const pct = Number(raw);
+  if (!Number.isInteger(pct) || pct < 1 || pct > 99) return null;
+  try { localStorage.setItem(PRUNE_CUSTOM_KEY, String(pct)); } catch { /* optional persistence */ }
+  return pct;
+}
+/** Only whole values 1–99 are accepted; invalid input returns null and must
+ * not execute a prune. Valid selections are remembered. */
+function readPruneCustom(id) {
+  const raw = Number($(id).value);
+  if (!Number.isInteger(raw) || raw < 1 || raw > 99) return null;
+  rememberPrunePercent(raw);
+  return 1 - raw / 100;
 }
 
 // quality macros: the one-knob row that drives the individual rows below it.
@@ -293,6 +328,7 @@ const S = {
   regCams: [],                 // cameras as they register (beat 3)
   solveStats: { pairsChecked: 0, pairsUsable: 0, solveSec: 0 },
   chartEvents: [],             // real refine/growth moments for the curve
+  splatHist: [],               // [iteration, count] for the graph cursor
   scoreScale: 'db',
   flash: null,
   detailTab: 'score',
@@ -302,6 +338,7 @@ const S = {
   keys: new Set(),             // held WASD keys (camera-relative fly)
   maxIters: INITIAL_ITERS,     // grows when the user continues training
   settings: loadSettings(),    // training knobs from the start-card panel
+  earlyPrune: null,            // approved one-shot 75% removal at cycle 500
   gen: 0,                      // run generation — stale async work checks it
 };
 
@@ -542,6 +579,7 @@ function toggleTrainingVisuals() {
   if (S.trainVisuals) S._viewKey = ''; // render the current model at the current camera pose
   else if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
   syncTrainingVisualsControl();
+  renderControls();
 }
 
 // the OAuth popup lands back on this page with ?code= — report and close
@@ -557,6 +595,17 @@ function boot() {
   vp.onDragStart = () => { stopTour(); };
   dev = new Developer();
 
+  const backgroundStart = $('btn-go-background');
+  // This route is Android-only: reconstruction and seeding still happen in
+  // the Activity, then the first durable trainer state is handed straight to
+  // the foreground service without entering an Activity-owned training run.
+  backgroundStart.hidden = !(globalThis.AndroidARBridge &&
+    typeof globalThis.AndroidARBridge.headlessCommand === 'function');
+  backgroundStart.addEventListener('click', () => {
+    if (backgroundStart.disabled) return;
+    S.startInBackground = true;
+    $('btn-go').click();
+  });
   $('btn-go').addEventListener('click', async () => {
     if (S.picking) { const p = S.pending || S.preset; closePicker(); await open(p, true); return; }
     if (S.pendingShare) {
@@ -582,30 +631,11 @@ function boot() {
       }
       go.disabled = false;
     }
-    startPrep();
+    await startPrep();
   });
   $('btn-new').addEventListener('click', async (e) => {
     e.stopPropagation();
-    const runId = S.runId || (S._localRun && S._localRun.id);
-    if (runId) await persistRunDetails(runId, { full: true }).catch(() => {});
-    // a shared creation holds nothing precious — Back is simply the way
-    // home. When the visitor came from within the app, real history.back()
-    // is better: the bfcache restores the feed with its scroll intact.
-    if (S._localRun && S._viewerOpen) { closeViewerToHome(); return; }
-    if (S.restored) {
-      let fromApp = false;
-      try {
-        const r = document.referrer && new URL(document.referrer);
-        fromApp = !!r && r.origin === location.origin;
-      } catch (err) { /* opaque referrer -> treat as external */ }
-      if (fromApp && history.length > 1) history.back();
-      else location.href = 'index.html';
-      return;
-    }
-    // Back from a run leaves the same way the logo does: a page navigation
-    // home. The wall is never rendered OVER a live scene — the beforeunload
-    // confirm guards a training in progress.
-    location.href = 'index.html';
+    await goBack();
   });
   $('btn-training-visuals').addEventListener('click', toggleTrainingVisuals);
   $('card-x').addEventListener('click', closePicker);
@@ -634,6 +664,9 @@ function boot() {
   initXRUI({
     flash,
     onCapture: (capture) => useOwnPhotos(capture.files, capture),
+    // the native import runs before any review modal exists: Start refuses
+    // while the counter stands (see startPrep)
+    setBusy: (on) => { S._intakeN = Math.max(0, (S._intakeN || 0) + (on ? 1 : -1)); },
   });
   $('xr-review-set').addEventListener('click', async () => {
     const dataset = S.preset?.capture || { kind: 'photos', files: S.preset?.files || [], points: [] };
@@ -654,10 +687,11 @@ function boot() {
     e.preventDefault(); card.classList.remove('drop');
     const files = e.dataTransfer.files;
     // a saved run comes back through the same door as photos
-    if (files.length === 1 && /\.(zip|sog|ply)$/i.test(files[0].name)) {
+    if (files.length === 1 && /\.(sog|ply)$/i.test(files[0].name)) {
       restoreSession({ bytes: new Uint8Array(await files[0].arrayBuffer()) });
       return;
     }
+    // zips ride the photo flow: useOwnPhotos sniffs session vs capture
     useOwnPhotos(files);
   });
   $('d-close').addEventListener('click', closeDetails);
@@ -894,10 +928,10 @@ function boot() {
     history.replaceState(null, '', aboutUrl(false));
   };
   window.closeAbout = closeAbout;
-  $('brand').addEventListener('click', () => {
+  $('brand').addEventListener('click', async () => {
     const atHome = !$('start').hidden && $('detail').hidden;
     if (atHome) openAbout();
-    else location.href = 'index.html';
+    else await goBack();   // off the home tile the brand IS Back (checkpoint included)
   });
   $('read-more').addEventListener('click', (e) => {
     e.preventDefault(); e.stopPropagation();
@@ -910,16 +944,18 @@ function boot() {
 
   checkGpu();
   if (new URLSearchParams(location.search).get('about')) { S._aboutFromUrl = true; openAbout(true); }
-  // a refresh mid-run would throw away the model (and, before storage
-  // landed, the capture) — ask first
+  // a refresh or tab-close mid-run would throw away the model (and, before
+  // storage landed, the capture) — ask first. A Back-leave never asks: it
+  // secured the run first, so there is nothing left to warn about.
   addEventListener('beforeunload', (e) => {
+    if (S._leaving) return;   // Back already saved — wave it through
     if (S.state === 'train' || S.state === 'prep') { e.preventDefault(); e.returnValue = ''; }
   });
   window.__splat = S;          // console access
   window.__vp = () => vp;      // console access (camera state)
   // installable PWA: the worker is a no-op (no caching), the manifest does
   // the rest. Relative URL -> correct scope on every deploy base path.
-  if ('serviceWorker' in navigator) {
+  if (SHELL !== 'browser' && 'serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
   showIntro();
@@ -954,13 +990,24 @@ function boot() {
     // truck default sat invisibly behind the start card and leaked into
     // Back navigation ("why is the truck loaded?")
   }
+  if (SHELL === 'browser') {
+    // the browser profile boots this same UI local-only: no AR capture
+    // actions, no avatar route, no backend — files in, training, model
+    // out. Reviews of picked photo+pose sets stay (they are local).
+    for (const id of ['btn-ar', 'btn-record', 'btn-xr-help', 'xr-open-tab', 'xr-ar-state', 'xr-device-guide', 'av-choice']) {
+      const el = $(id);
+      if (el) el.hidden = true;
+    }
+    document.querySelector('.xr-flow')?.remove();
+  }
   syncTrainingVisualsControl();
   requestAnimationFrame(loop);
 
   // a shared result: load it straight into the done-state viewer
-  if (mp.get('space')) restoreShared(mp.get('space'));
+  if (mp.get('space') && SHELL !== 'browser') restoreShared(mp.get('space'));
   else if (mp.get('model')) restoreSession({ url: mp.get('model'), reconUrl: mp.get('recon') });
-  else mountWall();
+  else if (mp.get('back')) headlessClearMarker().finally(() => mountWall());
+  else headlessBootCheck().then((took) => { if (!took) mountWall(); });
 }
 
 // WebGPU probe: navigator.gpu can EXIST while the adapter is unavailable
@@ -1037,9 +1084,19 @@ function showIntro() {
  *  in stored order — sorted on the way out, same rules as a fresh pick. */
 async function openCaptureSet(rec = null) {
   rec = rec || await loadLastCapture();
+  if (rec && rec.nativeCaptureId) {
+    try {
+      const capture = await importNativeCapture(globalThis.AndroidARBridge, rec.nativeCaptureId);
+      rec = {
+        ...rec, files: capture.files.map((f) => ({ name: f.name, blob: f, url: f.url })),
+        ...storedCapture(capture), metadata: capture.metadata,
+      };
+    } catch (e) { throw new Error(`The native scan archive is unreadable: ${e.message}`); }
+  }
   if (!rec || !rec.files || rec.files.length < 2) return null;
   const files = rec.files.map((e) => {
-    const f = new File([e.blob], e.name, { type: e.blob.type || 'image/jpeg' });
+    const f = Object.assign(new File([e.blob], e.name, { type: e.blob.type || 'image/jpeg' }),
+      { ...(e.url ? { url: e.url } : {}) });
     if (e.mask) f.mask = e.mask;   // avatar mode: the person's matte rides with the frame
     return f;
   });
@@ -1069,13 +1126,13 @@ async function openCaptureSet(rec = null) {
 /** The previous own capture, restored from this device's storage — a local-library tile. */
 async function lastCaptureTile() {
   const rec = await loadLastCapture();
-  if (!rec || !rec.files || rec.files.length < 2) return null;
+  // Native scans are listed from their immutable Android archives below; do
+  // not duplicate their JPEGs (or their tile) in IndexedDB.
+  if (!rec || rec.nativeCaptureId || !rec.files || rec.files.length < 2) return null;
   const b = document.createElement('div');
   b.className = 'galtile';
   b.style.cursor = 'pointer';
   b.title = `${rec.files.length} frames, saved on this device`;
-  // the badge keeps it apart from the shares — a capture OF a known scene
-  // makes the thumbnails near-identical
   const capWhen = rec.created
     ? new Date(rec.created).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
     : null;
@@ -1083,30 +1140,152 @@ async function lastCaptureTile() {
     <button class="run-menu" title="Options">⋯</button>
     <span class="galname">${rec.files.length} photos</span>
     <span class="galmeta">${capWhen ? `${capWhen} · ` : ''}local</span>`;
-  const img = Object.assign(new Image(), { src: URL.createObjectURL(rec.files[0].blob), alt: '' });
-  b.prepend(img);
-  tileMenu(b.querySelector('.run-menu'), [
-    { label: 'Train', act: async () => {
-      const set = await openCaptureSet(rec);
-      if (!set) return;
-      open(set);
-      if (!WALL_FIRST) showDetail(set);
-    } },
-    { label: 'Delete', danger: true, act: async () => {
-      const { deleteLastCapture } = await import('./store.js');
-      await deleteLastCapture();
-      b.remove();
-    } },
-  ]);
-  b.addEventListener('click', async () => {
-    if (S.picking) { S.pending = await openCaptureSet(rec); paintCard(S.pending); return; }
+  b.prepend(Object.assign(new Image(), { src: URL.createObjectURL(rec.files[0].blob), alt: '' }));
+  const train = async () => {
     const set = await openCaptureSet(rec);
     if (!set) return;
     open(set);
     if (!WALL_FIRST) showDetail(set);
+  };
+  tileMenu(b.querySelector('.run-menu'), [
+    { label: 'Train', act: train },
+    { label: 'Delete', danger: true, act: async () => {
+      const { deleteLastCapture } = await import('./store.js');
+      await deleteLastCapture(); b.remove();
+    } },
+  ]);
+  b.addEventListener('click', async () => {
+    if (S.picking) { S.pending = await openCaptureSet(rec); paintCard(S.pending); return; }
+    await train();
   });
   return b;
 }
+
+let legacyCaptureMigration = null;
+let legacyCaptureRemounted = false;
+/** Move an old IndexedDB-only AR capture into the canonical native archive.
+ * This is migration, not duplication: the blob record is deleted only after
+ * the native catalog verifies the complete archive. */
+async function migrateLegacyNativeCapture() {
+  const bridge = globalThis.AndroidARBridge;
+  if (!bridge || typeof bridge.writeCaptureArchiveChunk !== 'function') return false;
+  if (legacyCaptureMigration) return legacyCaptureMigration;
+  legacyCaptureMigration = (async () => {
+    const rec = await loadLastCapture();
+    if (!rec || rec.nativeCaptureId || !rec.transforms || !Array.isArray(rec.files) || rec.files.length < 3) return false;
+    const captureId = `legacy_${Math.max(1, Math.round(rec.created || Date.now()))}`;
+    const fileMap = new Map();
+    const files = rec.files.map((entry, i) => {
+      const name = `frame_${String(i).padStart(4, '0')}.jpg`;
+      fileMap.set(String(entry.name || '').split('/').pop(), name);
+      return { ...entry, name };
+    });
+    const writeBytes = async (name, bytes) => {
+      const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      for (let o = 0; o < data.length; o += 262144) {
+        if (!bridge.writeCaptureArchiveChunk(captureId, name,
+          Headless.encodeB64(data.subarray(o, o + 262144)), o + 262144 >= data.length)) {
+          throw new Error(`native archive rejected ${name}`);
+        }
+      }
+    };
+    for (const file of files) {
+      const blob = file.blob;
+      if (!blob || typeof blob.arrayBuffer !== 'function') throw new Error(`legacy frame ${file.name} is missing`);
+      await writeBytes(file.name, await blob.arrayBuffer());
+    }
+    const transforms = JSON.parse(JSON.stringify(rec.transforms));
+    for (const [i, frame] of (transforms.frames || []).entries()) {
+      const old = String(frame.file_path || '').split('/').pop();
+      frame.file_path = `./${fileMap.get(old) || files[i]?.name || ''}`;
+    }
+    const points = (rec.points || []).map((point) => ({ ...point,
+      ...(point.frameName ? { frameName: fileMap.get(String(point.frameName).split('/').pop()) || point.frameName } : {}) }));
+    const enc = new TextEncoder();
+    await writeBytes('transforms.json', enc.encode(JSON.stringify(transforms)));
+    await writeBytes('seed_points.json', enc.encode(JSON.stringify({ points, metadata: rec.metadata || {} })));
+    await writeBytes('capture.json', enc.encode(JSON.stringify({ ...(rec.metadata || {}), frames: files.length,
+      pointCount: points.length, migratedFromIndexedDB: true })));
+    const catalog = JSON.parse(bridge.listHomeLibrary());
+    if (!(catalog.captures || []).some((row) => row.captureId === captureId)) {
+      throw new Error('native archive verification failed');
+    }
+    const { deleteLastCapture, listRuns, patchRun } = await import('./store.js');
+    // Repoint legacy model records before deleting their old image blobs.
+    // Their model state stays their own; image/pose reads now resolve only
+    // through the migrated canonical archive.
+    for (const run of await listRuns()) {
+      const source = run && run.recon && run.recon.source;
+      if (!source || !Array.isArray(source.names) || !source.names.length) continue;
+      const urls = source.names.map((name, i) => {
+        const old = String(name || '').split('/').pop();
+        const nativeName = fileMap.get(old) || files[i]?.name;
+        return nativeName ? `https://appassets.androidplatform.net/captures/${captureId}/${nativeName}` : null;
+      });
+      if (!urls.every(Boolean)) continue;
+      await patchRun(run.id, { srcKey: `native:${captureId}`,
+        recon: { ...run.recon, source: { ...source, urls, captureId } } });
+    }
+    await deleteLastCapture();
+    return true;
+  })().catch((e) => { console.warn('[home] legacy AR migration failed', e); return false; });
+  return legacyCaptureMigration;
+}
+
+/** Every native ARCore archive is a ground-truth scan tile. Only references
+ * cross into JS; opening one fetches its files from the stable native folder. */
+async function nativeCaptureTiles(rows = null) {
+  const b = globalThis.AndroidARBridge;
+  if (!b || typeof b.listCaptureArchives !== 'function') return [];
+  if (rows == null) {
+    try { rows = JSON.parse(b.listCaptureArchives()); } catch { return []; }
+  }
+  if (!Array.isArray(rows)) return [];
+  return rows.map((row) => {
+    const tile = document.createElement('div');
+    tile.className = 'galtile'; tile.style.cursor = 'pointer';
+    const when = row.created ? new Date(row.created).toLocaleString([],
+      { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
+    tile.innerHTML = `<button class="run-menu" title="Options">⋯</button>
+      <span class="galname">${fmt(row.frameCount || 0)} ARCore photos</span>
+      <span class="galmeta">${when ? `${when} · ` : ''}native scan</span>`;
+    if (row.previewUri) tile.prepend(Object.assign(new Image(), { src: row.previewUri, alt: '' }));
+    tileMenu(tile.querySelector('.run-menu'), [
+      { label: 'Delete', danger: true, act: async () => {
+        // Native Java protects references from durable run manifests. Check
+        // main-style IndexedDB records too, including a run whose first file
+        // checkpoint has not landed yet.
+        const { listRuns } = await import('./store.js');
+        const referenced = (await listRuns()).find((run) =>
+          String(run?.srcKey || '').replace(/^native:/, '') === row.captureId ||
+          run?.recon?.source?.captureId === row.captureId);
+        if (referenced) {
+          flash('Delete its trained models first; this scan is still their source.', 7000);
+          return;
+        }
+        let answer = { deleted: false, reason: 'unsupported' };
+        try { answer = JSON.parse(b.deleteCaptureArchive(row.captureId)); } catch { /* report below */ }
+        if (answer.deleted) tile.remove();
+        else if (answer.reason === 'referenced') flash('Delete its trained models first; this scan is still their source.', 7000);
+        else flash('This scan could not be deleted.', 6000);
+      } },
+    ]);
+    tile.addEventListener('click', async () => {
+      try {
+        const capture = await importNativeCapture(b, row.captureId);
+        const rec = { kind: 'photos', created: row.created || Date.now(),
+          nativeCaptureId: row.captureId,
+          files: capture.files.map((f) => ({ name: f.name, blob: f, url: f.url })),
+          ...storedCapture(capture) };
+        const set = await openCaptureSet(rec);
+        if (!set) return;
+        open(set); if (!WALL_FIRST) showDetail(set);
+      } catch (e) { flash(`Could not open native scan: ${e.message}`, 8000); }
+    });
+    return tile;
+  });
+}
+
 
 /** tiles for the local runs library — every training run this device has
  *  started. Finished runs reopen in the viewer straight from their stored
@@ -1128,17 +1307,8 @@ function tileMenu(btn, items) {
       if (it.danger) b.className = 'danger';
       b.addEventListener('click', async (ev) => {
         ev.stopPropagation();
-        if (it.danger && b.dataset.armed !== '1') {
-          b.dataset.armed = '1';
-          b.textContent = 'Delete?';
-          b.classList.add('armed');
-          setTimeout(() => {
-            b.dataset.armed = '';
-            b.textContent = it.label;
-            b.classList.remove('armed');
-          }, 3000);
-          return;
-        }
+        if (it.danger && !(await inAppConfirm('Delete permanently',
+          'Delete this item from this device? This cannot be undone.', 'Delete'))) return;
         m.remove();
         await it.act();
       });
@@ -1154,28 +1324,47 @@ function tileMenu(btn, items) {
   });
 }
 
-async function localRunTiles() {
+let wallBlobUrls = [];
+function wallBlobUrl(blob) {
+  const url = URL.createObjectURL(blob);
+  wallBlobUrls.push(url);
+  return url;
+}
+
+async function localRunTiles(nativeRows = [], captureRows = []) {
   const { listRuns, deleteRun } = await import('./store.js');
   const runs = await listRuns();
+  const nativeByRun = new Map((nativeRows || []).map((row) => [row.runId, row]));
+  const captureById = new Map((captureRows || []).map((row) => [row.captureId, row]));
   const tiles = [];
-  for (const r of runs) {
+  for (const stored of runs) {
+    const nativeRow = nativeByRun.get(stored.id) || null;
+    const nativeNewer = !!(nativeRow && (nativeRow.iter || 0) >= (stored.iter || 0));
+    // Keep main's full model record, but paint live/durable Android metadata
+    // over stale IndexedDB fields. The latter cannot update while the service
+    // trains in its separate process.
+    const r = nativeNewer ? { ...stored,
+      name: nativeRow.name || stored.name,
+      status: nativeRow.status || stored.status,
+      iter: nativeRow.iter ?? stored.iter,
+      splats: nativeRow.splats ?? stored.splats,
+      psnr: nativeRow.psnr ?? stored.psnr,
+    } : stored;
     const live = S.runId === r.id && S.state === 'train';
+    const backgroundLive = !!(nativeRow && Headless.isLiveStatus(nativeRow));
     const src = r.recon && r.recon.source;
     const urlSrc = !!(src && Array.isArray(src.urls) && src.urls.length && src.urls.every(Boolean));
     const retrainable = !!(r.ownSrc || urlSrc);
-    if (r.status !== 'finished' && !r.sog && !(r.state && r.recon) && !retrainable && !live) {
-      // a dead tombstone: nothing to view, resume or retrain — the only
-      // possible action was Delete, so do that instead of listing it
-      deleteRun(r.id).catch(() => {});
-      continue;
-    }
     const b = document.createElement('div');
     b.className = 'galtile';
+    b.dataset.runId = r.id;
     b.style.cursor = (r.sog || (r.state && r.recon) || retrainable) ? 'pointer' : 'default';
     // finished scenes wear the same sub-header as the preset tiles:
     // splats · dB · MB — a scene is a scene, wherever it was trained
     const state = r.status === 'finished'
       ? `${fmt(r.splats || 0)} splats${r.psnr != null ? ` · ${(+r.psnr).toFixed(1)} dB` : ''}${r.sog ? ` · ${Math.max(1, Math.round(r.sog.size / 1e6))} MB` : ''}`
+      : backgroundLive
+        ? `${r.status === 'paused' ? 'background paused' : 'background training'} · ${fmt(r.splats || 0)} splats · ${fmt(r.iter || 0)} cycles`
       : live
         ? `training now · ${fmt(r.iter || 0)} cycles`
         : (r.state && r.recon)
@@ -1193,7 +1382,26 @@ async function localRunTiles() {
       <span class="galname">${esc(r.name || 'Training run')}</span>
       ${desc ? `<span class="galdesc">${esc(desc)}</span>` : ''}
       <span class="galmeta">${state}</span>`;
-    if (r.thumb) b.prepend(Object.assign(new Image(), { src: URL.createObjectURL(r.thumb), alt: '' }));
+    if (r.thumb) b.prepend(Object.assign(new Image(), { src: wallBlobUrl(r.thumb), alt: '' }));
+    else {
+      const captureId = String(r.srcKey || '').replace(/^native:/, '');
+      const fallbackPreview = nativeRow?.previewUri || captureById.get(captureId)?.previewUri;
+      if (fallbackPreview) b.prepend(Object.assign(new Image(), { src: fallbackPreview, alt: '' }));
+    }
+    const openNativeFresh = async (viewOnly) => {
+      if (!nativeRow) return false;
+      if (backgroundLive) { enterMonitor(r.id); return true; }
+      try {
+        flash('Refreshing the saved model …', 60000);
+        const rec = await mirrorHeadlessRun(r.id, nativeRow);
+        S._localRun = rec;
+        await continueLocalRun(viewOnly);
+        return true;
+      } catch (e) {
+        flash(`Could not refresh this model: ${e.message}`, 8000);
+        return false;
+      }
+    };
     const viewFromState = (rec) => {
       S._localRun = rec;
       continueLocalRun(true).catch((e) => {
@@ -1224,6 +1432,7 @@ async function localRunTiles() {
           flash('Could not save the new model name on this device.', 6000);
           return;
         }
+        await renameAndroidRun(r.id, name);
         r.name = name;
         const title = b.querySelector('.galname');
         if (title) title.textContent = name;
@@ -1235,9 +1444,22 @@ async function localRunTiles() {
       (r.sog || retrainable || (r.state && r.recon)) && { label: 'Train', act: () => { S._localRun = r; trainLocalChoice(); } },
       { label: 'Rename', act: renameLocalModel },
       r.spaceId && { label: 'Copy link', act: async () => { try { await navigator.clipboard.writeText(shareLinkOf(r.spaceId)); flash('Link copied.', 2500); } catch { flash(shareLinkOf(r.spaceId), 8000); } } },
-      { label: 'Delete', danger: true, act: async () => { await deleteRun(r.id); b.remove(); } },
+      { label: 'Delete', danger: true, act: async () => {
+        const bridge = headlessBridge();
+        if (bridge && typeof bridge.deleteRunArchive === 'function' && bridge.deleteRunArchive(r.id) === false) {
+          flash('A running model cannot be deleted.', 6000); return;
+        }
+        if (!(await deleteRun(r.id))) {
+          flash('This model could not be removed from device storage.', 7000); return;
+        }
+        b.remove();
+      } },
     ]);
-    b.addEventListener('click', () => {
+    b.addEventListener('click', async () => {
+      if (backgroundLive) { enterMonitor(r.id); return; }
+      if (nativeNewer && nativeRow && (nativeRow.iter || 0) > (stored.iter || 0)) {
+        await openNativeFresh(nativeRow.status === 'finished'); return;
+      }
       if (r.sog && r.recon) {
         restoreSession({
           url: URL.createObjectURL(r.sog),
@@ -1249,7 +1471,7 @@ async function localRunTiles() {
         // state (Compress there turns it into a sog tile)
         viewFromState(r);
       } else if (r.state && r.recon && !(S.runId === r.id && S.state === 'train')) {
-        // a pause checkpoint: no sog to view yet, but the run continues
+        // a leave checkpoint: no sog to view yet, but the run continues
         // exactly where it stopped
         resumeRun();
       } else if (retrainable && !(S.runId === r.id && S.state === 'train')) {
@@ -1260,6 +1482,109 @@ async function localRunTiles() {
       }
     });
     tiles.push(b);
+  }
+  return tiles;
+}
+
+
+async function renameAndroidRun(runId, name) {
+  const bridge = headlessBridge();
+  if (!bridge || typeof bridge.writeRunJson !== 'function' || !Headless.validRunId(runId)) return false;
+  try {
+    const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')));
+    if (!response.ok) return false;
+    const manifest = await response.json();
+    manifest.name = name;
+    const ok = bridge.writeRunJson(runId, 'manifest.json', JSON.stringify(manifest));
+    if (ok && S._hlManifest?.runId === runId) S._hlManifest = manifest;
+    return !!ok;
+  } catch { return false; }
+}
+
+/** Lightweight Home tiles for checkpoints in Android app data. Unlike the
+ * old rediscovery pass, this does not copy every state.bin into IndexedDB
+ * before Home can paint. The full checkpoint is loaded only when tapped. */
+async function androidRunTiles(ids = null) {
+  const bridge = headlessBridge();
+  if (!bridge || typeof bridge.listRecoverableRuns !== 'function') return [];
+  if (ids == null) {
+    try { ids = JSON.parse(bridge.listRecoverableRuns()); } catch { return []; }
+  }
+  if (!Array.isArray(ids) || !ids.length) return [];
+  const { deleteRun } = await import('./store.js');
+  const tiles = [];
+  for (const entry of ids) {
+    const runId = typeof entry === 'string' ? entry : entry && entry.runId;
+    if (!Headless.validRunId(runId)) continue;
+    try {
+      let manifest = null;
+      let status = { status: 'interrupted', owner: 'activity', iter: 0, at: 0 };
+      let photoCount = 0;
+      if (entry && typeof entry === 'object') {
+        manifest = { name: entry.name || 'Training run' };
+        photoCount = entry.photoCount | 0;
+        status = { ...status, ...entry };
+      } else {
+        const manifestResponse = await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')));
+        if (!manifestResponse.ok) continue;
+        manifest = await manifestResponse.json();
+        photoCount = Array.isArray(manifest.photos) ? manifest.photos.length : 0;
+        try {
+          const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
+          if (response.ok) status = { ...status, ...(await response.json()) };
+        } catch { /* checkpoint remains usable without control metadata */ }
+      }
+      const tile = document.createElement('div');
+      tile.className = 'galtile'; tile.style.cursor = 'pointer'; tile.dataset.runId = runId;
+      const finished = status.status === 'finished';
+      const state = finished
+        ? `${fmt(status.splats || 0)} splats${status.psnr != null ? ` · ${(+status.psnr).toFixed(1)} dB` : ''}`
+        : `saved checkpoint · ${fmt(status.iter || 0)} cycles`;
+      tile.innerHTML = `<button class="run-menu" title="Options">⋯</button>
+        <span class="galname">${esc(manifest.name || 'Training run')}</span>
+        <span class="galdesc">Stored in Android app data${photoCount ? ` · ${fmt(photoCount)} photos` : ''}.</span>
+        <span class="galmeta">${state}</span>`;
+      if (entry && typeof entry === 'object' && entry.previewUri) {
+        tile.prepend(Object.assign(new Image(), { src: entry.previewUri, alt: '' }));
+      }
+      const openFileRun = async () => {
+        flash('Opening the saved model …', 60000);
+        try {
+          const rec = await mirrorHeadlessRun(runId, status);
+          S._localRun = rec;
+          await continueLocalRun(finished);
+        } catch (e) {
+          console.error(e);
+          flash(`Could not open this saved model: ${e.message}`, 9000);
+        }
+      };
+      tileMenu(tile.querySelector('.run-menu'), [
+        { label: finished ? 'View' : 'Continue', act: openFileRun },
+        { label: 'Rename', act: async () => {
+          const previousName = manifest.name || 'Training run';
+          const name = await textCard('Rename this model', previousName);
+          if (!name || name === previousName) return;
+          if (!(await renameAndroidRun(runId, name))) {
+            flash('Could not save the new model name on this device.', 6000); return;
+          }
+          manifest.name = name;
+          const title = tile.querySelector('.galname');
+          if (title) title.textContent = name;
+          flash(`Renamed to ${name}.`, 4000);
+        } },
+        { label: 'Delete', danger: true, act: async () => {
+          if (typeof bridge.deleteRunArchive === 'function' && bridge.deleteRunArchive(runId) === false) {
+            flash('A running model cannot be deleted.', 6000); return;
+          }
+          if (!(await deleteRun(runId))) {
+            flash('This model could not be removed from device storage.', 7000); return;
+          }
+          tile.remove();
+        } },
+      ]);
+      tile.addEventListener('click', openFileRun);
+      tiles.push(tile);
+    } catch (e) { console.warn(`[home] unreadable Android run ${runId}`, e); }
   }
   return tiles;
 }
@@ -1469,12 +1794,48 @@ function persistCapture(rec) {
   });
 }
 
+// Async intake funnels through here (file picker, drops, captures, zips):
+// the landing set's open() bumps S.gen, which can kill startPrep in flight.
+// Start now queues behind this counter instead of making the user tap twice.
 async function useOwnPhotos(list, capture = null) {
-  const all = [...list];
+  S._intakeN = (S._intakeN || 0) + 1;
+  try { return await useOwnPhotosInner(list, capture); }
+  finally { S._intakeN--; }
+}
+async function useOwnPhotosInner(list, capture = null) {
+  // capture zips (exported photos + camera JSON) unpack to files and join
+  // the flow below; a session zip restores instead of training
+  const all = [];
+  let fromZip = false;
+  const zipSkipped = [];
+  for (const f of list) {
+    if (f && /\.zip$/i.test(f.name || '')) {
+      try {
+        const u = await unpackZipFile(f);
+        if (u.kind === 'session') { restoreSession({ bytes: u.bytes }); return; }
+        if (u.kind === 'capture') {
+          fromZip = true;
+          all.push(...u.files);
+          for (const s of u.skipped || []) zipSkipped.push(s);
+          continue;
+        }
+        flash(`"${f.name}" holds no photos or session — skipped.`, 5000);
+      } catch (e) { flash(`Could not unpack "${f.name}": ${e.message}`, 8000); }
+      continue;
+    }
+    all.push(f);
+  }
   if (!capture && all.some((f) => /\.json$/i.test(f.name))) {
     try {
-      capture = await reviewCapture(await datasetFromSelection(all));
+      capture = await reviewCapture(await datasetFromSelection(all, fromZip ? { fromZip: true } : {}));
       if (!capture) return;
+      // folder zips carry strays (OS metadata, thumbnails, second copies):
+      // name them so the review count never surprises
+      const leftOut = [...zipSkipped, ...(capture.dropped || [])];
+      if (leftOut.length) {
+        flash(`Left out of the zip import: ${leftOut.slice(0, 3).join('; ')}` +
+          `${leftOut.length > 3 ? `; +${leftOut.length - 3} more` : ''}.`, 9000);
+      }
     } catch (e) { flash(`Could not import capture: ${e.message}`, 9000); return; }
   }
   // video intake is back on (2026-09-08): the v2 extractor decodes every frame
@@ -1493,10 +1854,14 @@ async function useOwnPhotos(list, capture = null) {
   if (S.ownUrls) S.ownUrls.forEach(URL.revokeObjectURL);
   S.ownUrls = files.map((f) => URL.createObjectURL(f));
   // survive a refresh: the capture is kept on-device and offered back
+  const nativeCaptureId = capture?.metadata?.nativeCaptureId || null;
   persistCapture({
     kind: 'photos', created: Date.now(),
-    files: files.map((f) => ({ name: f.name, blob: f })),
-    ...(capture ? storedCapture({ ...capture, files }) : {}),
+    ...(capture ? storedCapture({ ...capture, files: nativeCaptureId ? [] : files }) : {}),
+    ...(nativeCaptureId ? { nativeCaptureId } : {}),
+    files: files.map((f) => nativeCaptureId
+      ? { name: f.name, url: f.url }
+      : { name: f.name, blob: f }),
   });
   const set = ownSet(files, S.ownUrls);
   if (capture?.transforms) {
@@ -1514,7 +1879,13 @@ async function useOwnPhotos(list, capture = null) {
 /** A video: every frame is scored (sharpness, motion, cuts), the picks are
  *  shown on a timeline the user can trim, then the winners are captured and
  *  continue exactly like a photo set. */
+// video intake lands through open() too — same guard as photo sets above
 async function useOwnVideo(file) {
+  S._intakeN = (S._intakeN || 0) + 1;
+  try { return await useOwnVideoInner(file); }
+  finally { S._intakeN--; }
+}
+async function useOwnVideoInner(file) {
   const card = document.createElement('div');
   card.className = 'upcard';
   card.id = 'vidcard';
@@ -1831,8 +2202,10 @@ function videoReview(card, ctx) {
 async function open(preset, autostart = false) {
   document.getElementById('failcard')?.remove();
   if (preset.list && !preset.names) {
+    S._intakeN = (S._intakeN || 0) + 1;
     try { await loadPresetList(preset); }
     catch { flash('Could not load that set\'s file list.', 5000); return; }
+    finally { S._intakeN--; }
   }
   S.gen++;
   if (S.session) { S.session.pause(); S.session.dispose(); }
@@ -1867,7 +2240,7 @@ async function open(preset, autostart = false) {
   S.chartEvents = [];
   S.maxIters = PERF.on ? PERF.iters : INITIAL_ITERS;
   S.perfMetrics = [];
-  S.holdHist = [];
+  S.holdHist = []; S.splatHist = [];
 
   S._lastReady = null;
   S.growthStopped = false;
@@ -1908,7 +2281,7 @@ async function open(preset, autostart = false) {
   // load once training starts (or a tile is touched), not now
   buildStrip(true);
   paintCard(preset);
-  if (autostart) startPrep();
+  if (autostart) await startPrep();
   else $('start').hidden = false;
 }
 
@@ -2007,15 +2380,72 @@ async function avatarPrep(gen) {
   return true;
 }
 
+/** One Start request owns the button until it enters prep or explains why it
+ *  cannot. Await every preflight (including AR intake completion and Android
+ *  run ownership) under visible button state and one top-level error boundary:
+ *  no guard or rejected promise may look like an inert button. */
 async function startPrep() {
+  if (S._startBusy) return false;
+  S._startBusy = true;
+  const go = $('btn-go'), backgroundGo = $('btn-go-background');
+  const oldLabel = go.textContent;
+  go.disabled = true;
+  if (backgroundGo) backgroundGo.disabled = true;
+  go.textContent = (S._intakeN || 0) > 0 ? 'Preparing photos…' : 'Starting…';
+  try {
+    return await startPrepInner();
+  } catch (e) {
+    console.error('[start]', e);
+    flash(`Could not start training: ${e && e.message ? e.message : e}`, 9000);
+    return false;
+  } finally {
+    S._startBusy = false;
+    if (S.state !== 'train' && S.state !== 'monitor') S.startInBackground = false;
+    if (S.state === 'ready' || !$('detail').hidden || !$('start').hidden) {
+      go.textContent = oldLabel;
+      go.disabled = !!S.noGpu;
+      if (backgroundGo) backgroundGo.disabled = !!S.noGpu;
+    }
+  }
+}
+
+async function startPrepInner() {
+  if ((S._intakeN || 0) > 0) {
+    const until = performance.now() + 15000;
+    while ((S._intakeN || 0) > 0 && performance.now() < until) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if ((S._intakeN || 0) > 0) {
+      flash('The photos are still being prepared. Please try again.', 7000);
+      return false;
+    }
+  }
   document.getElementById('failcard')?.remove();
   if (S.commitSettings && !S.commitSettings()) return;
+  // migrate-on-swipe: one GPU — a live headless run owns it until adopted,
+  // recovered or discarded (the monitor is the way back to it)
+  if (await headlessMarkerLive()) {
+    // Do not leave the user on a Start button which can never start. Put the
+    // already-running job in front of them; if its files race this read, the
+    // explanation remains as a fallback.
+    if (!(await headlessBootCheck()))
+      flash('A training run is still going in the background — reopen it from the monitor instead of starting over it.', 8000);
+    return false;
+  }
   if (!S.preset || S.photos.length < 3) { flash('Use at least 3 overlapping views; 20–200 are recommended.', 7000); return; }
   if (S.preset.capture?.transforms) {
     try { validateDataset(S.preset.capture); }
     catch (e) { flash(e.message, 8000); return; }
     S.avatarWanted = false;
   }
+  const earlyPruneApproved = confirm(
+    'Allow one automatic prune at 500 iterations to speed processing?\n\n' +
+    'It will remove 75% of the lowest-priority splats, keep 25%, and continue training automatically.'
+  );
+  S.earlyPrune = {
+    approved: earlyPruneApproved, iter: 500, ratio: 0.25,
+    done: !earlyPruneApproved, busy: false,
+  };
   // consume the detail-card history entry — Back during a run must not
   // resurrect a card that no longer applies
   if (history.state && history.state.sj) history.replaceState(null, '');
@@ -2050,7 +2480,7 @@ async function startPrep() {
   // metrics tick; stale dB and splat counts flash the same way).
   S.iter = 0; S.splats = 0; S.psnrTrain = null; S.psnrHold = null;
   S.itersPerSec = 0; S.minutes = 0; S.etaAt = null;
-  S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
+  S.holdHist = []; S.splatHist = []; S.chartEvents = [];  S.growthStopped = false;
   S.feats = new Map(); S.lastPairEv = null; S.shownPair = null; S.regCams = [];
   S.regPts = null; S.regPtsCount = 0; S.growNote = null;
   S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
@@ -2061,6 +2491,7 @@ async function startPrep() {
   // Unticked, this is a plain scene run whatever the set once was: a restored
   // capture's stored mattes leave the frames the session sees.
   S.avatarOpts = null;
+  if (SHELL === 'browser') S.avatarWanted = false;   // the browser profile trains scenes only — no avatar models ship there
   if (!S.avatarWanted) { S.avatar = null; for (const f of S.preset.files || []) delete f.mask; }
   avatarFrames(S.avatarWanted);
   const wantMatte = S.avatarWanted && !S.avatar && !!(S.preset.files && S.preset.files.length);
@@ -2384,7 +2815,7 @@ async function startPrep() {
 
     buildSceneFromSession();
     mountModelCanvas();
-    startTraining();
+    await startTraining();
   } catch (e) {
     if (S.gen !== gen) return;
     console.error(e);
@@ -2419,6 +2850,55 @@ function trainDeadEnd() {
   backToSetup();
 }
 
+/** Back — one routine for every door that means it (the header Back, the
+ *  brand title off the home tile, the phone's own Back through popstate's
+ *  sibling path): a live run is secured in IndexedDB and Android app data,
+ *  then home. */
+async function goBack() {
+  // The orbit viewer appears immediately after Stop & keep, while its state
+  // readback is asynchronous. Back must be a save barrier, not a teardown race.
+  if (S.state === 'done' && S._securing) {
+    flash('Saving the finished model …', 60000);
+    const saved = await S._securing.catch(() => false);
+    if (!saved) return;
+  }
+  const runId = S.runId || (S._localRun && S._localRun.id);
+  if (runId) await persistRunDetails(runId, { full: true }).catch(() => {});
+  // a shared creation holds nothing precious — Back is simply the way
+  // home. When the visitor came from within the app, real history.back()
+  // is better: the bfcache restores the feed with its scroll intact.
+  if (S._localRun && S._viewerOpen) { closeViewerToHome(); return; }
+  if (S.restored) {
+    let fromApp = false;
+    try {
+      const r = document.referrer && new URL(document.referrer);
+      fromApp = !!r && r.origin === location.origin;
+    } catch (err) { /* opaque referrer -> treat as external */ }
+    if (fromApp && history.length > 1) history.back();
+    else location.href = 'index.html';
+    return;
+  }
+  // Back out of a live run secures it first (the checkpoint lives here
+  // now — pausing is free), then waves the navigation through with no
+  // confirm: there is nothing left to warn about. ?back=1 tells the fresh
+  // boot this was a deliberate leave: the handoff marker stands down
+  // instead of hijacking the boot into recovery, and the Yours tile is
+  // the way back.
+  // The checkpoint is mirrored to Android app data before navigation, so
+  // Home can rediscover it even if IndexedDB is unavailable or evicted.
+  if (S.state === 'train' && S.runId) {
+    const saved = await checkpointRun('back').catch(() => null);
+    if (!saved) {
+      flash('Could not save this model yet. Training is still open; free storage and try Back again.', 9000);
+      return;
+    }
+  }
+  // Back from a run leaves the same way the logo does: a page navigation
+  // home. The wall is never rendered OVER a live scene. The flag waves the
+  // navigation past beforeunload — the run above is already secured.
+  S._leaving = true;
+  location.href = (S.state === 'train' || S.state === 'prep') ? 'index.html?back=1' : 'index.html';
+}
 /** After a failed solve: back to the setup card the run started from — with
  *  its settings and Start button, so a different resolution is one tap away.
  *  (In classic mode Start lives ON the detail card; the bare start card was
@@ -2435,6 +2915,7 @@ function backToSetup() {
  *  trained model funnels through here, so nothing opened on the previous
  *  screen survives the trip. */
 function closeOverlays() {
+  if (S._manualAlign) closeManualAlignment(false);
   document.querySelectorAll('.upcard').forEach((c) => c.remove());
   document.querySelectorAll('.xr-dialog').forEach((d) => { if (d.open) d.close(); else d.remove(); });
   if (!$('details').hidden) {
@@ -2633,7 +3114,8 @@ function buildSceneFromSession() {
         i, ci: b.ci, R: b.rc.R, t: b.rc.t, f: b.rc.f,
         w, h, cx: w / 2, cy: h / 2,
         url: p.url, name: p.name,
-        state: b.ci === ses.holdout || (ses.testCams && ses.testCams.includes(b.ci)) ? 'holdout' : 'placed',
+        state: b.rc.excluded ? 'removed' :
+          (b.ci === ses.holdout || (ses.testCams && ses.testCams.includes(b.ci)) ? 'holdout' : 'placed'),
         feats: (S.feats.get(b.rc.imgIdx) || {}).n || 0,
         psnr: null, pano: true,
       };
@@ -2652,7 +3134,8 @@ function buildSceneFromSession() {
         Object.assign(c, {
           R: m.R, t: m.t, f: rc ? rc.f : (m.f || 1000),
           w, h, cx: w / 2, cy: h / 2,
-          state: ci === ses.holdout || (ses.testCams && ses.testCams.includes(ci)) ? 'holdout' : 'placed',
+          state: rc?.excluded ? 'removed' :
+            (ci === ses.holdout || (ses.testCams && ses.testCams.includes(ci)) ? 'holdout' : 'placed'),
           ci,
           feats: (S.feats.get(m.imgIdx) || {}).n || 0,
         });
@@ -2694,9 +3177,14 @@ function localRunName(preset) {
   return name;
 }
 
-function startTraining() {
+async function startTraining() {
+  const directBackground = !!S.startInBackground;
+  S.startInBackground = false;
   S.state = 'train';
-  S.trainVisuals = false;
+  // a history entry of our own: the phone's Back (and the browser's) pops
+  // here, into the popstate checkpoint-leave — never straight out of the app
+  if (!(history.state && history.state.sj === 'run')) history.pushState({ sj: 'run' }, '');
+  S.trainVisuals = defaultTrainingVisuals();
   syncTrainingVisualsControl();
   const carryMinutes = S._carryTrainElapsed ? (S.minutes || 0) : 0;
   S._carryTrainElapsed = false;
@@ -2717,40 +3205,67 @@ function startTraining() {
   }
   // local library: every run is listed from the moment it starts — a small
   // record now, the finished result later (see finish())
-  // a continuation keeps its run identity — same tile, same slot — whether
-  // it resumes a pause or refines a finished result; only fresh runs get a
-  // new record, so a continued result replaces the previous trained state
+  // run identity: a continuation keeps its record; a same-session re-entry
+  // (device-lost recovery, a double-pressed Start) keeps the live one —
+  // minting new here duplicated the tile on every fault recovery. Fresh
+  // runs resolve below: an own capture adopts its stale same-source
+  // record instead of duplicating it.
   const resumeId = S._resumeRunId;
   S._securing = null;   // the previous run's finish work, if any, is history now
   S._resumeRunId = null;
-  S.runId = resumeId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-  androidNotifStart();   // background-safe from the first cycle
+  const keepId = resumeId || S.runId || null;
+  S.runId = keepId || `run_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
   S._ckptIter = 0;
-  (async () => {
-    if (resumeId) {
+  let freshRunId = null;
+  const runRecordReady = (async () => {
+    const runGen = S.gen;
+    const pid = String((S.preset && S.preset.id) || '');
+    // own captures carry a stable source key — the adoption lookup below
+    const capKind = S._capRec && S._capRec.kind;
+    const capFiles = (S.preset && S.preset.files) || [];
+    const { saveRun, patchRun, listRuns, captureSrcKey } = await import('./store.js');
+    const nativeCaptureId = S.preset?.capture?.metadata?.nativeCaptureId || null;
+    const srcKey = nativeCaptureId
+      ? `native:${nativeCaptureId}`
+      : (pid === '__own' || pid === '__last') && capKind && capFiles.length
+        ? captureSrcKey(capKind + (S.preset.capture?.transforms ? '+poses' : ''), capFiles) : null;
+    // marking a record live moves only the training head (status, horizon,
+    // diagnostics) — name, thumb, poses and source photos stay untouched
+    const livePatch = () => ({
+      status: 'training', maxIters: S.maxIters, ...(srcKey ? { srcKey } : {}),
+      detailSolve: captureRunSolveDetails(),
+      detailProgress: captureRunProgressDetails(),
+      detailGpu: gpuFacts(false),
+    });
+    if (keepId) {
       // the record already exists (thumb, checkpoint, name, and for a
       // finished run its last result) — just mark it live; the run's own
       // checkpoints and its final result overwrite the trained state in
       // place while the record's original camera poses stay untouched
-      const { patchRun } = await import('./store.js');
-      await patchRun(resumeId, {
-        status: 'training', maxIters: S.maxIters,
-        detailSolve: captureRunSolveDetails(),
-        detailProgress: captureRunProgressDetails(),
-        detailGpu: gpuFacts(false),
-      });
-      return;
+      if (await patchRun(keepId, livePatch())) return;
+      // storage lost the record mid-run — recreate it under the same id
+    } else if (srcKey) {
+      // a fresh run of an already-run capture replaces the stale record
+      // instead of duplicating its tile — but only a stale INTERRUPTED
+      // one: finished results are never adopted (a re-run that fails must
+      // not eat a good result), and neither is a record written in the
+      // last minute (a live run in another tab)
+      const stale = (await listRuns().catch(() => []))
+        .find((r) => r.srcKey === srcKey && r.status !== 'finished' &&
+          Date.now() - (r.updatedAt || 0) > 60000);
+      if (stale && S.gen === runGen && await patchRun(stale.id, livePatch())) {
+        S.runId = stale.id;
+        return;
+      }
     }
-    const runId = S.runId, runGen = S.gen;
-    const pid = String((S.preset && S.preset.id) || '');
+    const runId = S.runId;
     // own scenes are SCENES, not photos — a continued run keeps the name it
     // already carries; the tile's description holds the capture details
     let runName = localRunName(S.preset);
-    const { saveRun, patchRun } = await import('./store.js');
     await saveRun({
-      id: runId, name: runName,
+      id: runId, name: runName, ...(srcKey ? { srcKey } : {}),
       status: 'training', createdAt: Date.now(), updatedAt: Date.now(),
-      iter: S.iter || 0, maxIters: S.maxIters, splats: S.splats || 0, psnr: S.psnrTrain ?? null,
+      iter: S.iter || 0, maxIters: S.maxIters, splats: S.splats || 0, psnr: shownScore('train') ?? null,
       frames: (S.photos || []).length,
       // own-photo runs can train again from the device's capture store
       ownSrc: pid === '__own' || pid === '__last',
@@ -2758,22 +3273,35 @@ function startTraining() {
       detailProgress: captureRunProgressDetails(),
       detailGpu: gpuFacts(false),
     });
-    // Save the model record before the optional thumbnail fetch; Back/close
-    // should not race image decoding and lose the run's first snapshot.
-    if (S.gen !== runGen) return;
+    // The durable identity now exists. Optional thumbnail work stays off
+    // this barrier; the service manifest must never be staged under a run ID
+    // that a later IndexedDB adoption changes.
+    if (S.gen === runGen) freshRunId = runId;
+  })();
+  try { await runRecordReady; }
+  catch (e) { console.warn('[run] initial model record failed', e); }
+  if (!S.session || S.state !== 'train') return;
+  // Direct service starts need the same notification permission/foreground
+  // channel as local runs. Keeping this notification alive through transfer
+  // also satisfies Android's foreground-service startup deadline.
+  androidNotifStart();
+  stageHeadlessRun();
+  if (freshRunId) (async () => {
     try {
       const p = S.photos && S.photos[0];
-      if (p && p.url) {
-        const bmp = await createImageBitmap(await (await fetch(p.url)).blob(), { resizeWidth: 320 });
-        const cv = document.createElement('canvas');
-        cv.width = bmp.width; cv.height = bmp.height;
-        cv.getContext('2d').drawImage(bmp, 0, 0);
-        bmp.close();
-        const thumb = await new Promise((res) => cv.toBlob(res, 'image/webp', 0.8));
-        if (thumb && S.gen === runGen) await patchRun(runId, { thumb });
+      if (!p || !p.url) return;
+      const bmp = await createImageBitmap(await (await fetch(p.url)).blob(), { resizeWidth: 320 });
+      const cv = document.createElement('canvas');
+      cv.width = bmp.width; cv.height = bmp.height;
+      cv.getContext('2d').drawImage(bmp, 0, 0);
+      bmp.close();
+      const thumb = await new Promise((res) => cv.toBlob(res, 'image/webp', 0.8));
+      if (thumb && S.runId === freshRunId) {
+        const { patchRun } = await import('./store.js');
+        await patchRun(freshRunId, { thumb });
       }
-    } catch { /* the tile just goes textless */ }
-  })().catch(() => {});
+    } catch { /* the tile can fall back to its source preview */ }
+  })();
   const first = S.scene.cams.find((c) => c.R && c.state !== 'holdout') || S.scene.cams[0];
   if (first && first.R) {
     S.sel = first.i;
@@ -2788,12 +3316,14 @@ function startTraining() {
   syncTrainingVisualsControl();
   if (chart) {
     chart.train = (S.session.lossHistory || []).map(([i, v]) => [i, v]);
+    chart.splats = (S.splatHist || []).slice();
     chart.hold = (S.holdHist || []).slice();
     chart.maxIter = S.maxIters;
     chart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
     chart.draw();
   }
-  S.session.start();
+  if (directBackground) void startNewRunInBackground();
+  else S.session.start();
 }
 
 function syncTrainButtons() {
@@ -2853,7 +3383,7 @@ function showCapCard(e) {
   });
 }
 
-/** Manual prune/grow, any time: pick how much to keep (the flow reseeds
+/** Manual prune/grow, any time: pick how much to prune (the flow reseeds
  *  the trainer and grows on), or trigger one growth pass right now. */
 function showPrunePicker() {
   const ses = S.session;
@@ -2866,19 +3396,28 @@ function showPrunePicker() {
     <b>Prune / grow</b>
     <span class="sog-status">Fewer splats with room to regrow — or grow into the error right now.</span>
     <div class="row" id="prunepick-pick">
-      <button class="btn" data-ratio="0.75">Keep ¾</button>
-      <button class="btn" data-ratio="0.5">Keep ½</button>
-      <button class="btn" data-ratio="0.25">Keep ¼</button>
+      <!-- labels prune; data-ratio stays the keep fraction the flow wants -->
+      <button class="btn" data-ratio="0.75">Prune ¼</button>
+      <button class="btn" data-ratio="0.5">Prune ½</button>
       <button class="btn" data-grow="1">Grow now</button>
-      <input id="prunepick-custom" type="number" min="5" max="95" step="1" value="50" style="width:4.5em" title="Custom keep percentage (5–95)">
-      <button class="btn" data-custom="1">Keep %</button>
+      <input id="prunepick-custom" type="number" min="1" max="99" step="1" value="${rememberedPrunePercent()}" style="width:4.5em" title="Custom prune percentage (1–99)">
+      <button class="btn" data-custom="1">Prune %</button>
       <button class="btn linkish" data-ratio="">Cancel</button>
     </div>`;
   $('stage').appendChild(card);
+  $('prunepick-custom').addEventListener('change', (e) => rememberPrunePercent(e.target.value));
   card.querySelector('#prunepick-pick').addEventListener('click', (e) => {
-    const d = e.target && e.target.dataset ? e.target.dataset : null;
-    if (!d) return;
-    const customKeep = d.custom ? readKeepCustom('prunepick-custom') : 0;
+    // the custom input lives in this row: only BUTTON clicks answer —
+    // tapping the input to type must not dismiss the card
+    if (!e.target || e.target.tagName !== 'BUTTON') return;
+    const d = e.target.dataset;
+    const customKeep = d.custom ? readPruneCustom('prunepick-custom') : 0;
+    if (d.custom && customKeep == null) {
+      const input = $('prunepick-custom');
+      input.focus(); input.select();
+      flash('Enter a whole prune percentage from 1 to 99.', 6000);
+      return;
+    }
     card.remove();
     if (d.grow) { runGrowNow(); return; }
     if (d.custom) { runPruneAndContinue(customKeep); return; }
@@ -2934,11 +3473,13 @@ async function runPruneAndContinue(ratio = 0.5) {
     card.remove();
     const d = out.delta == null ? 'no holdout to score against'
       : `${out.delta >= 0 ? '+' : ''}${out.delta.toFixed(2)} dB holdout`;
-    flash(`Pruned ${fmt(out.from)} → ${fmt(out.to)} splats (${d}) — training on with room to grow.`, 7000);
+    flash(`Pruned ${fmt(out.from)} → ${fmt(out.to)} splats (${d}) — ${out.resumed ? 'training on with room to grow.' : 'press play to grow on.'}`, 7000);
   } catch (err) {
     card.remove();
     console.error(err);
-    flash(`Prune failed: ${err.message} — press play to resume.`, 8000);
+    // a failed prune resumes a training run onto the unpruned model (the
+    // session owns the loop now); an already-paused run stays paused
+    flash(`Prune failed: ${err.message} — ${ses.training ? 'training on with the unpruned model.' : 'press play to resume.'}`, 8000);
   } finally {
     S._pruning = false;
     syncTrainButtons();
@@ -2963,7 +3504,19 @@ function toggleTrain() {
   if (f) f.hidden = on;   // paused = the moment "stop here" makes sense
   // a user-pressed pause takes ownership from any touch-hold: the release
   // must not resume over it
-  if (!on) { S._dragPaused = false; checkpointRun('pause').catch(() => {}); }
+  if (!on) {
+    S._dragPaused = false;
+    // pausing is free now — the checkpoint moved to leaving (Back). Say so
+    // once: the old pause flash promised "safe to close", which pause no
+    // longer means.
+    try {
+      if (!localStorage.getItem('splatjs_pause_hint')) {
+        localStorage.setItem('splatjs_pause_hint', '1');
+        flash('Paused. Your progress saves when you leave with Back.', 7000);
+      }
+    } catch { /* private mode */ }
+  }
+  headlessStatusWrite(on ? 'active' : 'paused');
   // Shade control: where the bridge can flip the notification's button the
   // service stays up across the pause (Resume in the shade); old bridges
   // shed it and restart it instead.
@@ -3033,6 +3586,7 @@ function captureRunProgressDetails() {
   return {
     chart: compactRows(history, 800),
     holds: compactRows(holds, 800),
+    splats: compactRows(S.splatHist || [], 800),
     events: (S.chartEvents || []).slice(-300).map((e) => ({ ...e })),
     perf: {
       frames: (perf.frames || []).slice(-6000).map((r) => Array.from(r || [])),
@@ -3046,8 +3600,8 @@ function captureRunProgressDetails() {
     minutes: S.state === 'train'
       ? Math.max(S.minutes || 0, Math.round((performance.now() - (S.trainT0 || performance.now())) / 60000))
       : (S.minutes || 0),
-    psnrTrain: S.psnrTrain ?? null,
-    psnrHold: S.psnrHold ?? null,
+    psnrTrain: shownScore('train') ?? null,
+    psnrHold: shownScore('hold') ?? null,
   };
 }
 
@@ -3064,7 +3618,7 @@ async function persistRunDetails(id = S.runId, { full = false } = {}) {
   return updated;
 }
 
-function restoreRunDetails(run, session = S.session) {
+function restoreRunDetails(run, session = S.session, opts = {}) {
   if (!run) return;
   const solve = run.detailSolve || {};
   S.solveStats = solve.solveStats
@@ -3081,17 +3635,24 @@ function restoreRunDetails(run, session = S.session) {
   const frameCount = session && session.frames ? session.frames.length : 0;
   if (frameCount) S.sel = Math.max(0, Math.min(frameCount - 1, S.sel | 0));
   S._savedGpuFacts = run.detailGpu || null;
-  const progress = run.detailProgress || {};
+  // a continued run restarts at its state checkpoint, but the record's
+  // histories can run ahead of it (a Details persist lands checkpoint-free)
+  // — trim them to the resume point so the curve continues instead of
+  // plotting over itself. Viewing keeps the full record (no trim).
+  const progress = opts.trimToIter != null
+    ? trimProgressToIter(run.detailProgress || {}, opts.trimToIter)
+    : (run.detailProgress || {});
   S._savedDetailSettings = progress.settings || null;
   S.chartEvents = Array.isArray(progress.events) ? progress.events.map((e) => ({ ...e })) : [];
   S.holdHist = Array.isArray(progress.holds) ? progress.holds.map((r) => Array.from(r || [])) : [];
+  S.splatHist = Array.isArray(progress.splats) ? progress.splats.map((r) => Array.from(r || [])) : [];
   S.perfMetrics = Array.isArray(progress.metrics) ? progress.metrics.map((m) => Array.from(m || [])) : [];
   const lastMetric = S.perfMetrics[S.perfMetrics.length - 1];
   if (lastMetric && Number.isFinite(+lastMetric[2])) S.itersPerSec = +lastMetric[2];
   const fallbackChart = (S.restored && S.restored.stats && S.restored.stats.chart) || [];
   const history = Array.isArray(progress.chart) && progress.chart.length ? progress.chart : fallbackChart;
   if (session) {
-    session.lossHistory = history.map((r) => Array.from(r || []));
+    session.setLossHistory(history);
     session.perf = session.perf || { frames: [], marks: [] };
     const frameRows = ((progress.perf && progress.perf.frames) || []).map((r) => Array.from(r || []));
     const markRows = ((progress.perf && progress.perf.marks) || []).map((m) => ({ ...m }));
@@ -3109,11 +3670,13 @@ function restoreRunDetails(run, session = S.session) {
 
 // ── crash-safe checkpoint ───────────────────────────────────────────────────
 // The raw trainer state — a straight GPU readback, no PLY text, no SOG
-// k-means — goes into the run record whenever the user pauses, and (desktop
-// only) when the tab goes hidden mid-training. One slot per run, overwritten:
-// pausing means the browser may be closed, and the Yours tile continues the
-// run bit-exactly from where it stopped. The blob is dropped again the moment
-// the run finishes properly — the sog takes over.
+// k-means — goes into the run record when the user leaves the run (Back,
+// in-app or the phone's), and (desktop only) when the tab goes hidden
+// mid-training. Pausing writes nothing: it is just a breather. One slot per
+// run, overwritten: leaving means the page may be closed, and the Yours tile
+// continues the run from where it stopped (float16-close — training
+// re-converges the quantization noise). The blob is dropped again the
+// moment the run finishes properly — the sog takes over.
 /** Crash-safe checkpoint. Returns the secured { state, recon } on success
  *  (finish() adopts them into the in-memory run record — no second GPU
  *  readback, no store round-trip), null when there was nothing to keep. */
@@ -3123,29 +3686,47 @@ async function checkpointRun(reason) {
   // secured even if sog compression or the device dies right after training
   if (reason === 'finish' ? S.state !== 'done' : S.state !== 'train') return null;
   const it = S.session.trainer.iter | 0;
-  if (it < 200 || S._ckptBusy) return null;   // nothing worth keeping yet
+  if (S._ckptBusy || (reason === 'hidden' && it < 200)) return null;
   // hidden fires on every tab switch — only rewrite after real progress
   if (reason === 'hidden' && it - (S._ckptIter || 0) < 500) return null;
   S._ckptBusy = true;
   const gen = S.gen;
   try {
-    const { packState, buildReconJson } = await import('./session_io.js');
+    const { packState, buildReconJson, trainBudget } = await import('./session_io.js');
     const state = new Blob([await packState(S.session)]);
     if (S.gen !== gen) return null;
     const recon = buildReconJson(S);
     const detailProgress = captureRunProgressDetails();
-    const { patchRun } = await import('./store.js');
-    await patchRun(S.runId, {
+    const patch = {
       iter: it, splats: S.splats || S.session.trainer.n,
       psnr: S.psnrHold ?? S.psnrTrain ?? null,
-      cap: S.session.trainer.cap || 0,   // growth headroom carries over
+      cap: trainBudget(S.session),   // the configured budget carries over, not the allocation (seed x capMult under-allocates — the continue card must see the limit training runs under)
       state, recon, ckptAt: Date.now(), minutes: detailProgress.minutes,
       detailSolve: captureRunSolveDetails(),
       detailProgress,
       detailGpu: gpuFacts(false),
-    });
+    };
+    // Android app data is the durable fallback and must not depend on an IDB
+    // write succeeding: quota/process-profile loss was hiding completed runs.
+    const fileSaved = await writeDurableRunCheckpoint(state, recon, {
+      status: S.state === 'done' ? 'finished' : (S.session.training ? 'active' : 'paused'),
+      owner: 'activity', iter: it, splats: S.session.trainer.n | 0,
+      psnr: S.psnrHold ?? S.psnrTrain ?? null, at: Date.now(),
+    }).catch((e) => { console.warn('[checkpoint] Android mirror failed', e); return false; });
+    let idbSaved = false;
+    try {
+      const { patchRun, saveRun } = await import('./store.js');
+      idbSaved = await patchRun(S.runId, patch);
+      if (!idbSaved) {
+        await saveRun({ id: S.runId, name: localRunName(S.preset), status: S.state === 'done' ? 'finished' : 'training',
+          createdAt: Date.now(), updatedAt: Date.now(), maxIters: S.maxIters,
+          frames: (S.loadedFiles || []).length, ownSrc: true, ...patch });
+        idbSaved = true;
+      }
+    } catch (e) { console.warn('[checkpoint] IndexedDB mirror failed', e); }
+    if (!fileSaved && !idbSaved) throw new Error('neither Android app data nor IndexedDB accepted the checkpoint');
     S._ckptIter = it;
-    if (reason === 'pause') flash('Progress saved on this device — safe to close, continue anytime from Yours.', 6000);
+    if (reason === 'back') flash('Progress saved on this device — safe to close, continue anytime from Yours.', 6000);
     return { state, recon };
   } catch (e) {
     console.warn('checkpoint failed', e);   // best-effort: never disturb a run
@@ -3153,20 +3734,57 @@ async function checkpointRun(reason) {
   return null;
 }
 
+/** Persist camera-pose and training-set edits without rereading or rewriting
+ * the full splat state. The next required model checkpoint carries the same
+ * recon again, but these small metadata writes make the edit survive now. */
+async function persistReconEdit() {
+  if (!S.runId || !S.session || !S.session.trainer) return false;
+  const { buildReconJson } = await import('./session_io.js');
+  const recon = buildReconJson(S);
+  let fileSaved = false, idbSaved = false;
+  const bridge = headlessBridge();
+  try {
+    if (S._hlStagePromise) await S._hlStagePromise;
+    if (bridge && S._hlStaged === S.runId && S._hlPhotos) {
+      fileSaved = bridge.writeRunJson(S.runId, 'recon.json', JSON.stringify(recon)) !== false;
+    }
+  } catch (e) { console.warn('[recon-edit] Android metadata write failed', e); }
+  try {
+    const { patchRun } = await import('./store.js');
+    idbSaved = await patchRun(S.runId, {
+      recon, updatedAt: Date.now(), detailSolve: captureRunSolveDetails(),
+    });
+  } catch (e) { console.warn('[recon-edit] IndexedDB metadata write failed', e); }
+  if (S._localRun && S._localRun.id === S.runId) S._localRun.recon = recon;
+  return fileSaved || idbSaved;
+}
+
 function formatTrainingScore(psnr) {
   if (psnr == null || Number.isNaN(psnr)) return '—';
   return (S.scoreScale === 'similarity' ? psnrToApproxSsimPercent(psnr) : psnr).toFixed(2);
+}
+
+/** The score as shown: the latest complete shuffled-camera epoch. The
+ * headline, graph line, hover and saved history all use the same raw value. */
+function shownScore(which) {
+  const raw = which === 'hold' ? S.psnrHold : S.psnrTrain;
+  for (const c of [chart, dchart]) {
+    if (!c) continue;
+    const f = which === 'hold' ? c.lastHoldF : c.lastTrainF;
+    if (f != null) return f;
+  }
+  return raw;
 }
 
 function renderTrainingScore() {
   const similarity = S.scoreScale === 'similarity';
   const unit = similarity ? '%' : 'dB';
   const trainEl = $('t-ptrain');
-  if (trainEl) trainEl.textContent = formatTrainingScore(S.psnrTrain);
+  if (trainEl) trainEl.textContent = formatTrainingScore(shownScore('train'));
   const trainUnit = $('t-punit');
   if (trainUnit) trainUnit.textContent = unit;
   const holdEl = $('t-phold');
-  if (holdEl) holdEl.textContent = formatTrainingScore(S.psnrHold);
+  if (holdEl) holdEl.textContent = formatTrainingScore(shownScore('hold'));
   const holdUnit = $('t-hunit');
   if (holdUnit) holdUnit.textContent = unit;
 }
@@ -3189,6 +3807,7 @@ function queueMetricsPaint() {
       if (dchart) {
         const history = (S.session && S.session.lossHistory) || [];
         dchart.train = history.map(([i, v]) => [i, v]);
+        dchart.splats = (S.splatHist || []).slice();
         dchart.hold = (S.holdHist || []).slice();
         dchart.maxIter = S.maxIters;
         dchart.events = (S.chartEvents || []).map((e) => ({ ...e, at: e.iter / S.maxIters }));
@@ -3200,8 +3819,46 @@ function queueMetricsPaint() {
   });
 }
 
+function publishEarlyPruneState() {
+  // Before staging there is no second process to race; stageHeadlessRun will
+  // serialize the current flag later. Once staged, refuse to prune unless the
+  // one-shot marker is durable — duplicate 75% removals are unacceptable.
+  if (!S._hlManifest || !S.runId || !S.earlyPrune) return true;
+  S._hlManifest.settings = {
+    ...(S._hlManifest.settings || {}),
+    earlyPrune: { ...S.earlyPrune, busy: false },
+  };
+  const b = headlessBridge();
+  try { return !!b && b.writeRunJson(S.runId, 'manifest.json', JSON.stringify(S._hlManifest)) !== false; }
+  catch (e) { console.warn('[early-prune] manifest update failed', e); return false; }
+}
+
+async function maybeEarlyPrune(iter) {
+  const cfg = S.earlyPrune;
+  if (!cfg?.approved || cfg.done || cfg.busy || iter < cfg.iter ||
+      S._pruning || S._growing || !S.session?.trainer) return;
+  // One approved attempt only. Mark it before crossing the async prune so a
+  // handoff/checkpoint cannot run the destructive milestone twice.
+  cfg.busy = true;
+  cfg.done = true;
+  if (!publishEarlyPruneState()) {
+    cfg.busy = false;
+    flash('Could not safely record the speed-prune milestone — training continues unpruned.', 7000);
+    return;
+  }
+  flash('Approved speed prune: removing 75% of splats and continuing …', 7000);
+  try {
+    // The prune changes the live model only. It becomes durable at the next
+    // ordinary transition checkpoint (Back, handoff, or finish).
+    await runPruneAndContinue(cfg.ratio);
+  } finally { cfg.busy = false; publishEarlyPruneState(); }
+}
+
 function onMetrics(m) {
   S.iter = m.iter;
+  // Metrics emit inside the active frame promise. Cross a task boundary before
+  // pauseAndDrain(), otherwise the prune would wait on the frame calling it.
+  setTimeout(() => { void maybeEarlyPrune(m.iter); }, 0);
   S.splats = m.splats;
   S.itersPerSec = m.itersPerSec;
   androidNotifTick();
@@ -3228,11 +3885,19 @@ function onMetrics(m) {
     m.psnrTrain != null ? m.psnrTrain.toFixed(2) : '', m.psnrHold != null ? m.psnrHold.toFixed(2) : '']);
   if (m.psnrTrain != null) S.psnrTrain = m.psnrTrain;
   if (m.psnrHold != null) S.psnrHold = m.psnrHold;
+  if (Array.isArray(m.frameErrors) && S.scene?.cams) {
+    for (const cam of S.scene.cams) {
+      const error = cam.ci >= 0 ? m.frameErrors[cam.ci] : null;
+      if (Number.isFinite(error)) cam.error = error;
+    }
+    paintStrip();
+  }
   if (m.psnrHold != null) (S.holdHist ??= []).push([m.iter, m.psnrHold]);
+  if (Number.isFinite(m.splats)) (S.splatHist ??= []).push([m.iter, m.splats]);
   // the first few hundred cycles rocket from near-nothing to the real curve —
   // charting that ramp squashes the whole run's y-scale into a corner
   if (chart && m.psnrTrain != null && m.iter >= Math.min(500, S.maxIters * 0.02)) {
-    chart.push(m.iter, m.psnrTrain, m.psnrHold ?? null);
+    chart.push(m.iter, m.psnrTrain, m.psnrHold ?? null, m.splats);
     chart.maxIter = S.maxIters;
     chart.events = S.chartEvents.map((e) => ({ ...e, at: e.iter / S.maxIters }));
     queueMetricsPaint();
@@ -3262,7 +3927,7 @@ function onMetrics(m) {
     const runId = S.runId;
     const detailProgress = captureRunProgressDetails();
     import('./store.js').then(({ patchRun }) => patchRun(runId, {
-      iter: m.iter, splats: m.splats, psnr: m.psnrTrain ?? null,
+      iter: m.iter, splats: m.splats, psnr: shownScore('train') ?? null,
       minutes: detailProgress.minutes, detailProgress,
     })).catch(() => {});
   }
@@ -3303,7 +3968,11 @@ function onTrainEvent(e) {
     S.chartEvents.push({ iter: e.iter, kind: 'prune', label: `Pruned −${fmt(e.culled)}` });
     S.growNote = { text: `−${fmt(e.culled)} splats`, until: performance.now() + 2200 };
   }
-  if (e.kind === 'tandem-regrow' || e.kind === 'grow-now') {
+  if (e.kind === 'dead-cull') {
+    S.chartEvents.push({ iter: e.iter, kind: 'prune', label: `Dead −${fmt(e.culled)}` });
+    S.growNote = { text: `−${fmt(e.culled)} dead splats`, until: performance.now() + 2200 };
+  }
+  if (e.kind === 'grow-now') {
     S.chartEvents.push({ iter: e.iter, kind: 'grow', label: `Grew +${fmt(e.grown || 0)}` });
     S.growNote = { text: `+${fmt(e.grown || 0)} splats`, until: performance.now() + 2200 };
   }
@@ -3393,22 +4062,80 @@ async function deviceLostRecovery(msg) {
       });
     }
     if (S.gen !== gen) return;
+    // A file-backed service handback cannot use Session.recover(): Android's
+    // low-memory worker owns (and has now lost) its transferred seed pixels.
+    // Restart the visible WebView once, then reconstruct from state.bin.
+    if (S._hlStaged) {
+      const runId = S._hlStaged;
+      const restarts = S._hlGpuRestarts | 0;
+      const b = headlessBridge();
+      if (b && typeof b.restartForGpuRecovery === 'function' && restarts < 1) {
+        b.writeRunJson(runId, 'status.json', JSON.stringify({
+          status: 'interrupted', stopped: true, owner: 'activity', iter: S.iter | 0,
+          at: Date.now(), gpuRestarts: restarts + 1,
+          error: 'the Activity GPU was reset while returning; reopening from the saved checkpoint',
+        }));
+        S._hlGpuRestarts = restarts + 1;
+        b.restartForGpuRecovery(runId);
+        return;
+      }
+      try { S.session && S.session.dispose(); } catch { /* already lost */ }
+      S.session = null;
+      showRecovery(runId, {
+        status: 'interrupted', stopped: true, iter: S.iter | 0,
+        error: 'the Activity graphics process could not reopen the saved checkpoint; no run data was deleted',
+      });
+      flash('The graphics process could not restart. The checkpoint and original AR frames are still stored; Continue here can retry.', 12000);
+      return;
+    }
     await S.session.recover();
     if (S.gen !== gen) return;
     S.iter = 0; S.psnrTrain = null; S.psnrHold = null;
-    S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
+    S.holdHist = []; S.splatHist = []; S.chartEvents = [];  S.growthStopped = false;
     S.plyBlob = null; S.sogBlob = null;
     buildSceneFromSession();
     mountModelCanvas();
     quietView(S.session.view.resync && S.session.view.resync());
-    startTraining();
+    await startTraining();
   } catch (err) {
     console.error(err);
     if (S.gen === gen) {
-      solveFailed('The graphics device was lost and could not be brought back — ' +
-        'you are back at the setup screen. Your photos are kept; a lower Training resolution ' +
-        '(the gear) or fewer photos usually train fine.');
-      trainDeadEnd();
+      // A service handback is different from an ordinary tab loss: its exact
+      // checkpoint and photos are still on disk. lowMem moved the continuation
+      // seed into the failed worker, so Session.recover() cannot repair it in
+      // place. Recreate Android's visible WebView once to get a genuinely new
+      // renderer/GPU process, then boot again from the durable transaction.
+      const runId = S._hlStaged;
+      const restarts = S._hlGpuRestarts | 0;
+      const b = headlessBridge();
+      if (runId && b && typeof b.restartForGpuRecovery === 'function' && restarts < 1) {
+        try {
+          b.writeRunJson(runId, 'status.json', JSON.stringify({
+            status: 'interrupted', stopped: true, owner: 'activity', iter: S.iter | 0,
+            at: Date.now(), gpuRestarts: restarts + 1,
+            error: 'the Activity GPU was reset while returning; reopening from the saved checkpoint',
+          }));
+          S._hlGpuRestarts = restarts + 1;
+          b.restartForGpuRecovery(runId);
+          return;
+        } catch (restartErr) { console.error(restartErr); }
+      }
+      if (runId) {
+        // Never let a failed handback fall through trainDeadEnd() to Home. The
+        // marker, checkpoint, reconstruction and AR photos remain retryable.
+        try { S.session && S.session.dispose(); } catch { /* already lost */ }
+        S.session = null;
+        showRecovery(runId, {
+          status: 'interrupted', stopped: true, iter: S.iter | 0,
+          error: 'the Activity graphics process could not reopen the saved checkpoint; no run data was deleted',
+        });
+        flash('The graphics process could not restart. The checkpoint and original AR frames are still stored; Continue here can retry.', 12000);
+      } else {
+        solveFailed('The graphics device was lost and could not be brought back — ' +
+          'you are back at the setup screen. Your photos are kept; a lower Training resolution ' +
+          '(the gear) or fewer photos usually train fine.');
+        trainDeadEnd();
+      }
     }
   } finally {
     S._recovering = false;
@@ -3467,6 +4194,9 @@ if (!IOS) document.addEventListener('visibilitychange', () => {
  *  state checkpoint (viewOnly continueLocalRun). */
 function enterDone() {
   S.state = 'done';
+  // Every model-view path converges here; Back is an invariant of the viewer,
+  // not a responsibility each restore/finish caller may forget.
+  $('btn-new').hidden = false;
   syncTrainingVisualsControl();
   S.atFrame = -1; S.fadeTo = 0;
   vp.lock = null; vp.freeF = null;
@@ -3651,12 +4381,20 @@ async function finish() {
   S._securing = (async () => {
     while (S._ckptBusy) await new Promise((r) => setTimeout(r, 200));   // a 'hidden' write in flight
     let ckpt = null;
-    try { ckpt = await checkpointRun('finish'); } catch { /* best-effort */ }
-    if (S.gen !== gen) return;
+    try { ckpt = await checkpointRun('finish'); } catch (e) { console.warn('finish checkpoint failed', e); }
+    if (!ckpt) {
+      flash('The finished model is still open, but it could not be saved. Free storage before leaving.', 12000);
+      return false;
+    }
+    // The final checkpoint is now in Android files and/or IndexedDB; only then
+    // release the live marker so Home can rediscover the finished model.
+    headlessClear();
+    if (S.gen !== gen) return true;
     if (S.runId && S.gen === gen) {
       try {
         const thumb = await renderShareThumb();
         if (S.gen !== gen) return;
+        if (thumb) await writeRunBlob(S.runId, 'thumb.webp', thumb).catch(() => false);
         const { patchRun } = await import('./store.js');
         await patchRun(S.runId, {
           status: 'finished', iter: S.iter, splats: S.splats,
@@ -3685,6 +4423,8 @@ async function finish() {
         iter: S.iter, maxIters: S.maxIters, splats: S.splats || 0,
         psnr: S.psnrHold ?? S.psnrTrain ?? null, minutes: S.minutes,
         frames: (S.photos || []).length, ownSrc: true,
+        ...(S.preset?.capture?.metadata?.nativeCaptureId
+          ? { srcKey: `native:${S.preset.capture.metadata.nativeCaptureId}` } : {}),
         state: ckpt.state, recon: ckpt.recon,
         detailSolve: captureRunSolveDetails(),
         detailProgress: captureRunProgressDetails(),
@@ -3692,6 +4432,7 @@ async function finish() {
       };
       if (S.state === 'done') renderControls();   // swap the quick Train for the run's own
     }
+    return true;
   })();
   try { await S._securing; } catch { /* best-effort */ }
   if (PERF.on) perfCard();
@@ -3730,11 +4471,11 @@ async function restoreSession(src) {
     S._resumeRunId = null;
     S.feats = new Map(); S.lastPairEv = null;
     S.solveStats = { pairsChecked: 0, pairsUsable: 0, solveSec: 0 };
-    S.chartEvents = []; S.holdHist = [];  S.perfMetrics = []; S.itersPerSec = 0;
+    S.chartEvents = []; S.holdHist = []; S.splatHist = [];  S.perfMetrics = []; S.itersPerSec = 0;
     S._savedGpuFacts = null; S._savedDetailSettings = null;
     // a run that was already shared knows its space: the viewer offers its
     // link and its listing, where a reload used to leave only a Download
-    if (S._localRun && S._localRun.spaceId) S.share = { id: S._localRun.spaceId, title: S._localRun.name || '' };
+    if (SHELL !== 'browser' && S._localRun && S._localRun.spaceId) S.share = { id: S._localRun.spaceId, title: S._localRun.name || '' };
     S._viewerOpen = true;
     // the viewer is a navigable state: Back returns to the wall, never to
     // whatever page happened to precede the app
@@ -3746,7 +4487,10 @@ async function restoreSession(src) {
     // SOG + recon: the lite viewer — the engine renders the compressed splat
     // directly (sorted, WebGL2), nothing decodes to float arrays, and phones
     // without WebGPU can still view. ?nopc forces the trainer view.
-    const liteOk = !src.bytes && src.url && /\.sog($|\?)/.test(src.url) && src.reconUrl &&
+    // Browser-saved SOGs use blob: URLs, so their file extension is gone.
+    // Keep Android's established viewer selection unchanged.
+    const browserViewer = SHELL === 'browser';
+    const liteOk = !src.bytes && src.url && ((browserViewer && S._localRun?.sog) || /\.sog($|\?)/.test(src.url)) && src.reconUrl &&
       !new URLSearchParams(location.search).has('nopc');
     if (liteOk) {
       try {
@@ -3755,14 +4499,17 @@ async function restoreSession(src) {
         const buf = new Uint8Array(await r.arrayBuffer());
         let reconJson;
         if (buf[0] === 0x50 && buf[1] === 0x4b) {
-          const { unzipStore } = await import('./session_io.js');
-          reconJson = JSON.parse(new TextDecoder().decode(unzipStore(buf).get('recon.json')));
+          const { unzipStoreAsync } = await import('./session_io.js');
+          reconJson = JSON.parse(new TextDecoder().decode((await unzipStoreAsync(buf)).get('recon.json')));
         } else {
           reconJson = JSON.parse(new TextDecoder().decode(buf));
         }
         await hydrateLocalRunPhotos(reconJson, S._localRun);
         const { createSogView } = await import('./pcview.js');
-        const ses = await createSogView(src.url, { radius: reconJson.sceneRadius || 10, yUp: !!reconJson.knownCameras });
+        const viewOpts = browserViewer
+          ? { radius: reconJson.sceneRadius || 10 }
+          : { radius: reconJson.sceneRadius || 10, yUp: !!reconJson.knownCameras };
+        const ses = await createSogView(src.url, viewOpts);
         ses.frames = (reconJson.frames || []).map((f) => ({ ...f }));
         // the Details sheet reads session.recon (cams/points) — same shape
         // the old view-only path built via useReconstruction()
@@ -3787,11 +4534,15 @@ async function restoreSession(src) {
     const { gaussians, reconJson, state } = got;
     await hydrateLocalRunPhotos(reconJson, S._localRun);
     const iter = (state && state.iter) || (reconJson && reconJson.iter) || 0;
-    const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter), trainWorker: trainWorkerOpt() });
+    // Match arrival-space/main only in the Browser project: its view-only
+    // fallback stays on the main thread. Preserve Android's working viewer.
+    const ses = createSession({ holdout: -1, maxIters: Math.max(1, iter),
+      trainWorker: browserViewer ? false : trainWorkerOpt() });
     if (reconJson) {
       ses.useReconstruction({
         known: !!reconJson.knownCameras,
-        cams: reconJson.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
+        cams: reconJson.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy,
+          ...(c.excluded ? { excluded: true } : {}) })),
         points: [],
         k1: reconJson.k1 || 0, k2: reconJson.k2 || 0,
         ...(reconJson.fFeat ? { fFeat: reconJson.fFeat } : {}),
@@ -4081,19 +4832,6 @@ function perfCard() {
   card.querySelector('#perf-dl').addEventListener('click', downloadPerfLog);
 }
 
-/** after the run: an honest per-photograph score, filled in the background */
-async function scoreFrames() {
-  const gen = S.gen;
-  for (const c of S.scene.cams) {
-    if (c.ci < 0 || S.gen !== gen || S.state !== 'done') return;
-    try {
-      c.psnr = await S.session.evalFramePsnr(c.ci);
-      paintStrip();
-      if (!$('details').hidden) renderDetails();
-    } catch { return; }
-  }
-}
-
 // ── stage controls (train/done) ─────────────────────────────────────────────
 function seg(items, active, onPick) {
   const d = document.createElement('div');
@@ -4122,7 +4860,7 @@ function renderControls() {
   c.hidden = !live;
   if (!live) return;
 
-  if (S.atFrame >= 0) {
+  if (S.atFrame >= 0 && (S.state !== 'train' || S.trainVisuals)) {
     c.appendChild(seg([['swipe', 'Swipe'], ['loupe', 'Loupe'], ['error', 'Error']],
       S.compare, (v) => {
         if (S.compare === v) return;   // swallow the click that follows pointerdown
@@ -4131,6 +4869,16 @@ function renderControls() {
         renderControls();
         syncFrameUrl();
       }));
+    const align = document.createElement('button');
+    align.className = 'cbtn'; align.id = 'c-align'; align.textContent = 'Align'; align.disabled = !!S._aligning;
+    align.title = 'Correct this selected image’s camera pose';
+    align.addEventListener('click', alignSelectedFrame);
+    c.appendChild(align);
+    if (S._alignUndo?.i === S.sel) {
+      const undo = document.createElement('button'); undo.className = 'cbtn'; undo.id = 'c-align-undo';
+      undo.textContent = 'Undo align'; undo.disabled = !!S._aligning;
+      undo.addEventListener('click', undoSelectedAlignment); c.appendChild(undo);
+    }
   }
 
   if (S.state !== 'done') return;
@@ -4366,7 +5114,7 @@ function continueConfigCard(r) {
     ? recipe0.softPrune.ratio : 0;
   const prevSoft = prevSoftRatio > 0 ? `${Math.round(prevSoftRatio * 100)}%` : 'Off';
   const softOpts = [`<option value="" selected>${prevSoft}</option>`, '<option value="0">Off</option>',
-    ...[0.05, 0.1, 0.2, 0.3].map((v) => `<option value="${v}">${Math.round(v * 100)}%</option>`),
+    ...[0.01, 0.02, 0.05, 0.1].map((v) => `<option value="${v}">${Math.round(v * 100)}%</option>`),
     '<option value="custom">Custom…</option>'].join('');
   const card = document.createElement('div');
   card.className = 'upcard';
@@ -4445,10 +5193,25 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
   }
   const recon = lr.recon;
   let files;
-  const srcUrls = (recon.source && recon.source.urls) || [];
-  if (!lr.ownSrc && srcUrls.length && srcUrls.every(Boolean)) {
-    // preset / shared runs: the photographs live at stable URLs — refetch
-    flash('Fetching the photos …', 60000);
+  const sourceNames = (recon.source && recon.source.names) || (recon.frames || []).map((f) => f.name);
+  const savedCaptureId = recon.source?.captureId || String(lr.srcKey || '').replace(/^native:/, '') || null;
+  let srcUrls = (recon.source && recon.source.urls) || [];
+  // Records created before native URLs were stored still have a stable source
+  // key and frame names. Repair those references instead of consulting the
+  // mutable "last capture" slot, which can pair the model with wrong poses.
+  if ((!srcUrls.length || !srcUrls.every(Boolean)) &&
+      /^[A-Za-z0-9_-]{1,80}$/.test(savedCaptureId || '') && sourceNames.length) {
+    srcUrls = sourceNames.map((name) =>
+      `https://appassets.androidplatform.net/captures/${savedCaptureId}/${encodeURIComponent(name)}`);
+    recon.source = { ...(recon.source || {}), names: sourceNames, urls: srcUrls, captureId: savedCaptureId };
+    import('./store.js').then(({ patchRun }) => patchRun(lr.id,
+      { srcKey: `native:${savedCaptureId}`, recon })).catch(() => {});
+  }
+  if (srcUrls.length && srcUrls.every(Boolean)) {
+    // Stable URLs include presets and canonical native AR archives. Prefer
+    // them even for own captures: loading "last capture" here can substitute
+    // a newer scan and detach images from this model's saved camera poses.
+    flash(viewOnly ? 'Loading model …' : 'Fetching the photos …', 60000);
     files = await Promise.all(srcUrls.map(async (u, i) => {
       const r = await fetch(u);
       if (!r.ok) throw new Error(`photo fetch failed (${r.status})`);
@@ -4469,10 +5232,10 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
       return;
     }
   }
-  flash('Preparing to continue training …', 60000);
+  flash(viewOnly ? 'Loading model …' : 'Preparing to continue training …', 60000);
   let g, engine, stateIter = null, recipe = null;
   if (lr.state) {
-    // pause checkpoint: the trainer's raw floats — nothing baked, nothing
+    // leave checkpoint: the trainer's raw floats — nothing baked, nothing
     // quantized, tagged with the engine that wrote them. Bit-exact resume.
     const { parseState } = await import('./session_io.js');
     const st = parseState(new Uint8Array(await lr.state.arrayBuffer()));
@@ -4556,9 +5319,11 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     S.plyBlob = null; S.sogBlob = null;
     // keep the source identity: own captures stay '__own' (the next resume goes
     // back to the capture store), URL-backed runs keep their preset/urls so a
-    // pause during THIS run checkpoints a resumable source list again
+    // leaving during THIS run checkpoints a resumable source list again
+    const nativeCaptureId = savedCaptureId;
     S.preset = lr.ownSrc
-      ? { id: '__own', name: `${lr.name || 'Your photos'}` }
+      ? { id: '__own', name: `${lr.name || 'Your photos'}`,
+          ...(nativeCaptureId ? { capture: { metadata: { nativeARCore: true, nativeCaptureId } } } : {}) }
       : { id: (recon.source && recon.source.preset) || '__url', name: `${lr.name || 'Your photos'}` };
     S.loadedFiles = files.map((f, i) => Object.assign(f, { url: srcUrls[i] || undefined }));
     S.photos = files.map((f, i) => ({ url: URL.createObjectURL(f), name: f.name, i }));
@@ -4661,7 +5426,8 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     if (S.gen !== gen) return;
     ses.useReconstruction({
       known: !!recon.knownCameras,
-      cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy })),
+      cams: recon.cams.map((c) => ({ imgIdx: c.imgIdx, R: c.R, t: c.t, f: c.f, cx: c.cx, cy: c.cy,
+        ...(c.excluded ? { excluded: true } : {}) })),
       points: [],
       k1: recon.k1 || 0, k2: recon.k2 || 0,
       ...(recon.fFeat ? { fFeat: recon.fFeat } : {}),
@@ -4676,8 +5442,8 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     if (S.lodPlan) ses.trainer.growLimit = S.lodPlan.levels[S.lodPlan.idx] || S.lodPlan.levels[0];
     S.iter = baseIter;
     S.psnrTrain = null; S.psnrHold = null;
-    S.holdHist = []; S.chartEvents = [];  S.growthStopped = false;
-    restoreRunDetails(lr, ses);
+    S.holdHist = []; S.splatHist = []; S.chartEvents = [];  S.growthStopped = false;
+    restoreRunDetails(lr, ses, viewOnly ? {} : { trimToIter: baseIter });
     buildSceneFromSession();
     mountModelCanvas();
     if (viewOnly) {
@@ -4703,7 +5469,7 @@ async function continueLocalRun(viewOnly = false, opts = {}) {
     // store's blobs matched by name above, reused by reference and never
     // re-saved, so continuing costs no extra image storage
     S._resumeRunId = lr.id;
-    startTraining();
+    await startTraining();
     flash(`Continuing from ${fmt(baseIter)} cycles — +${fmt(S.maxIters - baseIter)} more.`, 6000);
   } catch (e) {
     if (S.gen !== gen) throw e;   // superseded mid-flight: another screen owns the UI now
@@ -4743,7 +5509,7 @@ async function continueTraining() {
   S.maxIters = await S.session.continueFor(MORE_ITERS);
   if (S.gen !== gen || !S.session || S.state !== 'done') return;
   S.state = 'train';
-  S.trainVisuals = false;
+  S.trainVisuals = defaultTrainingVisuals();
   syncTrainingVisualsControl();
   S.trainT0 = performance.now() - S.minutes * 60000;   // minutes stay cumulative
   S.growthStopped = false;
@@ -4755,6 +5521,7 @@ async function continueTraining() {
   syncTrainingVisualsControl();
   if (chart) {
     chart.train = S.session.lossHistory.map(([i, v]) => [i, v]);
+    chart.splats = (S.splatHist || []).slice();
     chart.hold = (S.holdHist || []).slice();
     chart.maxIter = S.maxIters;
     chart.draw();
@@ -5209,7 +5976,7 @@ function showDetail(setOrPreset) {
   $('set-solve').disabled = !!setOrPreset?.capture?.transforms;
   $('set-feat').disabled = !!setOrPreset?.capture?.transforms;
   setStartStyle(!(setOrPreset && setOrPreset.spaceId));
-  if (setOrPreset && setOrPreset.spaceId) {
+  if (setOrPreset && setOrPreset.spaceId && SHELL !== 'browser') {
     // a trained model of this benchmark is shared — View opens it, and the
     // published model's train PSNR joins the input facts once resolved
     const view = document.createElement('a');
@@ -5251,10 +6018,20 @@ addEventListener('popstate', () => {
   if (viewerOpen) { closeViewerToHome(); return; }
   if (detailOpen) { closeDetailCard(); return; }
   // back during a running solve/training: leave the same way the header
-  // Back does — a page navigation home (the wall is never rendered OVER a
-  // live scene; beforeunload asks before a training is thrown away)
+  // Back does — secure it, then a page navigation home (the wall is never
+  // rendered OVER a live scene). No confirm: the checkpoint is the save.
   if ((S.state === 'prep' || S.state === 'train') && $('start').hidden) {
-    location.href = 'index.html';
+    if (S.state === 'prep') {
+      S._leaving = true; location.href = 'index.html?back=1';
+    } else {
+      checkpointRun('back').catch(() => null).then((saved) => {
+        if (!saved) {
+          flash('Could not save this model yet. Training is still open; free storage and try Back again.', 9000);
+          return;
+        }
+        S._leaving = true; location.href = 'index.html?back=1';
+      });
+    }
   }
 });
 
@@ -5282,7 +6059,15 @@ function closeDetailCard() {
 
 /** Tear the restored viewer down and land on the wall — the SPA counterpart
  *  of the old full-page navigation home. */
-function closeViewerToHome() {
+async function closeViewerToHome() {
+  // Stop & keep enters the orbit viewer before the GPU readback has finished.
+  // Never tear down that session (or bump S.gen) until the model checkpoint is
+  // actually durable; this was the race that produced an empty Home.
+  if (S.state === 'done' && S._securing) {
+    flash('Saving the finished model …', 60000);
+    const saved = await S._securing.catch(() => false);
+    if (!saved) return;
+  }
   stopTour();
   try { S.session && S.session.dispose(); } catch (e) { /* view-only facade */ }
   document.getElementById('cv-model')?.remove();
@@ -5308,12 +6093,12 @@ function closeViewerToHome() {
 /** The creation's recon json (plain or store-zipped) — the photographs and
  *  cameras a "train this yourself" run needs. */
 async function fetchShareRecon(it) {
-  const { unzipStore } = await import('./session_io.js');
+  const { unzipStoreAsync } = await import('./session_io.js');
   const r = await fetch(it.splatjs.reconUrl);
   if (!r.ok) throw new Error('recon unavailable');
   const rb = new Uint8Array(await r.arrayBuffer());
   if (rb[0] === 0x50 && rb[1] === 0x4b) {
-    return JSON.parse(new TextDecoder().decode(unzipStore(rb).get('recon.json')));
+    return JSON.parse(new TextDecoder().decode((await unzipStoreAsync(rb)).get('recon.json')));
   }
   return JSON.parse(new TextDecoder().decode(rb));
 }
@@ -5352,31 +6137,93 @@ function textCard(heading, value, { action = 'Save', max = 80 } = {}) {
   });
 }
 
-/** Rebuild the local library from captures and runs in this browser's storage. */
+/** Rebuild the local library progressively. The main-branch behavior painted
+ * IndexedDB immediately; Android archive discovery must enhance that wall,
+ * never block every capture/model/training tile behind one slow source. */
+let wallMountToken = 0;
 async function mountWall() {
   const host = $('gallery');
   if (!host) return;
-  try {
-    const [capTile, runTiles] = await Promise.all([
-      lastCaptureTile().catch(() => null),
-      localRunTiles().catch(() => []),
-    ]);
-    const tiles = [...(capTile ? [capTile] : []), ...runTiles];
-    host.replaceChildren();
-    if (!tiles.length) { host.hidden = true; return; }
-    const heading = document.createElement('p');
-    heading.className = 'eyebrow';
-    heading.textContent = 'SAVED ON THIS DEVICE';
-    const grid = document.createElement('div');
-    grid.className = 'galgrid';
-    grid.append(...tiles);
-    host.append(heading, grid);
+  const token = ++wallMountToken;
+  for (const url of wallBlobUrls) URL.revokeObjectURL(url);
+  wallBlobUrls = [];
+  const heading = document.createElement('button');
+  heading.type = 'button';
+  heading.className = 'eyebrow wall-refresh';
+  heading.textContent = 'SAVED ON THIS DEVICE  ↻';
+  heading.title = 'Refresh saved captures and models';
+  heading.setAttribute('aria-label', 'Refresh saved captures and models');
+  heading.addEventListener('click', () => mountWall());
+  const grid = document.createElement('div');
+  grid.className = 'galgrid';
+  const slots = { scans: [], files: [], capture: [], local: [] };
+  // The refresh affordance is useful even before the first scan exists: it
+  // can discover a capture/service result created outside this WebView.
+  host.replaceChildren(heading, grid);
+  host.hidden = false;
+
+  const paint = () => {
+    if (token !== wallMountToken) return;
+    // Match main: IndexedDB run records are the model cards (thumbnail,
+    // rename, saved poses, in-place continuation). Android run files are a
+    // recovery fallback only when that same run record is absent.
+    const localIds = new Set(slots.local.map((tile) => tile.dataset.runId).filter(Boolean));
+    const recoveryFiles = slots.files.filter((tile) => !localIds.has(tile.dataset.runId));
+    const tiles = [...slots.scans, ...slots.capture, ...slots.local, ...recoveryFiles];
+    grid.replaceChildren(...tiles);
+    // Keep SAVED ON THIS DEVICE ↻ visible for an empty library too.
     host.hidden = false;
-  } catch { host.hidden = true; }
+  };
+  const load = (key, task, fallback = []) => {
+    Promise.resolve(task).then((value) => {
+      slots[key] = Array.isArray(value) ? value : (value ? [value] : []);
+      paint();
+    }, (e) => {
+      console.warn(`[home] ${key} library unavailable`, e);
+      slots[key] = fallback;
+      paint();
+    });
+  };
+
+  const native = globalThis.AndroidARBridge;
+  if (native && typeof native.listHomeLibrary === 'function') {
+    // Android has ONE catalog rooted in app data. Captures are canonical
+    // image+pose archives; runs are model checkpoints referencing capture IDs.
+    // IndexedDB is not a second Android Home library.
+    let catalog = { captures: [], runs: [] };
+    try { catalog = JSON.parse(native.listHomeLibrary()); } catch (e) {
+      console.warn('[home] native catalog unavailable', e);
+    }
+    load('scans', nativeCaptureTiles(catalog.captures));
+    load('files', androidRunTiles(catalog.runs));
+    // Main stores model checkpoints in IndexedDB. Keep those model records in
+    // the union (deduped by run ID); they reference the native capture archive
+    // and are not a second image/pose source.
+    load('local', localRunTiles(catalog.runs, catalog.captures));
+    migrateLegacyNativeCapture().then((moved) => {
+      if (moved && !legacyCaptureRemounted && token === wallMountToken) {
+        legacyCaptureRemounted = true; mountWall();
+      }
+    });
+  } else {
+    // Browser/main behavior: its origin-local IndexedDB is the sole library.
+    load('capture', lastCaptureTile());
+    load('local', localRunTiles());
+  }
 }
 
-window.addEventListener('pageshow', (e) => {
-  if (e.persisted && document.getElementById('gallery')) mountWall().catch(() => {});
+function refreshHomeWall() {
+  const start = $('start');
+  if (S.state === 'ready' && start && !start.hidden) mountWall().catch(() => {});
+}
+// Android may retain the same WebView while another Activity or the training
+// service owns the screen. Refresh on every real return, not only BFCache
+// pageshow: native captures/checkpoints can have changed without a reload or
+// a visibility transition.
+window.addEventListener('pageshow', refreshHomeWall);
+window.addEventListener('focus', refreshHomeWall);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refreshHomeWall();
 });
 
 /** From the viewer into the studio: the shared creation's photographs become
@@ -5542,11 +6389,445 @@ function leaveFrame() {
 
 function select(i) {
   if (!S.photos.length) return;
-  S.sel = (i + S.photos.length) % S.photos.length;
+  i = (i + S.photos.length) % S.photos.length;
+  if (S._manualAlign) { manualAlignmentSelectFrame(i); return; }
+  S.sel = i;
   $('strip-scroll')?.children[S.sel]?.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
   if ((S.state === 'train' || S.state === 'done') && S.scene) goToFrame(S.sel);
   paintStrip(); renderControls();
   if (!$('details').hidden) renderDetails();
+}
+
+function inAppConfirm(title, message, confirmLabel = 'Continue') {
+  return new Promise((resolve) => {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'app-confirm';
+    const head = document.createElement('div'); head.className = 'dlg-head';
+    const heading = document.createElement('h2'); heading.textContent = title;
+    head.appendChild(heading);
+    const body = document.createElement('div'); body.className = 'dlg-body';
+    const copy = document.createElement('p'); copy.textContent = message;
+    const actions = document.createElement('div'); actions.className = 'upcard-row';
+    const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel';
+    const accept = document.createElement('button'); accept.className = 'btn btn-accent'; accept.textContent = confirmLabel;
+    actions.append(cancel, accept); body.append(copy, actions); dialog.append(head, body);
+    document.body.appendChild(dialog);
+    let answered = false;
+    const finish = (answer) => {
+      if (answered) return;
+      answered = true;
+      if (dialog.open) dialog.close();
+      dialog.remove();
+      resolve(answer);
+    };
+    cancel.addEventListener('click', () => finish(false));
+    accept.addEventListener('click', () => finish(true));
+    dialog.addEventListener('cancel', (e) => { e.preventDefault(); finish(false); });
+    dialog.addEventListener('click', (e) => { if (e.target === dialog) finish(false); });
+    dialog.showModal();
+    accept.focus();
+  });
+}
+
+function poseT(R, centre) {
+  return [-(R[0]*centre[0]+R[1]*centre[1]+R[2]*centre[2]),
+    -(R[3]*centre[0]+R[4]*centre[1]+R[5]*centre[2]),
+    -(R[6]*centre[0]+R[7]*centre[1]+R[8]*centre[2])];
+}
+
+async function applyAlignedPose(i, R, t, source, remember = true) {
+  const cam = S.scene.cams[i];
+  if (remember) S._alignUndo = { i, R: [...cam.R], t: [...cam.t] };
+  await S.session.updateCameraPose(cam.ci, R, t);
+  cam.R = Array.from(R); cam.t = Array.from(t);
+  // Make durability immediate; normal checkpoints and background staging then
+  // carry the same recon/trainer pose without a second pose catalogue.
+  await persistReconEdit().catch((e) => console.warn('[align] metadata', e));
+  goToFrame(i); paintStrip(); renderControls();
+  flash(`Frame ${i + 1} aligned (${source}) and saved.`, 6000);
+}
+
+async function undoSelectedAlignment() {
+  const u = S._alignUndo;
+  if (!u || u.i !== S.sel || S._aligning) return;
+  if (!(await inAppConfirm('Undo alignment', `Restore frame ${u.i + 1} to its previous camera alignment?`, 'Undo alignment'))) return;
+  S._aligning = true; renderControls();
+  try {
+    await applyAlignedPose(u.i, u.R, u.t, 'undo', false);
+    S._alignUndo = null; renderControls();
+  } catch (err) { flash(`Could not undo alignment: ${err.message}`, 8000); }
+  finally { S._aligning = false; renderControls(); }
+}
+
+const quatDistanceDeg = (a, b) => 2 * Math.acos(clamp(Math.abs(a.reduce((n, x, k) => n + x * b[k], 0)), -1, 1)) * 180 / Math.PI;
+
+function alignmentChoices(cs, cams, i) {
+  if (!cs.length) return [];
+  const rows = cs.map((c) => ({ ...c, q: quatFromR(c.Rworld), weight: Math.max(1, c.inliers) }));
+  // Robust medoid: one bad essential solution cannot drag all four anchors.
+  let medoid = rows[0], best = Infinity;
+  for (const a of rows) {
+    const cost = rows.reduce((n, b) => n + quatDistanceDeg(a.q, b.q) * b.weight, 0);
+    if (cost < best) { best = cost; medoid = a; }
+  }
+  const good = rows.filter((r) => quatDistanceDeg(r.q, medoid.q) <= 12);
+  if (!good.length) return [];
+  const before = [1, 2].map((d) => cams[i - d]).find((c) => c?.R);
+  const after = [1, 2].map((d) => cams[i + d]).find((c) => c?.R);
+  const current = camCentre(cams[i]);
+  let centre = current;
+  if (before && after) {
+    const a = camCentre(before), b = camCentre(after);
+    centre = a.map((v, k) => (v + b[k]) / 2);
+  }
+  const choices = [];
+  if (good.length >= 2) {
+    let q = good[0].q, total = good[0].weight;
+    for (const row of good.slice(1)) {
+      q = qslerp(q, row.q, row.weight / (total + row.weight)); total += row.weight;
+    }
+    choices.push({ label: `Balanced · ${good.length} neighbours`, R: quatToR(q), centre,
+      source: `${good.length}-neighbour consensus` });
+  }
+  for (const row of good) choices.push({
+    label: `Anchor frame ${row.frame + 1} · ${row.inliers} matches`,
+    R: row.Rworld, centre, source: `frame ${row.frame + 1}`,
+  });
+  return choices;
+}
+
+function showAlignmentChoices(i, choices) {
+  document.getElementById('align-options')?.remove();
+  const card = document.createElement('div'); card.className = 'upcard'; card.id = 'align-options';
+  const title = document.createElement('b'); title.textContent = `Align frame ${i + 1}`;
+  const note = document.createElement('span'); note.className = 'sog-status';
+  note.textContent = 'Choose an automatic placement derived from up to two pictures before and two after. Balanced rejects disagreeing anchors. You can undo after applying.';
+  const row = document.createElement('div'); row.className = 'row';
+  choices.forEach((choice, k) => {
+    const b = document.createElement('button'); b.className = k === 0 ? 'btn btn-accent' : 'btn';
+    b.textContent = choice.label; b.dataset.choice = String(k); row.appendChild(b);
+  });
+  const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel'; row.appendChild(cancel);
+  card.append(title, note, row); $('stage').appendChild(card);
+  row.addEventListener('click', async (e) => {
+    if (e.target.tagName !== 'BUTTON') return;
+    const k = Number(e.target.dataset.choice);
+    if (!Number.isInteger(k) || !choices[k]) { card.remove(); return; }
+    const choice = choices[k];
+    if (!(await inAppConfirm('Apply alignment', `Apply “${choice.label}” to frame ${i + 1}?`, 'Apply'))) return;
+    card.remove(); S._aligning = true; renderControls();
+    try { await applyAlignedPose(i, choice.R, poseT(choice.R, choice.centre), choice.source); }
+    catch (err) { flash(`Alignment failed: ${err.message}`, 8000); }
+    finally { S._aligning = false; renderControls(); }
+  });
+}
+
+function showUnalignedFrameRemoval(i, why) {
+  document.getElementById('align-options')?.remove();
+  const card = document.createElement('div'); card.className = 'upcard'; card.id = 'align-options';
+  const title = document.createElement('b'); title.textContent = `No suitable alignment for frame ${i + 1}`;
+  const note = document.createElement('span'); note.className = 'sog-status'; note.textContent = why;
+  const row = document.createElement('div'); row.className = 'row';
+  const keep = document.createElement('button'); keep.className = 'btn linkish'; keep.textContent = 'Keep image';
+  const remove = document.createElement('button'); remove.className = 'btn btn-accent'; remove.textContent = 'Remove image';
+  row.append(keep, remove); card.append(title, note, row); $('stage').appendChild(card);
+  keep.addEventListener('click', () => card.remove());
+  remove.addEventListener('click', async () => {
+    if (!(await inAppConfirm('Remove image from model', `Remove frame ${i + 1} from this model? The original capture remains saved on this device.`, 'Remove image'))) return;
+    card.remove(); S._aligning = true; renderControls();
+    try {
+      const cam = S.scene?.cams?.[i];
+      if (!cam || cam.ci < 0) throw new Error('image is not part of the trainable camera set');
+      await S.session.excludeCameraImage(cam.ci);
+      cam.state = 'removed'; cam.psnr = null;
+      await persistReconEdit().catch((e) => console.warn('[remove-image] metadata', e));
+      leaveFrame(); paintStrip(); renderControls();
+      flash(`Frame ${i + 1} removed from training. The original capture was kept.`, 7000);
+    } catch (err) { flash(`Could not remove the image: ${err.message}`, 8000); }
+    finally { S._aligning = false; renderControls(); }
+  });
+}
+
+
+function resumeAfterManualAlignment(state) {
+  document.body.classList.remove('manual-aligning');
+  if (state.wasTraining && S.state === 'train' && S.session && !S.session.training) S.session.start();
+}
+
+function closeManualAlignment(returnToTarget = true) {
+  const state = S._manualAlign;
+  if (!state) return;
+  state.resizeObserver?.disconnect();
+  state.editor.remove();
+  S._manualAlign = null;
+  resumeAfterManualAlignment(state);
+  if (returnToTarget && S.scene?.cams?.[state.target]?.R) goToFrame(state.target);
+  paintStrip(); renderControls();
+}
+
+function manualAlignmentSelectFrame(i) {
+  const state = S._manualAlign;
+  if (!state || state.busy) return;
+  const targetPoints = state.marks.get(state.target) || [];
+  if (i !== state.target && targetPoints.length < 5) {
+    flash(`Place at least 5 points on frame ${state.target + 1} first.`, 5000);
+    return;
+  }
+  const cam = S.scene?.cams?.[i];
+  if (!cam?.R || cam.state === 'removed') {
+    flash('Choose a placed image with a registered camera pose.', 5000);
+    return;
+  }
+  state.frame = i; state.pointer = null; state.down = false; state.armed = false; state.displayBitmap = null;
+  S.sel = i; paintStrip();
+  const token = ++state.loadToken;
+  state.status.textContent = `Loading frame ${i + 1} …`;
+  bmp(S.photos[i].url).then((bitmap) => {
+    if (S._manualAlign !== state || token !== state.loadToken || !bitmap) return;
+    state.bitmap = bitmap;
+    if (bitmap.width > bitmap.height) {
+      const portrait = document.createElement('canvas');
+      portrait.width = bitmap.height; portrait.height = bitmap.width;
+      const ctx = portrait.getContext('2d');
+      ctx.translate(portrait.width, 0); ctx.rotate(Math.PI / 2); ctx.drawImage(bitmap, 0, 0);
+      state.displayBitmap = portrait; state.portraitRotated = true;
+    } else {
+      state.displayBitmap = bitmap; state.portraitRotated = false;
+    }
+    state.status.textContent = manualAlignmentStatus(state);
+    drawManualAlignment(state);
+  });
+}
+
+function manualAlignmentStatus(state) {
+  const pts = state.marks.get(state.frame) || [];
+  const targetCount = (state.marks.get(state.target) || []).length;
+  if (state.frame === state.target) {
+    return `${pts.length} point${pts.length === 1 ? '' : 's'} on alignment image · click Add new point for number ${pts.length + 1}${pts.length < 5 ? ' (5 minimum before choosing a reference)' : ' or choose a reference below'}`;
+  }
+  return `Reference frame ${state.frame + 1} · ${pts.length}/${targetCount} matching points · click Add new point for number ${pts.length + 1}`;
+}
+
+function manualCanvasPosition(state, e) {
+  const r = state.canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * state.canvas.width / r.width,
+    y: (e.clientY - r.top) * state.canvas.height / r.height };
+}
+
+function manualPointInside(state, p) {
+  const f = state.fit;
+  return !!f && p.x >= f.x && p.y >= f.y && p.x <= f.x + f.w && p.y <= f.y + f.h;
+}
+
+function manualDisplayToSource(state, x, y) {
+  return state.portraitRotated ? { x: y, y: 1 - x } : { x, y };
+}
+function manualSourceToDisplay(state, p) {
+  return state.portraitRotated ? { x: 1 - p.y, y: p.x } : p;
+}
+
+function commitManualPoint(state) {
+  if (!state.armed || !state.pointer || !manualPointInside(state, state.pointer) || !state.fit) return;
+  const arr = state.marks.get(state.frame) || [];
+  const target = state.marks.get(state.target) || [];
+  if (state.frame !== state.target && arr.length >= target.length) {
+    flash(`All ${target.length} numbered target points are already placed on this reference.`, 5000);
+    return;
+  }
+  const placed = manualDisplayToSource(state,
+    clamp((state.pointer.x - state.fit.x) / state.fit.w, 0, 1),
+    clamp((state.pointer.y - state.fit.y) / state.fit.h, 0, 1));
+  arr.push(placed);
+  state.armed = false; state.pointer = null;
+  state.marks.set(state.frame, arr);
+  state.status.textContent = manualAlignmentStatus(state);
+  drawManualAlignment(state);
+}
+
+function drawManualAlignment(state) {
+  const cv = state.canvas, ctx = cv.getContext('2d'), dpr = devicePixelRatio || 1;
+  const rect = cv.getBoundingClientRect();
+  const w = Math.max(1, Math.round(rect.width * dpr)), h = Math.max(1, Math.round(rect.height * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  ctx.fillStyle = '#070909'; ctx.fillRect(0, 0, w, h);
+  const b = state.displayBitmap;
+  if (!b) return;
+  const scale = Math.min(w / b.width, h / b.height);
+  const fw = b.width * scale, fh = b.height * scale;
+  state.fit = { x: (w - fw) / 2, y: (h - fh) / 2, w: fw, h: fh, scale };
+  const f = state.fit;
+  ctx.drawImage(b, f.x, f.y, f.w, f.h);
+
+  const pts = state.marks.get(state.frame) || [];
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = `700 ${12 * dpr}px system-ui`;
+  pts.forEach((sourcePoint, k) => {
+    const p = manualSourceToDisplay(state, sourcePoint);
+    const x = f.x + p.x * f.w, y = f.y + p.y * f.h;
+    ctx.beginPath(); ctx.arc(x, y, 10 * dpr, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(7,9,9,.82)'; ctx.fill();
+    ctx.strokeStyle = '#2fd4c1'; ctx.lineWidth = 2 * dpr; ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.fillText(String(k + 1), x, y + .5 * dpr);
+  });
+
+  const p = state.pointer;
+  if (!state.armed || !p || !manualPointInside(state, p)) return;
+  const ix = (p.x - f.x) / f.scale, iy = (p.y - f.y) / f.scale;
+  const radius = 54 * dpr, zoom = 4;
+  ctx.save();
+  ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx.clip();
+  const sr = radius / (f.scale * zoom);
+  ctx.drawImage(b, ix - sr, iy - sr, sr * 2, sr * 2,
+    p.x - radius, p.y - radius, radius * 2, radius * 2);
+  ctx.strokeStyle = 'rgba(255,255,255,.95)'; ctx.lineWidth = 1.5 * dpr;
+  ctx.beginPath(); ctx.moveTo(p.x - radius, p.y); ctx.lineTo(p.x + radius, p.y);
+  ctx.moveTo(p.x, p.y - radius); ctx.lineTo(p.x, p.y + radius); ctx.stroke();
+  ctx.restore();
+  ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+  ctx.strokeStyle = '#2fd4c1'; ctx.lineWidth = 2 * dpr; ctx.stroke();
+}
+
+async function finishManualAlignment(state) {
+  if (state.busy || S._manualAlign !== state) return;
+  const targetPts = state.marks.get(state.target) || [];
+  if (targetPts.length < 5) { flash('Place at least 5 points on the image being aligned.', 6000); return; }
+  const refs = [...state.marks.entries()].filter(([i, pts]) => i !== state.target && pts.length);
+  if (!refs.length) { flash('Choose at least one reference image from the roll and place the same numbered points.', 7000); return; }
+  const short = refs.find(([, pts]) => pts.length < 5);
+  if (short) { flash(`Frame ${short[0] + 1} needs at least 5 matching points.`, 6000); return; }
+  state.busy = true; state.finish.disabled = true; state.status.textContent = 'Triangulating landmarks and refining camera pose …';
+  try {
+    const solved = manualPoseFromCorrespondences({
+      cams: S.scene.cams, target: state.target, marks: state.marks, cloud: S.scene.xyz,
+    });
+    const ok = await inAppConfirm('Apply manual alignment',
+      `${solved.inliers} numbered landmarks agree (${solved.rmsPx.toFixed(1)} px RMS). Apply this camera pose to frame ${state.target + 1}?`, 'Apply alignment');
+    if (!ok) { state.busy = false; state.finish.disabled = false; state.status.textContent = manualAlignmentStatus(state); return; }
+    state.resizeObserver?.disconnect(); state.editor.remove(); S._manualAlign = null;
+    S._aligning = true; renderControls();
+    await applyAlignedPose(state.target, solved.R, solved.t, `${solved.inliers}-point manual match`);
+  } catch (err) {
+    console.warn('[manual-align]', err);
+    flash(`Manual alignment failed: ${err.message}`, 10000);
+    state.busy = false; state.finish.disabled = false; state.status.textContent = manualAlignmentStatus(state);
+  } finally {
+    if (!S._manualAlign) {
+      resumeAfterManualAlignment(state);
+      S._aligning = false; renderControls();
+    }
+  }
+}
+
+function startManualAlignment(target) {
+  document.getElementById('align-options')?.remove();
+  const editor = document.createElement('div'); editor.className = 'manual-align-editor';
+  const head = document.createElement('div'); head.className = 'manual-align-head';
+  const title = document.createElement('b'); title.textContent = `Manual alignment · frame ${target + 1}`;
+  const status = document.createElement('span'); status.className = 'manual-align-status';
+  const canvas = document.createElement('canvas'); canvas.className = 'manual-align-canvas'; canvas.tabIndex = 0;
+  const actions = document.createElement('div'); actions.className = 'manual-align-actions';
+  const another = document.createElement('button'); another.className = 'btn'; another.textContent = 'Add new point';
+  const undo = document.createElement('button'); undo.className = 'btn'; undo.textContent = 'Undo last point';
+  const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel';
+  const finish = document.createElement('button'); finish.className = 'btn btn-accent'; finish.textContent = 'Finish alignment';
+  const help = document.createElement('small');
+  help.textContent = 'Place numbered points on this portrait view first. Then choose registered images in the roll and mark the same features in number order. Click Add new point before each mark. Hold and drag for 2× slower crosshair movement; the loupe shows the exact pixel.';
+  actions.append(another, undo, cancel, finish); head.append(title, status, help, actions); editor.append(head, canvas); $('stage').appendChild(editor);
+  const wasTraining = !!(S.state === 'train' && S.session?.training);
+  if (wasTraining) S.session.pause();
+  document.body.classList.add('manual-aligning');
+  const state = { target, frame: target, marks: new Map([[target, []]]), editor, canvas, status, finish,
+    bitmap: null, displayBitmap: null, portraitRotated: false, pointer: null, fit: null,
+    down: false, armed: false, loadToken: 0, busy: false, wasTraining };
+  S._manualAlign = state;
+
+  canvas.addEventListener('pointerdown', (e) => {
+    if (state.busy || e.button > 0) return;
+    e.preventDefault(); e.stopPropagation();
+    if (!state.armed) { flash('Click “Add new point” before placing the next landmark.', 3500); return; }
+    canvas.setPointerCapture(e.pointerId);
+    state.down = true; state.lastClient = { x: e.clientX, y: e.clientY };
+    state.pointer = manualCanvasPosition(state, e); drawManualAlignment(state);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const p = manualCanvasPosition(state, e);
+    if (state.down && state.pointer) {
+      // Precision mode: physical movement advances the selected image point at
+      // half speed while the magnified crosshair remains over it.
+      state.pointer.x += (p.x - manualCanvasPosition(state, { clientX: state.lastClient.x, clientY: state.lastClient.y }).x) * .5;
+      state.pointer.y += (p.y - manualCanvasPosition(state, { clientX: state.lastClient.x, clientY: state.lastClient.y }).y) * .5;
+      state.lastClient = { x: e.clientX, y: e.clientY };
+    } else state.pointer = p;
+    drawManualAlignment(state);
+  });
+  canvas.addEventListener('pointerup', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    if (!state.down) return; state.down = false; commitManualPoint(state);
+  });
+  canvas.addEventListener('pointercancel', () => { state.down = false; });
+  another.addEventListener('click', () => {
+    if (state.busy) return;
+    const current = state.marks.get(state.frame) || [], targetPoints = state.marks.get(state.target) || [];
+    if (state.frame !== state.target && current.length >= targetPoints.length) {
+      flash('Place another numbered point on the alignment image first.', 4500); return;
+    }
+    state.armed = true; state.pointer = null; canvas.focus();
+    state.status.textContent = `Point ${current.length + 1} armed · tap or hold and drag the crosshair`;
+    drawManualAlignment(state);
+  });
+  undo.addEventListener('click', () => {
+    const pts = state.marks.get(state.frame) || []; pts.pop(); state.marks.set(state.frame, pts);
+    state.armed = false; state.pointer = null;
+    state.status.textContent = manualAlignmentStatus(state); drawManualAlignment(state);
+  });
+  cancel.addEventListener('click', () => closeManualAlignment(true));
+  finish.addEventListener('click', () => void finishManualAlignment(state));
+  state.resizeObserver = new ResizeObserver(() => drawManualAlignment(state));
+  state.resizeObserver.observe(canvas);
+  manualAlignmentSelectFrame(target);
+}
+
+function showAlignModePicker(i) {
+  document.getElementById('align-options')?.remove();
+  const card = document.createElement('div'); card.className = 'upcard'; card.id = 'align-options';
+  const title = document.createElement('b'); title.textContent = `Align frame ${i + 1}`;
+  const note = document.createElement('span'); note.className = 'sog-status';
+  note.textContent = 'Choose automatic feature matching, or manually identify the same numbered features across registered images.';
+  const row = document.createElement('div'); row.className = 'row';
+  const automatic = document.createElement('button'); automatic.className = 'btn btn-accent'; automatic.textContent = 'Automatically';
+  const manual = document.createElement('button'); manual.className = 'btn'; manual.textContent = 'Manually';
+  const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel';
+  row.append(automatic, manual, cancel); card.append(title, note, row); $('stage').appendChild(card);
+  automatic.addEventListener('click', () => { card.remove(); void alignSelectedFrameAutomatically(i); });
+  manual.addEventListener('click', () => startManualAlignment(i));
+  cancel.addEventListener('click', () => card.remove());
+}
+
+function alignSelectedFrame() {
+  const i = S.sel, cam = S.scene?.cams?.[i];
+  if (!cam?.R || S._aligning || S._manualAlign) return;
+  showAlignModePicker(i);
+}
+
+async function alignSelectedFrameAutomatically(i) {
+  const cam = S.scene?.cams?.[i];
+  if (!cam?.R || S._aligning) return;
+  S._aligning = true; renderControls();
+  try {
+    flash('Matching two pictures before and two after …', 15000);
+    const cs = await adjacentPoseCandidates(S.photos, S.scene.cams, i);
+    const choices = alignmentChoices(cs, S.scene.cams, i);
+    if (!choices.length) {
+      showUnalignedFrameRemoval(i,
+        'Automatic matching found no consistent adjacent-image placement. Keep the image unchanged, or remove it from this model.');
+      return;
+    }
+    showAlignmentChoices(i, choices);
+  } catch (err) {
+    console.warn('[align]', err);
+    showUnalignedFrameRemoval(i,
+      `Automatic alignment could not be validated (${err.message}). Keep the image unchanged, or remove it from this model.`);
+  } finally { S._aligning = false; renderControls(); }
 }
 
 function wireStage() {
@@ -5614,6 +6895,87 @@ function wireStage() {
 }
 
 // ── filmstrip ───────────────────────────────────────────────────────────────
+async function removeTrainingImage(i) {
+  if (S._removingImage) return;
+  const cam = S.scene?.cams?.[i];
+  if (!S.session?.trainer || !cam || cam.ci < 0) {
+    flash('This image is not part of the trainable camera set.', 5000);
+    return;
+  }
+  if (cam.state === 'removed') {
+    flash(`Frame ${i + 1} is already removed from training.`, 4000);
+    return;
+  }
+  if (!(await inAppConfirm('Remove image from training', `Remove frame ${i + 1} from training? The original image will remain saved on this device.`, 'Remove image'))) return;
+  S._removingImage = true;
+  try {
+    await S.session.excludeCameraImage(cam.ci);
+    cam.state = 'removed'; cam.error = null; cam.psnr = null;
+    await persistReconEdit().catch((e) => console.warn('[remove-image] metadata', e));
+    if (S.atFrame === i) leaveFrame();
+    paintStrip(); renderControls();
+    flash(`Frame ${i + 1} removed from training.`, 6000);
+  } catch (err) {
+    flash(`Could not remove the image: ${err.message}`, 8000);
+  } finally {
+    S._removingImage = false;
+    renderControls();
+  }
+}
+
+async function restoreTrainingImage(i) {
+  if (S._removingImage) return;
+  const cam = S.scene?.cams?.[i];
+  if (!S.session?.trainer || !cam || cam.ci < 0) {
+    flash('This image is not part of the trainable camera set.', 5000);
+    return;
+  }
+  if (cam.state !== 'removed') return;
+  if (!(await inAppConfirm('Restore image to training', `Return frame ${i + 1} to the training set?`, 'Restore image'))) return;
+  S._removingImage = true;
+  try {
+    await S.session.includeCameraImage(cam.ci);
+    cam.state = 'placed'; cam.error = null; cam.psnr = null;
+    await persistReconEdit().catch((e) => console.warn('[restore-image] metadata', e));
+    paintStrip(); renderControls();
+    flash(`Frame ${i + 1} restored to training.`, 6000);
+  } catch (err) {
+    flash(`Could not restore the image: ${err.message}`, 8000);
+  } finally {
+    S._removingImage = false;
+    renderControls();
+  }
+}
+
+function wireFrameLongPress(el, i) {
+  let timer = 0, x = 0, y = 0, fired = false;
+  const cancel = () => { clearTimeout(timer); timer = 0; };
+  el.addEventListener('pointerdown', (e) => {
+    if (S._manualAlign || (e.button != null && e.button !== 0)) return;
+    const cam = S.scene?.cams?.[i];
+    if (!S.session?.trainer || !cam || cam.ci < 0) return;
+    fired = false; x = e.clientX; y = e.clientY;
+    timer = setTimeout(() => {
+      timer = 0; fired = true;
+      navigator.vibrate?.(35);
+      void (cam.state === 'removed' ? restoreTrainingImage(i) : removeTrainingImage(i));
+    }, 1000);
+  });
+  el.addEventListener('pointermove', (e) => {
+    if (timer && Math.hypot(e.clientX - x, e.clientY - y) > 10) cancel();
+  });
+  el.addEventListener('pointerup', cancel);
+  el.addEventListener('pointercancel', cancel);
+  el.addEventListener('pointerleave', cancel);
+  el.addEventListener('contextmenu', (e) => {
+    if (timer || fired) e.preventDefault();
+  });
+  el.addEventListener('click', (e) => {
+    if (!fired) return;
+    fired = false; e.preventDefault(); e.stopImmediatePropagation();
+  }, true);
+}
+
 function buildStrip(deferPhotos = false) {
   const strip = $('strip');
   strip.innerHTML = '<div class="strip-scroll" id="strip-scroll"></div>';
@@ -5654,6 +7016,9 @@ function buildStrip(deferPhotos = false) {
     b.dataset.i = i;
     b.innerHTML = `<div class="ph"></div>
       <span class="frame-tag" hidden></span><div class="frame-bar"><i></i></div>`;
+    b.title = 'Long press to remove from training';
+    b.style.webkitTouchCallout = 'none';
+    wireFrameLongPress(b, i);
     b.addEventListener('click', () => { fill(b); select(i); });
     sc.appendChild(b);
     if (io) io.observe(b);
@@ -5671,8 +7036,8 @@ async function thumbBmp(i) {
     S._thumbPack ??= (async () => {
       const r = await fetch(S._thumbsUrl);
       if (!r.ok) throw new Error(`thumbs fetch failed (${r.status})`);
-      const { unzipStore } = await import('./session_io.js');
-      return unzipStore(new Uint8Array(await r.arrayBuffer()));
+      const { unzipStoreAsync } = await import('./session_io.js');
+      return unzipStoreAsync(new Uint8Array(await r.arrayBuffer()));
     })();
     const data = (await S._thumbPack).get(`${i}.jpg`);
     return data ? await createImageBitmap(new Blob([data], { type: 'image/jpeg' })) : null;
@@ -5682,11 +7047,28 @@ async function thumbBmp(i) {
   }
 }
 
+function frameErrorRank(value, errors) {
+  if (!Number.isFinite(value) || !errors.length) return null;
+  const lo = Math.min(...errors), hi = Math.max(...errors);
+  // 1 = lowest error/best placement, 0 = highest error/worst placement.
+  return hi > lo ? 1 - clamp((value - lo) / (hi - lo), 0, 1) : 1;
+}
+function frameErrorColor(value, errors) {
+  const q = frameErrorRank(value, errors);
+  if (q == null) return '#2fd4c1';
+  const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
+  const rgb = q < 0.5
+    ? mix([239, 91, 76], [242, 193, 78], q * 2)
+    : mix([242, 193, 78], [47, 212, 193], (q - 0.5) * 2);
+  return `rgb(${rgb.join(',')})`;
+}
+
 function paintStrip() {
   const sc = $('strip-scroll');
   if (!sc) return;
   const active = (S.state === 'train' && S.session && S.session.training && S.scene)
     ? (S.scene.cams.find((c) => c.ci === S.session.activeCam) || {}).i : -1;
+  const imageErrors = (S.scene?.cams || []).map((c) => c.error).filter(Number.isFinite);
   S.photos.forEach((p, i) => {
     const b = sc.children[i];
     if (!b) return;
@@ -5694,24 +7076,36 @@ function paintStrip() {
     b.dataset.sel = i === S.sel ? '1' : '0';
     b.dataset.live = i === active ? '1' : '0';
     b.dataset.state = c ? c.state : 'placed';
+    b.title = c?.state === 'removed' ? 'Long press to restore to training' : 'Long press to remove from training';
     const tag = b.querySelector('.frame-tag');
-    const t = c && c.state === 'holdout' ? 'held' : c && c.state === 'unplaced' ? 'out' : null;
+    const t = c && c.state === 'holdout' ? 'held' :
+      c && c.state === 'removed' ? 'removed' : c && c.state === 'unplaced' ? 'out' : null;
     tag.hidden = !t;
     if (t) { tag.dataset.t = c.state; tag.textContent = t; }
     const bar = b.querySelector('.frame-bar i');
-    const score = c && (c.psnr != null ? c.psnr
-      : (S.state !== 'ready' && c.state !== 'unplaced'
-        ? (c.state === 'holdout' ? S.psnrHold : S.psnrTrain) : null));
-    bar.style.width = score != null ? `${clamp((score - 12) / 22, 0, 1) * 100}%` : '0%';
-    bar.style.background = c && c.state === 'holdout' ? '#f2a03f' : '#2fd4c1';
+    // Use the camera's already-accumulated training MSE only for relative
+    // placement. No per-image PSNR evaluation is launched for the strip.
+    const error = c && Number.isFinite(c.error) ? c.error : null;
+    const rank = frameErrorRank(error, imageErrors);
+    bar.style.width = rank != null ? `${15 + rank * 85}%` : '0%';
+    bar.style.background = frameErrorColor(error, imageErrors);
   });
 }
 
 // ── dock ────────────────────────────────────────────────────────────────────
 function dock(kind) {
   const d = $('dock');
+  // Hide-visuals reparents the score graph into stage. A recovered trainer
+  // creates a new dock graph; remove every prior direct-stage graph first or
+  // both canvases remain visible (the large translucent overlay in reports).
+  document.querySelectorAll('#stage > .chartwrap, #stage > .chartwrap-expanded')
+    .forEach((el) => el.remove());
   d.className = 'dock' + (kind ? ` dock-${kind}` : '');
-  if (!kind) { d.innerHTML = ''; return; }
+  if (!kind) {
+    d.innerHTML = '';
+    chart = null;
+    return;
+  }
 
   if (kind === 'prep') {
     // the stage sequence IS the header: the current beat reads as the title,
@@ -5739,12 +7133,12 @@ function dock(kind) {
       <div class="chartwrap"><canvas id="chart"></canvas><div class="chart-tip" id="chart-tip" hidden></div></div>
       <div class="tscores">
         <div class="score" data-tone="accent">
-          <div class="score-1"><span class="score-v"><span id="t-ptrain">${formatTrainingScore(S.psnrTrain)}</span><small class="unit" id="t-punit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div>
+          <div class="score-1"><span class="score-v"><span id="t-ptrain">${formatTrainingScore(shownScore('train'))}</span><small class="unit" id="t-punit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div>
           <div class="score-sub"><span id="t-splats">${S.splats ? fmt(S.splats) : '—'}</span> splats</div>
           <button class="chart-scale score-scale" id="chart-scale" type="button">Use %</button>
           <span class="tmeta-grow" id="t-grow">&nbsp;</span>
         </div>
-        ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${formatTrainingScore(S.psnrHold)}</span><small class="unit" id="t-hunit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div><div class="score-sub">held out</div></div>` : ''}
+        ${S.session && S.session.holdout >= 0 ? `<div class="score" data-tone="alt"><div class="score-1"><span class="score-v"><span id="t-phold">${formatTrainingScore(shownScore('hold'))}</span><small class="unit" id="t-hunit">${S.scoreScale === 'similarity' ? '%' : 'dB'}</small></span></div><div class="score-sub">held out</div></div>` : ''}
       </div>`;
     $('t-play').addEventListener('click', toggleTrain);
     $('t-finish').addEventListener('click', async () => {
@@ -5761,6 +7155,7 @@ function dock(kind) {
         S.settings.gpu = v;
         $('t-gpu-v').textContent = `${tGpu.value}%`;
         if (S.session) S.session.opts.gpuUsage = v / 100;
+        updateHeadlessGpu(v);
         const panel = $('set-gpu');
         if (panel) { panel.value = String(v); $('set-gpu-v').textContent = `${v}%`; }
       });
@@ -5795,22 +7190,19 @@ function toggleScoreScale() {
   if (dchart) { dchart.scale = S.scoreScale; dchart.draw(); }
   syncScoreScaleControls();
   renderTrainingScore();
+  updateHeadlessScoreScale();
 }
 
-function chartTip(h) {
-  const tip = $('chart-tip');
-  if (!tip) return;
-  if (!h) { tip.hidden = true; return; }
-  tip.hidden = false;
-  tip.innerHTML = `${fmt(h.iter)} · <b style="color:#2fd4c1">${h.train.toFixed(1)} ${h.unit}</b>` +
-    (h.hold != null ? ` / <b style="color:#f2a03f">${h.hold.toFixed(1)} ${h.unit}</b>` : '') +
-    (h.event ? `<br><span style="color:#93a1a0">${h.event}</span>` : '');
-  // the readout rides the cursor INSIDE the plot: pinned to the top edge it
-  // hung past the stage in the expanded graph and hid behind the dock.
-  // Clamped sideways, floating 70px clear of the cursor (below it near the top).
+function positionChartTip(tip, h) {
+  // Both foreground and background readouts ride above the cursor inside the
+  // plot. Clamp sideways; only flip below when there is genuinely no room.
   const wrap = tip.parentElement;
   const W = wrap ? wrap.clientWidth : 0, H = wrap ? wrap.clientHeight : 0;
-  if (!W || !H) { tip.style.left = `${h.xPct}%`; tip.style.top = '4px'; return; }
+  if (!W || !H) {
+    tip.style.left = `${h.xPct}%`; tip.style.top = '4px';
+    tip.style.transform = 'translate(-50%, calc(-100% - 70px))';
+    return;
+  }
   const tw = tip.offsetWidth, th = tip.offsetHeight;
   const x = Math.max(tw / 2 + 4, Math.min(W - tw / 2 - 4, (h.xPct / 100) * W));
   const y = (Math.max(0, Math.min(100, h.yPct ?? 0)) / 100) * H;
@@ -5818,6 +7210,19 @@ function chartTip(h) {
   tip.style.top = `${(y / H) * 100}%`;
   tip.style.transform = y > th + 86 ? 'translate(-50%, calc(-100% - 70px))' : 'translate(-50%, 70px)';
 }
+
+function chartTipAt(id, h) {
+  const tip = $(id);
+  if (!tip) return;
+  if (!h) { tip.hidden = true; return; }
+  tip.hidden = false;
+  tip.innerHTML = `${fmt(h.iter)} cycles${h.splats != null ? ` · ${fmt(h.splats)} splats` : ''}<br>` +
+    `<b style="color:#2fd4c1">${h.train.toFixed(1)} ${h.unit}</b>` +
+    (h.hold != null ? ` / <b style="color:#f2a03f">${h.hold.toFixed(1)} ${h.unit}</b>` : '') +
+    (h.event ? `<br><span style="color:#93a1a0">${h.event}</span>` : '');
+  positionChartTip(tip, h);
+}
+function chartTip(h) { chartTipAt('chart-tip', h); }
 
 // ── flash ───────────────────────────────────────────────────────────────────
 function flash(msg, ms = 2800, links = []) {
@@ -5859,6 +7264,1111 @@ function renderHud() {
   }
   hud.replaceChildren(row);
 }
+
+// ── Android foreground-service handoff ──────────────────────────────────────
+// This Activity trains locally (live session, live viewer) and stages
+// a run directory under files/runs/<runId>/ from the first cycle — manifest,
+// photos and an exact transition checkpoint. When the Activity backgrounds (or
+// is swiped away), the :training foreground service resumes that checkpoint in
+// its headless WebView; the reopened
+// app monitors (snapshot viewer + progress when Show-visuals is on), adopts
+// the finish, or recovers. File shapes + cadence live in ./headless.js (shared
+// with the driver, unit-pinned); this side only stages, checkpoints, watches.
+//
+// Every entry here is best-effort and bridge-gated: without the files-dir
+// bridge (desktop, old app builds) each function returns silently and the run
+// continues exactly as without the feature.
+/** The files-dir bridge (MainActivity, new enough to stage runs). */
+const headlessBridge = () => {
+  const b = globalThis.AndroidARBridge;
+  return b && typeof b.writeRunJson === 'function' && typeof b.writeRunChunk === 'function' ? b : null;
+};
+/** A files-dir read must never own the Start button forever. Android's asset
+ *  handler is local, so seconds of silence means a wedged request, not useful
+ *  evidence that another trainer exists. */
+async function headlessFetch(url, timeoutMs = 2500) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try { return await fetch(url, { signal: ctl.signal }); }
+  finally { clearTimeout(timer); }
+}
+
+/** True when a run directory claims a live run (staging/booting/active/paused). */
+async function headlessMarkerLive() {
+  if (!headlessBridge()) return false;
+  try {
+    const r = await headlessFetch(Headless.activeUrl());
+    if (!r.ok) return false;
+    const { runId } = await r.json();
+    if (!Headless.validRunId(runId)) return false;
+    const st = await headlessFetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
+    if (!st.ok) return false;
+    const status = await st.json();
+    if (!Headless.isLiveStatus(status)) return false;
+    // This guard is reached only by a new Start request. An activity-owned
+    // live marker cannot own GPU work here (this page is still in setup), so
+    // it is debris from a failed/old local run. Do not let it brick Start.
+    if (status.owner === 'activity' && S.state === 'ready') {
+      try {
+        headlessBridge().writeRunJson(runId, 'status.json', JSON.stringify({
+          ...status, status: 'dismissed', at: Date.now(),
+          error: 'the previous local trainer was deliberately replaced',
+        }));
+        headlessBridge().clearActiveRun(runId);
+      } catch { /* the new staging pass will replace an un-clearable marker */ }
+      return false;
+    }
+    // a live run owned by a service that answers no ping died with its
+    // process (killed, crashed, updated): release it to recovery instead of
+    // blocking every new start behind a run that will never finish
+    if (status.owner === 'service' && !(await headlessServiceAlive(runId))) {
+      try {
+        headlessBridge().writeRunJson(runId, 'status.json', JSON.stringify({
+          ...status, status: 'interrupted', at: Date.now(),
+          error: 'the background trainer was gone when a new run started',
+        }));
+      } catch { /* best-effort: the new run's own staging overwrites the marker */ }
+      return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
+/** Liveness of a service-owned run: a fresh heartbeat proves it outright; a
+ *  quiet one gets a ping round-trip (answered from Java, which no page
+ *  throttle can silence) before it is declared dead. Conservative throughout:
+ *  any doubt blocks the new start, as before. */
+async function headlessServiceAlive(runId) {
+  const b = headlessBridge();
+  try {
+    const s = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json().catch(() => null);
+    if (Headless.heartbeatFresh(s)) return true;
+  } catch { /* fall through to the ping */ }
+  if (!b || typeof b.headlessCommand !== 'function') return true;
+  try { b.headlessCommand('headless-ping', runId); } catch { return true; }
+  await new Promise((r) => setTimeout(r, 1200));
+  try {
+    const s = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json();
+    return Headless.heartbeatFresh(s);
+  } catch { return false; }
+}
+/** Keep the staged service recipe in sync with the live GPU duty slider.
+ * The service reads this manifest when it boots after backgrounding. */
+function updateHeadlessScoreScale() {
+  const b = headlessBridge();
+  if (!b || !S._hlManifest || S._hlManifest.runId !== S.runId || S._hlStaged !== S.runId) return;
+  S._hlManifest = { ...S._hlManifest, scoreScale: S.scoreScale };
+  try { b.writeRunJson(S.runId, 'manifest.json', JSON.stringify(S._hlManifest)); }
+  catch (e) { console.warn('[headless] score unit update failed', e); }
+}
+
+function updateHeadlessGpu(value) {
+  const b = headlessBridge();
+  const v = Math.min(100, Math.max(10, Math.round(+value || 100)));
+  if (!b || !S._hlManifest || S._hlManifest.runId !== S.runId || S._hlStaged !== S.runId) return;
+  S._hlManifest = {
+    ...S._hlManifest, gpu: v,
+    settings: { ...(S._hlManifest.settings || {}), gpu: v },
+  };
+  try { b.writeRunJson(S.runId, 'manifest.json', JSON.stringify(S._hlManifest)); }
+  catch (e) { console.warn('[headless] GPU duty update failed', e); }
+}
+
+/** Stage the handoff for this run: manifest + marker now, photos in the
+ *  background (native captures retain their disk files, everything else
+ *  uploads its bytes), status flips to live when the photos land. */
+function stageHeadlessRun() {
+  const b = headlessBridge();
+  // the avatar route never stages (its post-training stages have no headless twin)
+  if (!b || !S.runId || S.avatar || S._hlStaged) return;
+  S._hlStaged = S.runId;
+  S._hlPhotos = false; S._hlCkptBusy = false;
+  S._hlStagePromise = (async () => {
+    const runId = S.runId, gen = S.gen;
+    try {
+      const files = (S.loadedFiles || []).filter((f) => f && f.name);
+      if (files.length < 3) throw new Error('no photos in hand');
+      const names = files.map((f) => f.name);
+      if (!names.every(Headless.validName)) throw new Error('photo names outside the handoff set');
+      const cap = S.preset && S.preset.capture;
+      const nativeCaptureId = cap?.metadata?.nativeCaptureId || '';
+      const native = !!(cap?.metadata?.nativeARCore && /^[A-Za-z0-9_-]{1,80}$/.test(nativeCaptureId));
+      const photoSource = native ? 'urls' : 'files';
+      const manifest = Headless.buildManifest({
+        runId, name: (S._localRun && S._localRun.name) || (S.preset && S.preset.name) || 'model',
+        maxIters: S.maxIters, gpu: S.settings.gpu, scoreScale: S.scoreScale,
+        srcKey: cap?.metadata?.nativeCaptureId || null,
+        photos: names, photoSource,
+        ...(native ? { photoUrls: names.map((name) => Headless.nativePhotoUrl(nativeCaptureId, name)) } : {}),
+        settings: { ...S.settings, ...(S.earlyPrune ? { earlyPrune: { ...S.earlyPrune, busy: false } } : {}) },
+      });
+      S._hlManifest = manifest;
+      b.writeRunJson(runId, 'manifest.json', JSON.stringify(manifest));
+      b.writeRunJson(runId, 'status.json', JSON.stringify(
+        { status: 'staging', owner: 'activity', iter: 0, at: Date.now() }));
+      b.setActiveRun(runId);
+      // Never delete older run directories here. Their state.bin, recon and
+      // retained photos are durable recovery sources backing Home tiles; only
+      // an explicit user deletion may remove them.
+      if (native) {
+        // ARCore archives are the ground truth. The run stores references only;
+        // both WebViews read the same immutable native JPEGs.
+        b.writeRunJson(runId, 'photos.json', JSON.stringify(
+          { names, source: 'urls', complete: true, at: Date.now() }));
+      } else {
+        // Browser/file-picker blobs have no native archive, so only those need
+        // a service-readable copy in the run directory.
+        await stagePhotoBlobs(runId, files);
+      }
+      if (S.gen !== gen || S.runId !== runId) return;   // the run moved on without us
+      S._hlPhotos = true;
+      headlessStatusWrite(S.session && S.session.training ? 'active' : 'paused');
+    } catch (e) {
+      // staging failed: the handoff stays disarmed (no photos.json, no live
+      // status) and the run continues locally exactly as without the feature
+      console.warn('[headless] staging failed — local training unaffected', e);
+    }
+  })().catch((e) => { console.warn('[headless] staging task failed', e); });
+}
+/** Upload photo bytes into the run dir (uploads, picker shots, video frames —
+ *  everything without disk files). Chunked base64, sequential, throttled past
+ *  the training loop's own hunger: one photo per macrotask at most. */
+async function stagePhotoBlobs(runId, files) {
+  const b = headlessBridge();
+  const names = [];
+  for (const f of files) {
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    for (let o = 0; o < bytes.length; o += 262144) {
+      b.writeRunChunk(runId, `photos/${f.name}`, Headless.encodeB64(bytes.subarray(o, o + 262144)),
+        o + 262144 >= bytes.length);
+    }
+    names.push(f.name);
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  b.writeRunJson(runId, 'photos.json', JSON.stringify({ names, complete: true, at: Date.now() }));
+}
+/** Store a small run-owned artifact such as its Home preview. */
+async function writeRunBlob(runId, name, blob) {
+  const b = headlessBridge();
+  if (!b || !Headless.validRunId(runId) || !Headless.validName(name) || !blob) return false;
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  for (let o = 0; o < bytes.length; o += 262144) {
+    if (!b.writeRunChunk(runId, name, Headless.encodeB64(bytes.subarray(o, o + 262144)),
+      o + 262144 >= bytes.length)) return false;
+  }
+  return true;
+}
+
+/** Mirror an already-packed checkpoint into Android app data. This is the
+ * durable model record used by Home; source photos remain references to their
+ * canonical scan archive. */
+async function writeDurableRunCheckpoint(state, recon, status = null) {
+  const b = headlessBridge();
+  if (S._hlStagePromise) await S._hlStagePromise;
+  if (!b || !S._hlStaged || S.runId !== S._hlStaged || !S._hlPhotos) return false;
+  const bytes = state instanceof Blob ? new Uint8Array(await state.arrayBuffer()) : new Uint8Array(state);
+  for (let o = 0; o < bytes.length; o += 262144) {
+    if (!b.writeRunChunk(S.runId, 'state.bin', Headless.encodeB64(bytes.subarray(o, o + 262144)),
+      o + 262144 >= bytes.length)) return false;
+  }
+  if (!b.writeRunJson(S.runId, 'recon.json', JSON.stringify(recon))) return false;
+  if (status) b.writeRunJson(S.runId, 'status.json', JSON.stringify(status));
+  return true;
+}
+
+/** One-shot file checkpoint used for Activity→service ownership transfer. */
+async function secureFileCheckpoint() {
+  const b = headlessBridge();
+  if (!b || !S._hlStaged || S.runId !== S._hlStaged || !S._hlPhotos) return false;
+  if (!S.session || !S.session.trainer || S._hlCkptBusy) return false;
+  S._hlCkptBusy = true;
+  try {
+    const { packState, buildReconJson } = await import('./session_io.js');
+    const state = await packState(S.session);
+    const recon = buildReconJson(S);
+    if (!(await writeDurableRunCheckpoint(state, recon))) return false;
+    // Mirror the same exact checkpoint into IndexedDB before relinquishing the
+    // Activity. The run then remains a visible, tappable Home tile even if the
+    // service process or active.json disappears.
+    try {
+      const { patchRun, saveRun } = await import('./store.js');
+      const detailProgress = captureRunProgressDetails();
+      const localPatch = {
+        status: 'training', iter: S.session.trainer.iter | 0,
+        splats: S.session.trainer.n | 0, state: new Blob([state]), recon,
+        ckptAt: Date.now(), minutes: detailProgress.minutes,
+        detailSolve: captureRunSolveDetails(), detailProgress, detailGpu: gpuFacts(false),
+      };
+      if (!(await patchRun(S.runId, localPatch))) {
+        await saveRun({
+          id: S.runId, name: (S.preset && S.preset.name) || 'Local Scene',
+          createdAt: Date.now(), updatedAt: Date.now(), maxIters: S.maxIters,
+          psnr: S.psnrHold ?? S.psnrTrain ?? null, frames: (S.loadedFiles || []).length,
+          ownSrc: !!(S.preset && (S.preset.id === '__own' || S.preset.id === '__last')),
+          ...localPatch,
+        });
+      }
+      if (S._localRun && S._localRun.id === S.runId) Object.assign(S._localRun,
+        { state: new Blob([state]), recon, detailProgress });
+    } catch (e) { console.warn('[headless] IndexedDB checkpoint mirror failed', e); }
+    headlessStatusWrite(S.session.training ? 'active' : 'paused', S.session.trainer.iter | 0);
+    return true;
+  } catch (e) {
+    console.warn('[headless] file checkpoint failed', e);   // never disturb the run
+    return false;
+  } finally { S._hlCkptBusy = false; }
+}
+/** Best-effort status write for the staged run (pause/active/iter). */
+function headlessStatusWrite(status, iter = null) {
+  const b = headlessBridge();
+  if (!b || !S._hlStaged || S.runId !== S._hlStaged) return;
+  try {
+    b.writeRunJson(S.runId, 'status.json', JSON.stringify({
+      status, owner: 'activity',
+      iter: iter ?? (S.session && S.session.trainer ? S.session.trainer.iter | 0 : 0),
+      splats: S.session && S.session.trainer ? S.session.trainer.n | 0 : (S.splats || 0),
+      psnr: S.psnrHold ?? S.psnrTrain ?? null,
+      at: Date.now(),
+    }));
+  } catch { /* best-effort */ }
+}
+/** The Activity's liveness beat: the service refuses the takeover while this
+ *  is fresh (a fast reopen + Continue-here must win over a booting twin). */
+function headlessActivityBeat(now) {
+  const b = headlessBridge();
+  if (!b || !S._hlStaged || S.runId !== S._hlStaged) return;
+  if (now - (S._hlBeatAt || 0) < 5000) return;
+  S._hlBeatAt = now;
+  try {
+    b.writeRunJson(S.runId, 'activity.json', JSON.stringify({ alive: true, at: Date.now() }));
+  } catch { /* best-effort */ }
+}
+/** Deliberate leave (Back): the IDB checkpoint is the resume path (Yours),
+ *  so the files-dir handoff stands down instead of hijacking the fresh boot
+ *  into recovery. Only ever clears the live marker, if one exists. */
+async function headlessClearMarker() {
+  const b = headlessBridge();
+  if (!b) return;
+  try {
+    const r = await fetch(Headless.activeUrl());
+    if (!r.ok) return;
+    const { runId } = await r.json();
+    if (Headless.validRunId(runId)) {
+      try {
+        b.writeRunJson(runId, 'status.json', JSON.stringify(
+          { status: 'dismissed', owner: 'activity', iter: S.iter || 0, at: Date.now() }));
+        b.clearActiveRun(runId);
+      } catch { /* best-effort */ }
+    }
+  } catch { /* best-effort */ }
+}
+/** Release the marker (local finish, adopt, discard). Only clears when the
+ *  marker still names this run — a newer run's claim is never touched. */
+function headlessClear(runId = S.runId) {
+  const b = headlessBridge();
+  S._hlStaged = null; S._hlPhotos = false; S._hlManifest = null;
+  if (!b || !runId) return;
+  try { b.clearActiveRun(runId); } catch { /* best-effort */ }
+}
+/** Convert the file-backed reconstruction's score history into the same
+ * IndexedDB detail shape used by local runs. */
+function headlessProgressDetails(recon, manifest, status = {}) {
+  const stats = (recon && recon.stats) || {};
+  return {
+    chart: Array.isArray(stats.chart) ? stats.chart.map((r) => Array.from(r || [])) : [],
+    holds: Array.isArray(stats.holds) ? stats.holds.map((r) => Array.from(r || [])) : [],
+    splats: Array.isArray(stats.splats) ? stats.splats.map((r) => Array.from(r || [])) : [],
+    events: Array.isArray(stats.events) ? stats.events.map((e) => ({ ...e })) : [],
+    perf: { frames: [], marks: [] }, metrics: [],
+    settings: { ...((manifest && manifest.settings) || {}) },
+    maxIters: (manifest && manifest.maxIters) || 0,
+    iter: status.iter ?? recon.iter ?? 0,
+    minutes: stats.minutes || 0,
+    psnrTrain: status.psnr ?? stats.psnrTrain ?? null,
+    psnrHold: stats.psnrHold ?? null,
+  };
+}
+
+/** Mirror Android's durable run directory into the local library. This makes
+ * a service checkpoint visible on Home even when IndexedDB was evicted before
+ * handoff, and keeps a second independently discoverable copy of state.bin. */
+function assertCheckpointPair(parsed, recon) {
+  if (!parsed || !recon) throw new Error('checkpoint is incomplete');
+  if (Number.isFinite(recon.iter) && Number.isFinite(parsed.iter) && recon.iter !== parsed.iter) {
+    throw new Error(`checkpoint transaction is still publishing (${parsed.iter} / ${recon.iter})`);
+  }
+}
+
+async function mirrorHeadlessRun(runId, status) {
+  const manifest = Headless.validateManifest(
+    await (await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')))).json());
+  const recon = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'recon.json')))).json();
+  const stateBytes = new Uint8Array(
+    await (await fetch(Headless.fresh(Headless.runUrl(runId, 'state.bin')))).arrayBuffer());
+  const { parseState } = await import('./session_io.js');
+  const parsed = parseState(stateBytes);
+  assertCheckpointPair(parsed, recon);
+  recon.source = {
+    preset: null, names: [...manifest.photos],
+    urls: manifest.photoSource === 'urls'
+      ? [...manifest.photoUrls]
+      : manifest.photos.map((n) => Headless.photoUrl(runId, n)),
+    ...(manifest.srcKey ? { captureId: manifest.srcKey } : {}),
+  };
+  let thumb = null;
+  try {
+    const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.png')));
+    if (r.ok) thumb = await r.blob();
+  } catch { /* optional */ }
+  const detailProgress = headlessProgressDetails(recon, manifest, status);
+  const rec = {
+    id: runId, name: manifest.name,
+    status: status.status === 'finished' ? 'finished' : 'training',
+    createdAt: manifest.stagedAt || Date.now(), updatedAt: Date.now(),
+    iter: parsed.iter, maxIters: manifest.maxIters,
+    splats: status.splats ?? recon.splats ?? parsed.gaussians.n,
+    psnr: status.psnr ?? recon.stats?.psnrTrain ?? null,
+    frames: manifest.photos.length, ownSrc: !!manifest.srcKey,
+    ...(manifest.srcKey ? { srcKey: `native:${manifest.srcKey}` } : {}),
+    state: new Blob([stateBytes]), recon, detailProgress,
+    ...(thumb ? { thumb } : {}),
+  };
+  try {
+    const { saveRun, patchRun } = await import('./store.js');
+    if (!(await patchRun(runId, rec))) await saveRun(rec);
+  } catch (e) {
+    // The Android checkpoint remains authoritative and openable even when
+    // IndexedDB is full, unavailable, or belongs to another WebView profile.
+    console.warn(`[headless] IndexedDB mirror failed for ${runId}`, e);
+  }
+  return rec;
+}
+
+let androidRunMirror = null;
+async function mirrorAndroidRunDirs() {
+  if (androidRunMirror) return androidRunMirror;
+  const b = headlessBridge();
+  if (!b || typeof b.listRecoverableRuns !== 'function') return 0;
+  androidRunMirror = (async () => {
+    let ids = [];
+    try { ids = JSON.parse(b.listRecoverableRuns()); } catch { return 0; }
+    if (!Array.isArray(ids) || !ids.length) return 0;
+    const { listRuns } = await import('./store.js');
+    const existing = new Set((await listRuns()).filter((r) => r && r.state && r.recon).map((r) => r.id));
+    let restored = 0;
+    for (const runId of ids) {
+      if (!Headless.validRunId(runId) || existing.has(runId)) continue;
+      try {
+        let status = { status: 'interrupted', owner: 'activity', at: 0 };
+        try {
+          const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')));
+          if (response.ok) status = await response.json();
+        } catch { /* a checkpoint is still a durable Home model without control metadata */ }
+        await mirrorHeadlessRun(runId, status);
+        restored++;
+      } catch (e) { console.warn(`[headless] could not mirror ${runId}`, e); }
+    }
+    return restored;
+  })();
+  try { return await androidRunMirror; }
+  finally { androidRunMirror = null; }
+}
+
+/** Boot hijack: a marker from an outlived run opens adopt / monitor /
+ *  recover instead of home. True when it took over boot. */
+async function headlessBootCheck() {
+  if (!headlessBridge()) return false;
+  let runId = null;
+  try {
+    const r = await fetch(Headless.activeUrl());
+    if (r.ok) runId = (await r.json()).runId;
+  } catch { /* an older broken handback may have removed only active.json */ }
+  if (!Headless.validRunId(runId)) {
+    const b = headlessBridge();
+    try { runId = typeof b.recoverActiveRun === 'function' ? b.recoverActiveRun() : null; }
+    catch { runId = null; }
+  }
+  if (!Headless.validRunId(runId)) return false;
+  let status = null;
+  try {
+    status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json();
+  } catch { status = null; }
+  if (!status || typeof status.status !== 'string') { headlessDiscard(runId); return false; }
+  // Populate Home before showing monitor/recovery. A failure here never blocks
+  // the authoritative Android files from opening in the monitor.
+  await mirrorHeadlessRun(runId, status).catch((e) => console.warn('[headless] Home mirror failed', e));
+  if (status.status === 'finished') { await adoptHeadlessRun(runId, 'finished'); return true; }
+  if (status.status === 'interrupted' && status.stopped) {
+    showRecovery(runId, status);
+    return true;
+  }
+  if (!Headless.isLiveStatus(status)) { showRecovery(runId, status); return true; }
+  let service = null;
+  try {
+    service = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json();
+  } catch { service = null; }
+  // owner activity + live status with no service heartbeat: the Activity died
+  // before any takeover (a crash, or a swipe racing the service boot) —
+  // recover from the files. A fresh service heartbeat means the takeover is
+  // already under way: monitor it instead of fighting it.
+  if (status.owner === 'service' || Headless.heartbeatFresh(service)) { enterMonitor(runId); return true; }
+  showRecovery(runId, status);
+  return true;
+}
+/** Notification tap into an existing Activity: reopen the file-backed
+ *  monitor, but never adopt or stop the service trainer automatically. */
+globalThis.__splatxrOpenMonitor = () => {
+  if (S.state === 'monitor') return;
+  headlessBootCheck().catch((e) => console.warn('[headless] monitor reopen failed', e));
+};
+
+/** The monitor: progress + snapshot viewer for a run owned by the service.
+ *  No session, no GPU, no viewport — this process only watches files. */
+function enterMonitor(runId) {
+  // Cut away every surface from the Activity's former train/home state. The
+  // monitor is a real screen, not a modal over a still-mounted chart or wall.
+  closeOverlays();
+  dock('');
+  $('monitor').hidden = true;
+  document.getElementById('cv-model')?.remove();
+  gpuCanvas = null;
+  window.scrollTo(0, 0);
+  S.state = 'monitor';
+  S._monRun = runId; S._monAt = 0;
+  S._monChartRows = 0; S._monScoreScale = null; S._monProgress = null;
+  if (!S._monChart) {
+    S._monChart = new Chart($('mon-chart'), { onHover: (h) => {
+      const tip = $('mon-chart-tip');
+      if (!h) { tip.hidden = true; return; }
+      tip.hidden = false;
+      tip.textContent = `${fmt(h.iter)} cycles${h.splats != null ? ` · ${fmt(h.splats)} splats` : ''} · ${h.train.toFixed(1)} ${h.unit}`;
+      positionChartTip(tip, h);
+    } });
+  }
+  S._monChart.reset();
+  $('mon-preview').hidden = true;
+  $('mon-gpu').value = String(S.settings.gpu ?? 100); $('mon-gpu-v').textContent = `${$('mon-gpu').value}%`;
+  $('mon-refresh').disabled = false; $('mon-refresh').textContent = 'Refresh preview';
+  $('mon-save').disabled = false;
+  $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
+  if (vp && vp.ctx) vp.ctx.clearRect(0, 0, vp.w, vp.h);
+  // This is a status screen, not a viewer. A snapshot behind the card's
+  // frosted backdrop was neither visible nor useful, so no canvas is mounted.
+  document.getElementById('cv-monitor')?.remove();
+  paintMonitorHead(runId);
+  wireMonitorOnce();
+  $('monitor').hidden = false;
+  syncMonitorButtons();
+  monitorPoll(0, true);
+}
+function wireMonitorOnce() {
+  if (S._monWired) return;
+  S._monWired = true;
+  $('mon-pause').addEventListener('click', () => {
+    const b = headlessBridge();
+    if (!b || !S._monRun) return;
+    try { b.headlessCommand(S._monPaused ? 'headless-resume' : 'headless-pause', S._monRun); } catch { /* best-effort */ }
+    S._monPaused = !S._monPaused;
+    syncMonitorButtons();
+  });
+  const monGpu = $('mon-gpu');
+  monGpu.addEventListener('pointerdown', () => { S._monGpuDragging = true; });
+  const endGpuDrag = () => { S._monGpuDragging = false; };
+  monGpu.addEventListener('pointerup', endGpuDrag); monGpu.addEventListener('pointercancel', endGpuDrag);
+  monGpu.addEventListener('input', () => {
+    const value = Math.min(100, Math.max(10, parseInt(monGpu.value, 10) || 100));
+    $('mon-gpu-v').textContent = `${value}%`;
+    S.settings.gpu = value;
+    const bridge = headlessBridge();
+    try {
+      if (!bridge?.headlessGpu) throw new Error('this app build cannot change background GPU usage');
+      bridge.headlessGpu(S._monRun, value);
+    } catch (err) { flash(`Could not change background GPU usage: ${err.message}`, 7000); }
+  });
+  monGpu.addEventListener('change', () => {
+    S._monGpuDragging = false;
+    const value = Math.min(100, Math.max(10, parseInt(monGpu.value, 10) || 100));
+    const panel = $('set-gpu');
+    if (panel) { panel.value = String(value); $('set-gpu-v').textContent = `${value}%`; }
+    saveSettings();
+    if (S._monManifest && S._monManifest.runId === S._monRun) {
+      S._monManifest = { ...S._monManifest, gpu: value,
+        settings: { ...(S._monManifest.settings || {}), gpu: value } };
+      try { headlessBridge()?.writeRunJson(S._monRun, 'manifest.json', JSON.stringify(S._monManifest)); }
+      catch (e) { console.warn('[headless] monitor GPU persistence failed', e); }
+    }
+  });
+  $('mon-score-unit').addEventListener('click', () => {
+    const current = S._monScoreScale ||
+      (S._monProgress?.scoreScale === 'similarity' ? 'similarity' : 'db');
+    S._monScoreScale = current === 'db' ? 'similarity' : 'db';
+    paintMonitorLive(S._monProgress);
+    paintMonitorProgress(S._monStatus || {}, S._monProgress);
+  });
+  $('mon-refresh').addEventListener('click', refreshMonitorPreview);
+  $('mon-prune').addEventListener('click', () => {
+    if (!S._monRun || document.getElementById('mon-edit-pick')) return;
+    const card = document.createElement('div');
+    card.className = 'upcard'; card.id = 'mon-edit-pick';
+    const title = document.createElement('b'); title.textContent = 'Prune / grow';
+    const note = document.createElement('span'); note.className = 'sog-status';
+    note.textContent = 'Fewer splats with room to regrow — or grow into the error right now.';
+    const row = document.createElement('div'); row.className = 'row';
+    for (const [label, percent, grow] of [['Prune ¼', 25, false], ['Prune ½', 50, false], ['Grow now', 0, true]]) {
+      const button = document.createElement('button'); button.className = 'btn'; button.textContent = label;
+      if (grow) button.dataset.grow = '1'; else button.dataset.percent = String(percent);
+      row.appendChild(button);
+    }
+    const custom = document.createElement('input'); custom.id = 'mon-prune-custom'; custom.type = 'number';
+    custom.min = '1'; custom.max = '99'; custom.step = '1'; custom.value = String(rememberedPrunePercent()); custom.style.width = '4.5em';
+    custom.title = 'Custom prune percentage (1–99)';
+    custom.addEventListener('change', () => rememberPrunePercent(custom.value));
+    row.appendChild(custom);
+    const customButton = document.createElement('button'); customButton.className = 'btn';
+    customButton.textContent = 'Prune %'; customButton.dataset.custom = '1'; row.appendChild(customButton);
+    const cancel = document.createElement('button'); cancel.className = 'btn linkish'; cancel.textContent = 'Cancel'; row.appendChild(cancel);
+    card.append(title, note, row); $('monitor').appendChild(card);
+    row.addEventListener('click', (e) => {
+      if (e.target.tagName !== 'BUTTON') return;
+      let percent = e.target.dataset.percent ? Number(e.target.dataset.percent) : 0;
+      if (e.target.dataset.custom) {
+        const keep = readPruneCustom('mon-prune-custom');
+        if (keep == null) {
+          custom.focus(); custom.select(); flash('Enter a whole prune percentage from 1 to 99.', 6000); return;
+        }
+        percent = Math.round((1 - keep) * 100);
+      }
+      const grow = e.target.dataset.grow === '1'; card.remove();
+      if (!grow && !percent) return;
+      const bridge = headlessBridge();
+      try {
+        if (grow) bridge?.headlessCommand('headless-grow', S._monRun);
+        else if (bridge?.headlessPrune) bridge.headlessPrune(S._monRun, percent);
+        else if (percent === 25) bridge?.headlessCommand('headless-prune', S._monRun);
+        else throw new Error('this app build does not support custom background pruning');
+        flash(grow ? 'Growing the background model …' : `Pruning ${percent}% of the background model …`, 5000);
+      } catch (err) { flash(`Could not send prune/grow: ${err.message}`, 7000); }
+    });
+  });
+  $('mon-save').addEventListener('click', () => {
+    const runId = S._monRun;
+    if (!runId || !confirm('Stop background training here and save the current model?')) return;
+    const button = $('mon-save'); button.disabled = true;
+    try {
+      const bridge = headlessBridge();
+      if (!bridge) throw new Error('background service bridge is unavailable');
+      bridge.headlessCommand('headless-save', runId);
+      flash('Stopping at a safe GPU boundary and saving the current model …', 60000);
+      setTimeout(() => {
+        if (S.state === 'monitor' && S._monRun === runId) button.disabled = false;
+      }, 15000);
+    } catch (err) {
+      button.disabled = false; flash(`Could not stop and save: ${err.message}`, 8000);
+    }
+  });
+  $('mon-stop').addEventListener('click', async () => {
+    if (!S._monRun) return;
+    $('mon-stop').disabled = true;
+    flash('Securing the background checkpoint and transferring training here …', 60000);
+    if (!(await returnHeadlessRun(S._monRun))) $('mon-stop').disabled = false;
+  });
+  $('mon-background').addEventListener('click', () => {
+    const runId = S._monRun, button = $('mon-background');
+    if (!runId || button.disabled) return;
+    button.disabled = true;
+    try {
+      const bridge = headlessBridge();
+      if (!bridge) throw new Error('background service bridge is unavailable');
+      bridge.headlessCommand('headless-start', runId);
+      S._monRecovery = false; S._monPaused = false;
+      $('mon-sub').hidden = true;
+      syncMonitorButtons(); button.disabled = true;
+      flash('Starting the saved checkpoint in background mode …', 10000);
+      setTimeout(() => {
+        if (S.state === 'monitor' && S._monRun === runId) monitorPoll(0, true);
+        button.disabled = false;
+      }, 1000);
+    } catch (err) {
+      button.disabled = false;
+      flash(`Could not start background training: ${err.message}`, 8000);
+    }
+  });
+  $('mon-continue').addEventListener('click', async () => {
+    if (!S._monRun) return;
+    $('mon-continue').disabled = true;
+    if (!(await returnHeadlessRun(S._monRun))) $('mon-continue').disabled = false;
+  });
+  $('mon-discard').addEventListener('click', () => {
+    if (S._monRun) headlessDiscard(S._monRun);
+    S._monRun = null;
+    $('monitor').hidden = true;
+    document.getElementById('cv-monitor')?.remove();
+    S.state = 'ready';
+    showHome();
+  });
+  $('mon-x').addEventListener('click', () => {
+    // step aside to the wall (the run keeps training headless); Start stays
+    // guarded by the live marker until adopted, recovered or discarded
+    $('monitor').hidden = true;
+    document.getElementById('cv-monitor')?.remove();
+    S.state = 'ready';
+    showHome();
+  });
+}
+function syncMonitorButtons() {
+  const p = $('mon-pause');
+  if (p) p.textContent = S._monPaused ? 'Resume' : 'Pause';
+  // wireMonitorOnce persists across monitor visits. Reset the transfer buttons
+  // from current state so a successful first handback cannot leave the second
+  // visit permanently disabled.
+  const transferring = !!S._handbackRun;
+  if ($('mon-stop')) $('mon-stop').disabled = transferring;
+  if ($('mon-continue')) $('mon-continue').disabled = transferring;
+  if ($('mon-background')) $('mon-background').disabled = transferring;
+  for (const id of ['mon-live', 'mon-rec']) {
+    const el = $(id);
+    if (el) el.hidden = (id === 'mon-live') === !!S._monRecovery;
+  }
+}
+async function paintMonitorHead(runId) {
+  S._monRecovery = false;
+  S._monManifest = null;
+  $('mon-name').textContent = 'Model';
+  $('mon-sub').hidden = true;
+  $('mon-sub').textContent = '';
+  syncMonitorButtons();
+  try {
+    const response = await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')));
+    const manifest = response.ok ? await response.json() : null;
+    if (S.state === 'monitor' && S._monRun === runId && manifest?.name) {
+      $('mon-name').textContent = manifest.name;
+    }
+    if (S.state === 'monitor' && S._monRun === runId && manifest) {
+      S._monManifest = manifest;
+      const value = Math.min(100, Math.max(10, Math.round(manifest.gpu ?? manifest.settings?.gpu ?? 100)));
+      S.settings.gpu = value;
+      $('mon-gpu').value = String(value); $('mon-gpu-v').textContent = `${value}%`;
+    }
+  } catch { /* the neutral model title remains */ }
+}
+/** The monitor tick (5 s): status/progress paint and lifecycle transitions.
+ * Preview rendering is explicit-only through Refresh preview. */
+async function monitorPoll(now, force = false) {
+  if (S.state !== 'monitor' || !S._monRun || S._monRecovery) return;
+  // Stop & continue intentionally makes the service publish a final
+  // interrupted/stopped checkpoint before releasing its GPU. That is a
+  // transfer protocol state, not a failure modal.
+  if (S._handbackRun === S._monRun) return;
+  if (!force && now - S._monAt < 5000) return;
+  S._monAt = now;
+  const runId = S._monRun;
+  try {
+    const status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json().catch(() => null);
+    if (!status) return;   // transient read failure — retry next poll
+    // A poll can have started just before the button set _handbackRun. Do not
+    // reinterpret the service's orderly stop acknowledgment as a crash.
+    if (S._handbackRun === runId) return;
+    if (status.status === 'finished') { adoptHeadlessRun(runId, 'finished'); return; }
+    if (status.status === 'interrupted' && status.stopped) {
+      showRecovery(runId, status);
+      return;
+    }
+    if (!Headless.isLiveStatus(status)) { showRecovery(runId, status); return; }
+    let service = null, progress = null;
+    try { service = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json(); } catch { /* quiet */ }
+    try { progress = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'progress.json')))).json(); } catch { /* quiet */ }
+    if (S._handbackRun === runId) return;
+    if (status.owner === 'service' && !Headless.heartbeatFresh(service)) { showRecovery(runId, status); return; }
+    S._monPaused = status.status === 'paused';
+    S._monStatus = status; S._monProgress = progress;
+    paintMonitorProgress(status, progress);
+    paintMonitorLive(progress);
+    syncMonitorButtons();
+  } catch (e) { console.warn('[headless] monitor poll failed', e); }
+}
+async function refreshMonitorPreview() {
+  const runId = S._monRun, button = $('mon-refresh');
+  if (!runId || !button || button.disabled) return;
+  button.disabled = true; button.textContent = 'Rendering …';
+  let before = 0;
+  try {
+    try {
+      const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.json')));
+      if (r.ok) before = Number((await r.json()).at) || 0;
+    } catch { /* first preview */ }
+    const bridge = headlessBridge();
+    if (!bridge) throw new Error('background service bridge is unavailable');
+    bridge.headlessCommand('headless-snapshot', runId);
+    let ready = false;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (S.state !== 'monitor' || S._monRun !== runId) return;
+      try {
+        const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.json')));
+        const meta = r.ok ? await r.json() : null;
+        if (meta && Number(meta.at) > before) { ready = true; break; }
+      } catch { /* snapshot transaction still publishing */ }
+    }
+    if (!ready) throw new Error('preview timed out');
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve; img.onerror = () => reject(new Error('preview image is unreadable'));
+      img.src = Headless.fresh(Headless.runUrl(runId, 'snapshot.png'));
+    });
+    const cv = $('mon-model'), ctx = cv.getContext('2d'), dpr = devicePixelRatio || 1;
+    $('mon-preview').hidden = false;
+    const r = cv.getBoundingClientRect();
+    cv.width = Math.max(1, Math.round(r.width * dpr)); cv.height = Math.max(1, Math.round(r.height * dpr));
+    const f = fitRect(img.width, img.height, cv.width, cv.height, 0);
+    ctx.clearRect(0, 0, cv.width, cv.height); ctx.drawImage(img, f.x, f.y, f.w, f.h);
+    button.textContent = 'Refresh preview';
+  } catch (err) {
+    button.textContent = 'Refresh preview'; flash(`Could not refresh preview: ${err.message}`, 7000);
+  } finally { button.disabled = false; }
+}
+
+function paintMonitorLive(progress) {
+  const c = S._monChart;
+  const scale = S._monScoreScale ||
+    (progress?.scoreScale === 'similarity' ? 'similarity' : 'db');
+  const unitButton = $('mon-score-unit');
+  if (unitButton) {
+    unitButton.textContent = scale === 'db' ? 'Use %' : 'Use dB';
+    unitButton.title = scale === 'db'
+      ? 'Show graph scores as approximate similarity percentages'
+      : 'Show graph scores in decibels';
+  }
+  if (c && progress) {
+    const rows = Array.isArray(progress.scoreHistory) ? progress.scoreHistory : [];
+    const splats = Array.isArray(progress.splatHistory) ? progress.splatHistory : [];
+    c.reset();
+    const nearSplats = (iter) => {
+      let out = progress.splats;
+      for (const row of splats) { if (row[0] <= iter) out = row[1]; else break; }
+      return out;
+    };
+    for (const row of rows) if (Number.isFinite(row[0]) && Number.isFinite(row[1])) c.push(row[0], row[1], null, nearSplats(row[0]));
+    c.scale = scale;
+    c.maxIter = progress.maxIters || Math.max(1, progress.iter || 1);
+    c.events = (Array.isArray(progress.events) ? progress.events : [])
+      .map((e) => ({ ...e, at: e.iter / c.maxIter }));
+    c.resize(); c.draw();
+  }
+
+}
+
+function paintMonitorProgress(status, progress) {
+  const p = progress || {};
+  const iter = p.iter ?? status.iter ?? 0, max = p.maxIters || 0;
+  $('mon-state').textContent = status.status === 'paused' ? 'Paused' :
+    status.status === 'staging' ? 'Preparing …' : status.status === 'booting' ? 'Taking over …' : 'Training';
+  $('mon-iter').textContent = max > 0
+    ? `${fmt(iter)} / ${fmt(max)} cycles (${Math.min(99, Math.round(100 * iter / max))}%)`
+    : `${fmt(iter)} cycles`;
+  const scoreScale = S._monScoreScale || (p.scoreScale === 'similarity' ? 'similarity' : 'db');
+  $('mon-score').textContent = p.psnr != null
+    ? (scoreScale === 'similarity'
+        ? `${psnrToApproxSsimPercent(+p.psnr).toFixed(1)} %`
+        : `${(+p.psnr).toFixed(1)} dB`)
+    : '—';
+  $('mon-splats').textContent = p.splats != null ? fmt(p.splats) : '—';
+  if (!S._monGpuDragging && Number.isFinite(+p.gpu)) {
+    const value = Math.min(100, Math.max(10, Math.round(+p.gpu)));
+    $('mon-gpu').value = String(value); $('mon-gpu-v').textContent = `${value}%`;
+  }
+}
+/** Take the run back from the service: stop any live twin, then verify it
+ *  stood down (or was already dead) before local training touches the GPU.
+ *  False = a takeover is still in flight, retry shortly. */
+async function headlessTakeover(runId) {
+  const b = headlessBridge();
+  // Do not start a dead service merely to tell it to stop: that path rewrites
+  // status.json and used to erase the renderer-restart transaction metadata.
+  try {
+    const [status, service] = await Promise.all([
+      fetch(Headless.fresh(Headless.runUrl(runId, 'status.json'))).then((r) => r.ok ? r.json() : null),
+      fetch(Headless.fresh(Headless.runUrl(runId, 'service.json'))).then((r) => r.ok ? r.json() : null),
+    ]);
+    // Finished is a committed model state, not a live-training ownership claim.
+    // Completion intentionally tears Java down, so a missing/stale final
+    // service heartbeat must never turn this durable result into "lost".
+    if (status?.status === 'finished') return true;
+    if (status && !Headless.isLiveStatus(status) && service &&
+        (service.alive === false || !Headless.heartbeatFresh(service))) return true;
+  } catch { /* command + acknowledgment loop below remains authoritative */ }
+  try { b && b.headlessCommand('headless-stop', runId); } catch { /* best-effort */ }
+  // A non-live status is written before Java destroys the service WebView.
+  // Wait for service.json alive:false (written AFTER teardown), or a stale
+  // heartbeat, so the Activity never creates a second WebGPU owner.
+  for (let i = 0; i < 90; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    let status = null, service = null;
+    try { status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json(); }
+    catch { /* a torn/transition read is not proof the GPU is gone */ }
+    try { service = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'service.json')))).json(); }
+    catch { service = null; }
+    if (status?.status === 'finished') return true;
+    const stateReleased = !status || !Headless.isLiveStatus(status) || status.owner === 'activity';
+    const serviceReleased = !!service &&
+      (service.alive === false || !Headless.heartbeatFresh(service));
+    if (stateReleased && serviceReleased) return true;
+  }
+  return false;
+}
+
+/** The one automatic service→Activity handback used by notification return,
+ *  normal foregrounding, and the monitor button. */
+async function returnHeadlessRun(runId) {
+  if (!runId) return false;
+  if (S._handbackRun === runId) return false;
+  S._handbackRun = runId;
+  flash('Returning training to the app …', 90000);
+  try {
+    if (!(await headlessTakeover(runId))) {
+      flash('The background trainer has not released the GPU yet. It is still safe in the service; try again shortly.', 9000);
+      return false;
+    }
+    return await adoptHeadlessRun(runId, 'continue');
+  } finally {
+    if (S._handbackRun === runId) S._handbackRun = null;
+    if (S.state === 'monitor') syncMonitorButtons();
+  }
+}
+/** Adopt a background run into this Activity: finished opens view-only in the
+ *  done viewer, continue resumes training locally under the same run id (the
+ *  photos are already staged, so the handoff re-arms without re-uploading). */
+async function adoptHeadlessRun(runId, mode) {
+  // Continue is the sole transition out of the monitor. Remove its canvas and
+  // any stale wall/train dock before continuation creates a new chart/canvas.
+  closeOverlays();
+  dock('');
+  $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
+  $('monitor').hidden = true;
+  document.getElementById('cv-monitor')?.remove();
+  document.getElementById('cv-model')?.remove();
+  gpuCanvas = null;
+  window.scrollTo(0, 0);
+  flash(mode === 'finished' ? 'Loading model …' : 'Resuming training here …', 60000);
+  let handbackStatus = {};
+  try {
+    const manifest = Headless.validateManifest(
+      await (await fetch(Headless.fresh(Headless.runUrl(runId, 'manifest.json')))).json());
+    S._hlManifest = manifest;
+    const recon = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'recon.json')))).json();
+    const stateBytes = new Uint8Array(
+      await (await fetch(Headless.fresh(Headless.runUrl(runId, 'state.bin')))).arrayBuffer());
+    const status = await (await fetch(Headless.fresh(Headless.runUrl(runId, 'status.json')))).json().catch(() => ({}));
+    handbackStatus = status;
+    S._hlGpuRestarts = status.gpuRestarts | 0;
+    const { parseState } = await import('./session_io.js');
+    const parsed = parseState(stateBytes);
+    assertCheckpointPair(parsed, recon); // reject a state/recon publication in progress
+    let thumb = null;
+    try {
+      const r = await fetch(Headless.fresh(Headless.runUrl(runId, 'snapshot.png')));
+      if (r.ok) thumb = await r.blob();
+    } catch { /* the tile just goes textless */ }
+    // photos resolve as URL-backed: the runs handler serves the staged bytes
+    recon.source = {
+      preset: null,
+      names: [...manifest.photos],
+      urls: manifest.photoSource === 'urls'
+      ? [...manifest.photoUrls]
+      : manifest.photos.map((n) => Headless.photoUrl(runId, n)),
+      ...(manifest.srcKey ? { captureId: manifest.srcKey } : {}),
+    };
+    const rec = {
+      id: runId, name: manifest.name, status: 'finished',
+      createdAt: manifest.stagedAt || Date.now(), updatedAt: Date.now(),
+      iter: status.iter ?? recon.iter ?? 0, maxIters: manifest.maxIters,
+      splats: status.splats ?? recon.splats ?? 0,
+      psnr: status.psnr ?? (recon.stats && recon.stats.psnrTrain) ?? null,
+      frames: manifest.photos.length, ownSrc: !!manifest.srcKey,
+      ...(manifest.srcKey ? { srcKey: `native:${manifest.srcKey}` } : {}),
+      state: new Blob([stateBytes]), recon,
+      detailProgress: headlessProgressDetails(recon, manifest, status),
+      ...(thumb ? { thumb } : {}),
+    };
+    const { saveRun, patchRun } = await import('./store.js');
+    // same id as the run's own record: adopting patches it, never duplicates it
+    if (!(await patchRun(runId, rec))) await saveRun(rec);
+    S._localRun = { ...rec };
+    $('monitor').hidden = true;
+    document.getElementById('cv-monitor')?.remove();
+    if (mode === 'finished') {
+      // Finished is authoritative even when Java's final service heartbeat is
+      // stale/missing. The takeover helper recognizes that committed status
+      // without sending the completed run through interruption recovery.
+      if (!(await headlessTakeover(runId))) {
+        throw new Error('the finished background run could not be opened yet');
+      }
+      await continueLocalRun(true);
+      if (S.state !== 'done' || !S.session || !S.session.trainer) {
+        throw new Error('the finished model did not rebuild');
+      }
+      // Finished/view-only has no live owner. Clear only AFTER its viewer is
+      // proven live; until then active.json is the recovery transaction log.
+      headlessClear(runId);
+    } else {
+      // The staged AR photos + active marker remain authoritative throughout
+      // rebuild. Never publish owner=activity before that Activity has a live
+      // trainer, and never clear the marker for a continuing run.
+      S._hlStaged = runId; S._hlPhotos = true; S._hlCkptBusy = false;
+      // WebView.destroy() ran before alive:false, but give the GPU process one
+      // turn to retire its device before allocating the Activity's replacement.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await continueLocalRun(false);
+      // Worker setup can resolve just before device.lost is delivered. Give
+      // that event a turn and reject a trainer whose GPU is already dead.
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      if (S.state !== 'train' || !S.session || !S.session.trainer || S.session.deviceLost) {
+        throw new Error('the local trainer did not rebuild on a live graphics device');
+      }
+      const b = headlessBridge();
+      if (b) {
+        try {
+          b.setActiveRun(runId);
+          b.writeRunJson(runId, 'status.json', JSON.stringify(
+            { status: 'active', owner: 'activity', iter: S.session.trainer.iter | 0,
+              at: Date.now(), gpuRestarts: S._hlGpuRestarts | 0 }));
+          b.writeRunJson(runId, 'activity.json', JSON.stringify({ alive: true, at: Date.now() }));
+        } catch { /* the next activity beat retries ownership evidence */ }
+      }
+    }
+    return true;
+  } catch (e) {
+    console.error(e);
+    // Transaction rollback: files, state and active.json were never cleared.
+    // Put recovery in front of the user instead of trainDeadEnd's Home screen.
+    S._hlStaged = runId; S._hlPhotos = true; S._hlCkptBusy = false;
+    const reason = String((e && e.message) || e);
+    if (mode === 'finished') {
+      // Never rewrite a durable finished result as interrupted merely because
+      // this viewer could not allocate/rebuild immediately. Home can reopen
+      // the same finished checkpoint on the next tap.
+      S.state = 'ready';
+      showHome();
+      flash(`Training finished and is saved on this device. The viewer could not open yet (${reason}); tap the finished model to retry.`, 12000);
+      return false;
+    }
+    const restarts = handbackStatus.gpuRestarts | 0;
+    const b = headlessBridge();
+    if (mode !== 'finished' && restarts < 1 &&
+        /device|GPU|graphics|WebGPU|worker/i.test(reason) && b &&
+        typeof b.restartForGpuRecovery === 'function') {
+      try {
+        b.writeRunJson(runId, 'status.json', JSON.stringify({
+          ...handbackStatus, status: 'interrupted', stopped: true, owner: 'activity',
+          at: Date.now(), gpuRestarts: restarts + 1,
+          error: `reopening the Activity graphics process after handback failure: ${reason}`,
+        }));
+        S._hlGpuRestarts = restarts + 1;
+        b.restartForGpuRecovery(runId);
+        return false;
+      } catch (restartErr) { console.error(restartErr); }
+    }
+    showRecovery(runId, { ...handbackStatus, status: 'interrupted', stopped: true,
+      error: `return to app failed: ${reason}` });
+    flash(`Could not resume in the app (${reason}) — the checkpoint and AR frames are still available here.`, 12000);
+    return false;
+  }
+}
+/** The run died out of reach (pressure kill, crash, pre-handoff swipe): offer
+ *  Continue-here from the files, or Discard. */
+function showRecovery(runId, status) {
+  closeOverlays();
+  dock('');
+  $('monitor').hidden = true;
+  document.getElementById('cv-model')?.remove();
+  gpuCanvas = null;
+  window.scrollTo(0, 0);
+  S.state = 'monitor';
+  S._monRun = runId; S._monRecovery = true;
+  $('start').hidden = true; $('detail').hidden = true; $('controls').hidden = true;
+  document.getElementById('cv-monitor')?.remove();
+  $('mon-name').textContent = 'Background training interrupted';
+  $('mon-sub').hidden = false;
+  const iter = status && status.iter ? ` at cycle ${fmt(status.iter)}` : '';
+  const why = status && status.error ? ` — ${status.error}` :
+    ' — the system reclaimed it while the app was away.';
+  $('mon-sub').textContent = `The run's last checkpoint${iter} is stored on this device${why}`;
+  wireMonitorOnce();
+  $('monitor').hidden = false;
+  syncMonitorButtons();
+}
+/** Drop the marker (unreadable status, user discard). The files stay until the
+ *  next staged run cleans them — a discard must never strand a booting twin
+ *  by deleting the bytes under it. */
+function headlessDiscard(runId) {
+  const b = headlessBridge();
+  try {
+    b && b.writeRunJson(runId, 'status.json', JSON.stringify(
+      { status: 'discarded', owner: 'activity', iter: 0, at: Date.now() }));
+  } catch { /* clearing the marker still hides it for this boot */ }
+  headlessClear(runId);
+}
+/** Start a freshly configured run directly under the service. Camera solving
+ * and trainer seeding necessarily happen here first; this waits for photo
+ * staging, secures that initial GPU state, then transfers ownership before
+ * the first ordinary Activity training screen can become the run's owner. */
+async function startNewRunInBackground() {
+  const b = headlessBridge(), runId = S.runId;
+  if (!b || !runId || S.state !== 'train' || !S.session) {
+    flash('Direct background training is unavailable in this app build.', 8000);
+    return;
+  }
+  flash('Preparing the background trainer and securing its starting state …', 60000);
+  let ok = false;
+  try {
+    if (S._hlStagePromise) await S._hlStagePromise;
+    ok = await secureFileCheckpoint();
+    if (!ok || S.runId !== runId || !S.session) throw new Error('the initial checkpoint could not be secured');
+    S.session.pause(); S.session.dispose();
+    S.session = null; S.scene = null;
+    document.getElementById('cv-model')?.remove(); gpuCanvas = null;
+    b.writeRunJson(runId, 'activity.json', JSON.stringify({ alive: false, at: Date.now() }));
+    // Start the service before polling its files from the monitor. The existing
+    // foreground notification remains in place and is adopted by the service.
+    b.headlessCommand('headless-start', runId);
+    enterMonitor(runId);
+    flash('Training started in background mode.', 8000);
+  } catch (err) {
+    console.warn('[headless] direct start failed', err);
+    // Before disposal the local run remains valid and should simply continue.
+    if (S.session && S.state === 'train') {
+      androidNotifStart();
+      S.session.start();
+      flash(`Could not transfer to background; training continues here: ${err.message}`, 10000);
+    } else {
+      flash(`Could not start background training: ${err.message}`, 10000);
+      showRecovery(runId, { status: 'interrupted', error: err.message });
+    }
+  }
+}
+
+/** Foreground-service handoff: secure one exact checkpoint, then relinquish
+ *  the Activity's GPU before the service creates its WebView. A failed save
+ *  leaves the local trainer untouched; Java retries while the Activity stays
+ *  backgrounded. Once successful this page becomes the file-backed monitor. */
+globalThis.__splatxrHandoff = async () => {
+  const b = headlessBridge();
+  const runId = S.runId;
+  let ok = false;
+  try { ok = await secureFileCheckpoint(); } catch { ok = false; }
+  if (ok && runId && S.runId === runId && S.state === 'train' && S.session) {
+    try { S.session.pause(); S.session.dispose(); } catch { /* checkpoint is already safe */ }
+    S.session = null;
+    S.scene = null;
+    document.getElementById('cv-model')?.remove();
+    gpuCanvas = null;
+    // bootHeadlessNow refuses a fresh Activity heartbeat. Retire it only after
+    // the checkpoint and GPU disposal have both succeeded.
+    try { b && b.writeRunJson(runId, 'activity.json', JSON.stringify({ alive: false, at: Date.now() })); }
+    catch { /* the service also waits out stale beats */ }
+    enterMonitor(runId);
+  }
+  try { b && b.handoffDone(runId, ok); } catch { /* the service's absence timer settles from the saved files */ }
+};
 
 // ── training notification (Android) ─────────────────────────────────────────
 // A foreground-service notification carries the live score + splat count and
@@ -6184,6 +8694,8 @@ function loop() {
     lastPulse = now;
     paintStrip();          // the pulse on the frame being trained on
   }
+  if (S.state === 'train') headlessActivityBeat(now);
+  if (S.state === 'monitor') monitorPoll(now);
 
   renderHud();
   draw();
@@ -6230,6 +8742,9 @@ function prepSub() {
 
 // ── drawing ─────────────────────────────────────────────────────────────────
 function draw() {
+  // migrate-on-swipe monitor: the snapshot canvas paints itself on poll —
+  // no viewport overlays over another process's training
+  if (S.state === 'monitor') return;
   const cv = $('cv');
   const r = cv.getBoundingClientRect();
   if (Math.abs(r.width * (vp.dpr || 1) - cv.width) > 2 || Math.abs(r.height * (vp.dpr || 1) - cv.height) > 2) vp.resize();
@@ -6694,14 +9209,6 @@ function openDetails() {
     syncDetailsUrl();
     return;
   }
-  // per-photo scores: one render + readback per camera, started the first
-  // time the sheet asks for them (not at finish, where they stole the GPU
-  // from the viewer)
-  if (S.state === 'done' && S.session && S.session.trainer && S.session.trainer.device &&
-      S.scene && S._scoredGen !== S.gen) {
-    S._scoredGen = S.gen;
-    scoreFrames().catch(() => {});
-  }
   $('d-export').replaceChildren(buildExport());
   renderDetails();
   syncDetailsUrl();
@@ -6747,7 +9254,7 @@ function renderDetails() {
   const survived = S.solveStats.pairsChecked
     ? Math.round(100 * S.solveStats.pairsUsable / S.solveStats.pairsChecked) : 0;
 
-  const gap = (S.psnrTrain != null && S.psnrHold != null) ? S.psnrTrain - S.psnrHold : null;
+  const gap = (shownScore('train') != null && shownScore('hold') != null) ? shownScore('train') - shownScore('hold') : null;
   const pf = (ses.perf && ses.perf.frames) || [];
   const colv = (i) => pf.map((r) => r[i]);
   const ipsAll = pf.length > 1
@@ -6772,8 +9279,8 @@ function renderDetails() {
       ],
       rows: [
         stat('Cycles', fmt(S.iter)),
-        S.psnrTrain != null ? stat('Trained photos', `${S.psnrTrain.toFixed(1)} <small>dB</small>`, 'accent') : '',
-        S.psnrHold != null ? stat('Hidden photo', `${S.psnrHold.toFixed(1)} <small>dB</small>`, 'alt') : '',
+        shownScore('train') != null ? stat('Trained photos', `${shownScore('train').toFixed(1)} <small>dB</small>`, 'accent') : '',
+        shownScore('hold') != null ? stat('Hidden photo', `${shownScore('hold').toFixed(1)} <small>dB</small>`, 'alt') : '',
         S.psnrTest != null ? stat(`Test photos (${S.psnrTest.frames.length})`, `${S.psnrTest.psnr.toFixed(2)} <small>dB</small>`, 'alt') : '',
         gap != null ? stat('Gap', `${gap.toFixed(1)} <small>dB</small>`, Math.abs(gap) < 1.5 ? 'accent' : undefined) : '',
         stat('Splats', fmt(S.splats)),
@@ -6884,7 +9391,7 @@ function renderDetails() {
   if (vis === 'perf') $('d-perf').textContent = S.detailTab === 'gpu' ? buildGpuReport() : buildPerfReport();
   if (vis === 'chart') {
     if (!dchart) {
-      dchart = new Chart($('d-chart'), {});
+      dchart = new Chart($('d-chart'), { onHover: (h) => chartTipAt('d-chart-tip', h) });
       $('d-chart-scale')?.addEventListener('click', toggleScoreScale);
     }
     dchart.maxIter = S.maxIters;
@@ -6894,6 +9401,7 @@ function renderDetails() {
     const hist = (S.session.lossHistory && S.session.lossHistory.length)
       ? S.session.lossHistory : (rstats.chart || []);
     dchart.train = hist.map(([i, v]) => [i, v]);
+    dchart.splats = (S.splatHist || []).slice();
     dchart.hold = chart ? chart.hold : ((S.holdHist && S.holdHist.length ? S.holdHist : rstats.holds) || []).slice();
     dchart.events = S.chartEvents.map((e) => ({ ...e, at: e.iter / S.maxIters }));
     dchart.resize();

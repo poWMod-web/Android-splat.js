@@ -52,6 +52,37 @@
 
   <div class="controls" id="controls" hidden></div>
 
+  <!-- background-training monitor: a run owned by the :training service while the
+       app was away — progress + snapshot viewer, no local session. -->
+  <div class="card-start" id="monitor" hidden>
+    <button class="card-x" id="mon-x" aria-label="Leave the monitor">&times;</button>
+    <p class="eyebrow">BACKGROUND TRAINING</p>
+    <h1 id="mon-name">Model</h1>
+    <p class="origin" id="mon-sub" hidden></p>
+    <div class="xr-capabilities" aria-label="Run status"><span id="mon-state">—</span><span id="mon-iter">—</span><span id="mon-score">—</span><span id="mon-splats">—</span></div>
+    <div class="monitor-gpu tmeta-gpu" title="Share of wall time used by background GPU training. Takes effect immediately."><label for="mon-gpu">GPU usage</label><input id="mon-gpu" type="range" min="10" max="100" step="5" value="100"><span id="mon-gpu-v">100%</span></div>
+    <div class="monitor-live-grid">
+      <div class="monitor-preview" id="mon-preview" hidden><canvas id="mon-model"></canvas><small>Service-rendered preview</small></div>
+      <div class="chartwrap monitor-chartwrap"><button class="chart-unit-toggle" id="mon-score-unit" type="button" title="Show graph scores as approximate similarity percentages">Use %</button><canvas id="mon-chart"></canvas><div class="chart-tip" id="mon-chart-tip" hidden></div></div>
+    </div>
+    <div class="upload" id="mon-live">
+      <div class="upload-btns">
+        <button class="btn btn-accent" id="mon-pause">Pause</button>
+        <button class="btn btn-outline" id="mon-refresh">Refresh preview</button>
+        <button class="btn btn-outline" id="mon-prune">Prune / grow</button>
+        <button class="btn btn-outline" id="mon-save">Stop &amp; save</button>
+        <button class="btn btn-outline" id="mon-stop">Stop &amp; continue here</button>
+      </div>
+    </div>
+    <div class="upload" id="mon-rec" hidden>
+      <div class="upload-btns">
+        <button class="btn btn-accent" id="mon-background">Continue in background</button>
+        <button class="btn btn-outline" id="mon-continue">Continue here</button>
+        <button class="btn btn-outline" id="mon-discard">Discard</button>
+      </div>
+    </div>
+  </div>
+
   <div class="card-start" id="start" hidden>
     <button class="card-x" id="card-x" hidden aria-label="Keep the current run">&times;</button>
 
@@ -66,7 +97,7 @@
     <div class="upload" id="upload">
       <div class="upload-btns">
         <button class="btn btn-accent btn-cta" id="btn-ar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H4a1 1 0 0 0-1 1v4m13-5h4a1 1 0 0 1 1 1v4M3 16v4a1 1 0 0 0 1 1h4m13-5v4a1 1 0 0 1-1 1h-4"/><circle cx="12" cy="12" r="4"/><path d="M12 7v2m0 6v2m-5-5h2m6 0h2"/></svg><span>Checking AR…</span></button>
-        <label class="btn btn-outline">Choose photos / import<input type="file" id="file-input" multiple accept="image/*,video/*,.json,.mov,.mp4,.m4v,.webm,.mkv" hidden></label>
+        <label class="btn btn-outline">Choose photos / import<input type="file" id="file-input" multiple accept="image/*,video/*,.json,.zip,.mov,.mp4,.m4v,.webm,.mkv" hidden></label>
         <button class="btn btn-outline" id="btn-record" hidden><svg viewBox="0 0 24 24" class="capicon" aria-hidden="true"><path d="M4.5 7.5h2.6l1.5-2h6.8l1.5 2h2.6a1.4 1.4 0 0 1 1.4 1.4v8.6a1.4 1.4 0 0 1-1.4 1.4h-15a1.4 1.4 0 0 1-1.4-1.4V8.9a1.4 1.4 0 0 1 1.4-1.4z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="12" cy="12.7" r="3.3" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Camera</button>
       </div>
     </div>
@@ -92,6 +123,7 @@
     <div class="xr-set-tools" id="xr-set-tools" hidden><span id="xr-set-mode"></span><button class="btn btn-outline" id="xr-review-set">Review frames &amp; poses</button><button class="btn btn-outline" id="xr-export-set">Export capture ↓</button></div>
     <div class="startrow">
       <button class="btn btn-accent big btn-cta" id="btn-go">Start training</button>
+      <button class="btn btn-outline big btn-cta" id="btn-go-background" hidden title="Prepare the model, then hand training directly to the Android background service">Start in background</button>
       <select class="q-quick" id="q-quick" title="Training quality — Draft is quick and light, Showcase trains long at the largest splat budget. The gear holds every knob.">
         <option value="draft">Draft</option>
         <option value="standard">Standard</option>
@@ -174,13 +206,13 @@
           <option value="">On</option>
           <option value="0">Off</option>
         </select></div>
-      <div class="setrow" title="Off by default. When enabled, training periodically culls the lowest-contributing fraction of splats (by accumulated render weight) and keeps going — the model holds more detail under the same splat budget."><label for="set-softprune">Soft prune</label>
+      <div class="setrow" title="Off by default — Off still removes vote-confirmed dead splats (zero render contribution two checks running). When enabled, training also periodically culls the lowest-contributing fraction of splats (by accumulated render weight) and keeps going — the model holds more detail under the same splat budget."><label for="set-softprune">Soft prune</label>
         <select id="set-softprune">
-          <option value="">Off</option>
+          <option value="">Off (dead only)</option>
+          <option value="0.01">Trim 1%</option>
+          <option value="0.02">Trim 2%</option>
           <option value="0.05">Trim 5%</option>
           <option value="0.1">Trim 10%</option>
-          <option value="0.2">Trim 20%</option>
-          <option value="0.3">Trim 30%</option>
           <option value="custom">Custom…</option>
         </select><input id="set-softprune-custom" type="number" min="1" max="50" step="1" value="10" hidden title="Custom trim percent (1–50)"></div>
       <div class="setrow" title="Choose a training budget from 10,000 to 50,000 cycles. A finished run can continue with +10,000 more."><label for="set-iters">Cycles</label>
@@ -265,6 +297,7 @@
         <canvas id="d-cv"></canvas>
         <div class="chartwrap details-chartwrap" id="d-chart-wrap" hidden>
           <canvas id="d-chart"></canvas>
+          <div class="chart-tip" id="d-chart-tip" hidden></div>
           <button class="chart-scale" id="d-chart-scale" type="button">Use %</button>
         </div>
         <pre id="d-perf" class="perfpre" hidden></pre>

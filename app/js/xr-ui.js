@@ -6,6 +6,31 @@ import { saveBlob } from './download.js';
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+/** Rehydrate a completed native ARCore scan directly from Android app
+ * storage. Used both by the capture-return event and by home boot recovery
+ * when IndexedDB was cleared or its original write failed. */
+export async function importNativeCapture(nativeBridge = globalThis.AndroidARBridge, captureId = null) {
+  if (!nativeBridge || typeof nativeBridge.exportDataset !== 'function') throw new Error('Native capture storage is unavailable.');
+  const payload = JSON.parse(nativeBridge.exportDataset(captureId || ''));
+  if (!payload.ready || payload.frameCount < 3) throw new Error(payload.error || 'Capture at least three frames before importing.');
+  const metadataUri = payload.metadataUri;
+  const responses = await Promise.all([
+    fetch(payload.transformsUri), fetch(payload.pointsUri), fetch(metadataUri),
+  ]);
+  if (responses.some((response) => !response.ok)) throw new Error('Native capture files could not be read from app storage.');
+  const [transforms, pointDocument, metadata] = await Promise.all(responses.map((response) => response.json()));
+  const files = await Promise.all(payload.frames.map(async (frame) => {
+    const response = await fetch(frame.uri);
+    if (!response.ok) throw new Error(`Could not read ${frame.name} from the native capture.`);
+    return Object.assign(new File([await response.blob()], frame.name, { type: 'image/jpeg' }),
+      { url: frame.uri, nativeCaptureId: payload.captureId });
+  }));
+  return validateDataset({ kind: 'ar', files, transforms, points: pointDocument.points || [],
+    pointsByFrame: pointDocument.pointsByFrame || null,
+    metadata: { ...metadata, ...pointDocument.metadata, nativeARCore: true,
+      nativeCaptureId: payload.captureId } });
+}
+
 function modal(html, className = '') {
   const dialog = document.createElement('dialog');
   dialog.className = `xr-dialog ${className}`;
@@ -130,7 +155,7 @@ export function reviewCapture(dataset) {
   });
 }
 
-export function initXRUI({ onCapture, flash }) {
+export function initXRUI({ onCapture, flash, setBusy }) {
   const button = $('btn-ar');
   const nativeBridge = globalThis.AndroidARBridge;
   const nativeAvailable = !!(nativeBridge && typeof nativeBridge.isAvailable === 'function' && nativeBridge.isAvailable());
@@ -144,31 +169,17 @@ export function initXRUI({ onCapture, flash }) {
   try { embedded = window.self !== window.top; } catch { /* cross-origin embedding */ }
   $('xr-open-tab').hidden = !embedded;
 
-  const importNativeCapture = async () => {
-    const payload = JSON.parse(nativeBridge.exportDataset());
-    if (!payload.ready || payload.frameCount < 3) throw new Error(payload.error || 'Capture at least three frames before importing.');
-    const metadataUri = 'https://appassets.androidplatform.net/captures/current/capture.json';
-    const responses = await Promise.all([
-      fetch(payload.transformsUri), fetch(payload.pointsUri), fetch(metadataUri),
-    ]);
-    if (responses.some((response) => !response.ok)) throw new Error('Native capture files could not be read from app storage.');
-    const [transforms, pointDocument, metadata] = await Promise.all(responses.map((response) => response.json()));
-    const files = await Promise.all(payload.frames.map(async (frame) => {
-      const response = await fetch(frame.uri);
-      if (!response.ok) throw new Error(`Could not read ${frame.name} from the native capture.`);
-      return new File([await response.blob()], frame.name, { type: 'image/jpeg' });
-    }));
-    return validateDataset({ kind: 'ar', files, transforms, points: pointDocument.points || [],
-      pointsByFrame: pointDocument.pointsByFrame || null,
-      metadata: { ...metadata, ...pointDocument.metadata, nativeARCore: true } });
-  };
-
   button.onclick = async () => {
     if (!capability.supported) { showXRHelp(capability.reason); return; }
     button.disabled = true;
     try {
       if (nativeAvailable) { nativeBridge.startCapture(); return; }
-      const dataset = await captureXR();
+      // the browser capture resolves before any review modal exists: Start
+      // queues behind the counter (the app's setBusy)
+      setBusy?.(true);
+      let dataset = null;
+      try { dataset = await captureXR(); }
+      finally { setBusy?.(false); }
       if (!dataset) return;
       const reviewed = await reviewCapture(dataset);
       if (reviewed) await onCapture(reviewed);
@@ -183,20 +194,21 @@ export function initXRUI({ onCapture, flash }) {
     $('xr-ar-state').dataset.ready = '1';
     button.querySelector('span').textContent = 'Capture with ARCore';
     $('xr-capability-note').textContent = 'Native ARCore capture pairs camera images with tracked poses and an RGB seed cloud.';
-    window.addEventListener('splatxr-native-capture', async () => {
+    window.addEventListener('splatxr-native-capture', async (event) => {
+      // the import (and the review after it) land through open(): Start
+      // queues behind the counter (the app's setBusy)
+      setBusy?.(true);
       try {
-        const dataset = await importNativeCapture();
+        const dataset = await importNativeCapture(nativeBridge, event.detail?.captureId || null);
         const reviewed = await reviewCapture(dataset);
         if (!reviewed) return;
         await onCapture(reviewed);
-        // the frames now live in the app as Blobs (IndexedDB) — the native
-        // copies are redundant, so drop them instead of leaving up to 200
-        // JPEGs in app storage until the next capture
-        try { nativeBridge.resetCaptureSession(); } catch { /* best-effort */ }
+        // The native archive remains the canonical source. IndexedDB and
+        // training runs retain only its stable identity and URLs.
       } catch (e) {
         console.error('[SplatXR] Native capture import failed:', e);
         showXRHelp(e.message || 'Native ARCore capture could not be imported.');
-      }
+      } finally { setBusy?.(false); }
     });
   }
 

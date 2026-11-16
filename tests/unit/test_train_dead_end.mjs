@@ -33,8 +33,10 @@ assert.match(rec, /back at the setup screen/,
   'an unrecoverable device should say where the user landed');
 assert.match(rec, /lower Training resolution/,
   'an unrecoverable device should name the actionable retry');
-assert.match(rec, /\n      trainDeadEnd\(\);/,
-  'a failed recovery should tear the dead train screen down');
+assert.match(rec, /else \{[\s\S]*back at the setup screen[\s\S]*trainDeadEnd\(\);/,
+  'a non-file-backed failed recovery should tear the dead train screen down');
+assert.match(rec, /if \(S\._hlStaged\)[\s\S]*showRecovery\(runId/,
+  'a file-backed handback failure should remain recoverable instead of returning Home');
 
 // continuations rebuild after tearing the viewer down — a failure in the
 // rebuild (e.g. higher resolution OOMs the seed) must land on setup too,

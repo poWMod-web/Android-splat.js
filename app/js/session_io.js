@@ -6,15 +6,17 @@
 //     sparse cloud, the source file list: everything the app needs to
 //     PRESENT a model (capture-path tour, frustums, orbit pivot) without
 //     re-solving, and to refetch the images for a training resume.
-//   state.bin  — the trainer's raw float parameters and SH coefficients:
-//     a bit-exact resume, no opacity baking, no SOG quantization.
+//   state.bin  — the trainer's parameters and SH coefficients as float16
+//     words (v2 — half the bytes; a resume re-converges the quantization
+//     noise, and v1 float32 blobs still read): no opacity baking, no SOG
+//     quantization.
 //
 // ?model=<url> accepts a session .zip, a .ply, or a .sog (decoded via the
 // vendored splat-transform); &recon=<url> adds presentation state to bare
 // model files. Bare exports carry baked opacities — fine for viewing, and
 // re-exports pass them through unchanged.
 
-import { zipStore } from './zip.js';
+import { zipStore, readZip } from './zip.js';
 import { loadST } from './sog.js';
 
 const STRIDE = 16;
@@ -38,6 +40,18 @@ export function trainRecipe(ses) {
   delete t.maxSplats; delete t.capMult;
   if (ses.opts && ses.opts.refineEvery != null) t.refineEvery = ses.opts.refineEvery;
   return t;
+}
+
+/** The splat budget training was CONFIGURED with (the session trainer opts'
+ *  maxSplats), falling back to the live allocation ceiling, then the model
+ *  size. trainer.cap alone lies low whenever seed x capMult under-allocates
+ *  (the default for explicit sub-1M budgets): the continue card's "Original
+ *  budget" and every ceiling that inherits it must see the configured limit,
+ *  not the allocation. */
+export function trainBudget(ses) {
+  const t = (ses && ses.opts && ses.opts.trainer) || {};
+  const tr = (ses && ses.trainer) || {};
+  return Math.max(t.maxSplats || 0, tr.cap || 0, tr.n || 0);
 }
 
 /** Capture-world gravity in the DATA frame, from a capture.json leveling
@@ -138,7 +152,9 @@ export function buildReconJson(S) {
     })) } : {}),
     iter: ses.trainer.iter,
     splats: ses.trainer.n,
-    maxSplats: ses.trainer.cap || 0,
+    // the CONFIGURED budget (records old enough to hold the allocation read
+    // low here, exactly as before — new saves carry the real limit)
+    maxSplats: trainBudget(ses),
     shK: ses.trainer.shK,
     sceneRadius: ses.model.radius,
     center: ses.model.center ? r6(ses.model.center) : null,
@@ -148,6 +164,7 @@ export function buildReconJson(S) {
       R: r6(c.R), t: r6(c.t), f: +c.f.toPrecision(7),
       ...(c.fy != null && c.fy !== c.f ? { fy: +c.fy.toPrecision(7) } : {}),
       cx: c.cx, cy: c.cy,
+      ...(c.excluded ? { excluded: true } : {}),
     })),
     frames: ses.frames.map((f) => ({ name: f.name, fw: f.fw, fh: f.fh, tw: f.tw, th: f.th,
       // the file's own pixel size (decodeFrames srcW/srcH): Full-size
@@ -155,6 +172,8 @@ export function buildReconJson(S) {
       ...(Number.isFinite(f.srcW) ? { nw: f.srcW, nh: f.srcH } : {}) })),
     source: {
       preset: S.preset && !String(S.preset.id).startsWith('__') ? S.preset.id : null,
+      ...(S.preset?.capture?.metadata?.nativeCaptureId
+        ? { captureId: S.preset.capture.metadata.nativeCaptureId } : {}),
       names: (S.loadedFiles || []).map((f) => f.name),
       // absolute URLs where the images live (preset runs resolve against the
       // deployment's data root — own captures have no URL and stay names-only)
@@ -166,8 +185,10 @@ export function buildReconJson(S) {
       psnrHold: S.psnrHold ?? null,
       psnrTest: S.psnrTest ? { psnr: S.psnrTest.psnr, frames: S.psnrTest.frames.length } : null,
       // the training curve, decimated to ~400 points
-      chart: decimate(ses.lossHistory || [], 400).map(([i, p]) => [i, +p.toFixed(3)]),
+      chart: decimate(ses.lossHistory || [], 800).map(([i, p]) => [i, +p.toFixed(3)]),
       holds: (S.holdHist || []).map(([i, p]) => [i, +p.toFixed(3)]),
+      splats: decimate(S.splatHist || [], 800).map(([i, n]) => [i, Math.round(n)]),
+      events: (S.chartEvents || []).slice(-300).map((e) => ({ ...e })),
     },
     cloud,
   };
@@ -210,23 +231,75 @@ export function convertSHDegree(g, degree) {
   return g;
 }
 
-/** The trainer's exact float state as one binary blob. */
+// float16 word codec for the v2 state payload — plain bit-twiddling, no
+// DataView float16 (too new for the WebViews this ships in). Round to
+// nearest, ties to even; NaN -> quiet NaN, overflow -> infinity.
+const _f32u = new Float32Array(1);
+const _f32b = new Uint32Array(_f32u.buffer);
+export function floatToHalf(v) {
+  _f32u[0] = v;
+  const x = _f32b[0];
+  const s = (x >> 16) & 0x8000;
+  const be = (x >> 23) & 0xff;
+  // inf, or quiet NaN for NaN — tested BEFORE the rebias, so a nonzero
+  // mantissa on an overflowing (but finite) value still saturates to inf
+  if (be === 255) return s | 0x7c00 | (x & 0x7fffff ? 0x200 : 0);
+  const e = be - 112;   // rebias the exponent 127 -> 15
+  const m = x & 0x7fffff;
+  if (e <= 0) {
+    if (e < -10) return s;   // underflows to signed zero
+    const sub = (m | 0x800000) >> (1 - e);
+    return s | ((sub + 0xfff + ((sub >> 13) & 1)) >> 13);
+  }
+  if (e >= 31) return s | 0x7c00;   // overflow -> infinity
+  // ADD, not OR: a mantissa rounding up to 0x400 carries into the exponent,
+  // and OR would swallow that carry whenever e is odd (e.g. 0.49999… -> 0.25)
+  return s | ((e << 10) + (((m + 0xfff + ((m >> 13) & 1)) >> 13)));
+}
+export function halfToFloat(h) {
+  const s = (h & 0x8000) << 16;
+  const e = (h >> 10) & 0x1f;
+  const m = h & 0x3ff;
+  if (e === 0) {
+    if (m === 0) { _f32b[0] = s; return _f32u[0]; }
+    let mm = m, ee = -14;   // subnormal: renormalize
+    while (!(mm & 0x400)) { mm <<= 1; ee--; }
+    _f32b[0] = s | ((ee + 127) << 23) | ((mm & 0x3ff) << 13);
+    return _f32u[0];
+  }
+  if (e === 31) { _f32b[0] = s | 0x7f800000 | (m << 13); return _f32u[0]; }
+  _f32b[0] = s | ((e + 112) << 23) | (m << 13);
+  return _f32u[0];
+}
+const floatsToHalfs = (src, dst) => { for (let i = 0; i < src.length; i++) dst[i] = floatToHalf(src[i]); };
+const halfsToFloats = (src, dst) => { for (let i = 0; i < src.length; i++) dst[i] = halfToFloat(src[i]); };
+
+/** The trainer's state as one binary blob: float16 params + SH (v2 — half
+ *  the bytes of the v1 float32 layout, for values a resume re-converges
+ *  within a few hundred iterations; the optimizer already cold-starts, so
+ *  nothing else is lost). */
 export async function packState(ses) {
   const { data, n, sh, shK, dc } = await ses.exportRawState();
   const head = new TextEncoder().encode(JSON.stringify({
-    magic: 'splatjs-state', version: 1, n, shK, iter: ses.trainer.iter,
+    magic: 'splatjs-state', version: 2, n, shK, iter: ses.trainer.iter,
     // convention tags (absent in old blobs = the v1 defaults): dc names the
     // color-slot encoding, engine picks the trainer a resume must rebuild
     dc: dc || 'sigmoid', engine: ses.trainer.v2 ? 'v2' : 'v1',
     recipe: trainRecipe(ses),
   }));
-  const params = new Uint8Array(data.buffer, data.byteOffset, n * STRIDE * 4);
-  const shBytes = sh ? new Uint8Array(sh.buffer, sh.byteOffset, n * shK * 3 * 4) : new Uint8Array(0);
-  const out = new Uint8Array(4 + head.length + params.length + shBytes.length);
+  // explicit-length views: short export buffers throw here, not silently
+  // (readGaussians hands over fresh float32 arrays, so these views align)
+  const src = new Float32Array(data.buffer, data.byteOffset, n * STRIDE);
+  const params = new Uint16Array(n * STRIDE);
+  floatsToHalfs(src, params);
+  const shCount = sh ? n * shK * 3 : 0;
+  const shHalf = new Uint16Array(shCount);
+  if (sh) floatsToHalfs(new Float32Array(sh.buffer, sh.byteOffset, shCount), shHalf);
+  const out = new Uint8Array(4 + head.length + params.byteLength + shHalf.byteLength);
   new DataView(out.buffer).setUint32(0, head.length, true);
   out.set(head, 4);
-  out.set(params, 4 + head.length);
-  out.set(shBytes, 4 + head.length + params.length);
+  out.set(new Uint8Array(params.buffer), 4 + head.length);
+  out.set(new Uint8Array(shHalf.buffer), 4 + head.length + params.byteLength);
   return out;
 }
 
@@ -269,12 +342,23 @@ export function unzipStore(bytes) {
   return out;
 }
 
+/** unzipStore that also inflates deflated entries (OS-compressor zips) —
+ *  async, via the platform DecompressionStream. Same Map shape; our own
+ *  stored exports still take the fast sync path first. */
+export async function unzipStoreAsync(bytes) {
+  try {
+    return unzipStore(bytes);
+  } catch {
+    return readZip(bytes);   // stored parse failed — maybe deflated (or corrupt: readZip says so)
+  }
+}
+
 export function parseState(bytes) {
   if (bytes.length < 4) throw new Error('truncated state header');
   const headLen = new DataView(bytes.buffer, bytes.byteOffset).getUint32(0, true);
   if (headLen > bytes.length - 4) throw new Error('truncated state header');
   const head = JSON.parse(new TextDecoder().decode(bytes.subarray(4, 4 + headLen)));
-  if (head.magic !== 'splatjs-state' || head.version !== 1) {
+  if (head.magic !== 'splatjs-state' || (head.version !== 1 && head.version !== 2)) {
     throw new Error('not a supported splat.js state blob');
   }
   if (!Number.isSafeInteger(head.n) || head.n < 1 ||
@@ -282,18 +366,30 @@ export function parseState(bytes) {
       !Number.isSafeInteger(head.iter) || head.iter < 0) {
     throw new Error('invalid state metadata');
   }
-  let o = 4 + headLen;
-  const expected = head.n * (STRIDE * 4 + head.shK * 3 * 4);
+  const o = 4 + headLen;
+  const word = head.version === 2 ? 2 : 4;   // v2 stores float16 words
+  const expected = head.n * (STRIDE + head.shK * 3) * word;
   if (!Number.isSafeInteger(expected) || bytes.length - o !== expected) {
     throw new Error('state data length does not match its header');
   }
   const params = new Float32Array(head.n * STRIDE);
-  new Uint8Array(params.buffer).set(bytes.subarray(o, o + params.byteLength));
-  o += params.byteLength;
   let sh = null;
-  if (head.shK) {
-    sh = new Float32Array(head.n * head.shK * 3);
-    new Uint8Array(sh.buffer).set(bytes.subarray(o, o + sh.byteLength));
+  if (head.version === 2) {
+    // the JSON header is an arbitrary length, so the payload is rarely
+    // 2-aligned: one copy onto an aligned buffer (the constructor copies
+    // even Buffer views), then typed views over it
+    const body = new Uint8Array(bytes.subarray(o));
+    halfsToFloats(new Uint16Array(body.buffer, 0, params.length), params);
+    if (head.shK) {
+      sh = new Float32Array(head.n * head.shK * 3);
+      halfsToFloats(new Uint16Array(body.buffer, params.length * 2, sh.length), sh);
+    }
+  } else {
+    new Uint8Array(params.buffer).set(bytes.subarray(o, o + params.byteLength));
+    if (head.shK) {
+      sh = new Float32Array(head.n * head.shK * 3);
+      new Uint8Array(sh.buffer).set(bytes.subarray(o + params.byteLength, o + params.byteLength + sh.byteLength));
+    }
   }
   return {
     gaussians: { data: params, n: head.n, sh, shK: head.shK, dc: head.dc === 'sh' ? 'sh' : 'sigmoid' },
@@ -425,7 +521,7 @@ export async function decodeModel(bytes, reconUrl) {
   if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
     // PK: either our session zip — or a bare SOG bundle, which is a zip too
     let entries = null;
-    try { entries = unzipStore(bytes); } catch { /* compressed: not ours */ }
+    try { entries = await unzipStoreAsync(bytes); } catch { /* not a readable zip */ }
     if (entries && entries.has('recon.json')) {
       reconJson = JSON.parse(new TextDecoder().decode(entries.get('recon.json')));
     }
@@ -453,7 +549,7 @@ export async function decodeModel(bytes, reconUrl) {
       // one-entry STORED zip, so accept both forms here
       const rb = new Uint8Array(await r.arrayBuffer());
       if (rb[0] === 0x50 && rb[1] === 0x4b) {
-        const entries = unzipStore(rb);
+        const entries = await unzipStoreAsync(rb);
         const entry = entries.get('recon.json') || [...entries.values()][0];
         if (entry) reconJson = JSON.parse(new TextDecoder().decode(entry));
       } else {
@@ -466,3 +562,30 @@ export async function decodeModel(bytes, reconUrl) {
 
 const headTextIs = (bytes, tag) =>
   new TextDecoder().decode(bytes.subarray(0, tag.length)) === tag;
+
+// ---------------------------------------------------------------------------
+// resume trimming
+// ---------------------------------------------------------------------------
+
+/** Trim a saved detailProgress to a resume point: the record's per-iteration
+ *  histories (chart, holds, events, metrics) can run AHEAD of its state
+ *  checkpoint — a Details persist lands checkpoint-free — so a continued
+ *  run would plot new points over the already-plotted stretch. Keeps rows
+ *  at or before `iter` (metrics key on [1], events on .iter); rows without
+ *  a readable iteration are kept, never destroy what we can't place.
+ *  Returns a FRESH object — the record keeps its full history for viewing. */
+export function trimProgressToIter(progress, iter) {
+  const src = progress && typeof progress === 'object' ? progress : {};
+  if (!Number.isFinite(iter)) return { ...src };
+  const rowBefore = (r) => !Array.isArray(r) || !Number.isFinite(r[0]) || r[0] <= iter;
+  const evBefore = (e) => !e || typeof e !== 'object' || !Number.isFinite(e.iter) || e.iter <= iter;
+  const metBefore = (m) => !Array.isArray(m) || !Number.isFinite(m[1]) || m[1] <= iter;
+  return {
+    ...src,
+    ...(Array.isArray(src.chart) ? { chart: src.chart.filter(rowBefore) } : {}),
+    ...(Array.isArray(src.holds) ? { holds: src.holds.filter(rowBefore) } : {}),
+    ...(Array.isArray(src.splats) ? { splats: src.splats.filter(rowBefore) } : {}),
+    ...(Array.isArray(src.events) ? { events: src.events.filter(evBefore) } : {}),
+    ...(Array.isArray(src.metrics) ? { metrics: src.metrics.filter(metBefore) } : {}),
+  };
+}

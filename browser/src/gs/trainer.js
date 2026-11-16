@@ -10,7 +10,7 @@ import {
 import { rodrigues, m3mul, makeRng } from '../sfm/geometry.js';
 import { createGpu } from '../gpu/context.js';
 import { ssimIndexRgb } from './ssim.js';
-import { planSoftPrune, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES } from './softprune.js';
+import { planSoftPrune, planDeadCull, chunkPlan, COMPACT_SRC, COMPACT_TEMP_BYTES, CULLED } from './softprune.js';
 
 // plan item (6): one event-loop turn between the stages of multi-second
 // queue drains (refine readbacks, refined-eval passes) — input and the
@@ -34,6 +34,20 @@ export const UNI_RING = 64;
 export const MERGE_BUDGET_MS = 250;
 /** Steps per merged submit before the first timer measurement lands. */
 export const UNMEASURED_MERGE = 8;
+
+/** Shuffled-epoch camera deck (INRIA dealing): a Fisher–Yates permutation
+ *  of [0, n), drawn with pop(). Every camera trains exactly once per pass,
+ *  then the deck reshuffles — even coverage instead of the with-replacement
+ *  lottery, which leaves ~37% of cameras unseen after N steps. Uses the
+ *  trainer's own RNG, so seeded runs reproduce the dealing order too. */
+export function shuffledCamDeck(n, rand) {
+  const deck = Array.from({ length: Math.max(0, n | 0) }, (_, i) => i);
+  for (let i = deck.length - 1; i > 0; i--) {
+    const j = (rand() * (i + 1)) | 0;
+    const t = deck[i]; deck[i] = deck[j]; deck[j] = t;
+  }
+  return deck;
+}
 
 /** Partition camera target images (whole cameras, in order) into chunks of
  *  at most `limitBytes` each, so packed training targets fit adapters whose
@@ -84,6 +98,11 @@ export class GSTrainer {
     // 4.18 -> 3.65 ms (~85 % of an object-centric scene is in view); parity exact.
     this.compact = opts.compact ?? true;
     this.iter = 0;
+    // setup() flips this once every buffer, bind group and CPU deck exists —
+    // until then the entry points below fail LOUD instead of throwing the
+    // GPU's cryptic TypeErrors (copyBufferToBuffer on an undefined buffer,
+    // .length on a missing deck) from a half-booted trainer (2026-11)
+    this.ready = false;
     this._mEnc = null;      // (1) open merged-batch encoder (null outside a batch)
     this._ringUsed = 0;     // (1) ring slots consumed by the open encoder
     this._tsSteps = 0;      // (1) steps encoded in the open batch (timer scaling)
@@ -461,8 +480,13 @@ export class GSTrainer {
       ...this.camMeta.map((m) => Math.ceil(m.w / 2) * Math.ceil(m.h / 2)));
     // sizing for the lazy SSIM-metric buffers (see _ensureSsimMetric)
     this.ssimMetricBytes = Math.max(32, maxSsimPixels * 32);
-    this.bufStats = buf(16, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'stats');
-    d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
+    // Four global counters followed by [squared-error, valid-pixels] for
+    // every camera. Per-camera counters are accumulated by the same training
+    // pixels as the epoch score, so image quality needs no extra renders.
+    this._statsWords = 4 + cams.length * 2;
+    this._statsZero = new Uint32Array(this._statsWords);
+    this.bufStats = buf(this._statsWords * 4, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'stats');
+    d.queue.writeBuffer(this.bufStats, 0, this._statsZero);
     // (2) the batch GPU timer: one timestamp pair brackets each step's
     // whole pass (stepOnce is a single submit). Absent without the
     // timestamp-query feature — the batch adapter falls back to wall dt.
@@ -481,7 +505,7 @@ export class GSTrainer {
       this._tsHavePrev = false;
       this._tsPrevSlots = 0;
     }
-    this.bufStatsRead = buf(16, B.COPY_DST | B.MAP_READ, 'statsRead');
+    this.bufStatsRead = buf(this._statsWords * 4, B.COPY_DST | B.MAP_READ, 'statsRead');
     this.bufParamsRead = buf(nb, B.COPY_DST | B.MAP_READ, 'paramsRead'); // cap-sized
     this.bufCamGrad = buf((cams.length + 1) * 8 * 4, B.STORAGE | B.COPY_DST | B.COPY_SRC, 'camGrad');
     d.queue.writeBuffer(this.bufCamGrad, 0, new Int32Array((cams.length + 1) * 8));
@@ -882,6 +906,8 @@ export class GSTrainer {
     // Atomic float order in the kernels stays nondeterministic, so this
     // narrows the spread, it does not zero it.
     this.rand = Number.isFinite(this.opts.seed) ? makeRng(this.opts.seed) : () => Math.random();
+    this._pruneVotes = new Uint16Array(0);   // consecutive low-mass windows per row (soft-prune hysteresis)
+    this._camDeck = [];   // shuffled-epoch deck (stepOnce refills per pass)
 
     // gradcheck metadata
     this.hBySlot = [
@@ -892,6 +918,7 @@ export class GSTrainer {
       'pos.x', 'pos.y', 'pos.z', 'logSx', 'logSy', 'logSz',
       'q.w', 'q.x', 'q.y', 'q.z', 'c.r', 'c.g', 'c.b', 'opa', 'pad', 'pad',
     ];
+    this.ready = true;
   }
 
   _camUniform({ R, t, f, fy, cx, cy, w, h, g = 0, b = 0, bg = null }, trainMode, offset, camIdx = 0) {
@@ -1116,6 +1143,7 @@ export class GSTrainer {
     const sum = new Float64Array(names.length);
     let steps = 0;
     for (let s = 0; s < k; s++) {
+      // deliberately NOT the epoch deck: a timing probe must not deal training's hand
       let ci = (this.rand() * this.camMeta.length) | 0;
       for (let tries = 0; tries < 16 && (ci === this.holdout || (this.excluded && this.excluded.has(ci))); tries++) ci = (ci + 1) % this.camMeta.length;
       const meta = this.camMeta[ci];
@@ -1215,6 +1243,7 @@ export class GSTrainer {
    *  Set trainer.holdout = <camIdx> to exclude a camera from training
    *  (evaluate it with evalCamPsnr for an honest novel-view metric). */
   stepOnce() {
+    if (!this.ready) throw new Error('GSTrainer.stepOnce: setup() did not complete');
     const d = this.device;
     // (1) merged-submit bracketing: inside a batch every step encodes into
     // the shared encoder (one submit per batch); unbracketed callers get the
@@ -1230,13 +1259,16 @@ export class GSTrainer {
       this._mEnc = d.createCommandEncoder();
       this._ringUsed = 0;
     }
-    let ci = (this.rand() * this.camMeta.length) | 0;
-    // skip the holdout and any excluded (e.g. motion-blurred) cameras
-    for (let tries = 0; tries < 16; tries++) {
-      const bad = ci === this.holdout || (this.excluded && this.excluded.has(ci));
-      if (!bad) break;
-      ci = (ci + 1) % this.camMeta.length;
+    // A shuffled epoch contains every trainable camera exactly once. Filtering
+    // before dealing avoids substituting adjacent cameras for holdout/removed
+    // entries (which used to duplicate some images and skip others).
+    if (!this._camDeck.length) {
+      this._camDeck = shuffledCamDeck(this.camMeta.length, this.rand)
+        .filter((ci) => ci !== this.holdout && !(this.excluded && this.excluded.has(ci)));
     }
+    // Degenerate configurations are rejected by setup/UI, but retain a safe
+    // fallback rather than indexing undefined if every camera was excluded.
+    const ci = this._camDeck.length ? this._camDeck.pop() : 0;
     const meta = this.camMeta[ci];
     this.lastCam = ci; // which camera this step trains on (UI pulse)
     if (this.shK && (this.opts.shRamp ?? true)) {
@@ -1605,7 +1637,7 @@ export class GSTrainer {
       : new Float32Array(this.camUniforms[ci]);
     uni[24] = 0; uni[25] = 0; uni[26] = 0; // evaluate on black whatever the training background was
     const rows = this.camMeta.length + 1;
-    d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
+    d.queue.writeBuffer(this.bufStats, 0, this._statsZero);
     this._writeTrainUniforms(uni);
     const enc = d.createCommandEncoder();
     const p = enc.beginComputePass();
@@ -1657,7 +1689,7 @@ export class GSTrainer {
       }
       ssim = ssimIndexRgb(pred, target, width, height, valid);
     }
-    d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
+    d.queue.writeBuffer(this.bufStats, 0, this._statsZero);
     this.pixelsSeen = 0; // running train-psnr window was clobbered
     const mse = v / 16 / (validPx * 3);
     return { psnr: mse > 0 ? -10 * Math.log10(mse) : Infinity, camGrad, ...(includeSsim ? { ssim } : {}) };
@@ -1710,11 +1742,12 @@ export class GSTrainer {
 
   /** Read and reset accumulated squared-error stats -> mean L2 per pixel-channel. */
   async readLoss() {
+    if (!this.ready) throw new Error('GSTrainer.readLoss: setup() did not complete');
     const d = this.device;
     const enc = d.createCommandEncoder();
-    enc.copyBufferToBuffer(this.bufStats, 0, this.bufStatsRead, 0, 16);
+    enc.copyBufferToBuffer(this.bufStats, 0, this.bufStatsRead, 0, this._statsWords * 4);
     d.queue.submit([enc.finish()]);
-    d.queue.writeBuffer(this.bufStats, 0, new Uint32Array(4));
+    d.queue.writeBuffer(this.bufStats, 0, this._statsZero);
     const px = this.pixelsSeen;
     this.pixelsSeen = 0;
     await this.bufStatsRead.mapAsync(GPUMapMode.READ);
@@ -1722,6 +1755,12 @@ export class GSTrainer {
     const v = s[0];
     const validPx = s[2]; // valid-pixel count (undistortion borders excluded)
     this.entryOverflowTiles = (this.entryOverflowTiles || 0) + s[3];
+    this.cameraErrors = this.camMeta.map((_, ci) => {
+      const sum = s[4 + ci * 2], n = s[5 + ci * 2];
+      // Mean squared error is enough for relative image ranking. Do not turn
+      // every camera into a separately presented/evaluated PSNR metric.
+      return n > 0 ? sum / 16 / (n * 3) : null;
+    });
     this.bufStatsRead.unmap();
     if (px === 0 || validPx === 0) return null;
     const mse = v / 16 / (validPx * 3);
@@ -2004,6 +2043,7 @@ export class GSTrainer {
   }
 
   async refine(rng = this.rand) {
+    if (!this.ready) throw new Error('GSTrainer.refine: setup() did not complete');
     // (1) the cost basis may move under the merge cap — re-measure (one
     // conservative batch) rather than overshoot on a stale estimate
     this._msStepEst = null;
@@ -2537,7 +2577,7 @@ export class GSTrainer {
   }
 
   /** Periodic importance culling (Speedy-Splat method, opt-in via
-   *  opts.softPrune { ratio, every, until, milestones }): drop the
+   *  opts.softPrune { ratio, every, until }): drop the
    *  lowest-rendered-mass
    *  fraction of splats and compact every per-splat buffer GPU-side.
    *  Survivors keep their Adam moments — unlike relocation and reseed, a
@@ -2545,19 +2585,25 @@ export class GSTrainer {
    *  windows WITHOUT draining them (gather mode 2), so refine planning
    *  never notices. Skips while a protected seed range is active (rows
    *  permute) and whenever the plan refuses (too few rows, no signal).
-   *  ratioOverride (the session's early milestones) culls that fraction
-   *  instead of cfg.ratio. Every refine culls until `until` of the run;
-   *  milestones fire ahead of the schedule. Returns { culled, n, floorBound }. */
-  async softPrune(ratioOverride = null) {
-    const cfg = this.opts.softPrune;
-    if (!cfg) return { culled: 0, n: this.n };
-    const ratio = ratioOverride ?? cfg.ratio ?? 0.1;
-    if (!(ratio > 0 && ratio < 1)) return { culled: 0, n: this.n };
-    if (this.protect && this.iter < this.protect.until) return { culled: 0, n: this.n };
-    // an LOD level hold is a polish window at a fixed count — culling
-    // would eat the level out from under its snapshot
-    if (this.growLimit && this.growLimit < this.cap && this.n >= this.growLimit) {
-      return { culled: 0, n: this.n };
+   *  ratioOverride culls that fraction instead of cfg.ratio
+   *  (programmatic use). Every refine culls until `until` of the run.
+   *  Candidates vote per window and
+   *  only consecutive offenders die (cfg.votes ?? 2); skipRatchet frees a
+   *  cull from the floor entirely (neither held nor set). Returns
+   *  { culled, n, floorBound, candidates }. */
+  /** Vote-sheet resize + rendered-mass gather (mode 2: the windows are
+   *  read WITHOUT draining, so refine planning never notices). One scoring
+   *  pass serves both the ratio trim and the dead cull. */
+  async _gatherMasses() {
+    if (!this.ready) throw new Error('GSTrainer._gatherMasses: setup() did not complete');
+    // votes ride the rows: growth appends (new tail starts clean), the
+    // compaction permutes survivors, a reseed births a fresh trainer.
+    // Relocated rows inherit their index's votes — one good window resets
+    // them, so only the still-bad die.
+    if (this._pruneVotes.length !== this.n) {
+      const nv = new Uint16Array(this.n);
+      nv.set(this._pruneVotes.subarray(0, Math.min(this._pruneVotes.length, this.n)));
+      this._pruneVotes = nv;
     }
     const d = this.device;
     d.queue.writeBuffer(this.uniGather, 0, new Uint32Array([this.n, 2, 0, 0]));
@@ -2580,11 +2626,22 @@ export class GSTrainer {
     const logitOp = new Float32Array(this.n);
     const meanLogS = new Float32Array(this.n);
     for (let i = 0; i < this.n; i++) { masses[i] = g[i * 4 + 2]; logitOp[i] = g[i * 4]; meanLogS[i] = g[i * 4 + 3]; }
-    const plan = planSoftPrune(masses, this.n, ratio, {
-      minCull: cfg.minCull ?? 1024, floor: cfg.floor ?? 8192,
-      last: this._softPruneFloor || 0, cap: this.cap, logitOp, meanLogS,
-    });
-    if (!plan) return { culled: 0, n: this.n };
+    return { masses, logitOp, meanLogS };
+  }
+
+  /** Compact every per-splat buffer to a cull plan (GPU-side ranked
+   *  scatter into temp, then plain copies home). Survivors carry their
+   *  vote history to their new rows; row-indexed CPU state dies with the
+   *  permutation. */
+  _compactToPlan(plan) {
+    // survivors keep their vote history through the compaction
+    const nvotes = new Uint16Array(plan.kept);
+    for (let i = 0; i < this.n; i++) {
+      const r = plan.rank[i];
+      if (r !== CULLED) nvotes[r] = this._pruneVotes[i];
+    }
+    this._pruneVotes = nvotes;
+    const d = this.device;
     this._ensureCompact();
     d.queue.writeBuffer(this.bufCompactRank, 0, plan.rank);
     const bufs = [
@@ -2617,14 +2674,101 @@ export class GSTrainer {
         d.queue.submit([enc.finish()]);
       }
     }
-    this.n = plan.kept;
+    this._setLiveCount(plan.kept);
+  }
+
+  /** Retire the live count after an in-place row change: the GPU rows are
+   *  already right — this drops the count, the Adam horizon word and the
+   *  relocation census, and rebuilds the per-cam uniforms. Shared by
+   *  _compactToPlan and applyPrunedModel. */
+  _setLiveCount(kept) {
+    this.n = kept;
     this.adamData[23] = this.n * STRIDE;
     this.camUniforms = this.camMeta.map((mm, i) => this._camUniform(mm, 1, mm.offset, i));
     // row-indexed CPU state dies with the permutation: the census baseline
     this._lastReloc = null;
-    // the growth ratchet: the next prune (below the cap) holds this floor
-    this._softPruneFloor = plan.kept;
-    return { culled: plan.culled, n: this.n, floorBound: plan.floorBound };
+  }
+
+  /** In-place hard prune: the CPU merge-down's rows take over the live
+   *  trainer — no reseed, no pixels, no fresh boot. Params ride the
+   *  refine-patch kernel (growth's own path) with zeroed Adam moments:
+   *  merged rows are new values, their history is meaningless. SH uploads
+   *  direct — the patch kernel can only copy SH between rows, and merged
+   *  SH is recomputed. Grads and projections need no handling: the chain
+   *  zeroes grads and the projection pass rewrites proj rows every frame.
+   *  Targets, split, schedules and iter continue untouched — continuity a
+   *  reseed cannot match. Returns { kept, n }. */
+  applyPrunedModel({ data, n: kept, sh = null, shK = 0 }) {
+    if (!this.ready) throw new Error('GSTrainer.applyPrunedModel: setup() did not complete');
+    if (!Number.isInteger(kept) || kept < 1 || kept > this.n) {
+      throw new Error(`GSTrainer.applyPrunedModel: kept ${kept} out of range 1..${this.n}`);
+    }
+    if (!data || data.length < kept * STRIDE) {
+      throw new Error('GSTrainer.applyPrunedModel: params short for the kept rows');
+    }
+    if ((shK || 0) !== this.shK) {
+      throw new Error(`GSTrainer.applyPrunedModel: shK ${shK} does not match the trainer's ${this.shK}`);
+    }
+    if (this.shK && (!sh || sh.length < kept * this.shK * 3)) {
+      throw new Error('GSTrainer.applyPrunedModel: SH short for the kept rows');
+    }
+    // every kept row: fresh params, zeroed moments (growth's own path)
+    const touched = new Map();
+    for (let i = 0; i < kept; i++) touched.set(i, { shSrc: null, zeroMV: true, zeroShMV: true });
+    this._refinePatch(touched, data);
+    // merged SH is recomputed values, not a permutation — upload direct
+    if (this.shK) this.device.queue.writeBuffer(this.bufSH, 0, sh.subarray(0, kept * this.shK * 3));
+    // merged rows are new: no vote history, and the soft-prune ratchet
+    // holds this floor (later prunes eat regrowth, not the curve)
+    this._pruneVotes = new Uint16Array(kept);
+    this._softPruneFloor = kept;
+    this._setLiveCount(kept);
+    return { kept, n: this.n };
+  }
+
+  async softPrune(ratioOverride = null, { skipRatchet = false } = {}) {
+    const cfg = this.opts.softPrune;
+    if (!cfg) return { culled: 0, n: this.n };
+    const ratio = ratioOverride ?? cfg.ratio ?? 0.1;
+    if (!(ratio > 0 && ratio < 1)) return { culled: 0, n: this.n };
+    if (this.protect && this.iter < this.protect.until) return { culled: 0, n: this.n };
+    // an LOD level hold is a polish window at a fixed count — culling
+    // would eat the level out from under its snapshot
+    if (this.growLimit && this.growLimit < this.cap && this.n >= this.growLimit) {
+      return { culled: 0, n: this.n };
+    }
+    const { masses, logitOp, meanLogS } = await this._gatherMasses();
+    const plan = planSoftPrune(masses, this.n, ratio, {
+      minCull: cfg.minCull ?? 1024, floor: cfg.floor ?? 8192,
+      last: this._softPruneFloor || 0, cap: this.cap, logitOp, meanLogS,
+      votes: this._pruneVotes, votesNeeded: cfg.votes ?? 2, skipRatchet,
+    });
+    if (!plan || !plan.culled) return { culled: 0, n: this.n, candidates: plan ? plan.candidates : 0 };
+    this._compactToPlan(plan);
+    // the growth ratchet: the next prune (below the cap) holds this floor —
+    // unless bypassed (neither held nor set)
+    if (!skipRatchet) this._softPruneFloor = plan.kept;
+    return { culled: plan.culled, n: this.n, floorBound: plan.floorBound, candidates: plan.candidates };
+  }
+
+  /** Dead-splat culling for soft-prune-off runs: no ratio trim, no floor,
+   *  no ratchet — only rows with zero rendered mass `votesNeeded` windows
+   *  running (the same hysteresis as the soft path) are compacted out.
+   *  Obstructed rows are pure overhead, never signal. Yields entirely when
+   *  the tandem owns culling. Returns { culled, n, candidates }. */
+  async pruneDead({ votesNeeded = 2, minCull = 1024 } = {}) {
+    if (this.opts.softPrune) return { culled: 0, n: this.n };
+    if (this.protect && this.iter < this.protect.until) return { culled: 0, n: this.n };
+    // an LOD level hold is a polish window at a fixed count — culling
+    // would eat the level out from under its snapshot
+    if (this.growLimit && this.growLimit < this.cap && this.n >= this.growLimit) {
+      return { culled: 0, n: this.n };
+    }
+    const { masses } = await this._gatherMasses();
+    const plan = planDeadCull(masses, this.n, { votes: this._pruneVotes, votesNeeded, minCull });
+    if (!plan || !plan.culled) return { culled: 0, n: this.n, candidates: plan ? plan.candidates : 0 };
+    this._compactToPlan(plan);
+    return { culled: plan.culled, n: this.n, candidates: plan.candidates };
   }
 
   /** Lazily built compaction kit: no buffers, no pipelines until the first
@@ -2690,6 +2834,7 @@ export class GSTrainer {
 
   /** Read back current Gaussian parameters (+ SH coeffs when enabled). */
   async readGaussians() {
+    if (!this.ready) throw new Error('GSTrainer.readGaussians: setup() did not complete');
     const d = this.device;
     const enc = d.createCommandEncoder();
     enc.copyBufferToBuffer(this.bufParams, 0, this.bufParamsRead, 0, this.n * STRIDE * 4);

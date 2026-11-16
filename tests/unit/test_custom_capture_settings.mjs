@@ -52,7 +52,7 @@ const capture = readFileSync(new URL('../../app/js/xr-capture.js', import.meta.u
 assert.match(capture, /auto: false/);
 assert.doesNotMatch(capture, /data-action="auto" checked/);
 assert.doesNotMatch(capture, /AUTO_INTERVAL_MS|lastAutoTime|AUTO_MIN_ROTATION|shouldAutoCapture/);
-assert.match(capture, /state\.auto && state\.autoRunning && state\.distanceTrigger\.sample\(position\)/);
+assert.match(capture, /state\.auto && state\.autoRunning &&[\s\S]*state\.distanceTrigger\.sample\(position\)/);
 assert.match(capture, /type="number" data-action="distance"/);
 assert.match(capture, /value="\$\{spacingCm\}"/);
 assert.match(capture, /CAPTURE_SPACING_KEY/);
@@ -83,8 +83,10 @@ assert.match(controller, /const phoneClass = isPhoneClass\(\);/);
 assert.match(controller, /function trainWorkerOpt\(\) \{/);
 assert.match(controller, /get\('trainworker'\)/);
 assert.match(controller, /return isPhoneClass\(\) \? false : 'auto';/);
-assert.equal((controller.match(/trainWorker: trainWorkerOpt\(\),?/g) || []).length, 3,
-  'fresh, restore and continue sessions all take the worker/local decision');
+assert.equal((controller.match(/trainWorkerOpt\(\)/g) || []).length, 4,
+  'the helper plus fresh, restored Android and continued sessions keep the worker/local decision');
+assert.match(controller, /trainWorker: browserViewer \? false : trainWorkerOpt\(\)/,
+  'only Browser follows arrival-space/main’s main-thread view-only fallback; Android stays unchanged');
 // remote training rasterizes on the worker with the same compute kernel as
 // local — only the SOG-lite stand-in earns the cheap-viewer moving budget
 // (2026-11: the worker view rendered up to 2x main's pixels on one phone)

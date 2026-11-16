@@ -13,10 +13,30 @@ assert.doesNotMatch(html, /btn-xr-example|Try a scene with known cameras|Synthet
 assert.doesNotMatch(app, /onExample|btn-xr-example|fetchGallery|HOME_BENCHMARK_IDS|creationTile\(/,
   'the synthetic example and remote community/benchmark gallery must not be active in the app');
 const wall = app.match(/async function mountWall\(\)[\s\S]*?(?=\/\*\* From the viewer into the studio)/)?.[0] || '';
-assert.match(wall, /lastCaptureTile\(\)[\s\S]*localRunTiles\(\)/,
-  'the saved-work area should be populated only from local captures and runs');
+assert.match(wall, /listHomeLibrary\(\)[\s\S]*nativeCaptureTiles\(catalog\.captures\)[\s\S]*androidRunTiles\(catalog\.runs\)[\s\S]*localRunTiles\(\)/,
+  'Android should merge canonical captures with native and main-branch model checkpoints');
+assert.match(wall, /typeof native\.listHomeLibrary === 'function'[\s\S]*listHomeLibrary\(\)[\s\S]*nativeCaptureTiles\(catalog\.captures\)[\s\S]*androidRunTiles\(catalog\.runs\)[\s\S]*else \{[\s\S]*lastCaptureTile\(\)[\s\S]*localRunTiles\(\)/,
+  'Android captures stay native while model checkpoints retain main-branch compatibility');
+assert.doesNotMatch(wall, /Promise\.all\(/,
+  'catalog tile groups should paint independently');
 assert.doesNotMatch(wall, /fetch\(|import\(['"]\.\/share\.js/,
   'mounting saved work must not issue network requests');
+assert.match(wall, /heading = document\.createElement\('button'\)[\s\S]*wall-refresh[\s\S]*heading\.addEventListener\('click', \(\) => mountWall\(\)\)/,
+  'the saved-work heading should explicitly refresh the native and IndexedDB catalogs');
+assert.match(wall, /host\.replaceChildren\(heading, grid\);\s*host\.hidden = false/,
+  'SAVED ON THIS DEVICE refresh stays visible even when the catalog is empty');
+assert.doesNotMatch(wall, /if \(!tiles\.length\) \{ host\.hidden = true/,
+  'an empty scan/model list must not hide its refresh affordance');
+assert.match(app, /function refreshHomeWall\(\)[\s\S]*S\.state === 'ready'[\s\S]*mountWall\(\)/,
+  'returning to a visible Home screen should automatically refresh saved models');
+assert.match(app, /addEventListener\('pageshow', refreshHomeWall\)[\s\S]*addEventListener\('focus', refreshHomeWall\)/,
+  'every retained-WebView return should refresh Home, not only BFCache restores');
+assert.match(app, /visibilitychange[\s\S]*!document\.hidden\) refreshHomeWall\(\)/,
+  'becoming visible should use the same guarded Home refresh');
+assert.match(app, /nativeNewer[\s\S]*Keep main's full model record[\s\S]*status: nativeRow\.status[\s\S]*splats: nativeRow\.splats/,
+  'service-owned Android progress must overlay stale IndexedDB card metadata');
+assert.match(app, /openNativeFresh[\s\S]*mirrorHeadlessRun\(r\.id, nativeRow\)/,
+  'opening a newer native checkpoint should refresh the model record before continuing');
 assert.doesNotMatch(xrUi, /btn-xr-example|onExample/,
   'XR UI must not retain a handler for the removed demo tile');
 assert.doesNotMatch(html, /fonts\.googleapis\.com|fonts\.gstatic\.com/,

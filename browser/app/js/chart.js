@@ -10,68 +10,65 @@ export function psnrToApproxSsimPercent(psnr) {
   return Math.max(0, Math.min(100, 100 / (1 + ratio ** 4)));
 }
 
-/** Samples held from the START of each drawn line: nothing plots until
- *  the series runs past these — the first samples climb almost vertically
- *  off a cold start (large, disoriented splats) and would pin the floor
- *  far below the working range. The hold is up front, not a trim after
- *  the fact: short series draw nothing at all, so early points never
- *  appear and then vanish. Raw samples stay stored regardless. */
-const SKIP_FIRST = 3;
-
-/** Live plateau filter: snaps up to genuine rises, drifts down slowly,
- *  and holds inside a noise deadband — the trend without the jitter.
- *  attack: base rise gain per sample; snap: extra gain per unit of rise
- *  (large steps latch almost fully); release: fall gain per sample;
- *  deadband: smaller changes hold the level. Stateless across draws —
- *  series() runs a fresh pass, so redraws, scale toggles and scrubs
- *  can't desync the curve. Operates in raw dB; the caller converts. */
-export class LivePlateauFilter {
-  constructor(attack = 0.15, release = 0.02, deadband = 0.05, snap = 2.2) {
-    this.attack = attack; this.release = release;
-    this.deadband = deadband; this.snap = snap;
-    this.level = null;
-  }
-  update(x) {
-    if (this.level == null) { this.level = x; return x; }
-    const d = x - this.level;
-    if (Math.abs(d) < this.deadband) return this.level;   // noise: hold
-    if (d > 0) this.level += d * Math.min(1, this.attack + this.snap * d);
-    else this.level += d * this.release;                  // dips decay slowly
-    return this.level;
-  }
-  series(pts) {
-    this.level = null;
-    return pts.map(([iter, v]) => [iter, this.update(v)]);
-  }
-}
-
 export class Chart {
   constructor(canvas, { onHover, onScrub } = {}) {
     this.cv = canvas;
     this.ctx = canvas.getContext('2d');
     this.scale = 'db';
-    this.train = []; this.hold = [];
+    this.train = []; this.hold = []; this.splats = [];
     this.ghost = null; this.events = []; this.maxIter = 40000;
     this.onHover = onHover; this.onScrub = onScrub;
     this.hover = null; this.scrubbable = false; this.mark = null;
+    this.xZoom = 1;                 // right-anchored recent-history zoom
+    this._pointers = new Map();
+    if (canvas.style) canvas.style.touchAction = 'none';
 
     const pos = (e) => {
       const r = this.cv.getBoundingClientRect();
       return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
     };
+    const pinchDistance = () => {
+      const p = [...this._pointers.values()];
+      return p.length < 2 ? 0 : Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+    };
     canvas.addEventListener('pointermove', (e) => {
       const p = pos(e);
+      if (this._pointers.has(e.pointerId)) this._pointers.set(e.pointerId, p);
+      if (this._pointers.size >= 2) {
+        const d = pinchDistance();
+        if (this._pinchDistance > 0) {
+          this.xZoom = Math.max(1, Math.min(64, this._pinchZoom * d / this._pinchDistance));
+        }
+        this.hover = null; this.onHover?.(null); this.draw(); return;
+      }
       this.hover = p;
       if (this._drag && this.onScrub) this.onScrub(this._frac(p.x));
       this.draw();
     });
-    canvas.addEventListener('pointerleave', () => { this.hover = null; this.onHover?.(null); this.draw(); });
-    canvas.addEventListener('pointerdown', (e) => {
-      if (!this.scrubbable) return;
-      this._drag = true; canvas.setPointerCapture(e.pointerId);
-      this.onScrub?.(this._frac(pos(e).x));
+    canvas.addEventListener('pointerleave', () => {
+      if (!this._pointers.size) { this.hover = null; this.onHover?.(null); this.draw(); }
     });
-    canvas.addEventListener('pointerup', () => { this._drag = false; });
+    canvas.addEventListener('pointerdown', (e) => {
+      const p = pos(e);
+      this._pointers.set(e.pointerId, p);
+      try { canvas.setPointerCapture(e.pointerId); } catch { /* optional in test canvases */ }
+      if (this._pointers.size === 2) {
+        this._pinchDistance = pinchDistance(); this._pinchZoom = this.xZoom;
+        this._drag = false; this.hover = null; this.onHover?.(null); return;
+      }
+      if (this.scrubbable) {
+        this._drag = true;
+        this.onScrub?.(this._frac(p.x));
+      }
+    });
+    const pointerDone = (e) => {
+      this._pointers.delete(e.pointerId);
+      if (this._pointers.size < 2) this._pinchDistance = 0;
+      if (!this._pointers.size) this._drag = false;
+      this.draw();
+    };
+    canvas.addEventListener('pointerup', pointerDone);
+    canvas.addEventListener('pointercancel', pointerDone);
   }
 
   _frac(xf) {
@@ -90,17 +87,20 @@ export class Chart {
     return { train: this.train, hold: this.hold };
   }
 
-  /** Raw post-hold samples (still in dB): the dots' material and the
-   *  hover's lookup — never the held-back cold start. */
-  _heldRaw(series) {
-    return series.length > SKIP_FIRST ? series.slice(SKIP_FIRST) : [];
+  /** Display the measured complete-epoch samples directly. */
+  _displaySeries(series) {
+    return (series || []).map(([iter, value]) => [iter, this._displayValue(value)]);
   }
 
-  _displaySeries(series) {
-    const held = this._heldRaw(series);
-    if (!held.length) return [];
-    return new LivePlateauFilter().series(held)
-      .map(([iter, value]) => [iter, this._displayValue(value)]);
+  /** Dynamic x extent for the given last-sample iters: the data's reach
+   *  plus a breath of headroom, never past the run's horizon. */
+  _xMaxFor(lastIters) {
+    const m = Math.max(0, ...lastIters);
+    return Math.min(this.maxIter, Math.max(1, m * 1.06, m + 1));
+  }
+
+  _xWindow(xMax) {
+    return { min: xMax * (1 - 1 / Math.max(1, this.xZoom || 1)), max: xMax };
   }
 
   // top just fits the event dots; there are no x labels, so the bottom is
@@ -110,13 +110,14 @@ export class Chart {
   resize() {
     const rect = this.cv.getBoundingClientRect();
     const dpr = Math.min(2, devicePixelRatio || 1);
-    this.cv.width = Math.max(1, rect.width * dpr);
-    this.cv.height = Math.max(1, rect.height * dpr);
-    this.dpr = dpr;
-    // any layout shift (window resize, panel toggle, chart expand) leaves
-    // the pointer over a different fraction — drop the stale hover so the
-    // readout cannot re-fire detached from the cursor on the next redraw
+    const width = Math.max(1, rect.width * dpr), height = Math.max(1, rect.height * dpr);
+    if (this.cv.width === width && this.cv.height === height && this.dpr === dpr) return false;
+    this.cv.width = width; this.cv.height = height; this.dpr = dpr;
+    // Only a real layout change invalidates pointer coordinates. Details
+    // repaints call resize frequently; clearing every time made its cursor
+    // disappear even though the canvas had not moved.
     this.clearHover();
+    return true;
   }
 
   clearHover() {
@@ -125,12 +126,13 @@ export class Chart {
     this.draw();
   }
 
-  push(iter, train, hold) {
+  push(iter, train, hold, splats = null) {
     this.train.push([iter, train]);
     if (hold != null) this.hold.push([iter, hold]);
+    if (Number.isFinite(splats)) this.splats.push([iter, splats]);
   }
 
-  reset() { this.train = []; this.hold = []; }
+  reset() { this.train = []; this.hold = []; this.splats = []; }
 
   draw() {
     const ctx = this.ctx, W = this.cv.width, H = this.cv.height, dpr = this.dpr || 1;
@@ -140,17 +142,24 @@ export class Chart {
     if (pw <= 0 || ph <= 0) return;
 
     const active = this._activeSeries();
-    const trainHeld = this._heldRaw(active.train);
-    const holdHeld = this._heldRaw(active.hold);
-    const train = this._displaySeries(active.train);
-    const hold = this._displaySeries(active.hold);
-    const ghostTrain = this._displaySeries(this.ghost?.train || []);
-    const ghostHold = this._displaySeries(this.ghost?.hold || []);
-    // the raw dots behind the filtered lines: very small, very light —
-    // the honest scatter the curve summarizes (ghost stays line-only)
-    const trainDots = trainHeld.map(([iter, value]) => [iter, this._displayValue(value)]);
-    const holdDots = holdHeld.map(([iter, value]) => [iter, this._displayValue(value)]);
-    const ys = [...train, ...hold, ...ghostTrain, ...ghostHold, ...trainDots, ...holdDots].map((p) => p[1]);
+    // The right edge remains anchored to the latest score. Pinch zoom discards
+    // older points from both x drawing and y autoscaling.
+    const lastIt = (arr) => (arr.length ? arr[arr.length - 1][0] : 0);
+    const fullXMax = this._xMaxFor([lastIt(active.train), lastIt(active.hold),
+      lastIt(this.ghost?.train || []), lastIt(this.ghost?.hold || [])]);
+    const { min: xMin, max: xMax } = this._xWindow(fullXMax);
+    const visible = (series) => (series || []).filter(([iter]) => iter >= xMin && iter <= xMax);
+    const trainRaw = visible(active.train);
+    const holdRaw = visible(active.hold);
+    // The headline remains the latest measured value even if a sparse series
+    // leaves no point in an extremely narrow window.
+    this.lastTrainF = active.train.length ? active.train[active.train.length - 1][1] : null;
+    this.lastHoldF = active.hold.length ? active.hold[active.hold.length - 1][1] : null;
+    const train = this._displaySeries(trainRaw);
+    const hold = this._displaySeries(holdRaw);
+    const ghostTrain = this._displaySeries(visible(this.ghost?.train || []));
+    const ghostHold = this._displaySeries(visible(this.ghost?.hold || []));
+    const ys = [...train, ...hold, ...ghostTrain, ...ghostHold].map((p) => p[1]);
     let lo = ys.length ? Math.min(...ys) : (this.scale === 'similarity' ? 0 : 10);
     let hi = ys.length ? Math.max(...ys) : (this.scale === 'similarity' ? 100 : 30);
     const minSpan = this.scale === 'similarity' ? 1 : 6;
@@ -161,16 +170,9 @@ export class Chart {
     lo -= pad; hi += pad;
     if (this.scale === 'similarity') { lo = Math.max(0, lo); hi = Math.min(100, hi); }
 
-    const X = (i) => l + (i / this.maxIter) * pw;
+    const xSpan = Math.max(1e-9, xMax - xMin);
+    const X = (i) => l + ((i - xMin) / xSpan) * pw;
     const Y = (v) => t + ph - ((v - lo) / (hi - lo)) * ph;
-
-    // faint progress wash left of the latest sample — the chart quietly
-    // doubles as a progress bar without competing with the curve
-    if (active.train.length) {
-      const px = X(active.train[active.train.length - 1][0]);
-      ctx.fillStyle = 'rgba(94, 231, 214, .055)';
-      ctx.fillRect(l, t, Math.max(0, Math.min(px, l + pw) - l), ph);
-    }
 
     // grid
     ctx.font = `400 ${11 * dpr}px "Spline Sans Mono", monospace`;
@@ -191,7 +193,7 @@ export class Chart {
     // events
     for (const e of this.events) {
       const x = X(e.at * this.maxIter);
-      if (x > l + pw) continue;
+      if (x < l || x > l + pw) continue;
       ctx.strokeStyle = e.kind === 'grow' ? 'rgba(242,160,63,.28)' : 'rgba(147,161,160,.24)';
       ctx.setLineDash([2 * dpr, 3 * dpr]); ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(x, t); ctx.lineTo(x, t + ph); ctx.stroke();
@@ -215,15 +217,6 @@ export class Chart {
       line(ghostTrain, 'rgba(147,161,160,.35)', [4, 3], 1.2);
       line(ghostHold, 'rgba(147,161,160,.22)', [2, 3], 1.2);
     }
-    const dots = (pts, color) => {
-      if (!pts.length) return;
-      ctx.fillStyle = color;
-      for (const p of pts) {
-        ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 1.5 * dpr, 0, 7); ctx.fill();
-      }
-    };
-    dots(holdDots, 'rgba(242,160,63,.35)');
-    dots(trainDots, 'rgba(47,212,193,.30)');
     line(hold, '#f2a03f', [5, 3], 1.5);
     line(train, '#2fd4c1', null, 1.8);
 
@@ -233,8 +226,7 @@ export class Chart {
       const x = X(this.mark != null ? this.mark : last[0]);
       ctx.strokeStyle = 'rgba(230,236,235,.25)'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(x, t); ctx.lineTo(x, t + ph); ctx.stroke();
-      // the dot rides the drawn (trimmed, smoothed) line's end, not the raw
-      // sample — else it floats off the curve it terminates
+      // The endpoint rides the last measured complete-epoch score.
       const drawn = train[train.length - 1];
       if (this.mark == null && drawn) {
         ctx.fillStyle = '#2fd4c1';
@@ -243,11 +235,11 @@ export class Chart {
     }
 
     // hover readout
-    if (this.hover && trainHeld.length) {
-      const it = this._frac(this.hover.x) * this.maxIter;
+    if (this.hover && trainRaw.length) {
+      const it = xMin + this._frac(this.hover.x) * xSpan;
       const near = (arr) => arr.length ? arr.reduce((a, p) => Math.abs(p[0] - it) < Math.abs(a[0] - it) ? p : a) : null;
-      const a = near(trainHeld), h = near(holdHeld);
-      const ev = this.events.find((e) => Math.abs(e.at * this.maxIter - it) < this.maxIter * .012);
+      const a = near(trainRaw), h = near(holdRaw), n = near(this.splats);
+      const ev = this.events.find((e) => Math.abs(e.at * this.maxIter - it) < xSpan * .012);
       if (a) {
         const x = X(a[0]);
         ctx.strokeStyle = 'rgba(230,236,235,.4)'; ctx.lineWidth = 1;
@@ -261,6 +253,7 @@ export class Chart {
           yPct: this.hover.y * 100,
           iter: Math.round(a[0]),
           train: this._displayValue(a[1]), hold: h ? this._displayValue(h[1]) : null,
+          splats: n ? Math.round(n[1]) : null,
           unit: this.scale === 'similarity' ? '%' : 'dB', event: ev ? ev.label : null,
         });
       }

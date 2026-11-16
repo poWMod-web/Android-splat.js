@@ -85,8 +85,14 @@ export class RemoteTrainer {
     return r;
   }
 
-  async softPrune(ratio = null) {
-    const r = await this._rpc.call('softPrune', { ratio });
+  async softPrune(ratio = null, opts = null) {
+    const r = await this._rpc.call('softPrune', { ratio, skipRatchet: !!(opts && opts.skipRatchet) });
+    this.iter = r.iter; this.n = r.n;
+    return r;
+  }
+
+  async pruneDead() {
+    const r = await this._rpc.call('pruneDead', {});
     this.iter = r.iter; this.n = r.n;
     return r;
   }
@@ -94,6 +100,7 @@ export class RemoteTrainer {
   async readLoss() {
     const r = await this._rpc.call('readLoss', {});
     if (r.entryOverflowTiles) this.entryOverflowTiles = r.entryOverflowTiles;
+    this.cameraErrors = Array.isArray(r.cameraErrors) ? r.cameraErrors : [];
     return r.mse;
   }
 
@@ -105,6 +112,11 @@ export class RemoteTrainer {
   camDrift() { return this._rpc.call('camDrift', {}); }
   capture(cam) { return this._rpc.call('capture', { cam }); }
   sync() { return this._rpc.call('sync', {}); }
+  async updateCameraPose(i, R, t) {
+    const meta = await this._rpc.call('updateCameraPose', { i, R, t });
+    if (this.camMeta[i]) Object.assign(this.camMeta[i], meta);
+    return meta;
+  }
 
   /** Push an allow-listed live set (see trainworker CONFIG_KEYS); known keys
    *  also update the main-side mirror. */

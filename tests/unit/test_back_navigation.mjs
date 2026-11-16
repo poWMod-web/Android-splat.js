@@ -39,10 +39,10 @@ assert.match(trainShare, /closeOverlays\(\);/, 'leaving the viewer for setup sho
 
 // going back to a trained model or home closes overlays — every landing calls it
 const calls = (app.match(/\n\s*closeOverlays\(\);/g) || []).length;
-assert.equal(calls, 8, `all eight transition sites should call the closer (found ${calls})`);
+assert.equal(calls, 11, `all eleven transition sites, including monitor/recovery/adopt, should call the closer (found ${calls})`);
 for (const [name, from, to] of [
-  ['closeDetailCard', 'function closeDetailCard()', 'function closeViewerToHome()'],
-  ['closeViewerToHome', 'function closeViewerToHome()', 'async function fetchShareRecon('],
+  ['closeDetailCard', 'function closeDetailCard()', 'async function closeViewerToHome()'],
+  ['closeViewerToHome', 'async function closeViewerToHome()', 'async function fetchShareRecon('],
   ['restoreShared', 'async function restoreShared(', 'function setStartStyle('],
 ]) {
   const slice = app.slice(app.indexOf(from), app.indexOf(to));
@@ -62,4 +62,15 @@ assert.match(pop, /const detailOpen =/, 'popstate should snapshot the detail lay
 assert.match(pop, /closeOverlays\(\);/, 'phone Back should dismiss modals and score graphs');
 assert.match(pop, /if \(aboutOpen\) return;/, 'phone Back should still close About first');
 
+
+
+const dockStart = app.indexOf('function dock(kind)');
+const dockFn = app.slice(dockStart, app.indexOf('function syncScoreScaleControls', dockStart));
+assert.match(dockFn, /#stage > \.chartwrap, #stage > \.chartwrap-expanded[\s\S]*forEach\(\(el\) => el\.remove\(\)\)/,
+  'every dock transition must destroy a score graph reparented into stage');
 console.log('back-button visibility + overlay cleanup on navigation: passed');
+
+const doneStart = app.indexOf('function enterDone()');
+const done = app.slice(doneStart, app.indexOf('/** Avatar mode', doneStart));
+assert.match(done, /S\.state = 'done';[\s\S]*\$\('btn-new'\)\.hidden = false/,
+  'every model-view path must expose Back as an enterDone invariant');

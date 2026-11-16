@@ -535,8 +535,9 @@ body { overflow: hidden; }
 button.countv:hover { color: var(--accent); }
 /* one centred group: Start, the quality dropdown to its right at the same
    height, then the gear */
-.startrow { display: flex; justify-content: center; align-items: center; }
+.startrow { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; row-gap: 8px; }
 .startrow .q-quick { margin-left: 10px; }
+.startrow #btn-go-background { margin-left: 8px; }
 .startrow .setgear { margin-left: 4px; }
 .q-quick {
   appearance: none; -webkit-appearance: none;   /* no native chevron */
@@ -605,6 +606,13 @@ button.countv:hover { color: var(--accent); }
 }
 .upcard input:focus { border-color: var(--accent-30); }
 .upcard-row { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* Branded confirmation replaces WebView's origin-titled JavaScript prompt. */
+.app-confirm { width: min(420px, calc(100% - 32px)); }
+.app-confirm .dlg-head { padding: 20px 22px 14px; }
+.app-confirm .dlg-head h2 { margin: 0; font-size: 21px; }
+.app-confirm .dlg-body { display: grid; gap: 20px; padding: 18px 22px 20px; }
+.app-confirm .dlg-body p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
 
 /* the ?perf benchmark summary */
 #perfcard { width: min(560px, 92%); }
@@ -1136,4 +1144,43 @@ a.cbtn { text-decoration: none; }
   padding: 4px 9px;
   font-size: 11px;
   line-height: 1.2;
+}
+
+/* The saved-work heading is also an explicit refresh control. Background
+   service progress lives outside IndexedDB, so Home must offer a deliberate
+   rescan without making the user reload the whole WebView. */
+.wall-refresh { display: block; margin: 0 auto 8px; padding: 8px 10px; border-radius: 8px; }
+.wall-refresh:hover, .wall-refresh:focus-visible { color: var(--paper); background: rgba(255,255,255,.05); }
+
+/* Service monitor: snapshots and score live inside the card, never behind its
+   frosted backdrop. The service remains the sole WebGPU owner. */
+#monitor { width: 100%; max-width: none; height: calc(100dvh - 52px); box-sizing: border-box; }
+#monitor > .monitor-live-grid { width: min(920px, 100%); }
+.monitor-live-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin: 14px auto 2px; width: 100%; }
+.monitor-preview, .monitor-chartwrap { min-height: 190px; border: 1px solid var(--line); background: rgba(7,9,9,.72); border-radius: 10px; overflow: hidden; position: relative; }
+.monitor-preview canvas, .monitor-chartwrap canvas { display: block; width: 100%; height: 190px; }
+.chart-unit-toggle { position: absolute; z-index: 2; top: 8px; right: 8px; padding: 5px 9px; border: 1px solid var(--line-2); border-radius: var(--pill); background: rgba(7,9,9,.86); color: var(--muted); font: 600 11px var(--ui); cursor: pointer; }
+.chart-unit-toggle:hover { color: var(--paper); border-color: var(--accent-30); }
+.monitor-preview canvas { object-fit: contain; }
+.monitor-preview small { position: absolute; left: 8px; bottom: 6px; color: var(--dim); font: 10px var(--mono); background: rgba(7,9,9,.72); padding: 2px 4px; }
+@media (max-width: 700px) { .monitor-live-grid { grid-template-columns: 1fr; } }
+.monitor-preview[hidden] + .monitor-chartwrap { grid-column: 1 / -1; }
+.monitor-gpu { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 10px auto 0; color: var(--dim); font: 11px var(--mono); }
+.monitor-gpu input { width: min(260px, 48vw); }
+
+/* Numbered landmark editor for manual camera alignment. It occupies only the
+   model stage, leaving the filmstrip available for choosing reference views. */
+body.manual-aligning #controls, body.manual-aligning #dock { display: none !important; }
+.manual-align-editor { position: absolute; z-index: 18; inset: 0; display: flex; flex-direction: column; background: rgba(7,9,9,.97); color: var(--paper); }
+.manual-align-head { flex: none; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 6px 14px; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.manual-align-head > b { font-size: 14px; }
+.manual-align-head > small { grid-column: 1 / -1; color: var(--muted); line-height: 1.35; }
+.manual-align-status { color: var(--accent); font: 12px var(--mono); }
+.manual-align-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 7px; }
+.stage .manual-align-canvas { position: static; inset: auto; flex: 1; min-height: 0; width: 100%; height: 100%; cursor: none; touch-action: none; }
+@media (max-width: 620px) {
+  .manual-align-head { grid-template-columns: 1fr; padding: 8px; }
+  .manual-align-head > small, .manual-align-actions { grid-column: 1; }
+  .manual-align-head > small { font-size: 10px; }
+  .manual-align-actions .btn { padding: 7px 9px; font-size: 11px; }
 }

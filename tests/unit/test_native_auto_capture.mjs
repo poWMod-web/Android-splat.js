@@ -6,8 +6,12 @@ assert.match(source, /CheckBox autoToggle = new CheckBox\(this\);[\s\S]*autoTogg
 assert.match(source, /autoToggle\.setChecked\(false\)/, 'native capture must retain the WebXR manual-capture default');
 assert.match(source, /getInt\("capture_spacing_cm", 10\)/, 'native default spacing must be 10 cm');
 assert.match(source, /if \(value < 2 \|\| value > 200\)/, 'spacing must be editable from 2 to 200 cm');
-assert.match(source, /boolean autoDue = autoCaptureEnabled && autoCaptureRunning && cloudRenderer\.sampleTravel\(position\)/,
-  'automatic shots need the mode armed AND the run started');
+assert.match(source, /autoFirstCapturePending = running/,
+  'pressing Start should arm the first sample while tracking warms up');
+assert.match(source, /boolean firstAutoDue = autoCaptureEnabled && autoCaptureRunning && autoFirstCapturePending;[\s\S]*\(firstAutoDue \|\| cloudRenderer\.sampleTravel\(position\)\)/,
+  'the first sample is due immediately; distance spacing governs later samples');
+assert.match(source, /if \(firstAutoDue && saved\) autoFirstCapturePending = false/,
+  'a transient unavailable camera image must not consume the first sample');
 assert.match(source, /if \(!autoCaptureEnabled \|\| !autoCaptureRunning\) cloudRenderer\.breakTravelContinuity\(\);/,
   'a stopped run must not accumulate travel');
 assert.match(source, /if \(autoCaptureEnabled\) \{\s*\/\/ auto mode: the center button starts\/stops the automatic run\s*setAutoCaptureRunning\(!autoCaptureRunning\);/,
@@ -20,7 +24,18 @@ assert.match(source, /else if \(autoCaptureRunning\) shutterView\.setLabel\("Sto
   'a running auto capture should offer Stop on the center button');
 assert.match(source, /else shutterView\.setLabel\("Start", "Start auto-capture"\);/,
   'an armed auto capture should offer Start on the center button');
-assert.match(source, /if \(manualDue \|\| autoDue\) capture\(frame\)/);
+assert.match(source, /boolean earlyCaptureReady = earlyCaptureTrackingReady\(frame\)[\s\S]*if \(manualPending \|\| autoDue\)[\s\S]*if \(earlyCaptureReady\)[\s\S]*capture\(frame\)/,
+  'manual and automatic opening captures should wait for positional tracking warm-up');
+assert.match(source, /FIRST_CAPTURE_WARMUP_MS = 8000L[\s\S]*FIRST_CAPTURE_FALLBACK_MS = 12000L[\s\S]*SECOND_CAPTURE_SETTLE_MS = 3000L[\s\S]*FIRST_CAPTURE_MIN_REFERENCES = 40/,
+  'the first two images should receive a substantial ARCore convergence window');
+assert.match(source, /frame\.acquirePointCloud\(\)[\s\S]*firstTrackingReferences = Math\.max[\s\S]*elapsed >= FIRST_CAPTURE_FALLBACK_MS/,
+  'pre-capture tracking should collect references continuously with a bounded fallback for texture-poor scenes');
+assert.match(source, /keep manual\/first-auto requests pending/,
+  'a shutter press during warm-up must remain armed rather than being discarded');
+assert.match(source, /capturedAnchor = arSession\.createAnchor\(pose\)[\s\S]*frameAnchors\.add\(capturedAnchor\)/,
+  'captured poses should remain attached to ARCore map refinement');
+assert.match(source, /refreshCapturedAnchorPoses\(\)[\s\S]*anchor\.getPose\(\)\.toMatrix[\s\S]*transform_matrix/,
+  'export should replace early shutter snapshots with the latest tracked anchor poses');
 assert.match(source, /distanceSinceCapture \+= distance[\s\S]*return distanceSinceCapture \+ 1e-6f >= spacingMeters/);
 assert.match(source, /void captured\(float\[\] position\)[\s\S]*distanceSinceCapture = 0f/);
 console.log('native ARCore distance auto-capture UI and 10 cm default: passed');

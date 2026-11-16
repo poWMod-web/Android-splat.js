@@ -4,17 +4,41 @@ import { readFileSync } from 'node:fs';
 const xr = readFileSync(new URL('../../app/js/xr-ui.js', import.meta.url), 'utf8');
 const main = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/MainActivity.java', import.meta.url), 'utf8');
 const nativeCap = readFileSync(new URL('../../android/app/src/main/java/space/arrival/splatxr/NativeCaptureActivity.java', import.meta.url), 'utf8');
+const app = readFileSync(new URL('../../app/js/app.js', import.meta.url), 'utf8');
+const store = readFileSync(new URL('../../app/js/store.js', import.meta.url), 'utf8');
 
-// Imported frames are fetched as Blobs, so once a native capture is accepted
-// its on-disk copies are redundant — and deleting models never touches them.
-// The success path must drop them instead of leaving ~200 JPEGs behind.
-assert.match(xr, /if \(!reviewed\) return;\s*await onCapture\(reviewed\);\s*\/\/[\s\S]*?try \{ nativeBridge\.resetCaptureSession\(\); \} catch/,
-  'an accepted native import should wipe the redundant on-disk capture');
-assert.match(main, /@JavascriptInterface public void resetCaptureSession\(\) \{[\s\S]*?NativeCaptureActivity\.resetCaptureSession\(MainActivity\.this\);/,
-  'the bridge should expose the native capture wipe');
-assert.match(nativeCap, /static void resetCaptureSession\(Context context\) \{[\s\S]*?deleteTree\(new File\(context\.getFilesDir\(\), "captures\/current"\)\);/,
-  'the wipe should delete the capture directory when no capture is live');
-assert.match(nativeCap, /if \(active == this\) active = null;/,
-  'finishing the capture activity should release it so the wipe takes the delete path');
+// A completed native scan is an immutable, ID-addressed archive. New scans
+// and training handoffs must reference it rather than wiping or copying it.
+assert.match(nativeCap, /captureId = "capture_" \+ System\.currentTimeMillis\(\);[\s\S]*new File\(new File\(getFilesDir\(\), "captures"\), captureId\)/,
+  'each capture should get a stable native archive directory');
+const onCreate = nativeCap.slice(nativeCap.indexOf('onCreate(Bundle'), nativeCap.indexOf('private void applySafeAreaInsets'));
+assert.doesNotMatch(onCreate, /deleteTree\(/,
+  'opening a new capture must not delete an older scan archive');
+assert.match(nativeCap, /if \(!captureFinished && outputDir != null\) deleteTree\(outputDir\)/,
+  'only an incomplete capture should be cleaned up automatically');
+assert.match(nativeCap, /putExtra\("captureId", captureId\)/,
+  'the completed archive identity should be returned to the WebView');
+assert.match(main, /splatxr-native-capture[\s\S]*detail:\{captureId:/,
+  'the native result event should carry the archive identity');
+assert.match(xr, /export async function importNativeCapture\(nativeBridge[\s\S]*captureId = null[\s\S]*exportDataset\(captureId \|\| ''\)[\s\S]*nativeCaptureId: payload\.captureId/,
+  'native import should preserve its archive reference');
+assert.match(main, /public String listCaptureArchives\(\)[\s\S]*previewUri/,
+  'Home should be able to enumerate all valid native scan archives');
+assert.ok(main.includes('name.matches(\"frame_[0-9]{4}\\\\.jpg\")'),
+  'Java frame matching must escape the regex dot with a valid Java string escape');
+assert.match(main, /Native scan archives are the image ground truth[\s\S]*public String exportDataset\(String requestedId\)/,
+  'the bridge should export references for a requested archive');
+assert.match(main, /public String deleteCaptureArchive\(String captureId\)[\s\S]*manifest\.json[\s\S]*\"referenced\"/,
+  'explicit scan deletion should refuse archives referenced by durable runs');
+assert.match(main, /public boolean deleteRunArchive\(String runId\)[\s\S]*readActive[\s\S]*status\.json[\s\S]*value\.equals\("active"\)[\s\S]*clearActive[\s\S]*deleteArchiveTree/,
+  'model deletion should protect live trainers but clear stale finished/interrupted recovery pointers');
+assert.match(app, /if \(it\.danger && !\(await inAppConfirm\('Delete permanently'[\s\S]*await it\.act\(\)/,
+  'Delete should use one explicit confirmation instead of silently arming a second click');
+assert.doesNotMatch(app, /dataset\.armed|b\.textContent = 'Delete\?'/,
+  'the obsolete three-second two-click delete gesture must not remain');
+assert.match(store, /export async function deleteRun\(id\)[\s\S]*return true[\s\S]*return false/,
+  'model deletion should report storage failure instead of removing only the visible tile');
+assert.match(app, /if \(!\(await deleteRun\(r\.id\)\)\)[\s\S]*could not be removed from device storage/,
+  'the model tile should disappear only after IndexedDB confirms deletion');
 
-console.log('native capture cleanup after import: passed');
+console.log('native capture archive lifecycle: passed');
