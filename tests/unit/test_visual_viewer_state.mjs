@@ -15,7 +15,7 @@ assert.match(toggle, /syncTrainingVisualsControl\(\);\s*renderControls\(\);/,
 assert.match(continuation, /viewOnly \? 'Loading model …' : 'Preparing to continue training …'/,
   'view-only checkpoint loading must not claim training is resuming');
 for (const [name, source] of [['app', viewport], ['browser', browserViewport]]) {
-  assert.match(source, /if \(o\.model\) s \*= 0\.25/,
+  assert.match(source, /if \(o\.model\) s \*= 0\.1/,
     `${name}: camera pyramids over the training model must render at 10% scale`);
 }
 

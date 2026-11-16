@@ -708,8 +708,8 @@ export class Viewport {
       if (this._camSize) s = Math.min(s, Math.max(this._camSize, rad * 0.02));
     }
     // Camera pyramids are only orientation cues over the live training model;
-    // keep them at 25% of the solve/debug size so they do not cover the splats.
-    if (o.model) s *= 0.25;
+    // keep them at 10% of the solve/debug size so they do not cover the splats.
+    if (o.model) s *= 0.1;
     const upto = o.reveal ?? list.length;
     const path = [];
     const stride = Math.max(1, Math.ceil(list.length / 30));
