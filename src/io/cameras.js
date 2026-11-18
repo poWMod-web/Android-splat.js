@@ -90,6 +90,76 @@ function lookAt(cams) {
   return { point: p, distance: dist[dist.length >> 1] };
 }
 
+/** Align an SfM reconstruction to externally measured camera centres with a
+ * metric similarity transform. This keeps SfM's bundle-adjusted relative
+ * poses and sparse cloud while restoring the AR/robot/world coordinate frame.
+ * Horn's quaternion solution is evaluated by power iteration on its symmetric
+ * 4x4 matrix; no external linear-algebra dependency is required. */
+export function alignReconstructionToKnown(recon, knownRecon) {
+  const knownByImage = new Map(knownRecon.cams.map((c) => [c.imgIdx, c]));
+  const pairs = recon.cams
+    .filter((c) => knownByImage.has(c.imgIdx))
+    .map((c) => ({ a: centre(c), b: centre(knownByImage.get(c.imgIdx)) }));
+  if (pairs.length < 3) throw new Error('at least three shared cameras are required to align SfM to known poses');
+
+  const mean = (key) => [0, 1, 2].map((k) => pairs.reduce((s, p) => s + p[key][k], 0) / pairs.length);
+  const ca = mean('a'), cb = mean('b');
+  const H = new Float64Array(9);
+  let aa = 0;
+  for (const p of pairs) {
+    const a = p.a.map((v, k) => v - ca[k]), b = p.b.map((v, k) => v - cb[k]);
+    aa += a[0] ** 2 + a[1] ** 2 + a[2] ** 2;
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) H[r * 3 + c] += a[r] * b[c];
+  }
+  if (!(aa > 1e-12)) throw new Error('known camera centres have no usable baseline');
+  const [sxx, sxy, sxz, syx, syy, syz, szx, szy, szz] = H;
+  const N = [
+    sxx + syy + szz, syz - szy, szx - sxz, sxy - syx,
+    syz - szy, sxx - syy - szz, sxy + syx, szx + sxz,
+    szx - sxz, sxy + syx, -sxx + syy - szz, syz + szy,
+    sxy - syx, szx + sxz, syz + szy, -sxx - syy + szz,
+  ];
+  // Shift to positive definite before power iteration. Eigenvectors are
+  // unchanged, while a large negative eigenvalue can no longer win by
+  // absolute magnitude or make convergence alternate.
+  const shift = 2 * H.reduce((sum, v) => sum + Math.abs(v), 0) + 1e-12;
+  for (let i = 0; i < 4; i++) N[i * 4 + i] += shift;
+  let q = [1, 0, 0, 0];
+  for (let it = 0; it < 96; it++) {
+    const n = [0, 1, 2, 3].map((r) => N[r * 4] * q[0] + N[r * 4 + 1] * q[1] + N[r * 4 + 2] * q[2] + N[r * 4 + 3] * q[3]);
+    const l = Math.hypot(...n); q = n.map((v) => v / l);
+  }
+  const [w, x, y, z] = q;
+  const Q = [
+    1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+    2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+    2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y),
+  ];
+  const mv = (M, v) => [0, 1, 2].map((r) => M[r * 3] * v[0] + M[r * 3 + 1] * v[1] + M[r * 3 + 2] * v[2]);
+  let num = 0;
+  for (const p of pairs) {
+    const ra = mv(Q, p.a.map((v, k) => v - ca[k]));
+    num += ra.reduce((s, v, k) => s + v * (p.b[k] - cb[k]), 0);
+  }
+  const scale = num / aa;
+  if (!(scale > 0) || !Number.isFinite(scale)) throw new Error('SfM-to-known alignment produced an invalid scale');
+  const qca = mv(Q, ca), offset = cb.map((v, k) => v - scale * qca[k]);
+  const mapPoint = (X) => mv(Q, X).map((v, k) => scale * v + offset[k]);
+  const QT = [Q[0], Q[3], Q[6], Q[1], Q[4], Q[7], Q[2], Q[5], Q[8]];
+  const mm = (A, B) => [0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => A[r * 3] * B[c] + A[r * 3 + 1] * B[3 + c] + A[r * 3 + 2] * B[6 + c]));
+  const cams = recon.cams.map((c) => {
+    const C = mapPoint(centre(c)), R = mm(c.R, QT);
+    const t = mv(R, C).map((v) => -v);
+    return { ...c, R, t };
+  });
+  const points = recon.points.map((p) => ({ ...p, X: mapPoint(p.X) }));
+  const rms = Math.sqrt(pairs.reduce((sum, p) => {
+    const d = mapPoint(p.a).map((v, k) => v - p.b[k]);
+    return sum + d[0] ** 2 + d[1] ** 2 + d[2] ** 2;
+  }, 0) / pairs.length);
+  return { ...recon, cams, points, known: false, alignedToKnown: true, knownAlignment: { scale, rms, cameras: pairs.length } };
+}
+
 /** Random seed points filling the volume the cameras look at: what 3DGS seeds a synthetic set with
  *  when there is no sparse cloud. A masked set's hull then keeps the ones on the subject. */
 export function randomSeedPoints(cams, n = 50000, seed = 1) {

@@ -185,6 +185,17 @@ function trainWorkerOpt() {
   if (q === '0' || q === 'false') return false;
   return isPhoneClass() ? false : 'auto';
 }
+function sfmWorkflowOpts(st) {
+  return {
+    ...solveTierOpts(st.solve || 'standard'),
+    graph: ['walk', 'orbit', 'dense'].includes(st.match) ? st.match : 'orbit',
+    ...(st.map === 'high' ? {
+      interimBA: true, interimBARatio: 0.12, interimBAMaxPoints: 20000,
+      lkRefine: true, trackExtend: true, obsFilter: true,
+    } : {}),
+  };
+}
+
 function deviceDefaults() {
   const phone = isPhoneClass();
   return phone
@@ -194,8 +205,8 @@ function deviceDefaults() {
     // on the lean solve, desktops take the middle tier; the precise tier is
     // the High/Showcase macro's (a ten-minute solve behind a two-minute
     // draft training was the complaint, 2026-09-09)
-    ? { v: 2, res: 480, feat: 0, buf: 1, sh: 0, iters: 10000, splats: 0, lod: false, mcmc: false, solve: 'quick', gpu: 100, av: { ...AV_DEFAULTS } }
-    : { v: 2, res: 0, feat: 0, buf: 1, sh: 3, iters: 0, splats: 0, lod: false, mcmc: false, solve: 'standard', gpu: 100, av: { ...AV_DEFAULTS } };
+    ? { v: 2, res: 480, feat: 0, buf: 1, sh: 0, iters: 10000, splats: 0, lod: false, mcmc: false, solve: 'quick', match: 'walk', map: 'standard', gpu: 100, av: { ...AV_DEFAULTS } }
+    : { v: 2, res: 0, feat: 0, buf: 1, sh: 3, iters: 0, splats: 0, lod: false, mcmc: false, solve: 'standard', match: 'orbit', map: 'standard', gpu: 100, av: { ...AV_DEFAULTS } };
 }
 function loadSettings() {
   const d = deviceDefaults();
@@ -706,7 +717,9 @@ function boot() {
       $('set-res').value = want ? String(want) : '';
     }
     $('set-feat').value = st.feat ? String(st.feat) : '';
-    $('set-solve').value = st.solve === 'quick' ? 'quick' : 'standard';   // 'precise' (an alias) shows as Standard
+    $('set-solve').value = ['quick', 'standard', 'precise'].includes(st.solve) ? st.solve : 'standard';
+    $('set-match').value = ['walk', 'orbit', 'dense'].includes(st.match) ? st.match : 'orbit';
+    $('set-map').value = st.map === 'high' ? 'high' : 'standard';
     $('set-buf').value = String(st.buf);
     $('set-buf-hint').hidden = st.buf !== 2;
     $('set-sh').value = String(st.sh);
@@ -787,6 +800,8 @@ function boot() {
     st.res = parseInt($('set-res').value, 10) || 0;
     st.feat = parseInt($('set-feat').value, 10) || 0;
     st.solve = $('set-solve').value || 'standard';
+    st.match = $('set-match').value || 'orbit';
+    st.map = $('set-map').value || 'standard';
     st.buf = parseFloat($('set-buf').value) || 1;
     st.sh = parseInt($('set-sh').value, 10);
     st.shup = $('set-shup').value === '1';
@@ -805,7 +820,7 @@ function boot() {
   S.commitSettings = readSettings;
   // every select in the panel persists on change — the avatar rows (and Horizontal SH) were
   // missing from this list, so their toggles changed the dropdown and nothing else (2026-09-17)
-  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-softprune', 'set-softprune-custom', 'set-shup', 'set-gpu', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
+  for (const id of ['set-res', 'set-feat', 'set-solve', 'set-match', 'set-map', 'set-buf', 'set-sh', 'set-iters', 'set-splats', 'set-lod', 'set-lod-count', 'set-mcmc', 'set-softprune', 'set-softprune-custom', 'set-shup', 'set-gpu', ...AV_KEYS.map((k) => 'set-av-' + k)]) {
     const el = $(id); if (el) el.addEventListener('change', readSettings);
   }
   // the avatar route: the box on the start card. It is a property of THIS run,
@@ -2610,7 +2625,7 @@ async function startPrepInner() {
         // solve (10s+ frozen UI on phones). Training is untouched: measured
         // fine on-device, and fenceRing/gpuChunkMs (library opts) would tax
         // throughput for nothing.
-        sfm: { ...solveTierOpts(st.solve || 'quick'), workers: 3, uiYield: true, ...VIDEO_GATES(), ...(S.avatarOpts && S.avatarOpts.session && S.avatarOpts.session.sfm || {}), ...SFM_BISECT },
+        sfm: { ...VIDEO_GATES(), ...sfmWorkflowOpts(st), workers: 3, uiYield: true, ...(S.avatarOpts && S.avatarOpts.session && S.avatarOpts.session.sfm || {}), ...SFM_BISECT },
       } : {
         // desktop solver default since 2026-09-04: 8000 SIFT features from the
         // upsampled first octave (COLMAP's default). Feature localisation is
@@ -2626,7 +2641,7 @@ async function startPrepInner() {
         // Standard takes the 8000 budget at the base octave, Draft the lean
         // 3900 / octave-0 solve — see SOLVE_TIERS in the library.
         // the avatar's solve options win over the settings tier (they were overridden here until 2026-09-16: the precise tier and ?sfmall never reached the solver)
-        sfm: { ...solveTierOpts(st.solve || 'standard'), ...VIDEO_GATES(), ...(S.avatarOpts && S.avatarOpts.session && S.avatarOpts.session.sfm || {}), ...SFM_BISECT },
+        sfm: { ...VIDEO_GATES(), ...sfmWorkflowOpts(st), ...(S.avatarOpts && S.avatarOpts.session && S.avatarOpts.session.sfm || {}), ...SFM_BISECT },
       }),
       // phones solve at the desktop feature resolution again: 720 was part
       // of the OOM firefight, but the real culprit was the UI bitmap cache —
@@ -2671,16 +2686,25 @@ async function startPrepInner() {
     if (knownCapture) {
       onStage({ stage: 'known', done: 0, total: 1 });
       const points = measuredSeeds(knownCapture);
-      session.useKnownCameras(parseCameras(knownCapture.transforms), { ...(points.length ? { points } : {}), seedCount: phoneClass ? 8000 : 20000 });
-      if (session.recon.cams.length !== session.frames.length) throw new Error('Some images lost their known cameras during decoding. No estimated poses will be substituted.');
-      S.solveStats.solveSec = 0;
-      onStage({ stage: 'solved', done: 1, total: 1, detail: { cams: session.recon.cams.length, points: session.recon.points.length, known: true } });
-      flash(`${session.recon.cams.length} known camera poses loaded — camera solve skipped. ${points.length ? 'Measured seeds.' : 'Random-volume initialization.'}`, 7000);
+      const knownRecon = session.useKnownCameras(parseCameras(knownCapture.transforms), { ...(points.length ? { points } : {}), seedCount: phoneClass ? 8000 : 20000 });
+      if (knownRecon.cams.length !== session.frames.length) throw new Error('Some images lost their known cameras during decoding. No estimated poses will be substituted.');
+      try {
+        await session.refineKnownCameras(knownRecon, { debug: (d) => { S.internals = d; } });
+        if (points.length) session.recon.points.push(...points);
+        const a = session.recon.knownAlignment;
+        flash(`SfM refined ${a.cameras} AR poses · alignment RMS ${a.rms.toFixed(4)} m · ${session.recon.points.length} sparse points.`, 7000);
+      } catch (e) {
+        if (e?.name === 'AbortError') throw e;
+        session.useReconstruction(knownRecon);
+        console.warn('[sfm] AR pose refinement unavailable; retaining measured poses', e);
+        onStage({ stage: 'solved', done: 1, total: 1, detail: { cams: knownRecon.cams.length, points: knownRecon.points.length, known: true } });
+        flash(`AR poses retained — SfM refinement could not connect this set (${e.message || e}).`, 7000);
+      }
     } else {
       await session.solve({ debug: (d) => { S.internals = d; } });
     }
     if (S.gen !== gen) return;
-    if (!knownCapture) S.solveStats.solveSec = (performance.now() - t0) / 1000;
+    S.solveStats.solveSec = (performance.now() - t0) / 1000;
 
     // No threshold guessing: below 3 placed cameras there is no multi-view
     // problem left to solve — stop with advice. Anything above that trains,
@@ -3119,7 +3143,11 @@ function buildSceneFromSession() {
   }
   const capturedPoints = S.preset?.capture?.points || [];
   const savedCloud = S._localRun?.recon?.cloud || S.restored?.reconJson?.cloud || null;
-  const { xyz, rgb } = buildDisplayCloud(capturedPoints, savedCloud, (recon && recon.points) || []);
+  // A completed AR+SfM solve displays its triangulated sparse cloud; a
+  // fallback known-pose run still displays the native captured references.
+  const { xyz, rgb } = recon?.alignedToKnown
+    ? buildDisplayCloud(recon.points, savedCloud, recon.points)
+    : buildDisplayCloud(capturedPoints, savedCloud, (recon && recon.points) || []);
   S.scene = {
     cams, xyz, rgb,
     center: (ses.model && ses.model.center) || [0, 0, 0],
@@ -5904,9 +5932,11 @@ function showDetail(setOrPreset) {
   $('xr-set-tools').hidden = !capturedFiles;
   $('xr-review-set').disabled = !capturedFiles || setOrPreset.files.length < 3;
   $('xr-export-set').disabled = !capturedFiles || setOrPreset.files.length < 3;
-  $('xr-set-mode').textContent = setOrPreset?.capture?.transforms ? 'KNOWN POSES · NO CAMERA SOLVE' : 'PHOTO INPUT · ORIGINAL CAMERA SOLVE';
-  $('set-solve').disabled = !!setOrPreset?.capture?.transforms;
-  $('set-feat').disabled = !!setOrPreset?.capture?.transforms;
+  $('xr-set-mode').textContent = setOrPreset?.capture?.transforms ? 'AR POSES · SFM REFINEMENT' : 'PHOTO INPUT · SFM RECONSTRUCTION';
+  $('set-solve').disabled = false;
+  $('set-feat').disabled = false;
+  $('set-match').disabled = false;
+  $('set-map').disabled = false;
   setStartStyle(!(setOrPreset && setOrPreset.spaceId));
   if (setOrPreset && setOrPreset.spaceId && SHELL !== 'browser') {
     // a trained model of this benchmark is shared — View opens it, and the

@@ -24,14 +24,16 @@ assert.match(source, /else if \(autoCaptureRunning\) shutterView\.setLabel\("Sto
   'a running auto capture should offer Stop on the center button');
 assert.match(source, /else shutterView\.setLabel\("Start", "Start auto-capture"\);/,
   'an armed auto capture should offer Start on the center button');
-assert.match(source, /boolean earlyCaptureReady = earlyCaptureTrackingReady\(frame\)[\s\S]*if \(manualPending \|\| autoDue\)[\s\S]*if \(earlyCaptureReady\)[\s\S]*capture\(frame\)/,
-  'manual and automatic opening captures should wait for positional tracking warm-up');
-assert.match(source, /FIRST_CAPTURE_WARMUP_MS = 8000L[\s\S]*FIRST_CAPTURE_FALLBACK_MS = 12000L[\s\S]*SECOND_CAPTURE_SETTLE_MS = 3000L[\s\S]*FIRST_CAPTURE_MIN_REFERENCES = 40/,
-  'the first two images should receive a substantial ARCore convergence window');
-assert.match(source, /frame\.acquirePointCloud\(\)[\s\S]*firstTrackingReferences = Math\.max[\s\S]*elapsed >= FIRST_CAPTURE_FALLBACK_MS/,
-  'pre-capture tracking should collect references continuously with a bounded fallback for texture-poor scenes');
+assert.match(source, /boolean earlyCaptureReady = openingCaptureTrackingReady\(frame\)[\s\S]*if \(manualPending \|\| autoDue\)[\s\S]*if \(earlyCaptureReady\)[\s\S]*capture\(frame\)/,
+  'manual and automatic opening captures should wait for positional tracking readiness');
+assert.match(source, /OPENING_CAPTURE_MIN_REFERENCES = 24/,
+  'the first two images should require a live set of ARCore positional references');
+assert.match(source, /frame\.acquirePointCloud\(\)[\s\S]*currentTrackingReferences\+\+[\s\S]*return currentTrackingReferences >= OPENING_CAPTURE_MIN_REFERENCES/,
+  'opening readiness should be based on current map evidence');
+assert.doesNotMatch(source, /WARMUP_MS|FALLBACK_MS|SETTLE_MS|elapsedRealtime\(\)/,
+  'opening capture readiness must not contain a timer warm-up or elapsed-time fallback');
 assert.match(source, /keep manual\/first-auto requests pending/,
-  'a shutter press during warm-up must remain armed rather than being discarded');
+  'a shutter press while tracking becomes ready must remain armed rather than being discarded');
 assert.match(source, /capturedAnchor = arSession\.createAnchor\(pose\)[\s\S]*frameAnchors\.add\(capturedAnchor\)/,
   'captured poses should remain attached to ARCore map refinement');
 assert.match(source, /refreshCapturedAnchorPoses\(\)[\s\S]*anchor\.getPose\(\)\.toMatrix[\s\S]*transform_matrix/,

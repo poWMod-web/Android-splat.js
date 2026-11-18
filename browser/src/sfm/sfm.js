@@ -62,9 +62,13 @@ const FOCAL_SCALES = [1.0, 0.8, 0.65, 0.575, 1.16, 1.3];
 // alias for the bench and older links. (This block was lost once to a
 // `git checkout -- src` on 2026-09-10 and restored the same day.)
 export const SOLVE_TIERS = {
-  quick:    { siftFeats: 3900, siftFirstOctave: 0,  refineAspect: false },
-  standard: { siftFeats: 8000, siftFirstOctave: -1, refineAspect: true },
-  precise:  { siftFeats: 8000, siftFirstOctave: -1, refineAspect: true },
+  quick:    { siftFeats: 3900,  siftFirstOctave: 0,  refineAspect: false },
+  standard: { siftFeats: 8000,  siftFirstOctave: -1, refineAspect: true },
+  // Maximum extraction keeps more low-contrast landmarks and gives every BA
+  // pass a larger point budget. It is intentionally explicit rather than an
+  // alias so high-resolution photo sets can trade time for pose precision.
+  precise:  { siftFeats: 12000, siftFirstOctave: -1, refineAspect: true,
+              interimBAMaxPoints: 18000, finalTrials: 3 },
 };
 export const solveTierOpts = (name) => ({ ...(SOLVE_TIERS[name] || SOLVE_TIERS.standard) });
 
