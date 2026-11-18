@@ -209,3 +209,69 @@ export async function gpuMatchAll(feats, pairs, ratio = 0.8, log = () => {}, ext
   log(`  GPU matching: ${pairs.length} pairs in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
   return results;
 }
+
+/** Pick the strongest retrieval edges while keeping the caller's sequential or
+ * orbit graph. Exported separately so pair-selection policy is deterministic
+ * and testable without WebGPU. scores: [{ i, j, score }]. */
+export function selectRetrievedPairs(imageCount, basePairs, scores, partners = 8, minScore = 4) {
+  const key = (i, j) => i < j ? `${i}:${j}` : `${j}:${i}`;
+  const selected = new Map(basePairs.map(([i, j]) => [key(i, j), i < j ? [i, j] : [j, i]]));
+  const ranked = Array.from({ length: imageCount }, () => []);
+  for (const edge of scores) {
+    if (edge.score < minScore) continue;
+    ranked[edge.i].push(edge); ranked[edge.j].push(edge);
+  }
+  for (const list of ranked) {
+    list.sort((a, b) => b.score - a.score || a.i - b.i || a.j - b.j);
+    for (const edge of list.slice(0, partners)) selected.set(key(edge.i, edge.j), [edge.i, edge.j]);
+  }
+  return [...selected.values()].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+}
+
+/** COLMAP-style descriptor preselection, implemented independently on top of
+ * this project's matcher. A small, spatially uniform descriptor sample is
+ * matched across every image pair on WebGPU. The resulting retrieval votes
+ * add likely-overlap pairs that filename/capture-order neighbourhoods miss;
+ * full descriptors and geometric verification still decide final matches. */
+export async function gpuPreselectPairs(feats, basePairs, {
+  sampleSize = 192, partners = 8, minScore = 4, device = null,
+  log = () => {}, onProgress = null,
+} = {}) {
+  const n = feats.length;
+  if (n <= 2) return basePairs;
+  const sampled = feats.map((f) => {
+    const count = Math.min(sampleSize, f.n);
+    const desc = new Uint8Array(count * 128);
+    // Round-robin over a 4x4 image grid. Retrieval then describes overlap of
+    // the whole view rather than whichever textured object won the response
+    // ranking. Within each tile the detector's strongest features come first.
+    let maxX = 1, maxY = 1;
+    for (let i = 0; i < f.n; i++) { maxX = Math.max(maxX, f.x[i]); maxY = Math.max(maxY, f.y[i]); }
+    const cells = Array.from({ length: 16 }, () => []);
+    for (let i = 0; i < f.n; i++) {
+      const cx = Math.min(3, Math.floor(4 * f.x[i] / maxX));
+      const cy = Math.min(3, Math.floor(4 * f.y[i] / maxY));
+      cells[cy * 4 + cx].push(i);
+    }
+    const pos = new Uint16Array(16), picked = [];
+    while (picked.length < count) {
+      let added = false;
+      for (let c = 0; c < 16 && picked.length < count; c++) {
+        if (pos[c] < cells[c].length) { picked.push(cells[c][pos[c]++]); added = true; }
+      }
+      if (!added) break;
+    }
+    for (let k = 0; k < picked.length; k++) {
+      const src = picked[k];
+      desc.set(f.desc.subarray(src * 128, src * 128 + 128), k * 128);
+    }
+    return { n: picked.length, desc };
+  });
+  const allPairs = [];
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) allPairs.push([i, j]);
+  const votes = await gpuMatchAll(sampled, allPairs, 0.9, () => {}, device, onProgress);
+  const scores = allPairs.map(([i, j], k) => ({ i, j, score: (votes[k]?.length || 0) >> 1 }));
+  const selected = selectRetrievedPairs(n, basePairs, scores, partners, minScore);
+  log(`  GPU descriptor retrieval: ${allPairs.length} candidate pairs → ${selected.length} full matches`);
+  return selected;
+}

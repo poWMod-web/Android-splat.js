@@ -16,7 +16,7 @@
 
 import { detectAndDescribe, detectAndDescribeMS } from './features.js';
 import { detectSift, matchSift } from './sift.js';
-import { gpuMatchAll } from './gpumatch.js';
+import { gpuMatchAll, gpuPreselectPairs } from './gpumatch.js';
 import { matchDescriptors } from './matching.js';
 import {
   I3, ransacE, decomposeE, selectPose, triangulateN, parallaxAngle,
@@ -67,7 +67,8 @@ export const SOLVE_TIERS = {
   // Maximum extraction keeps more low-contrast landmarks and gives every BA
   // pass a larger point budget. It is intentionally explicit rather than an
   // alias so high-resolution photo sets can trade time for pose precision.
-  precise:  { siftFeats: 12000, siftFirstOctave: -1, refineAspect: true,
+  precise:  { siftFeats: 12000, siftFirstOctave: -1, siftSpatialBalance: true,
+              descriptorPreselection: true, refineAspect: true,
               interimBAMaxPoints: 18000, finalTrials: 3 },
 };
 export const solveTierOpts = (name) => ({ ...(SOLVE_TIERS[name] || SOLVE_TIERS.standard) });
@@ -412,7 +413,7 @@ async function runSfMOnce(images, log, sampleColor, opts = {}) {
         wk.postMessage({
           id, gray: images[id].gray, w: images[id].fw, h: images[id].fh,
           maxFeats: opts.siftFeats || 3900, firstOctave: opts.siftFirstOctave ?? 0,
-          peakScale: opts.siftPeak ?? 1,
+          peakScale: opts.siftPeak ?? 1, spatialBalance: !!opts.siftSpatialBalance,
         });
       };
       workers.forEach(feed);
@@ -435,7 +436,7 @@ async function runSfMOnce(images, log, sampleColor, opts = {}) {
       // 82.5% keypoint recall vs COLMAP's own extraction; slower).
       const f = useSift
         ? detectSift(images[i].gray, images[i].fw, images[i].fh, opts.siftFeats || 3900,
-            opts.siftFirstOctave ?? 0, opts.siftPeak ?? 1)
+            opts.siftFirstOctave ?? 0, opts.siftPeak ?? 1, !!opts.siftSpatialBalance)
         : opts.msFeatures
           ? detectAndDescribeMS(images[i].gray, images[i].fw, images[i].fh, 1500)
           : detectAndDescribe(images[i].gray, images[i].fw, images[i].fh, 1500);
@@ -501,7 +502,7 @@ async function runSfMOnce(images, log, sampleColor, opts = {}) {
             wk.postMessage({
               id, gray: images[id].gray, w: images[id].fw, h: images[id].fh,
               maxFeats: opts.siftFeats || 3900, firstOctave: -1,
-              peakScale: opts.siftPeak ?? 1,
+              peakScale: opts.siftPeak ?? 1, spatialBalance: !!opts.siftSpatialBalance,
             });
           };
           workers.forEach(feed);
@@ -510,7 +511,7 @@ async function runSfMOnce(images, log, sampleColor, opts = {}) {
       } else {
         for (const id of starved) {
           const f = detectSift(images[id].gray, images[id].fw, images[id].fh,
-            opts.siftFeats || 3900, -1, opts.siftPeak ?? 1);
+            opts.siftFeats || 3900, -1, opts.siftPeak ?? 1, !!opts.siftSpatialBalance);
           f.id = id;
           adopt(f);
           await tick(); checkAbort();
@@ -543,7 +544,26 @@ async function runSfMOnce(images, log, sampleColor, opts = {}) {
   // loop pinned so loosely that two 8-16 camera clusters registered ~5 units
   // off (a ghost truck in training). Dense long-range: truck-250 ATE
   // 2.18% -> 0.00% vs COLMAP. GPU matching absorbs the extra pairs.
-  const pairs = buildPairs(n, opts.graph || (useSift ? 'dense' : 'walk'));
+  let pairs = buildPairs(n, opts.graph || (useSift ? 'dense' : 'walk'));
+  // Retrieval closes a major failure mode of order-based graphs: imported
+  // photos are frequently renamed, selected, or copied out of capture order.
+  // Match small descriptor samples globally, then spend full matching and
+  // RANSAC only on each image's strongest likely-overlap partners.
+  if (useSift && opts.descriptorPreselection && n > 30 &&
+      typeof navigator !== 'undefined' && navigator.gpu) {
+    try {
+      pairs = await gpuPreselectPairs(feats, pairs, {
+        sampleSize: opts.preselectionFeatures ?? 192,
+        partners: opts.preselectionPartners ?? 8,
+        minScore: opts.preselectionMinScore ?? 4,
+        device: opts.gpu && opts.gpu.device, log,
+        onProgress: (d, t) => ev({ stage: 'matching', done: d, total: t,
+          detail: { usable: 0, pair: null, retrieval: true } }),
+      });
+    } catch (e) {
+      log(`  GPU descriptor retrieval unavailable (${e.message}) — using the ordered pair graph`);
+    }
+  }
   log(`matching ${pairs.length} image pairs ...`);
   const t0m = performance.now();
   const pairInfo = []; // { i, j, matches: [[fa, fb], ...] }

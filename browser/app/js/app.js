@@ -189,6 +189,8 @@ function sfmWorkflowOpts(st) {
   return {
     ...solveTierOpts(st.solve || 'standard'),
     graph: ['walk', 'orbit', 'dense'].includes(st.match) ? st.match : 'orbit',
+    descriptorPreselection: st.match !== 'walk',
+    preselectionPartners: st.match === 'dense' ? 12 : 8,
     ...(st.map === 'high' ? {
       interimBA: true, interimBARatio: 0.12, interimBAMaxPoints: 20000,
       lkRefine: true, trackExtend: true, obsFilter: true,

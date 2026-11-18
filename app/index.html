@@ -172,11 +172,11 @@
           <option value="standard">Precise · 8,000</option>
           <option value="precise">Maximum · 12,000</option>
         </select></div>
-      <div class="setrow" title="Step 2 — choose which image pairs are geometrically verified. Walk is local and robust; Orbit adds loop closures; Exhaustive checks the densest pair graph."><label for="set-match">2 · Matching</label>
+      <div class="setrow" title="Step 2 — choose which image pairs are geometrically verified. Orbit and Dense first run global GPU descriptor retrieval, recovering overlap even when imported photos are out of order; full matching is still ratio-tested, cross-checked and geometrically verified."><label for="set-match">2 · Matching</label>
         <select id="set-match">
-          <option value="walk">Walk</option>
-          <option value="orbit">Orbit</option>
-          <option value="dense">Dense loop closure</option>
+          <option value="walk">Walk · ordered</option>
+          <option value="orbit">Orbit · GPU retrieval</option>
+          <option value="dense">Dense · GPU retrieval</option>
         </select></div>
       <div class="setrow" title="Step 3 — triangulate the sparse cloud and jointly refine camera poses, lens distortion and 3D points. High runs bundle adjustment more often while the map grows."><label for="set-map">3 · Mapping</label>
         <select id="set-map">
