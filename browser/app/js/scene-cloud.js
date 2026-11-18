@@ -1,7 +1,13 @@
 // Build the sparse point cloud displayed with camera poses in Details.
 // Saved trainer reconstructions intentionally omit live `recon.points` on
 // restore; their frozen display cloud lives in recon.json's `cloud` field.
-export function buildDisplayCloud(capturedPoints = [], savedCloud = null, reconPoints = []) {
+export function buildDisplayCloud(capturedPoints = [], savedCloud = null, reconPoints = [], preferReconstruction = false) {
+  // An AR capture that completed SfM should visualize the triangulated sparse
+  // reconstruction (including its merged measured seeds), not hide it behind
+  // the raw native feature samples. Legacy known-pose runs retain the previous
+  // captured-cloud preference.
+  if (preferReconstruction && Array.isArray(reconPoints) && reconPoints.length)
+    return cloudFromPoints(reconPoints);
   const points = Array.isArray(capturedPoints) && capturedPoints.length ? capturedPoints : [];
   if (points.length) return cloudFromPoints(points);
 

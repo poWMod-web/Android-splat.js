@@ -64,7 +64,7 @@ function downsample2(src, w, h) {
 
 /** Extract SIFT keypoints + descriptors.
  *  gray: Float32Array 0..1. Returns { n, x, y, scale, angle, desc(Uint8Array n*128) }. */
-export function detectSift(gray, w, h, maxFeats = 4000, firstOctave = 0, peakScale = 1) {
+export function detectSift(gray, w, h, maxFeats = 4000, firstOctave = 0, peakScale = 1, spatialBalance = false) {
   const PT = PEAK_THRESH * peakScale;
   let baseImg = gray, bw = w, bh = h;
   if (firstOctave === -1) {
@@ -184,9 +184,27 @@ export function detectSift(gray, w, h, maxFeats = 4000, firstOctave = 0, peakSca
     else break;
   }
 
-  // keep strongest by contrast
+  // Keep strongest by contrast. Maximum-precision extraction optionally uses
+  // tile quotas before a global fill: high-texture corners can otherwise use
+  // the entire budget while broad, weakly textured regions receive no
+  // landmarks and cannot contribute to pose estimation.
   feats.sort((a, b) => b.contrast - a.contrast);
-  if (feats.length > maxFeats) feats.length = maxFeats;
+  if (feats.length > maxFeats) {
+    if (spatialBalance) {
+      const COLS = 4, ROWS = 4, quota = Math.max(1, Math.floor(maxFeats / (COLS * ROWS)));
+      const counts = new Uint16Array(COLS * ROWS), keep = [], deferred = [];
+      for (const f of feats) {
+        const tx = Math.min(COLS - 1, Math.max(0, Math.floor(f.x * COLS / w)));
+        const ty = Math.min(ROWS - 1, Math.max(0, Math.floor(f.y * ROWS / h)));
+        const cell = ty * COLS + tx;
+        if (counts[cell] < quota) { counts[cell]++; keep.push(f); }
+        else deferred.push(f);
+      }
+      for (let i = 0; keep.length < maxFeats && i < deferred.length; i++) keep.push(deferred[i]);
+      keep.sort((a, b) => b.contrast - a.contrast);
+      feats.length = 0; feats.push(...keep);
+    } else feats.length = maxFeats;
+  }
 
   // orientations + descriptors
   const out = [];

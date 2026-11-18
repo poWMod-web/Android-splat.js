@@ -165,10 +165,23 @@
           <option value="1280">1280 px</option>
           <option value="1600">1600 px</option>
         </select></div>
-      <div class="setrow" title="How hard the camera solver works. Quick: 3900 landmarks per photo at the base scale — about half the solve time, poses good enough for a draft. Standard: 8000 landmarks from an upsampled scale plus a pixel-aspect term — the sharpest poses (about +0.4 dB on the trained model)."><label for="set-solve">Camera solve</label>
+      <div class="setgroup">Structure from motion</div>
+      <div class="setrow" title="Step 1 — extract scale- and rotation-stable SIFT landmarks. Maximum keeps 12,000 landmarks per image and gives bundle adjustment a larger point budget."><label for="set-solve">1 · Features</label>
         <select id="set-solve">
-          <option value="quick">Quick</option>
+          <option value="quick">Quick · 3,900</option>
+          <option value="standard">Precise · 8,000</option>
+          <option value="precise">Maximum · 12,000</option>
+        </select></div>
+      <div class="setrow" title="Step 2 — choose which image pairs are geometrically verified. Orbit and Dense first run global GPU descriptor retrieval, recovering overlap even when imported photos are out of order; full matching is still ratio-tested, cross-checked and geometrically verified."><label for="set-match">2 · Matching</label>
+        <select id="set-match">
+          <option value="walk">Walk · ordered</option>
+          <option value="orbit">Orbit · GPU retrieval</option>
+          <option value="dense">Dense · GPU retrieval</option>
+        </select></div>
+      <div class="setrow" title="Step 3 — triangulate the sparse cloud and jointly refine camera poses, lens distortion and 3D points. High runs bundle adjustment more often while the map grows."><label for="set-map">3 · Mapping</label>
+        <select id="set-map">
           <option value="standard">Standard</option>
+          <option value="high">High precision</option>
         </select></div>
       <div class="setrow" title="Render grid relative to the training resolution. 2× removes edge ringing at sharp viewing sizes (~1.7× slower) but roughly quadruples GPU working memory — on phones the run may abort for lack of memory; 0.5× quarters the raster work."><label for="set-buf">Working buffer</label>
         <select id="set-buf">

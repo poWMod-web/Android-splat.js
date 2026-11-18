@@ -25,7 +25,7 @@
 // conversion, and the hidden-tab watchdog.
 
 import { decodeFrames } from './io/frames.js';
-import { reconFromKnownCameras } from './io/cameras.js';
+import { reconFromKnownCameras, alignReconstructionToKnown } from './io/cameras.js';
 import { focalPxFrom35 } from './io/exif.js';
 import { isEquirect, sliceEquirect, faceSizeFor, probeImageSize, FACE_ROTS } from './io/pano.js';
 import { runSfM } from './sfm/sfm.js';
@@ -480,6 +480,20 @@ export class Session {
     this._log(`known cameras: ${recon.cams.length} of ${this.frames.length} frames, ` +
       `${recon.points.length} ${opts.points && opts.points.length ? 'given' : 'random'} seed points, no solve`);
     return recon;
+  }
+
+  /** Solve image geometry independently, then similarity-align the resulting
+   * bundle-adjusted cameras and sparse cloud to ARCore/external poses. If SfM
+   * cannot connect the set, the caller can retain knownRecon as a safe fallback. */
+  async refineKnownCameras(knownRecon, extra = {}) {
+    if (!knownRecon?.cams?.length) throw new Error('known reconstruction required');
+    const focalPx = knownRecon.cams[0].f;
+    await this.solve({ focalPx, lockIntrinsics: true, ...extra });
+    this.recon = alignReconstructionToKnown(this.recon, knownRecon);
+    const a = this.recon.knownAlignment;
+    this._log(`SfM refined ${a.cameras} known poses and aligned them to the measured frame (scale ${a.scale.toFixed(5)}, centre RMS ${a.rms.toFixed(5)})`);
+    this._stage({ stage: 'align', done: 1, total: 1, detail: a });
+    return this.recon;
   }
 
   /** Load a reconstruction obtained elsewhere ({ cams, points, ... }). */
